@@ -8,7 +8,7 @@
 
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 429 tests unitarios pasando al 100% (97 suites, 0 fallos).
+- **Suite de pruebas automáticas:** 434 tests unitarios pasando al 100% (98 suites, 0 fallos).
 
 ---
 
@@ -95,7 +95,7 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v19`):**
+2. **Service Worker (`studio-ide-shell-v26`):**
    - Estrategia **Network-First** para el App Shell propio garantizando la versión más fresca con internet y fallback offline automático.
    - Pre-cacheo de módulos críticos (incluyendo el analizador sintáctico Acorn y los motores de ejecución de C/C++ y SQL) en `RUNTIME_CACHE` durante el evento `install`.
 3. **Privacidad de credenciales:**
@@ -111,7 +111,7 @@
 .
 ├── index.html                  # Shell principal, CSP, diálogos modales accesibles y maquetación
 ├── manifest.json               # Manifiesto Web App (PWA standalone para iPadOS y escritorio)
-├── sw.js                       # Service Worker v19 (App Shell + Runtime Cache de Acorn/CDNs)
+├── sw.js                       # Service Worker v26 (App Shell + Runtime Cache de Acorn/CDNs)
 ├── .nojekyll                   # Desactiva el procesamiento de Jekyll en GitHub Pages
 ├── README.md                   # Documentación técnica y arquitectura de la solución
 ├── MANUAL_DE_USUARIO.md        # Manual exhaustivo para el usuario final (iPad y PC)
@@ -157,7 +157,7 @@
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas y switcher de medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 429 pruebas unitarias y E2E
+└── tests/                      # Suite automatizada con 434 pruebas unitarias y E2E
 ```
 
 ---
@@ -171,8 +171,8 @@ npm --prefix tests test
 ```
 
 Resultado actual:
-- **429 pruebas unitarias y de integración ejecutadas.**
-- **97 suites completadas.**
+- **434 pruebas unitarias y de integración ejecutadas.**
+- **98 suites completadas.**
 - **0 fallos, 0 pruebas canceladas.**
 - Tiempo de ejecución: **~1.5 segundos.**
 

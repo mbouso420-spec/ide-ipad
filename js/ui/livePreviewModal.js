@@ -301,9 +301,6 @@ export function initLivePreviewModal({
 
   openBtn?.addEventListener("click", async () => {
     jsRunOverride = "auto";
-    if (typeof onBeforePreview === "function") {
-      await onBeforePreview();
-    }
     await loadAcorn();
     await openPreview();
   });
@@ -391,12 +388,18 @@ export function initLivePreviewModal({
   }
 
   const MAX_CONSOLE_LINES = 500;
+  const MAX_CONSOLE_LINE_CHARS = 10000;
 
   function appendConsoleLine(level, text) {
     if (!consoleList) return;
     while (consoleList.children.length >= MAX_CONSOLE_LINES && consoleList.firstElementChild) {
       consoleList.removeChild(consoleList.firstElementChild);
     }
+    const rawStr = String(text ?? "");
+    const safeText =
+      rawStr.length > MAX_CONSOLE_LINE_CHARS
+        ? `${rawStr.slice(0, MAX_CONSOLE_LINE_CHARS)}… [truncado]`
+        : rawStr;
     const item = document.createElement("div");
     item.className =
       level === "error"
@@ -404,7 +407,7 @@ export function initLivePreviewModal({
         : level === "warn"
           ? "preview-log-item is-warn"
           : "preview-log-item";
-    item.textContent = text;
+    item.textContent = safeText;
     consoleList.appendChild(item);
     consoleList.scrollTop = consoleList.scrollHeight;
   }

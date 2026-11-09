@@ -1,9 +1,12 @@
 import { keyboardRouter } from "./keyboardRouter.js";
 import { getStorageQuotaEstimate, formatStorageBytes } from "../storage/storageQuota.js";
+import { saveCredentialsBackup } from "../storage/workspaceDb.js";
 import {
   AI_PROVIDERS,
   getKeyStorageMode,
   setKeyStorageMode,
+  exportKeysBundle,
+  hasStoredCredentials,
   getApiKey,
   getSavedModel,
   getSavedProviderId,
@@ -423,6 +426,13 @@ export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, o
     const mode = e.target.value;
     if (mode === "session" || mode === "local") {
       setKeyStorageMode(mode);
+      try {
+        if (mode === "session" || !hasStoredCredentials()) {
+          void saveCredentialsBackup("");
+        } else {
+          void saveCredentialsBackup(exportKeysBundle());
+        }
+      } catch (_) {}
     }
   });
 

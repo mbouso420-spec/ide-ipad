@@ -97,12 +97,14 @@ async function initApp() {
 
   // Restaurar credenciales (claves IA y token GitHub) desde IndexedDB si Safari/iPadOS vació localStorage
   try {
-    if (!hasStoredCredentials()) {
+    if (getKeyStorageMode() === "session") {
+      void saveCredentialsBackup("");
+    } else if (!hasStoredCredentials()) {
       const backupJson = await readCredentialsBackup();
       if (backupJson) {
         importKeysBundle(backupJson);
       }
-    } else if (getKeyStorageMode() !== "session") {
+    } else {
       void saveCredentialsBackup(exportKeysBundle());
     }
   } catch {
@@ -344,7 +346,13 @@ async function initApp() {
       } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
         activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
       }
+      if (splitActiveFileId === oldPath) {
+        splitActiveFileId = newPath;
+      } else if (isFolder && splitActiveFileId && splitActiveFileId.startsWith(`${oldPath}/`)) {
+        splitActiveFileId = `${newPath}${splitActiveFileId.slice(oldPath.length)}`;
+      }
       editor.renameFileStates(oldPath, newPath, isFolder);
+      editorSplit?.renameFileStates?.(oldPath, newPath, isFolder);
 
       await persistTabsState();
       await reloadProjectEntries();

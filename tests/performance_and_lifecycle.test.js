@@ -6,17 +6,22 @@ import {
   base64ToUint8Array,
   isBinaryFile,
   isImageFile,
-  getImageMimeType
+  getImageMimeType,
+  BINARY_EXTENSIONS
 } from "../js/storage/fileImport.js";
 import { buildZipArchive } from "../js/storage/zipExporter.js";
 import { searchInFiles } from "../js/search/projectSearch.js";
 import { createEditorManager } from "../js/editor/editorManager.js";
 import {
   ensureInitialWorkspace,
+  createLocalProject,
   deleteProject,
   deleteProjectEntry,
   renameProjectEntry,
   createProjectFromGistBackup,
+  hydrateGithubProject,
+  hydrateLazyGithubProject,
+  convertLocalProjectToGithub,
   upsertEntry,
   updateFileContent,
   getProjectEntries,
@@ -45,9 +50,11 @@ import {
   buildSqlRunnerPreview
 } from "../js/preview/sqlRunner.js";
 import {
+  escapeAttr,
   parseCssImportConditions,
   wrapCssWithConditions,
   bundleHtmlWithFolderAssets,
+  buildStandalonePythonPreview,
   MAX_PREVIEW_ASSET_BYTES,
   MAX_TOTAL_INLINED_CSS
 } from "../js/preview/htmlBundler.js";
@@ -853,6 +860,108 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       });
 
       assert.equal(shortcutFired, true, "Debe disparar el atajo global una vez cerrado el modal");
+    });
+  });
+
+  describe("12. Auditoría Forense Microscópica (AppSec, ObjectURL, Split Sync y Transacciones)", () => {
+    test("escapeAttr escapa <, >, &, comillas dobles y simples previniendo cierre de comentarios HTML (-->)", () => {
+      const payload = 'evil"--><script>alert(1)</script><style a=\'x&y\'>';
+      const escaped = escapeAttr(payload);
+      assert.ok(!escaped.includes("-->"), "No debe permitir secuencias --> sin escapar");
+      assert.ok(!escaped.includes("<script>"), "No debe permitir apertura de etiquetas HTML");
+      assert.ok(escaped.includes("&amp;"));
+      assert.ok(escaped.includes("&lt;"));
+      assert.ok(escaped.includes("&gt;"));
+      assert.ok(escaped.includes("&quot;"));
+      assert.ok(escaped.includes("&#39;"));
+    });
+
+    test("buildStandalonePythonPreview revoca URL.revokeObjectURL(blobUrl) al detener o fallar el Web Worker", () => {
+      const html = buildStandalonePythonPreview("print('hola')", "main.py", []);
+      assert.ok(html.includes("URL.revokeObjectURL(blobUrl)"), "Debe revocar el ObjectURL del Worker para evitar fugas de memoria");
+    });
+
+    test("editor.syncDoc sincroniza contenido sin disparar bucle recursivo en onDocChange y preserva cursor en rango", async () => {
+      const mount = document.createElement("div");
+      let docChangesCount = 0;
+      const editor = await createEditorManager({
+        mountEl: mount,
+        enableMinimap: false,
+        onDocChange: () => { docChangesCount++; },
+        onSelectionChange: () => {}
+      });
+
+      editor.openFile({
+        id: "sync.js",
+        path: "sync.js",
+        lang: "js",
+        isBinary: false,
+        content: "const a = 1;\nconst b = 2;"
+      });
+
+      assert.equal(docChangesCount, 0);
+
+      // Sincronizar desde la vista dividida no debe disparar onDocChange de vuelta
+      editor.syncDoc("sync.js", "const a = 100;");
+      assert.equal(docChangesCount, 0, "syncDoc no debe disparar onDocChange recursivo");
+      assert.equal(editor.getValue(), "const a = 100;");
+
+      // clearActiveFile limpia sin dejar el archivo fantasma en statesByFile
+      editor.clearActiveFile();
+      assert.equal(editor.getActiveFileId(), null);
+      assert.equal(editor.getValue(), "");
+      editor.destroy();
+    });
+
+    test("hydrateGithubProject e hydrateLazyGithubProject preservan isBinary y base64, y convertLocalProjectToGithub opera atómicamente", async () => {
+      await ensureInitialWorkspace();
+      const ghProj = await hydrateGithubProject({
+        owner: "studio",
+        repo: "forensic-test",
+        branch: "main",
+        files: [
+          { path: "README.md", content: "# Hola", sha: "sha1" },
+          { path: "assets/icon.png", content: "AQIDBA==", isBinary: true, base64: "AQIDBA==", sha: "sha2" }
+        ]
+      });
+
+      const localProj = await createLocalProject("Local Atomic Test");
+      await upsertEntry(localProj.id, "app.js", { isFolder: false, content: "console.log(1);" });
+      await upsertEntry(localProj.id, "logo.png", { isFolder: false, content: "AQID", isBinary: true, base64: "AQID" });
+
+      try {
+        const ghEntries = await getProjectEntries(ghProj.id);
+        const iconEntry = ghEntries.find((e) => e.path === "assets/icon.png");
+        assert.equal(iconEntry?.isBinary, true, "hydrateGithubProject debe preservar isBinary");
+        assert.equal(iconEntry?.base64, "AQIDBA==", "hydrateGithubProject debe preservar base64");
+
+        await convertLocalProjectToGithub(localProj.id, { owner: "studio", repo: "converted", branch: "main" });
+        const convertedEntries = await getProjectEntries(localProj.id);
+        const convertedApp = convertedEntries.find((e) => e.path === "app.js");
+        const convertedLogo = convertedEntries.find((e) => e.path === "logo.png");
+        assert.equal(convertedApp?.trackedInGithub, true);
+        assert.equal(convertedApp?.baseContent, "console.log(1);");
+        assert.equal(convertedLogo?.isBinary, true);
+        assert.equal(convertedLogo?.base64, "AQID");
+      } finally {
+        await deleteProject(ghProj.id);
+        await deleteProject(localProj.id);
+      }
+    });
+
+    test("searchInFiles utiliza BINARY_EXTENSIONS unificado omitiendo formatos multimedia y de base de datos (.flac, .sqlite, .db)", async () => {
+      assert.ok(BINARY_EXTENSIONS.has("flac"));
+      assert.ok(BINARY_EXTENSIONS.has("sqlite"));
+      assert.ok(BINARY_EXTENSIONS.has("db"));
+
+      const files = [
+        { path: "audio.flac", content: "secreto_en_binario" },
+        { path: "datos.sqlite", content: "secreto_en_binario" },
+        { path: "notas.txt", content: "secreto_en_binario" }
+      ];
+      const res = searchInFiles(files, "secreto_en_binario");
+      assert.equal(res.totalMatches, 1, "Solo debe indexar notas.txt y omitir .flac/.sqlite");
+      assert.equal(res.results[0].path, "notas.txt");
     });
   });
 });

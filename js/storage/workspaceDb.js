@@ -726,6 +726,8 @@ async function replaceAllProjectFilesFromGithub(projectId, files) {
       contentLoaded: Boolean(file.contentLoaded),
       trackedInGithub: true,
       forceModified: false,
+      isBinary: Boolean(file.isBinary),
+      base64: file.base64 ?? null,
       deleted: false,
       updatedAt: now
     });
@@ -777,6 +779,8 @@ export async function hydrateLazyGithubProject({ owner, repo, branch, commitSha,
       baseContent: canReuse ? prev.baseContent : "",
       blobSha: item.blobSha,
       mode: item.mode || null,
+      isBinary: Boolean(canReuse ? prev.isBinary : item.isBinary),
+      base64: canReuse ? (prev.base64 ?? null) : (item.base64 ?? null),
       contentLoaded: canReuse
     };
   });
@@ -861,6 +865,8 @@ export async function hydrateGithubProject({ owner, repo, branch, commitSha, fil
       baseContent: file.content,
       blobSha: file.blobSha || null,
       mode: file.mode || null,
+      isBinary: Boolean(file.isBinary),
+      base64: file.base64 ?? null,
       contentLoaded: true
     }))
   );
@@ -1157,13 +1163,22 @@ export async function convertLocalProjectToGithub(projectId, githubMeta) {
   await putRecord(STORE_PROJECTS, project);
 
   const entries = await getAllRawProjectEntries(projectId);
-  for (const entry of entries) {
-    if (!entry.isFolder) {
-      entry.trackedInGithub = true;
-      entry.baseContent = entry.content;
-      entry.deleted = false;
-      await putRecord(STORE_FILES, entry);
-    }
+  const filesToUpdate = entries.filter((entry) => !entry.isFolder);
+  if (filesToUpdate.length > 0) {
+    const db = await openDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_FILES, "readwrite");
+      const store = tx.objectStore(STORE_FILES);
+      for (const entry of filesToUpdate) {
+        entry.trackedInGithub = true;
+        entry.baseContent = entry.content;
+        entry.deleted = false;
+        store.put(entry);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error || new Error("No se pudieron actualizar las entradas de GitHub."));
+      tx.onabort = () => reject(tx.error || new Error("Transacción abortada al convertir el proyecto a GitHub."));
+    });
   }
 
   return project;

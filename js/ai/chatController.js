@@ -13,6 +13,7 @@ import {
   getKeyStorageMode,
   getSavedModel,
   getSavedProviderId,
+  hasStoredCredentials,
   importKeysBundle,
   saveApiKey,
   saveModel,
@@ -241,7 +242,9 @@ export function initChatController({
 
   function syncCredentialsBackup() {
     try {
-      if (getKeyStorageMode() !== "session") {
+      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
+        void saveCredentialsBackup("");
+      } else {
         void saveCredentialsBackup(exportKeysBundle());
       }
     } catch {

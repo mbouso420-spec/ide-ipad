@@ -112,7 +112,9 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
 
     ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
 
-    for (let i = 0; i < totalLines; i++) {
+    const step = totalLines > height * 2 ? Math.max(1, Math.floor(totalLines / height)) : 1;
+
+    for (let i = 0; i < totalLines; i += step) {
       const line = lines[i] || "";
       if (!line.trim()) continue;
 

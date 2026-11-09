@@ -247,6 +247,7 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
   );
 
   let view = null;
+  let isSyncingExternal = false;
 
   function resolveLanguageExtension(lang) {
     switch (lang) {
@@ -316,8 +317,10 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
           indentWithTab
         ]),
         EditorView.updateListener.of((update) => {
-          if (update.docChanged && activeFileId) {
+          if (update.docChanged && activeFileId && !isSyncingExternal) {
             onDocChange(activeFileId, update.state.doc.toString());
+            minimap?.render();
+          } else if (update.docChanged && isSyncingExternal) {
             minimap?.render();
           }
           if (update.selectionSet || update.docChanged) {
@@ -404,9 +407,6 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
   }
 
   function clearActiveFile() {
-    if (view && activeFileId) {
-      statesByFile.set(activeFileId, view.state);
-    }
     activeFileId = null;
     clearErrorMarkers();
     purgeViewDocument();
@@ -633,9 +633,18 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
     if (activeFileId === fileId && view) {
       const cur = view.state.doc.toString();
       if (cur !== newContent) {
-        view.dispatch({
-          changes: { from: 0, to: view.state.doc.length, insert: newContent }
-        });
+        const prevMain = view.state.selection.main;
+        const nextAnchor = Math.min(prevMain.anchor, newContent.length);
+        const nextHead = Math.min(prevMain.head, newContent.length);
+        isSyncingExternal = true;
+        try {
+          view.dispatch({
+            changes: { from: 0, to: view.state.doc.length, insert: newContent },
+            selection: { anchor: nextAnchor, head: nextHead }
+          });
+        } finally {
+          isSyncingExternal = false;
+        }
       }
     } else {
       const cached = statesByFile.get(fileId);
@@ -669,6 +678,7 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
     toggleMinimap: (force) => minimap?.toggle(force),
     isMinimapVisible: () => (minimap ? minimap.isVisible() : false),
     getActiveFileId: () => activeFileId,
+    getValue: () => (view ? view.state.doc.toString() : ""),
     syncDoc,
     focus: () => view?.focus(),
     destroy() {
@@ -1048,6 +1058,7 @@ function createFallbackEditor({ mountEl, initialWrap, initialFontSize, onDocChan
     toggleMinimap: (force) => fallbackMinimap?.toggle(force),
     isMinimapVisible: () => (fallbackMinimap ? fallbackMinimap.isVisible() : false),
     getActiveFileId: () => activeFileId,
+    getValue: () => (textarea ? textarea.value : ""),
     syncDoc: (fileId, newContent) => {
       if (activeFileId === fileId && textarea) {
         if (textarea.value !== newContent) {

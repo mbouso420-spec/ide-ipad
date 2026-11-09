@@ -32,7 +32,7 @@ import {
   saveCredentialsBackup,
   saveProjectState
 } from "../storage/workspaceDb.js";
-import { exportKeysBundle, getKeyStorageMode } from "../ai/providers.js";
+import { exportKeysBundle, getKeyStorageMode, hasStoredCredentials } from "../ai/providers.js";
 
 /**
  * Controlador del flujo de conexión con GitHub (PAT local + Octokit),
@@ -231,7 +231,9 @@ export function initGithubController({
     saveGithubToken(token);
     hideTokenWarning();
     try {
-      if (getKeyStorageMode() !== "session") {
+      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
+        void saveCredentialsBackup("");
+      } else {
         void saveCredentialsBackup(exportKeysBundle());
       }
     } catch {}
@@ -248,7 +250,9 @@ export function initGithubController({
     clearGithubToken();
     hideTokenWarning();
     try {
-      if (getKeyStorageMode() !== "session") {
+      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
+        void saveCredentialsBackup("");
+      } else {
         void saveCredentialsBackup(exportKeysBundle());
       }
     } catch {}

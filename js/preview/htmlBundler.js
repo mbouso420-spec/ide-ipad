@@ -64,7 +64,12 @@ export function resolveRelativePath(baseDir, relPath) {
 }
 
 export function escapeAttr(str) {
-  return String(str).replace(/"/g, "&quot;");
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 export function escapeHtmlText(str) {
@@ -1282,7 +1287,10 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           var r = {
             canStop: true,
             post: function (msg) { worker.postMessage(msg); },
-            stop: function () { worker.terminate(); }
+            stop: function () {
+              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+              worker.terminate();
+            }
           };
           worker.onmessage = function (event) {
             sawWorkerMessage = true;
@@ -1291,6 +1299,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           worker.onerror = function (event) {
             if (event && event.preventDefault) event.preventDefault();
             if (!sawWorkerMessage && runner === r) {
+              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
               worker.terminate();
               runner = createMainThreadRunner();
               executePass();

@@ -1,16 +1,9 @@
 import { getKeyStorageMode } from "../ai/providers.js";
 import { toFriendlyNetworkError } from "../net/networkErrors.js";
+import { BINARY_EXTENSIONS } from "../storage/fileImport.js";
 
 const GH_TOKEN_KEY = "ide.github.pat";
 const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
-
-const BINARY_EXTENSIONS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp",
-  "pdf", "zip", "tar", "gz", "7z", "rar",
-  "woff", "woff2", "ttf", "otf", "eot",
-  "mp3", "wav", "ogg", "mp4", "webm", "mov",
-  "exe", "dll", "so", "dylib", "o", "a", "obj", "bin", "wasm"
-]);
 
 const MAX_TEXT_FILE_BYTES = 350000;
 

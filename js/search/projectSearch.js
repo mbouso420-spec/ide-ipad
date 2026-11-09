@@ -3,13 +3,7 @@
  * Permite buscar cadenas de texto, palabras completas o expresiones regulares en todo el workspace.
  */
 
-const BINARY_EXTENSIONS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp",
-  "pdf", "zip", "tar", "gz", "7z", "rar",
-  "woff", "woff2", "ttf", "otf", "eot",
-  "mp3", "wav", "ogg", "mp4", "webm", "mov",
-  "exe", "dll", "so", "dylib", "o", "a", "obj", "bin", "wasm"
-]);
+import { BINARY_EXTENSIONS } from "../storage/fileImport.js";
 
 /**
  * Escapa caracteres especiales para usar en una expresión regular.

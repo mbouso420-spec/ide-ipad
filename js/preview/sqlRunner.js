@@ -535,7 +535,7 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
             var warnBanner = document.createElement("div");
             warnBanner.className = "sql-hint";
             warnBanner.style.padding = "6px 12px";
-            warnBanner.style.color = "#d97706";
+            warnBanner.style.color = "var(--warn)";
             warnBanner.textContent = "⚠️ La consulta devolvió " + originalRowCount + " filas. Se muestran las primeras " + MAX_SQL_DISPLAY_ROWS + " para prevenir saturación de memoria. Usá LIMIT y OFFSET para paginar consultas masivas.";
             card.appendChild(warnBanner);
           }
