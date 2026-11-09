@@ -15,6 +15,8 @@ import {
   ensureInitialWorkspace,
   deleteProject,
   deleteProjectEntry,
+  renameProjectEntry,
+  createProjectFromGistBackup,
   upsertEntry,
   updateFileContent,
   getProjectEntries,
@@ -685,6 +687,172 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
         content: "AQID"
       });
       assert.equal(editor.getActiveFileId(), "main.js");
+      editor.destroy();
+    });
+  });
+
+  describe("11. Correcciones de Auditoría Integral 360° (Integridad Binaria, Concurrencia, WASM y Bundler)", () => {
+    test("renameProjectEntry preserva isBinary y base64 sin emitir tormenta de ENTRY_UPSERTED", async () => {
+      const projId = "test-binary-rename-360";
+      await ensureInitialWorkspace();
+      await upsertEntry(projId, "assets/logo.png", {
+        isFolder: false,
+        content: "iVBORw0KGgoAAAANSUhEUg==",
+        isBinary: true,
+        base64: "iVBORw0KGgoAAAANSUhEUg=="
+      });
+
+      const events = [];
+      const otherTabChannel = new BroadcastChannel("studio_ide_workspace_sync");
+      otherTabChannel.unref?.();
+      otherTabChannel.addEventListener("message", (ev) => {
+        if (ev.data?.projectId === projId) {
+          events.push(ev.data);
+        }
+      });
+
+      try {
+        await renameProjectEntry(projId, "assets/logo.png", "assets/brand.png", false);
+        await new Promise((r) => setTimeout(r, 40));
+
+        const entries = await getProjectEntries(projId);
+        const renamed = entries.find((e) => e.path === "assets/brand.png");
+        assert.ok(renamed, "El archivo renombrado debe existir en IndexedDB");
+        assert.equal(renamed.isBinary, true, "Debe preservar el flag isBinary tras renombrar");
+        assert.equal(renamed.base64, "iVBORw0KGgoAAAANSUhEUg==", "Debe preservar el payload base64 tras renombrar");
+        assert.equal(events.filter((e) => e.type === "ENTRY_UPSERTED").length, 0, "No debe emitir ENTRY_UPSERTED intermedios durante rename");
+        assert.equal(events.filter((e) => e.type === "ENTRY_RENAMED").length, 1, "Debe emitir exactamente 1 evento ENTRY_RENAMED");
+      } finally {
+        otherTabChannel.close();
+        await deleteProject(projId);
+      }
+    });
+
+    test("createProjectFromGistBackup persiste correctamente content, isBinary, base64 y mode", async () => {
+      await ensureInitialWorkspace();
+      const created = await createProjectFromGistBackup({
+        projectName: "Gist Binary Test",
+        entries: [
+          { path: "main.py", content: "print('ok')", mode: "100755" },
+          { path: "icon.png", content: "AQIDBA==", isBinary: true, base64: "AQIDBA==" }
+        ]
+      });
+
+      try {
+        const entries = await getProjectEntries(created.id);
+        const pyFile = entries.find((e) => e.path === "main.py");
+        const pngFile = entries.find((e) => e.path === "icon.png");
+        assert.equal(pyFile?.content, "print('ok')");
+        assert.equal(pyFile?.mode, "100755");
+        assert.equal(pngFile?.isBinary, true);
+        assert.equal(pngFile?.base64, "AQIDBA==");
+      } finally {
+        await deleteProject(created.id);
+      }
+    });
+
+    test("restoreEmergencyBackup ordena múltiples respaldos por savedAt ascendente para que gane el más reciente", async () => {
+      const storage = new Map();
+      const mockStorage = {
+        getItem: (k) => storage.get(k) ?? null,
+        setItem: (k, v) => storage.set(k, String(v)),
+        removeItem: (k) => storage.delete(k),
+        get length() { return storage.size; },
+        key: (i) => Array.from(storage.keys())[i] ?? null
+      };
+
+      // Insertar primero en el Map una clave con timestamp MÁS NUEVO (t = 2000)
+      storage.set(
+        getEmergencyBackupKey("proj-order", "tab-newer"),
+        JSON.stringify({
+          savedAt: 2000,
+          projectId: "proj-order",
+          instanceId: "tab-newer",
+          items: [{ projectId: "proj-order", filePath: "index.js", content: "version NUEVA" }]
+        })
+      );
+      // Insertar después en el Map una clave con timestamp MÁS VIEJO (t = 1000)
+      storage.set(
+        getEmergencyBackupKey("proj-order", "tab-older"),
+        JSON.stringify({
+          savedAt: 1000,
+          projectId: "proj-order",
+          instanceId: "tab-older",
+          items: [{ projectId: "proj-order", filePath: "index.js", content: "version VIEJA" }]
+        })
+      );
+
+      const writes = [];
+      const mockDb = {
+        async entryExists() { return true; },
+        async updateFileContent(pid, path, content) {
+          writes.push({ pid, path, content });
+        }
+      };
+
+      const restored = await restoreEmergencyBackup(mockDb, mockStorage, "proj-order");
+      assert.equal(restored, 2);
+      assert.equal(writes.length, 2);
+      assert.equal(writes[0].content, "version VIEJA");
+      assert.equal(writes[1].content, "version NUEVA", "El respaldo con mayor savedAt debe aplicarse al final");
+    });
+
+    test("bundleHtmlWithFolderAssets incrusta imágenes locales Base64 y SVG como data URIs", () => {
+      const fileMap = new Map([
+        ["logo.png", { path: "logo.png", isBinary: true, base64: "iVBORw0KGgo=", content: "iVBORw0KGgo=" }],
+        ["icon.svg", { path: "icon.svg", isBinary: false, content: '<svg xmlns="http://www.w3.org/2000/svg"><circle r="5"/></svg>' }]
+      ]);
+
+      const rawHtml = '<!DOCTYPE html><html><body><img class="brand" src="./logo.png" alt="Logo"><img src="icon.svg"></body></html>';
+      const bundled = bundleHtmlWithFolderAssets("index.html", rawHtml, fileMap);
+
+      assert.ok(bundled.includes('src="data:image/png;base64,iVBORw0KGgo="'), "Debe incrustar PNG binario como data URI Base64");
+      assert.ok(bundled.includes('src="data:image/svg+xml;charset=utf-8,'), "Debe incrustar SVG local como data URI UTF-8");
+    });
+
+    test("buildSqlRunnerPreview libera la instancia previa con db.close() al reiniciar la base", () => {
+      const html = buildSqlRunnerPreview("SELECT 1;", "test.sql");
+      assert.ok(html.includes("db.close()"), "Debe invocar db.close() antes de recrear SQL.Database para evitar fugas en el heap WASM");
+      assert.ok(html.includes("var Engine = sqlEngine || window.SQL;"), "Debe conservar referencia a sqlEngine al reiniciar");
+    });
+
+    test("KeyboardRouter bloquea atajos globales de fondo cuando un modal con blockGlobalShortcuts está activo", () => {
+      const router = new KeyboardRouter();
+      let shortcutFired = false;
+      router.registerGlobalShortcut("ctrl+p", () => {
+        shortcutFired = true;
+      });
+
+      router.pushModal({
+        id: "dialog-settings",
+        blockGlobalShortcuts: true,
+        onEscape: () => true
+      });
+
+      router.handleKeyDown({
+        key: "p",
+        ctrlKey: true,
+        metaKey: false,
+        altKey: false,
+        shiftKey: false,
+        preventDefault: () => {},
+        stopImmediatePropagation: () => {}
+      });
+
+      assert.equal(shortcutFired, false, "No debe disparar atajos globales mientras el diálogo modal está abierto");
+
+      router.popModal("dialog-settings");
+      router.handleKeyDown({
+        key: "p",
+        ctrlKey: true,
+        metaKey: false,
+        altKey: false,
+        shiftKey: false,
+        preventDefault: () => {},
+        stopImmediatePropagation: () => {}
+      });
+
+      assert.equal(shortcutFired, true, "Debe disparar el atajo global una vez cerrado el modal");
     });
   });
 });

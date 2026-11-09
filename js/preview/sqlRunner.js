@@ -443,6 +443,7 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
     (function () {
       var initialScript = ${safeContent};
       var db = null;
+      var sqlEngine = null;
       var lastResults = [];
       var lastFullQuery = null;
       var isPaginatedQuery = false;
@@ -477,6 +478,8 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
             return "https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/" + file;
           }
         }).then(function (SQL) {
+          sqlEngine = SQL;
+          window.SQL = SQL;
           db = new SQL.Database();
           statusEl.textContent = "Listo para consultas";
           statusEl.style.color = "var(--ok)";
@@ -605,10 +608,10 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
                 lines.push(row.map(function (v) {
                   if (v === null || v === undefined) return "";
                   var s = String(v);
-                  return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
+                  return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
                 }).join(","));
               });
-              downloadBlob("resultados_sql_pagina_" + meta.currentPage + ".csv", lines.join("\r\n"), "text/csv;charset=utf-8");
+              downloadBlob("resultados_sql_pagina_" + meta.currentPage + ".csv", lines.join("\\r\\n"), "text/csv;charset=utf-8");
               sendLog("log", "Exportada página " + meta.currentPage + " en CSV (" + res.values.length + " filas)");
             });
             actionsWrap.appendChild(btnPageCsv);
@@ -812,8 +815,12 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
       });
 
       btnReset.addEventListener("click", function () {
-        if (window.SQL && window.SQL.Database) {
-          db = new window.SQL.Database();
+        var Engine = sqlEngine || window.SQL;
+        if (Engine && Engine.Database) {
+          if (db && typeof db.close === "function") {
+            try { db.close(); } catch (_) {}
+          }
+          db = new Engine.Database();
           runFullScript(initialScript);
         }
       });
@@ -846,7 +853,7 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
             lines.push(row.map(function (v) {
               if (v === null || v === undefined) return "";
               var s = String(v);
-              return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
+              return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
             }).join(","));
           });
         });

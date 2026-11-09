@@ -313,6 +313,10 @@ export function initLivePreviewModal({
     dialog?.close();
   });
 
+  dialog?.addEventListener("close", () => {
+    stopIframe();
+  });
+
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
       stopIframe();
@@ -386,8 +390,13 @@ export function initLivePreviewModal({
     consoleList.innerHTML = "";
   }
 
+  const MAX_CONSOLE_LINES = 500;
+
   function appendConsoleLine(level, text) {
     if (!consoleList) return;
+    while (consoleList.children.length >= MAX_CONSOLE_LINES && consoleList.firstElementChild) {
+      consoleList.removeChild(consoleList.firstElementChild);
+    }
     const item = document.createElement("div");
     item.className =
       level === "error"

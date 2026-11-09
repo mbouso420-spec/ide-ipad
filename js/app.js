@@ -489,6 +489,8 @@ async function initApp() {
       await upsertEntry(activeProject.id, newPath, {
         isFolder: false,
         content: source.content,
+        isBinary: Boolean(source.isBinary),
+        base64: source.base64 || null,
         allowOverwrite: false
       });
       await reloadProjectEntries();
@@ -904,6 +906,9 @@ async function initApp() {
       !event.shiftKey &&
       (event.key === "w" || event.key === "W")
     ) {
+      if (keyboardRouter.getActiveModal() || document.querySelector("dialog[open]")) {
+        return;
+      }
       if (activeFileId) {
         event.preventDefault();
         requestCloseTab(activeFileId);
@@ -924,13 +929,23 @@ async function initApp() {
       }
 
       await reloadProjectEntries();
+      // Re-verificar tras la lectura asíncrona por si el usuario tecleó mientras se cargaban las entradas
+      if (!activeProject || event.projectId !== activeProject.id || saveTimers.has(timerKey)) {
+        return;
+      }
+
       const updated = filesOnly.find((f) => f.id === event.path);
       if (!updated) return;
 
       if (event.path === activeFileId) {
         // Invalida el estado cacheado en statesByFile y reabre limpiamente desde IndexedDB sin recargar toda la UI
         editor.dropFileState(event.path);
-        editor.openFile(updated);
+        if (isBinaryFile(updated)) {
+          renderBinaryPreview(updated);
+        } else {
+          hideBinaryPreview();
+          editor.openFile(updated);
+        }
         renderTabs();
       } else {
         // Invalida el estado en segundo plano para que al hacer clic se lea el contenido fresco
@@ -939,7 +954,7 @@ async function initApp() {
       }
 
       if (editorSplit) {
-        if (splitActiveFileId === event.path) {
+        if (splitActiveFileId === event.path && !isBinaryFile(updated)) {
           editorSplit.dropFileState(event.path);
           editorSplit.openFile(updated);
         } else {
@@ -949,7 +964,8 @@ async function initApp() {
       return;
     }
 
-    // Para cambios estructurales (creación, renombrado, borrado)
+    // Para cambios estructurales (creación, renombrado, borrado): volcar primero ediciones pendientes locales
+    await flushPendingSaves();
     await reloadProjectEntries();
     renderWorkspaceView();
   });

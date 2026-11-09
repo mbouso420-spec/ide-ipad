@@ -762,7 +762,7 @@ export function mountCRunnerView(containerEl, {
       termStatus.textContent = "Error de red / API";
       const errDiv = document.createElement("div");
       errDiv.className = "c-term-stderr";
-      errDiv.textContent = `Error al conectar con la API de compilación: ${escapeHtml(err.message)}`;
+      errDiv.textContent = `Error al conectar con la API de compilación: ${err.message}`;
       termBody.appendChild(errDiv);
       onCompilerResult({ success: false, errors: [] });
     } finally {
@@ -1192,7 +1192,11 @@ export function buildCRunnerPreview(activeFile, companionFiles = []) {
         } catch (err) {
           termStatus.className = "terminal-status is-err";
           termStatus.textContent = "Error de red / API";
-          termBody.innerHTML = '<span class="out-stderr">Error al conectar con la API de compilación: ' + err.message + '</span>';
+          termBody.innerHTML = "";
+          var errSpan = document.createElement("span");
+          errSpan.className = "out-stderr";
+          errSpan.textContent = "Error al conectar con la API de compilación: " + err.message;
+          termBody.appendChild(errSpan);
           sendLog("error", "[C/C++] Error de conexión: " + err.message);
         } finally {
           btnCompile.disabled = false;

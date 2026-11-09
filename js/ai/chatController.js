@@ -1040,7 +1040,7 @@ export function initChatController({
         }
         window.setTimeout(() => {
           btnApplyAction.disabled = false;
-          btnApplyAction.innerHTML = `${icon("fileCheck")}<span>Aplicar a ${baseName}</span>`;
+          btnApplyAction.innerHTML = `${icon("fileCheck")}<span>Aplicar a ${escapeHtml(baseName)}</span>`;
         }, 1500);
       });
     } else {
@@ -1077,7 +1077,7 @@ export function initChatController({
     btn.type = "button";
     btn.className = "btn btn-ghost btn-sm";
     btn.title = title;
-    btn.innerHTML = `${icon(iconName)}<span>${label}</span>`;
+    btn.innerHTML = `${icon(iconName)}<span>${escapeHtml(label)}</span>`;
     btn.addEventListener("click", onClick);
     return btn;
   }

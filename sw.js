@@ -108,13 +108,6 @@ self.addEventListener("activate", (event) => {
       const staleKeys = keys.filter((k) => k !== SHELL_CACHE && k !== RUNTIME_CACHE);
       await Promise.all(staleKeys.map((k) => caches.delete(k)));
       await self.clients.claim();
-
-      if (staleKeys.length > 0) {
-        const windowClients = await self.clients.matchAll({ type: "window" });
-        for (const client of windowClients) {
-          client.navigate(client.url).catch(() => {});
-        }
-      }
     })()
   );
 });

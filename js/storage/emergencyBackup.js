@@ -73,17 +73,25 @@ function getAllStorageKeys(storage) {
   }
 }
 
-function parseBackupItems(raw) {
-  if (!raw) return [];
+function parseBackupPayload(raw) {
+  if (!raw) return { savedAt: 0, items: [] };
   try {
     const parsed = JSON.parse(raw);
+    const savedAt = typeof parsed?.savedAt === "number" ? parsed.savedAt : 0;
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
-    return items.filter(
-      (it) => it && typeof it.projectId === "string" && typeof it.filePath === "string" && typeof it.content === "string"
-    );
+    return {
+      savedAt,
+      items: items.filter(
+        (it) => it && typeof it.projectId === "string" && typeof it.filePath === "string" && typeof it.content === "string"
+      )
+    };
   } catch {
-    return [];
+    return { savedAt: 0, items: [] };
   }
+}
+
+function parseBackupItems(raw) {
+  return parseBackupPayload(raw).items;
 }
 
 /**
@@ -267,11 +275,23 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
     return 0;
   }
 
+  const snapshots = targetKeys.map((key, index) => {
+    const payload = parseBackupPayload(storage.getItem(key));
+    return {
+      key,
+      index,
+      savedAt: payload.savedAt,
+      items: payload.items
+    };
+  });
+
+  // Ordenar cronológicamente por savedAt ascendente para que el respaldo más reciente prevalezca
+  snapshots.sort((a, b) => (a.savedAt - b.savedAt) || (a.index - b.index));
+
   let totalRestored = 0;
-  for (const key of targetKeys) {
-    const items = parseBackupItems(storage.getItem(key));
-    if (items.length > 0) {
-      for (const item of items) {
+  for (const snap of snapshots) {
+    if (snap.items.length > 0) {
+      for (const item of snap.items) {
         if (await db.entryExists(item.projectId, item.filePath)) {
           await db.updateFileContent(item.projectId, item.filePath, item.content);
           totalRestored += 1;
@@ -280,7 +300,7 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
     }
     // Borrado individual y atómico de la clave procesada en el snapshot
     try {
-      storage.removeItem(key);
+      storage.removeItem(snap.key);
     } catch (_) {}
   }
 

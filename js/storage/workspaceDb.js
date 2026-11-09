@@ -463,7 +463,8 @@ export async function upsertEntry(
     contentLoaded = true,
     mode = null,
     isBinary = false,
-    base64 = null
+    base64 = null,
+    silent = false
   } = {}
 ) {
   const cleanPath = normalizePath(path);
@@ -556,7 +557,9 @@ export async function upsertEntry(
   };
 
   await putRecord(STORE_FILES, record);
-  broadcastWorkspaceChange({ type: "ENTRY_UPSERTED", projectId, path: cleanPath, isFolder });
+  if (!silent) {
+    broadcastWorkspaceChange({ type: "ENTRY_UPSERTED", projectId, path: cleanPath, isFolder });
+  }
   return record;
 }
 
@@ -617,7 +620,10 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
       baseContent: preserveTargetBase,
       fromGithub: false,
       allowOverwrite: true,
-      mode: item.mode ?? null
+      mode: item.mode ?? null,
+      isBinary: Boolean(item.isBinary),
+      base64: item.base64 ?? null,
+      silent: true
     });
 
     await removeOrSoftDeleteRecord(item);
@@ -1119,9 +1125,14 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
   await putRecord(STORE_PROJECTS, project);
 
   for (const entry of fileEntries) {
-    await upsertEntry(id, entry.path, entry.content || "", {
+    await upsertEntry(id, entry.path, {
+      isFolder: false,
+      content: entry.content || "",
+      isBinary: Boolean(entry.isBinary),
+      base64: entry.base64 || null,
       allowOverwrite: true,
-      mode: entry.mode || null
+      mode: entry.mode || null,
+      silent: true
     });
   }
 

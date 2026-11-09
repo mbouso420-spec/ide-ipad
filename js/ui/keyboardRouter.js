@@ -39,6 +39,7 @@ export class KeyboardRouter {
           const res = originalShowModal.apply(dialog, args);
           this.pushModal({
             id: dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`,
+            blockGlobalShortcuts: true,
             onEscape: () => {
               if (dialog.open) dialog.close();
             }
@@ -139,6 +140,10 @@ export class KeyboardRouter {
           event.stopImmediatePropagation();
           return;
         }
+      }
+
+      if (activeModal.blockGlobalShortcuts) {
+        return;
       }
     }
 

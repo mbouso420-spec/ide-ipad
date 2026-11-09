@@ -1,4 +1,5 @@
 import { normalizePath } from "../storage/workspaceDb.js";
+import { getImageMimeType } from "../storage/fileImport.js";
 import { buildLoopGuardRuntime } from "./loopGuard.js";
 
 export const HTML_EXTENSIONS = new Set(["html", "htm"]);
@@ -517,7 +518,7 @@ export function bundleHtmlWithFolderAssets(
 ) {
   const dir = getParentFolder(entryPath);
 
-  const resolveAsset = (rawHref) => {
+  const resolveRawEntry = (rawHref) => {
     if (!rawHref || /^(https?:|data:|blob:|\/\/)/i.test(rawHref)) {
       return null;
     }
@@ -533,6 +534,11 @@ export function bundleHtmlWithFolderAssets(
     if (!asset && !cleanRef.startsWith("/")) {
       asset = fileMap.get(normalizePath(cleanRef)) || null;
     }
+    return asset || null;
+  };
+
+  const resolveAsset = (rawHref) => {
+    const asset = resolveRawEntry(rawHref);
     if (!asset || asset.content == null || typeof asset.content !== "string") {
       return null;
     }
@@ -664,6 +670,26 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
+  // Incrustar imágenes locales (<img src="...">) almacenadas en Base64 o SVG dentro del proyecto
+  html = html.replace(/<img\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+    const entry = resolveRawEntry(rawSrc);
+    if (!entry) return fullTag;
+    const ext = getFileExtension(entry.path || rawSrc);
+    const b64Payload = typeof entry.base64 === "string" && entry.base64.length > 0
+      ? entry.base64
+      : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
+        ? entry.content
+        : null;
+    if (b64Payload) {
+      const mime = getImageMimeType(entry.path || rawSrc);
+      return `<img${beforeSrc}src=${quote}data:${mime};base64,${b64Payload}${quote}${afterSrc}>`;
+    }
+    if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
+      return `<img${beforeSrc}src=${quote}data:image/svg+xml;charset=utf-8,${encodeURIComponent(entry.content)}${quote}${afterSrc}>`;
+    }
+    return fullTag;
+  });
+
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (fullTag, attrs, inlineCode) => {
     const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
     if (!srcMatch) {
@@ -671,7 +697,8 @@ export function bundleHtmlWithFolderAssets(
       const type = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
       const isJs = !type || type === "module" || type === "text/javascript" || type === "application/javascript";
       if (!isJs || !inlineCode.trim()) return fullTag;
-      return `<script${attrs}>${transformJs(inlineCode, type === "module")}</script>`;
+      const safeInline = transformJs(inlineCode, type === "module").replace(/<\/script>/gi, "<\\/script>");
+      return `<script${attrs}>${safeInline}</script>`;
     }
     const asset = resolveAsset(srcMatch[1]);
     if (!asset) return fullTag;

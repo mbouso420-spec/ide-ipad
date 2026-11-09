@@ -671,6 +671,8 @@ export async function saveProjectToGist(token, { projectName, entries, existingG
       .map((e) => ({
         path: e.path,
         content: typeof e.content === "string" ? e.content : "",
+        isBinary: Boolean(e.isBinary),
+        base64: e.base64 || null,
         mode: e.mode || null
       }))
   };
