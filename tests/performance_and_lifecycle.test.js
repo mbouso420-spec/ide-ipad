@@ -15,6 +15,9 @@ import {
   buildContentAttributes,
   computeSmartReplacement,
   createEditorManager,
+  extractWordBeforeCursor,
+  getLanguageCompletions,
+  scoreCompletionMatch,
   scoreLineSimilarity
 } from "../js/editor/editorManager.js";
 import {
@@ -1138,6 +1141,66 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       assert.ok(res.text.includes("const msg = `Hola, ${nombre}!`;"), "Debe actualizar el bloque de la función saludar");
       assert.ok(res.text.includes("export function despedir(nombre) {"), "Debe conservar las funciones posteriores del archivo");
       assert.ok(scoreLineSimilarity("  const total = a + b;", "const total = a * b;") > 0.65);
+    });
+
+    test("getLanguageCompletions y acceptTopCompletion autocompletan palabras del lenguaje (ej. prin -> printf en C) y coincidencias de 3+ letras", async () => {
+      // 1. Escribiendo "prin" en C sugiere "printf" primero y también fprintf, sprintf, snprintf
+      const cSuggestions = getLanguageCompletions("c", "prin", "int main() {\n  prin\n}");
+      assert.ok(cSuggestions.length >= 3);
+      assert.equal(cSuggestions[0].label, "printf", "La primera sugerencia para 'prin' en C debe ser 'printf'");
+      assert.ok(cSuggestions.some((s) => s.label === "fprintf"));
+      assert.ok(cSuggestions.some((s) => s.label === "snprintf"));
+
+      // 2. Similitud de 3+ letras o subsecuencia (ej. "prinf" o "prtf" -> "printf", "scnf" -> "scanf", "retrun" -> "return")
+      const fuzzyPrintf = getLanguageCompletions("c", "prinf");
+      assert.ok(fuzzyPrintf.some((s) => s.label === "printf"), "Debe sugerir 'printf' ante 'prinf'");
+
+      const subseqScanf = getLanguageCompletions("c", "scnf");
+      assert.ok(subseqScanf.some((s) => s.label === "scanf"), "Debe sugerir 'scanf' ante 'scnf'");
+
+      const cppCout = getLanguageCompletions("cpp", "cout");
+      assert.ok(cppCout.some((s) => s.label === "std::cout"), "En C++ 'cout' debe sugerir 'std::cout'");
+
+      const jsReturn = getLanguageCompletions("js", "retrun");
+      assert.ok(jsReturn.some((s) => s.label === "return"), "En JS 'retrun' debe sugerir 'return'");
+
+      assert.ok(scoreCompletionMatch("prin", "printf") > scoreCompletionMatch("prin", "fprintf"));
+
+      // 3. Integración con el editor: al escribir "prin" al final y aceptar autocompletado, reemplaza "prin" por "printf"
+      const wordRange = extractWordBeforeCursor("int main() {\n  prin", 19);
+      assert.equal(wordRange.word, "prin");
+      assert.equal(wordRange.from, 15);
+      assert.equal(wordRange.to, 19);
+
+      const wrapper = document.createElement("div");
+      const mount = document.createElement("div");
+      wrapper.appendChild(mount);
+
+      const editor = await createEditorManager({
+        mountEl: mount,
+        enableMinimap: false,
+        onDocChange: () => {},
+        onSelectionChange: () => {}
+      });
+
+      editor.openFile({
+        id: "main.c",
+        path: "main.c",
+        lang: "c",
+        isBinary: false,
+        content: ""
+      });
+
+      // Insertar "int main() {\n  prin" en la posición del cursor
+      editor.insertAtCursor("int main() {\n  prin", 0);
+      const liveCompletions = editor.getCompletions();
+      assert.equal(liveCompletions[0]?.label, "printf");
+
+      const accepted = editor.acceptTopCompletion();
+      assert.equal(accepted, true);
+      assert.equal(editor.getValue(), "int main() {\n  printf", "Debe completar 'prin' -> 'printf' conservando el código previo");
+
+      editor.destroy();
     });
   });
 });

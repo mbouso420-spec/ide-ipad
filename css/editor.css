@@ -380,38 +380,151 @@
   }
 }
 
-/* Menú de autocompletado inteligente de CodeMirror 6 adaptado a grafito oscuro */
-.editor-mount .cm-tooltip {
-  border: 0;
+/* Menú de autocompletado inteligente de CodeMirror 6 y barra inferior de sugerencias en vivo */
+.editor-mount .cm-tooltip,
+.editor-split-body .cm-tooltip {
+  border: var(--rule-hair) solid var(--color-rule-strong);
   border-radius: var(--radius-card);
   background: var(--color-paper-2);
   color: var(--color-ink);
   box-shadow: var(--shadow-card);
 }
 
-.editor-mount .cm-tooltip.cm-tooltip-autocomplete > ul {
+.editor-mount .cm-tooltip.cm-tooltip-autocomplete > ul,
+.editor-split-body .cm-tooltip.cm-tooltip-autocomplete > ul {
   font-family: var(--font-outlier);
   font-size: var(--text-xs);
   max-height: 220px;
   padding: var(--space-2xs);
 }
 
-.editor-mount .cm-tooltip-autocomplete ul li {
+.editor-mount .cm-tooltip-autocomplete ul li,
+.editor-split-body .cm-tooltip-autocomplete ul li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
   padding-block: var(--space-2xs);
   padding-inline: var(--space-xs);
   border-radius: var(--radius-control);
   color: var(--color-ink-2);
 }
 
-.editor-mount .cm-tooltip-autocomplete ul li[aria-selected] {
+.editor-mount .cm-tooltip-autocomplete ul li[aria-selected],
+.editor-split-body .cm-tooltip-autocomplete ul li[aria-selected] {
   background: var(--color-accent-soft);
   color: var(--color-ink);
 }
 
-.editor-mount .cm-completionMatchedText {
+.editor-mount .cm-completionMatchedText,
+.editor-split-body .cm-completionMatchedText {
   color: var(--color-accent-text);
   font-weight: 600;
   text-decoration: none;
+}
+
+.editor-mount .cm-completionDetail,
+.editor-split-body .cm-completionDetail {
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-style: normal;
+  color: var(--color-muted);
+  margin-left: var(--space-xs);
+}
+
+/* Barra inferior de sugerencias de autocompletado mientras el usuario escribe */
+.editor-autocomplete-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-sm);
+  background: var(--color-paper-2);
+  border-top: var(--rule-hair) solid var(--color-rule);
+  min-height: 36px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+.editor-autocomplete-bar[hidden] {
+  display: none !important;
+}
+
+.editor-autocomplete-hint {
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--color-muted);
+  white-space: nowrap;
+  user-select: none;
+  flex-shrink: 0;
+}
+
+.editor-autocomplete-track {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  flex: 1;
+  min-width: 0;
+}
+
+.editor-autocomplete-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  min-height: 28px;
+  padding: 2px var(--space-xs);
+  border-radius: var(--radius-control);
+  border: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-3);
+  color: var(--color-ink-2);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    background-color var(--dur-micro) var(--ease-out),
+    border-color var(--dur-micro) var(--ease-out),
+    color var(--dur-micro) var(--ease-out);
+}
+
+.editor-autocomplete-pill:hover,
+.editor-autocomplete-pill:focus-visible {
+  background: var(--color-accent-soft);
+  border-color: var(--color-rule-strong);
+  color: var(--color-ink);
+  outline: none;
+}
+
+.editor-autocomplete-pill.is-selected {
+  background: var(--color-accent-soft);
+  border-color: var(--color-accent-text);
+  color: var(--color-ink);
+}
+
+.editor-autocomplete-label {
+  font-weight: 600;
+  color: var(--color-accent-text);
+}
+
+.editor-autocomplete-detail {
+  color: var(--color-muted);
+  font-size: var(--text-xs);
+}
+
+.editor-autocomplete-kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 5px;
+  border-radius: var(--radius-control);
+  background: var(--color-paper);
+  border: var(--rule-hair) solid var(--color-rule);
+  color: var(--color-muted);
+  font-family: var(--font-outlier);
+  font-size: 10px;
+  line-height: 1.2;
 }
 
 @media (max-width: 44rem) {
