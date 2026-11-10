@@ -49,7 +49,7 @@ export const KEYBOARD_SHORTCUTS = [
  *   onSelectProvider?: (providerId: string) => void
  * }} config
  */
-export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, onSelectProvider }) {
+export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardChange, getContextSnapshot, onSelectProvider }) {
   const dialog = document.getElementById("settings-dialog");
   const openBtn = document.getElementById("btn-open-settings");
   const closeBtn = document.getElementById("btn-close-settings");
@@ -57,6 +57,7 @@ export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, o
   const selectTheme = document.getElementById("select-theme");
   const chkWordWrap = document.getElementById("setting-word-wrap");
   const chkMinimap = document.getElementById("setting-minimap");
+  const chkHardwareKeyboard = document.getElementById("setting-hardware-keyboard");
   const selectKeyStorage = document.getElementById("setting-key-storage");
   const selectAutosave = document.getElementById("setting-autosave-delay");
   const selectAiTemp = document.getElementById("setting-ai-temperature");
@@ -289,6 +290,10 @@ export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, o
       chkMinimap.checked = Boolean(editor.isMinimapVisible?.());
     }
 
+    if (chkHardwareKeyboard && editor) {
+      chkHardwareKeyboard.checked = editor.isHardwareKeyboardMode ? Boolean(editor.isHardwareKeyboardMode()) : true;
+    }
+
     if (selectKeyStorage) {
       selectKeyStorage.value = getKeyStorageMode();
     }
@@ -327,8 +332,10 @@ export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, o
     if (!quotaTextEl) return;
     try {
       const estimate = await getStorageQuotaEstimate();
-      if (estimate && estimate.quota) {
-        quotaTextEl.textContent = `${formatStorageBytes(estimate.usage)} usados de ${formatStorageBytes(estimate.quota)} disponibles`;
+      const quota = estimate?.quotaBytes ?? estimate?.quota ?? 0;
+      const usage = estimate?.usageBytes ?? estimate?.usage ?? 0;
+      if (estimate && quota > 0) {
+        quotaTextEl.textContent = `${formatStorageBytes(usage)} usados de ${formatStorageBytes(quota)} disponibles`;
       } else {
         quotaTextEl.textContent = "Almacenamiento persistente activo en IndexedDB";
       }
@@ -419,6 +426,14 @@ export function initSettingsModal({ editor, onThemeChange, getContextSnapshot, o
       chkMinimap.checked = enabled;
       const btnMinimap = document.getElementById("btn-editor-minimap");
       if (btnMinimap) btnMinimap.setAttribute("aria-pressed", String(enabled));
+    }
+  });
+
+  chkHardwareKeyboard?.addEventListener("change", () => {
+    if (editor && typeof editor.setHardwareKeyboardMode === "function") {
+      const enabled = editor.setHardwareKeyboardMode(Boolean(chkHardwareKeyboard.checked));
+      chkHardwareKeyboard.checked = enabled;
+      onHardwareKeyboardChange?.(enabled);
     }
   });
 

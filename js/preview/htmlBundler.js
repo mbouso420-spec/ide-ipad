@@ -1284,29 +1284,41 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           var prefix = "var __loadScript = function (url) { importScripts(url); return Promise.resolve(); };\\n";
           var blobUrl = URL.createObjectURL(new Blob([prefix + runnerSrc], { type: "text/javascript" }));
           var worker = new Worker(blobUrl);
+          var revoked = false;
+          function revokeBlobUrl() {
+            if (!revoked) {
+              revoked = true;
+              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+            }
+          }
           var r = {
             canStop: true,
             post: function (msg) { worker.postMessage(msg); },
             stop: function () {
-              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
+              window.removeEventListener("pagehide", onPageHide);
+              revokeBlobUrl();
               worker.terminate();
             }
           };
+          function onPageHide() {
+            r.stop();
+          }
           worker.onmessage = function (event) {
             sawWorkerMessage = true;
+            revokeBlobUrl();
             handle(event.data);
           };
           worker.onerror = function (event) {
             if (event && event.preventDefault) event.preventDefault();
             if (!sawWorkerMessage && runner === r) {
-              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
-              worker.terminate();
+              r.stop();
               runner = createMainThreadRunner();
               executePass();
               return;
             }
             handle({ type: "fatal", message: event && event.message ? event.message : "Error en el motor Python." });
           };
+          window.addEventListener("pagehide", onPageHide, { once: true });
           return r;
         } catch (_) {
           return createMainThreadRunner();
@@ -1666,7 +1678,8 @@ function renderMarkdownProseBlock(text) {
 
 export function formatMdInline(str) {
   const codes = [];
-  const masked = String(str).replace(/`([^`]+)`/g, (_, c) => {
+  const cleanStr = String(str ?? "").replace(/\u0000/g, "");
+  const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
     codes.push(`<code>${escapeHtmlText(c)}</code>`);
     return `\u0000C${i}\u0000`;
@@ -1674,7 +1687,7 @@ export function formatMdInline(str) {
 
   let safe = escapeHtmlText(masked);
   safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
     '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
   );
   safe = safe.replace(/\[([^\]]+)\]\((#[a-zA-Z0-9_-]+)\)/g, '<a href="$2">$1</a>');

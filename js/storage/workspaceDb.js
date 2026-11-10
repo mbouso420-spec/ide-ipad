@@ -131,14 +131,22 @@ export function normalizePath(rawPath) {
   return stack.join("/");
 }
 
-const INVALID_PATH_CHARS = /[:*?"<>|\u0000-\u001f]/;
+const INVALID_PATH_CHARS = /[:*?"<>|\u0000-\u001f\u007f]/;
 
 /**
  * Valida una ruta escrita por el usuario (crear, renombrar, importar).
  * Devuelve la ruta normalizada o lanza un Error con un mensaje claro en español.
  */
 export function validateUserPath(rawPath) {
-  const raw = String(rawPath || "").trim();
+  const rawStr = String(rawPath || "");
+  const rawBadChar = rawStr.match(INVALID_PATH_CHARS);
+  if (rawBadChar) {
+    const code = rawBadChar[0].charCodeAt(0);
+    const shown = code < 32 || code === 127 ? "caracteres de control" : `"${rawBadChar[0]}"`;
+    throw new Error(`El nombre no puede contener ${shown}. Evitá : * ? " < > |`);
+  }
+
+  const raw = rawStr.trim();
   if (!raw) {
     throw new Error("Escribí un nombre válido.");
   }
@@ -147,7 +155,8 @@ export function validateUserPath(rawPath) {
   }
   const rawSegments = raw.split(/[/\\]/);
   for (const seg of rawSegments) {
-    if (seg === "." || seg === "..") {
+    const trimmedSeg = seg.trim();
+    if (trimmedSeg === "." || trimmedSeg === "..") {
       throw new Error('El nombre no puede contener referencias relativas "." o "..".');
     }
     if (seg.length > 255) {
@@ -161,7 +170,8 @@ export function validateUserPath(rawPath) {
   }
   const badChar = clean.match(INVALID_PATH_CHARS);
   if (badChar) {
-    const shown = badChar[0].charCodeAt(0) < 32 ? "caracteres de control" : `"${badChar[0]}"`;
+    const code = badChar[0].charCodeAt(0);
+    const shown = code < 32 || code === 127 ? "caracteres de control" : `"${badChar[0]}"`;
     throw new Error(`El nombre no puede contener ${shown}. Evitá : * ? " < > |`);
   }
   return clean;
@@ -485,10 +495,8 @@ export async function upsertEntry(
     );
   }
   if (!isFolder) {
-    const allCurrent = await getAllRawProjectEntries(projectId);
-    const hasChildEntries = allCurrent.some(
-      (e) => !e.deleted && e.path.startsWith(`${cleanPath}/`)
-    );
+    const prefixKey = makeFileKey(projectId, `${cleanPath}/`);
+    const hasChildEntries = await hasActiveKeyWithPrefix(STORE_FILES, prefixKey);
     if (hasChildEntries) {
       throw new Error(`Ya existe una carpeta llamada "${cleanPath}" con contenido adentro.`);
     }
@@ -607,27 +615,102 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
     (e) => !e.deleted && (e.path === fromPath || (isFolder && e.path.startsWith(`${fromPath}/`)))
   );
 
+  if (affected.length === 0) {
+    return;
+  }
+
+  // Validar colisiones con ancestros archivo antes de abrir la transacción
   for (const item of affected) {
     const suffix = item.path.slice(fromPath.length);
     const targetPath = `${toPath}${suffix}`;
-    const prevTarget = rawByPath.get(targetPath);
-    const preserveTargetBase =
-      prevTarget && prevTarget.trackedInGithub ? prevTarget.baseContent : item.trackedInGithub ? "" : item.baseContent;
-
-    await upsertEntry(projectId, targetPath, {
-      isFolder: item.isFolder,
-      content: item.content,
-      baseContent: preserveTargetBase,
-      fromGithub: false,
-      allowOverwrite: true,
-      mode: item.mode ?? null,
-      isBinary: Boolean(item.isBinary),
-      base64: item.base64 ?? null,
-      silent: true
-    });
-
-    await removeOrSoftDeleteRecord(item);
+    const parts = targetPath.split("/");
+    if (parts.length > 1) {
+      let prefix = "";
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+        const existingFolder = rawByPath.get(prefix);
+        if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
+          throw new Error(`No se puede crear dentro de "${prefix}" porque es un archivo.`);
+        }
+      }
+    }
   }
+
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const now = Date.now();
+    const ensuredFolders = new Set();
+
+    for (const item of affected) {
+      const suffix = item.path.slice(fromPath.length);
+      const targetPath = `${toPath}${suffix}`;
+      const parts = targetPath.split("/");
+      if (parts.length > 1) {
+        let prefix = "";
+        for (let i = 0; i < parts.length - 1; i += 1) {
+          prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+          if (ensuredFolders.has(prefix)) continue;
+          const existingFolder = rawByPath.get(prefix);
+          if (!existingFolder || existingFolder.deleted) {
+            const folderKey = makeFileKey(projectId, prefix);
+            store.put({
+              key: folderKey,
+              projectId,
+              path: prefix,
+              isFolder: true,
+              content: "",
+              baseContent: "",
+              contentLoaded: true,
+              deleted: false,
+              updatedAt: now
+            });
+          }
+          ensuredFolders.add(prefix);
+        }
+      }
+
+      const prevTarget = rawByPath.get(targetPath);
+      const preserveTargetBase =
+        prevTarget && prevTarget.trackedInGithub ? prevTarget.baseContent : item.trackedInGithub ? "" : item.baseContent;
+      const recreatedOverUnloaded = Boolean(
+        !item.isFolder && prevTarget && prevTarget.trackedInGithub && prevTarget.contentLoaded === false
+      );
+      const targetKey = makeFileKey(projectId, targetPath);
+
+      store.put({
+        key: targetKey,
+        projectId,
+        path: targetPath,
+        isFolder: item.isFolder,
+        content: item.isFolder ? "" : item.content,
+        baseContent: item.isFolder ? "" : preserveTargetBase,
+        blobSha: item.isFolder ? null : prevTarget?.blobSha ?? null,
+        mode: item.isFolder ? null : item.mode ?? prevTarget?.mode ?? null,
+        contentLoaded: item.isFolder ? true : Boolean(item.contentLoaded ?? true),
+        trackedInGithub: Boolean(prevTarget?.trackedInGithub),
+        forceModified: recreatedOverUnloaded || Boolean(prevTarget?.forceModified),
+        isBinary: Boolean(item.isBinary ?? prevTarget?.isBinary),
+        base64: item.base64 ?? prevTarget?.base64 ?? null,
+        deleted: false,
+        updatedAt: now
+      });
+
+      if (item.trackedInGithub && !item.isFolder) {
+        item.deleted = true;
+        item.updatedAt = now;
+        store.put(item);
+      } else {
+        store.delete(item.key);
+      }
+    }
+
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de renombrado se canceló."));
+  });
+
   broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder });
 }
 
@@ -1052,6 +1135,31 @@ function getRecord(storeName, key) {
   );
 }
 
+function hasActiveKeyWithPrefix(storeName, prefix) {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, "readonly");
+        const store = tx.objectStore(storeName);
+        const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`, false, false);
+        const req = store.openCursor(range);
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) {
+            resolve(false);
+            return;
+          }
+          if (!cursor.value.deleted) {
+            resolve(true);
+            return;
+          }
+          cursor.continue();
+        };
+        req.onerror = () => reject(req.error);
+      })
+  );
+}
+
 function putRecord(storeName, value) {
   return openDb().then(
     (db) =>
@@ -1114,7 +1222,19 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
   const id = `${slug || "proyecto"}-gist-${Date.now().toString(36)}`;
   const now = Date.now();
 
-  const fileEntries = (entries || []).filter((e) => !e.isFolder && e.path);
+  const fileEntries = [];
+  for (const e of entries || []) {
+    if (!e || e.isFolder || !e.path) continue;
+    try {
+      const validPath = validateUserPath(e.path);
+      fileEntries.push({ ...e, path: validPath });
+    } catch {
+      const fallbackPath = normalizePath(e.path);
+      if (fallbackPath && !/[\x00-\x1f:*?"<>|]/.test(fallbackPath)) {
+        fileEntries.push({ ...e, path: fallbackPath });
+      }
+    }
+  }
   const firstFile = fileEntries[0]?.path || "main.cpp";
 
   const project = {

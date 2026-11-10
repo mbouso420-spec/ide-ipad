@@ -8,7 +8,7 @@ import { initLivePreviewModal } from "./ui/livePreviewModal.js";
 import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
-import { createEditorManager } from "./editor/editorManager.js";
+import { computeSmartReplacement, createEditorManager } from "./editor/editorManager.js";
 import { initChatController } from "./ai/chatController.js";
 import { initGithubController } from "./github/githubController.js";
 import {
@@ -48,7 +48,8 @@ import {
   saveProjectState,
   setSavedActiveProjectId,
   updateFileContent,
-  upsertEntry
+  upsertEntry,
+  validateUserPath
 } from "./storage/workspaceDb.js";
 import { keyboardRouter } from "./ui/keyboardRouter.js";
 import {
@@ -240,9 +241,26 @@ async function initApp() {
     };
   };
 
+  const symbolBar = initSymbolBar({
+    onInsert(text, cursorBack) {
+      if (!activeFileId) return;
+      editor.insertAtCursor(text, cursorBack);
+    },
+    onToggle(touchKeyboardVisible) {
+      const hardwareMode = !touchKeyboardVisible;
+      editor.setHardwareKeyboardMode?.(hardwareMode);
+      editorSplit?.setHardwareKeyboardMode?.(hardwareMode);
+    }
+  });
+  editor.setHardwareKeyboardMode?.(!symbolBar.isVisible());
+
   const settingsModal = initSettingsModal({
     editor,
     getContextSnapshot,
+    onHardwareKeyboardChange(hardwareMode) {
+      symbolBar.setVisible?.(!hardwareMode);
+      editorSplit?.setHardwareKeyboardMode?.(hardwareMode);
+    },
     onSelectProvider(providerId) {
       if (!layout.isRightPanelOpen()) {
         layout.toggleRightPanel();
@@ -253,13 +271,6 @@ async function initApp() {
 
   keyboardRouter.registerGlobalShortcut("ctrl+,", () => settingsModal?.open());
   keyboardRouter.registerGlobalShortcut("meta+,", () => settingsModal?.open());
-
-  const symbolBar = initSymbolBar({
-    onInsert(text, cursorBack) {
-      if (!activeFileId) return;
-      editor.insertAtCursor(text, cursorBack);
-    }
-  });
 
   async function downloadSingleFile(filePath) {
     const target = filesOnly.find((f) => f.id === filePath);
@@ -786,34 +797,42 @@ async function initApp() {
       layout.closeRightOnCompactAction();
       return true;
     },
-    async onReplaceSelection(code) {
+    async onReplaceSelection(code, contextHint = null) {
       if (!activeFileId) {
         return false;
       }
-      if (!activeSelection.lineCount) {
-        editor.replaceEntireDocument(code);
-      } else {
-        editor.replaceSelection(code);
-      }
+      editor.replaceSelection(code, contextHint);
       layout.closeRightOnCompactAction();
       return true;
     },
-    async onApplyWholeFile(code, lang) {
+    async onApplyWholeFile(code, lang, contextHint = null) {
       await ensureAnOpenFile(lang);
       const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
       if (!activeFile) return;
+      const smart = computeSmartReplacement(activeFile.content ?? "", code, {
+        cursorLine: activeSelection?.cursorLine || 1,
+        selectionFrom: 0,
+        selectionTo: 0,
+        contextHint
+      });
       diffModal.openConfirmApplyDiff({
         fileName: activeFile.shortName,
         oldCode: activeFile.content,
-        newCode: code,
+        newCode: smart.text,
         onConfirm() {
-          editor.replaceEntireDocument(code);
+          editor.replaceEntireDocument(smart.text);
           layout.closeRightOnCompactAction();
         }
       });
     },
     async onApplyToFile(targetPath, code) {
-      const norm = normalizePath(targetPath);
+      let norm;
+      try {
+        norm = validateUserPath(targetPath);
+      } catch {
+        norm = normalizePath(targetPath);
+      }
+      if (!norm) return false;
       let targetFile = filesOnly.find((f) => normalizePath(f.path) === norm);
       if (!targetFile) {
         await upsertEntry(activeProject.id, norm, {
@@ -837,8 +856,16 @@ async function initApp() {
     },
     async onApplyMultiFile(filesToApply) {
       if (!Array.isArray(filesToApply) || filesToApply.length === 0) return false;
+      let firstValidNorm = null;
       for (const item of filesToApply) {
-        const norm = normalizePath(item.path);
+        let norm;
+        try {
+          norm = validateUserPath(item.path);
+        } catch {
+          norm = normalizePath(item.path);
+        }
+        if (!norm || /[\x00-\x1f:*?"<>|]/.test(norm)) continue;
+        if (!firstValidNorm) firstValidNorm = norm;
         const existing = filesOnly.find((f) => normalizePath(f.path) === norm);
         if (existing) {
           existing.content = item.code;
@@ -859,10 +886,11 @@ async function initApp() {
         }
       }
       await reloadProjectEntries();
-      const firstNorm = normalizePath(filesToApply[0].path);
-      const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstNorm);
-      if (firstTarget) {
-        await openOrFocusFile(firstTarget.id);
+      if (firstValidNorm) {
+        const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
+        if (firstTarget) {
+          await openOrFocusFile(firstTarget.id);
+        }
       }
       renderTabs();
       return true;
@@ -1191,14 +1219,22 @@ async function initApp() {
     const item = { timerId: 0, projectId, filePath, content };
     item.timerId = window.setTimeout(async () => {
       item.timerId = 0;
-      // La entrada sigue registrada mientras se escribe: así el respaldo de emergencia y
-      // flushPendingSaves también cubren un guardado que está "en vuelo".
-      await updateFileContent(projectId, filePath, content);
-      if (saveTimers.get(timerKey) === item) {
-        saveTimers.delete(timerKey);
+      try {
+        // La entrada sigue registrada mientras se escribe: así el respaldo de emergencia y
+        // flushPendingSaves también cubren un guardado que está "en vuelo".
+        await updateFileContent(projectId, filePath, content);
+        if (saveTimers.get(timerKey) === item) {
+          saveTimers.delete(timerKey);
+        }
+        explorer.setAutosaveStatus("Autoguardado en IndexedDB");
+        explorer.refreshStorageIndicator?.();
+        await github.refreshTopbarBadge();
+      } catch (err) {
+        const isQuota = err && err.name === "QuotaExceededError";
+        explorer.setAutosaveStatus(
+          isQuota ? "Error: Almacenamiento local lleno" : "Error al guardar en IndexedDB"
+        );
       }
-      explorer.setAutosaveStatus("Autoguardado en IndexedDB");
-      await github.refreshTopbarBadge();
     }, delay);
 
     saveTimers.set(timerKey, item);
@@ -1987,11 +2023,12 @@ function registerPwaServiceWorker() {
 }
 
 function escapeHtml(str) {
-  return String(str)
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 document.addEventListener("DOMContentLoaded", initApp);

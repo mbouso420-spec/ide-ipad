@@ -211,9 +211,15 @@ export function initLivePreviewModal({
     // 2. Extraer todos los assets locales referenciados por el HTML
     const referencedPaths = extractReferencedAssetPaths(targetFile.path, targetFile.content || "");
     const unloadedToFetch = [];
+    const filesByNormPath = new Map();
+    for (const f of allFiles || []) {
+      if (f && f.path) {
+        filesByNormPath.set(normalizePath(f.path), f);
+      }
+    }
 
     for (const refPath of referencedPaths) {
-      const assetFile = (allFiles || []).find((f) => normalizePath(f.path) === normalizePath(refPath));
+      const assetFile = filesByNormPath.get(normalizePath(refPath));
       if (assetFile && (assetFile.contentLoaded === false || (assetFile.content === "" && assetFile.blobSha))) {
         unloadedToFetch.push(assetFile);
       }
@@ -227,11 +233,11 @@ export function initLivePreviewModal({
     // 4. Revisar si entre los CSS descargados hay reglas @import url(...) que a su vez requieran descarga
     const secondaryUnloaded = [];
     for (const refPath of referencedPaths) {
-      const assetFile = (allFiles || []).find((f) => normalizePath(f.path) === normalizePath(refPath));
+      const assetFile = filesByNormPath.get(normalizePath(refPath));
       if (assetFile && getFileExtension(assetFile.path) === "css" && typeof assetFile.content === "string") {
         const cssImports = extractCssImportPaths(assetFile.path, assetFile.content);
         for (const impPath of cssImports) {
-          const impFile = (allFiles || []).find((f) => normalizePath(f.path) === normalizePath(impPath));
+          const impFile = filesByNormPath.get(normalizePath(impPath));
           if (impFile && (impFile.contentLoaded === false || (impFile.content === "" && impFile.blobSha))) {
             secondaryUnloaded.push(impFile);
           }

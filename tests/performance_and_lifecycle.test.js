@@ -11,7 +11,12 @@ import {
 } from "../js/storage/fileImport.js";
 import { buildZipArchive } from "../js/storage/zipExporter.js";
 import { searchInFiles } from "../js/search/projectSearch.js";
-import { createEditorManager } from "../js/editor/editorManager.js";
+import {
+  buildContentAttributes,
+  computeSmartReplacement,
+  createEditorManager,
+  scoreLineSimilarity
+} from "../js/editor/editorManager.js";
 import {
   ensureInitialWorkspace,
   createLocalProject,
@@ -962,6 +967,177 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       const res = searchInFiles(files, "secreto_en_binario");
       assert.equal(res.totalMatches, 1, "Solo debe indexar notas.txt y omitir .flac/.sqlite");
       assert.equal(res.results[0].path, "notas.txt");
+    });
+
+    test("searchInFiles bloquea expresiones regulares con cuantificadores anidados y alternancias solapadas (ReDoS)", () => {
+      const files = [{ path: "app.js", content: "a".repeat(50) + "!" }];
+      const redosVectors = [
+        "(a+)+b",
+        "((a)+)+b",
+        "(?:[a-z]{1,5})+b",
+        "(a|a)+b",
+        "(a|ab)+c"
+      ];
+      for (const vector of redosVectors) {
+        const res = searchInFiles(files, vector, { isRegex: true });
+        assert.ok(res.error, `Debe bloquear el vector ReDoS: ${vector}`);
+        assert.equal(res.totalMatches, 0);
+      }
+    });
+
+    test("validateUserPath bloquea vectores de Path Traversal, caracteres de control ASCII y rutas absolutas de Windows", () => {
+      const badPaths = [
+        "../secret.txt",
+        "..\\Windows\\System32",
+        "a/ .. /b.js",
+        "C:\\Windows\\win.ini",
+        "archivo\u0000.js",
+        "\u0007bell.txt",
+        "linea\nsalto.py",
+        "del\u007fchar.c"
+      ];
+      for (const bad of badPaths) {
+        assert.throws(() => validateUserPath(bad), `Debe rechazar ruta insegura: ${JSON.stringify(bad)}`);
+      }
+    });
+  });
+
+  describe("13. Modo Teclado Físico en iPadOS (inputmode=none) y Reemplazo Inteligente de Código IA", () => {
+    test("buildContentAttributes y editor.setHardwareKeyboardMode configuran inputmode=none y desactivan barra flotante de iPadOS", async () => {
+      const hwAttrs = buildContentAttributes(true);
+      assert.equal(hwAttrs.inputmode, "none", "Modo Teclado Físico debe establecer inputmode='none'");
+      assert.equal(hwAttrs.autocorrect, "off");
+      assert.equal(hwAttrs.autocapitalize, "off");
+      assert.equal(hwAttrs.spellcheck, "false");
+      assert.equal(hwAttrs.autocomplete, "off");
+      assert.equal(hwAttrs.writingsuggestions, "false");
+
+      const touchAttrs = buildContentAttributes(false);
+      assert.equal(touchAttrs.inputmode, "text", "Modo Teclado Táctil debe establecer inputmode='text'");
+
+      const mount = document.createElement("div");
+      const editor = await createEditorManager({
+        mountEl: mount,
+        enableMinimap: false,
+        onDocChange: () => {},
+        onSelectionChange: () => {}
+      });
+
+      assert.equal(editor.isHardwareKeyboardMode(), true, "Por defecto debe iniciar en Modo Teclado Físico");
+      editor.setHardwareKeyboardMode(false);
+      assert.equal(editor.isHardwareKeyboardMode(), false);
+      editor.toggleHardwareKeyboardMode();
+      assert.equal(editor.isHardwareKeyboardMode(), true);
+      editor.destroy();
+    });
+
+    test("computeSmartReplacement y editor.replaceSelection reemplazan SOLO la línea objetivo cuando la IA devuelve 1 sola línea en un archivo multilínea", async () => {
+      const originalDoc = [
+        "function calcularTotal(precio, impuesto) {",
+        "  const subtotal = precio * 1;",
+        "  const total = subtotal + impuesto;",
+        "  return total;",
+        "}"
+      ].join("\n");
+
+      // Caso 1: La IA devuelve una sola línea modificando 'const total = ...' sin selección activa
+      const res1 = computeSmartReplacement(originalDoc, "const total = subtotal * (1 + impuesto);", {
+        cursorLine: 1,
+        selectionFrom: 0,
+        selectionTo: 0
+      });
+
+      assert.equal(res1.mode, "single-line");
+      assert.equal(res1.targetLineNumber, 3);
+      assert.equal(
+        res1.text,
+        [
+          "function calcularTotal(precio, impuesto) {",
+          "  const subtotal = precio * 1;",
+          "  const total = subtotal * (1 + impuesto);",
+          "  return total;",
+          "}"
+        ].join("\n"),
+        "Debe reemplazar únicamente la línea 3 conservando la sangría y el resto del archivo intacto"
+      );
+
+      // Caso 2: La IA menciona en su explicación previa qué línea o código cambiar (contextHint)
+      const res2 = computeSmartReplacement(originalDoc, "return Math.round(total * 100) / 100;", {
+        cursorLine: 1,
+        selectionFrom: 0,
+        selectionTo: 0,
+        contextHint: {
+          precedingProse: "Cambiá la línea `return total;` por el valor redondeado:"
+        }
+      });
+      assert.equal(res2.mode, "single-line");
+      assert.equal(res2.targetLineNumber, 4);
+      assert.ok(res2.text.includes("function calcularTotal(precio, impuesto) {"));
+      assert.ok(res2.text.includes("  return Math.round(total * 100) / 100;"));
+      assert.ok(res2.text.endsWith("}"));
+
+      // Caso 3: Integrado en editor.replaceSelection sobre archivo abierto
+      const mount = document.createElement("div");
+      const editor = await createEditorManager({
+        mountEl: mount,
+        enableMinimap: false,
+        onDocChange: () => {},
+        onSelectionChange: () => {}
+      });
+
+      editor.openFile({
+        id: "calc.js",
+        path: "calc.js",
+        lang: "js",
+        isBinary: false,
+        content: originalDoc
+      });
+
+      editor.replaceSelection("const subtotal = Math.max(0, precio);");
+      const updatedLines = editor.getValue().split("\n");
+      assert.equal(updatedLines.length, 5, "No debe borrar las demás líneas del archivo");
+      assert.equal(updatedLines[0], "function calcularTotal(precio, impuesto) {");
+      assert.equal(updatedLines[1], "  const subtotal = Math.max(0, precio);");
+      assert.equal(updatedLines[2], "  const total = subtotal + impuesto;");
+      assert.equal(updatedLines[3], "  return total;");
+      assert.equal(updatedLines[4], "}");
+
+      editor.destroy();
+    });
+
+    test("computeSmartReplacement reemplaza solo la función o bloque coincidente cuando la IA devuelve un fragmento parcial multilínea", () => {
+      const fullFile = [
+        "import { helper } from './helper.js';",
+        "",
+        "function saludar(nombre) {",
+        "  const msg = 'Hola ' + nombre;",
+        "  console.log(msg);",
+        "  return msg;",
+        "}",
+        "",
+        "export function despedir(nombre) {",
+        "  return 'Chau ' + nombre;",
+        "}"
+      ].join("\n");
+
+      const partialFunctionSnippet = [
+        "function saludar(nombre) {",
+        "  const msg = `Hola, ${nombre}!`;",
+        "  return msg;",
+        "}"
+      ].join("\n");
+
+      const res = computeSmartReplacement(fullFile, partialFunctionSnippet, {
+        cursorLine: 1,
+        selectionFrom: 0,
+        selectionTo: 0
+      });
+
+      assert.equal(res.mode, "block");
+      assert.ok(res.text.includes("import { helper } from './helper.js';"), "Debe conservar los imports al inicio del archivo");
+      assert.ok(res.text.includes("const msg = `Hola, ${nombre}!`;"), "Debe actualizar el bloque de la función saludar");
+      assert.ok(res.text.includes("export function despedir(nombre) {"), "Debe conservar las funciones posteriores del archivo");
+      assert.ok(scoreLineSimilarity("  const total = a + b;", "const total = a * b;") > 0.65);
     });
   });
 });

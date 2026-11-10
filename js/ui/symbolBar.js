@@ -1,4 +1,4 @@
-const SYMBOL_STORAGE_KEY = "ide.symbols.visible";
+const SYMBOL_STORAGE_KEY = "ide.touchKeyboard.enabled";
 
 /**
  * Mapas de símbolos táctiles adaptados al lenguaje activo.
@@ -233,10 +233,10 @@ export const LANGUAGE_SYMBOLS = {
 };
 
 /**
- * Inicializa la barra inferior de símbolos rápidos para iPad, adaptable al lenguaje y ocultable en PC.
- * @param {{ onInsert: (text: string, cursorBack: number) => void }} options
+ * Inicializa la barra inferior de símbolos rápidos para iPad y el conmutador de teclado táctil/físico.
+ * @param {{ onInsert: (text: string, cursorBack: number) => void, onToggle?: (touchKeyboardVisible: boolean) => void }} options
  */
-export function initSymbolBar({ onInsert }) {
+export function initSymbolBar({ onInsert, onToggle }) {
   const track = document.getElementById("symbol-keys-track");
   const langPill = document.getElementById("symbol-lang-pill");
   const toggleBtn = document.getElementById("btn-toggle-symbols");
@@ -247,15 +247,24 @@ export function initSymbolBar({ onInsert }) {
   applyVisibility();
 
   toggleBtn?.addEventListener("click", () => {
-    visible = !visible;
+    setVisible(!visible);
+  });
+
+  function setVisible(nextState) {
+    visible = Boolean(nextState);
     saveStoredBool(SYMBOL_STORAGE_KEY, visible);
     applyVisibility();
-  });
+    onToggle?.(visible);
+    return visible;
+  }
 
   function applyVisibility() {
     document.body.dataset.symbolsVisible = String(visible);
     if (toggleBtn) {
       toggleBtn.setAttribute("aria-pressed", String(visible));
+      toggleBtn.title = visible
+        ? "Teclado táctil y barra de símbolos activos (tocá para volver a Modo Teclado Físico sin barra flotante)"
+        : "Modo Teclado Físico activo: sin barra flotante de teclado virtual en iPad (tocá para abrir teclado en pantalla)";
     }
   }
 
@@ -296,13 +305,16 @@ export function initSymbolBar({ onInsert }) {
     }
   }
 
-  return { setLanguage };
+  return {
+    setLanguage,
+    isVisible: () => visible,
+    setVisible
+  };
 }
 
 function readDefaultVisibility() {
-  if (typeof window.matchMedia === "function") {
-    return window.matchMedia("(pointer: coarse)").matches;
-  }
+  // Por defecto iniciamos en Modo Teclado Físico (barra táctil oculta e inputmode="none")
+  // para evitar que iPadOS despliegue la barra flotante del teclado virtual al usar teclado físico.
   return false;
 }
 

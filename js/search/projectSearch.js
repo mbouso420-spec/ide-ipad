@@ -45,6 +45,98 @@ export function escapeRegExp(str) {
  *   error: string | null
  * }}
  */
+/**
+ * Detecta patrones de expresiones regulares susceptibles a Catastrophic Backtracking (ReDoS):
+ * 1. Cuantificadores anidados a cualquier nivel de paréntesis: (a+)+, ((a)+)+, (a{1,5})+, ([a-z]+)*
+ * 2. Alternancias solapadas o duplicadas dentro de grupos cuantificados: (a|a)+, (a|ab)+, (ab|a)*
+ * @param {string} rawPattern
+ * @returns {boolean}
+ */
+export function hasUnsafeReDoSPattern(rawPattern) {
+  const src = String(rawPattern || "");
+  // Reemplazar escapes y clases de caracteres [...] por un token neutro 'a'
+  let normalized = "";
+  let inCharClass = false;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "\\") {
+      normalized += "a";
+      i += 1;
+      continue;
+    }
+    if (inCharClass) {
+      if (ch === "]") {
+        inCharClass = false;
+        normalized += "a";
+      }
+      continue;
+    }
+    if (ch === "[") {
+      inCharClass = true;
+      continue;
+    }
+    normalized += ch;
+  }
+
+  const isRepetitionAt = (str, idx) => {
+    const c = str[idx];
+    return c === "+" || c === "*" || c === "{";
+  };
+
+  // Analizar grupos con pila para detectar cuantificadores anidados y alternancias solapadas
+  const stack = [];
+  for (let i = 0; i < normalized.length; i += 1) {
+    const ch = normalized[i];
+    if (ch === "(") {
+      // Ignorar prefijos de grupo como ?:, ?=, ?!
+      let startIdx = i + 1;
+      if (normalized[startIdx] === "?") {
+        startIdx += 2;
+      }
+      stack.push({ hasQuantifier: false, startIdx });
+    } else if (ch === ")") {
+      const group = stack.pop();
+      if (!group) continue;
+      const groupBody = normalized.slice(group.startIdx, i);
+      const groupQuantified = isRepetitionAt(normalized, i + 1);
+
+      if (groupQuantified) {
+        if (group.hasQuantifier) {
+          return true;
+        }
+        // Verificar alternancias solapadas en grupo cuantificado: ej. (a|a)+ o (a|ab)+
+        if (groupBody.includes("|")) {
+          const branches = groupBody
+            .split("|")
+            .map((b) => b.replace(/[()?:^$]/g, "").trim())
+            .filter(Boolean);
+          for (let a = 0; a < branches.length; a += 1) {
+            for (let b = a + 1; b < branches.length; b += 1) {
+              if (
+                branches[a] === branches[b] ||
+                branches[a].startsWith(branches[b]) ||
+                branches[b].startsWith(branches[a])
+              ) {
+                return true;
+              }
+            }
+          }
+        }
+      }
+
+      if (stack.length > 0 && (group.hasQuantifier || groupQuantified)) {
+        stack[stack.length - 1].hasQuantifier = true;
+      }
+    } else if (isRepetitionAt(normalized, i)) {
+      if (stack.length > 0) {
+        stack[stack.length - 1].hasQuantifier = true;
+      }
+    }
+  }
+
+  return false;
+}
+
 export function searchInFiles(files, query, options = {}) {
   const {
     caseSensitive = false,
@@ -63,6 +155,14 @@ export function searchInFiles(files, query, options = {}) {
   try {
     let pattern;
     if (isRegex) {
+      if (hasUnsafeReDoSPattern(query)) {
+        return {
+          results: [],
+          totalMatches: 0,
+          filesMatched: 0,
+          error: "Expresión regular inválida: contiene cuantificadores anidados inseguros."
+        };
+      }
       pattern = query;
     } else {
       pattern = escapeRegExp(query);

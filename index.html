@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org https://cdnjs.cloudflare.com; img-src 'self' data: https: blob:; frame-src 'self' blob: data:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org https://cdnjs.cloudflare.com; img-src 'self' data: https: blob:; frame-src 'self' blob: data:; object-src 'none'; base-uri 'self';">
   <meta name="theme-color" content="#10131a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -212,9 +212,9 @@
               type="button"
               id="btn-toggle-symbols"
               class="btn btn-ghost btn-sm btn-icon"
-              aria-pressed="true"
-              aria-label="Alternar barra de símbolos"
-              title="Mostrar u ocultar barra de símbolos para iPad"
+              aria-pressed="false"
+              aria-label="Alternar teclado táctil en pantalla y barra de símbolos"
+              title="Modo Teclado Físico activo: sin barra flotante de teclado virtual en iPad (tocá para abrir teclado en pantalla)"
             >
               <span data-icon="keyboard"></span>
             </button>
@@ -509,6 +509,13 @@
               id="chat-prompt-input"
               class="chat-input"
               rows="2"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
+              writingsuggestions="false"
+              inputmode="none"
+              enterkeyhint="send"
               placeholder="Preguntá sobre tu código o desplegá acciones (✦)…"
             ></textarea>
 
@@ -652,6 +659,12 @@
               type="text"
               id="gh-commit-msg"
               class="field-control"
+              spellcheck="false"
+              autocorrect="off"
+              autocapitalize="off"
+              autocomplete="off"
+              writingsuggestions="false"
+              inputmode="none"
               placeholder="Ej: Actualizar estilos y lógica desde Studio IDE"
             >
           </div>
@@ -948,6 +961,11 @@
               <label class="setting-toggle">
                 <input type="checkbox" id="setting-minimap" checked>
                 <span class="setting-toggle-label">Minimapa visual lateral (vista de pájaro para archivos extensos)</span>
+              </label>
+
+              <label class="setting-toggle">
+                <input type="checkbox" id="setting-hardware-keyboard" checked>
+                <span class="setting-toggle-label">Modo Teclado Físico en iPad: ocultar teclado virtual y barra flotante de iPadOS</span>
               </label>
             </div>
           </div>

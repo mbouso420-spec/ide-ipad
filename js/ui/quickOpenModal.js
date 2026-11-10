@@ -203,9 +203,10 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
 }
 
 function escapeHtml(str) {
-  return String(str)
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

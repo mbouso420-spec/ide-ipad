@@ -191,7 +191,13 @@ const XSS_PAYLOADS = [
   "> <style>*{display:none}</style>",
   "\u0000CODE0\u0000<img src=x onerror=alert(2)>",
   "[click](javascript:alert(1))",
-  "[ok](https://e.com/\"onmouseover=alert(1))"
+  "[ok](https://e.com/\"onmouseover=alert(1))",
+  "[xss](https://e.com/`code`onmouseover=alert(1))",
+  "[v1](https://e.com/\u0000CODE0\u0000\"onfocus=alert(1))",
+  "[v2](data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==)",
+  "[v3](vbscript:msgbox(1))",
+  "[v4](https://e.com/a\u2028b\"onmouseover=alert(1))",
+  "[`nested`](https://e.com/path?x=`\"onmouseover=alert(1)`)"
 ];
 
 /** Elimina las etiquetas permitidas y verifica que no quede ningún '<' crudo. */

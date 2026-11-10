@@ -1,4 +1,5 @@
 import { toFriendlyNetworkError } from "../net/networkErrors.js";
+import { saveCredentialsBackup } from "../storage/workspaceDb.js";
 
 const STORAGE_MODE_KEY = "ide.ai.storageMode";
 const ACTIVE_PROVIDER_KEY = "ide.ai.provider";
@@ -171,7 +172,7 @@ export function getKeyStorageMode() {
 
 export function setKeyStorageMode(nextMode) {
   const prevMode = getKeyStorageMode();
-  if (prevMode === nextMode) {
+  if (prevMode === nextMode && nextMode !== "session") {
     return;
   }
 
@@ -185,15 +186,28 @@ export function setKeyStorageMode(nextMode) {
       const val = fromStore.getItem(k);
       if (val) {
         toStore.setItem(k, val);
+      }
+      if (fromStore !== toStore) {
         fromStore.removeItem(k);
+      }
+      if (nextMode === "session") {
+        window.localStorage.removeItem(k);
       }
     }
     for (const extraKey of [GH_TOKEN_STORAGE_KEY, GH_REPOS_CACHE_KEY]) {
       const val = fromStore.getItem(extraKey);
       if (val) {
         toStore.setItem(extraKey, val);
+      }
+      if (fromStore !== toStore) {
         fromStore.removeItem(extraKey);
       }
+      if (nextMode === "session") {
+        window.localStorage.removeItem(extraKey);
+      }
+    }
+    if (nextMode === "session") {
+      void saveCredentialsBackup("");
     }
   } catch {
     // Entorno restringido

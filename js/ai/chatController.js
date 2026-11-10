@@ -948,15 +948,24 @@ export function initChatController({
       container.appendChild(planEl);
     }
 
+    let lastProseContent = "";
+    let previousCodeBlock = "";
     for (const seg of segments) {
       if (seg.type === "prose") {
+        lastProseContent += (lastProseContent ? "\n" : "") + (seg.content || "");
         const wrapper = document.createElement("div");
         wrapper.innerHTML = formatProseHtml(seg.content);
         while (wrapper.firstChild) {
           container.appendChild(wrapper.firstChild);
         }
       } else {
-        container.appendChild(buildCodeBlockElement(seg.lang, seg.code, seg.filePath));
+        const contextHint = {
+          precedingProse: lastProseContent,
+          previousCodeBlock
+        };
+        container.appendChild(buildCodeBlockElement(seg.lang, seg.code, seg.filePath, contextHint));
+        previousCodeBlock = seg.code || "";
+        lastProseContent = "";
       }
     }
 
@@ -968,7 +977,7 @@ export function initChatController({
     }
   }
 
-  function buildCodeBlockElement(lang, code, filePath = null) {
+  function buildCodeBlockElement(lang, code, filePath = null, contextHint = null) {
     const block = document.createElement("div");
     block.className = "chat-code-block";
 
@@ -1016,9 +1025,9 @@ export function initChatController({
       "Reemplazar código",
       hasSelNow
         ? "Reemplazar las líneas seleccionadas"
-        : "Reemplazar todo el archivo (sin selección activa)",
+        : "Reemplazar línea o bloque correspondiente en el editor",
       async () => {
-        const applied = await onReplaceSelection(code);
+        const applied = await onReplaceSelection(code, contextHint);
         if (applied !== false) {
           btnReplace.innerHTML = `${icon("check")}<span>Reemplazado</span>`;
           window.setTimeout(() => {
@@ -1047,8 +1056,8 @@ export function initChatController({
         }, 1500);
       });
     } else {
-      btnApplyAction = createCodeActionButton("fileCheck", "Aplicar cambios", "Reemplazar contenido completo del archivo (reversible con Deshacer)", () => {
-        onApplyWholeFile(code, lang);
+      btnApplyAction = createCodeActionButton("fileCheck", "Aplicar cambios", "Revisar diferencias y aplicar al archivo (reversible con Deshacer)", () => {
+        onApplyWholeFile(code, lang, contextHint);
       });
     }
 
@@ -1110,8 +1119,9 @@ export function initChatController({
 
     if (snapshot.activeFile) {
       const safeActiveContent = truncateCodeContent(snapshot.activeFile.content, budget);
+      const cursorLine = snapshot.selection?.cursorLine || 1;
       parts.push(
-        `\n--- ARCHIVO ACTIVO EN EL EDITOR: ${snapshot.activeFile.name} (${snapshot.activeFile.lang}) ---\n\`\`\`${snapshot.activeFile.lang}\n${safeActiveContent}\n\`\`\``
+        `\n--- ARCHIVO ACTIVO EN EL EDITOR: ${snapshot.activeFile.name} (${snapshot.activeFile.lang}, cursor en línea ${cursorLine}) ---\n\`\`\`${snapshot.activeFile.lang}\n${safeActiveContent}\n\`\`\``
       );
     }
 
@@ -1149,7 +1159,7 @@ export function initChatController({
         btn.disabled = false;
         btn.title = hasSel
           ? "Reemplazar las líneas seleccionadas"
-          : "Reemplazar todo el archivo (sin selección activa)";
+          : "Reemplazar línea o bloque correspondiente en el editor";
       }
     }
   }
@@ -1436,7 +1446,8 @@ export function estimateTokens(charCount) {
 
 export function formatInlineMarkdown(str) {
   const codeTokens = [];
-  const withPlaceholders = String(str).replace(/`([^`]+)`/g, (_, code) => {
+  const cleanStr = String(str ?? "").replace(/\u0000/g, "");
+  const withPlaceholders = cleanStr.replace(/`([^`]+)`/g, (_, code) => {
     const idx = codeTokens.length;
     codeTokens.push(`<code class="chat-inline-code">${escapeHtml(code)}</code>`);
     return `\u0000CODE${idx}\u0000`;
@@ -1444,7 +1455,7 @@ export function formatInlineMarkdown(str) {
 
   let safe = escapeHtml(withPlaceholders);
   safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
     '<a href="$2" target="_blank" rel="noopener noreferrer" class="chat-link">$1</a>'
   );
   safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
@@ -1480,9 +1491,10 @@ async function copyToClipboardSafe(text) {
 }
 
 function escapeHtml(str) {
-  return String(str)
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }

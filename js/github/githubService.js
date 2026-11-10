@@ -529,19 +529,22 @@ export async function pushAtomicCommit({
         branch
       });
       latestCommitSha = initRes?.commit?.sha || null;
+      baseTreeSha = initRes?.commit?.tree?.sha || null;
       remainingChanges.splice(firstAddedIdx, 1);
 
       if (remainingChanges.length === 0 && latestCommitSha) {
         return { commitSha: latestCommitSha };
       }
 
-      const branchDataAfter = await client.request("GET /repos/{owner}/{repo}/branches/{branch}", {
-        owner,
-        repo,
-        branch
-      });
-      latestCommitSha = branchDataAfter?.commit?.sha || null;
-      baseTreeSha = branchDataAfter?.commit?.commit?.tree?.sha || null;
+      if (!latestCommitSha || !baseTreeSha) {
+        const branchDataAfter = await client.request("GET /repos/{owner}/{repo}/branches/{branch}", {
+          owner,
+          repo,
+          branch
+        });
+        latestCommitSha = branchDataAfter?.commit?.sha || null;
+        baseTreeSha = branchDataAfter?.commit?.commit?.tree?.sha || null;
+      }
     } else {
       throw err;
     }
@@ -555,43 +558,54 @@ export async function pushAtomicCommit({
     throw new RemoteAheadError(latestCommitSha, expectedBaseSha);
   }
 
-  const treeItems = [];
-  for (const change of remainingChanges) {
-    if (change.status === "deleted") {
-      treeItems.push({
-        path: change.path,
-        mode: "100644",
-        type: "blob",
-        sha: null
-      });
-      continue;
-    }
-    const mode = change.mode === "100755" ? "100755" : "100644";
-    if (change.isBinary || change.encoding === "base64" || (change.base64 && typeof change.base64 === "string")) {
-      const b64 = change.base64 || (typeof change.content === "string" ? change.content : "");
-      const createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
-        owner,
-        repo,
-        content: b64,
-        encoding: "base64"
-      });
-      const blobSha = createdBlob?.sha || createdBlob?.data?.sha || null;
-      treeItems.push({
-        path: change.path,
-        mode,
-        type: "blob",
-        sha: blobSha
-      });
-    } else {
-      treeItems.push({
-        path: change.path,
-        // Conserva el bit de ejecución (100755) de scripts existentes; el resto se publica como archivo normal.
-        mode,
-        type: "blob",
-        content: typeof change.content === "string" ? change.content : ""
-      });
+  const BLOB_UPLOAD_CONCURRENCY = 4;
+  const treeItems = new Array(remainingChanges.length);
+  let nextIdx = 0;
+
+  async function uploadWorker() {
+    while (nextIdx < remainingChanges.length) {
+      const idx = nextIdx++;
+      const change = remainingChanges[idx];
+      if (change.status === "deleted") {
+        treeItems[idx] = {
+          path: change.path,
+          mode: "100644",
+          type: "blob",
+          sha: null
+        };
+        continue;
+      }
+      const mode = change.mode === "100755" ? "100755" : "100644";
+      if (change.isBinary || change.encoding === "base64" || (change.base64 && typeof change.base64 === "string")) {
+        const b64 = change.base64 || (typeof change.content === "string" ? change.content : "");
+        const createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
+          owner,
+          repo,
+          content: b64,
+          encoding: "base64"
+        });
+        const blobSha = createdBlob?.sha || createdBlob?.data?.sha || null;
+        treeItems[idx] = {
+          path: change.path,
+          mode,
+          type: "blob",
+          sha: blobSha
+        };
+      } else {
+        treeItems[idx] = {
+          path: change.path,
+          // Conserva el bit de ejecución (100755) de scripts existentes; el resto se publica como archivo normal.
+          mode,
+          type: "blob",
+          content: typeof change.content === "string" ? change.content : ""
+        };
+      }
     }
   }
+
+  await Promise.all(
+    Array.from({ length: Math.min(BLOB_UPLOAD_CONCURRENCY, remainingChanges.length) }, () => uploadWorker())
+  );
 
   const createdTree = await client.request("POST /repos/{owner}/{repo}/git/trees", {
     owner,
