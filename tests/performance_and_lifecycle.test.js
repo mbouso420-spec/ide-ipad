@@ -1314,5 +1314,76 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       assert.ok(allOuts.includes("Valor: 42"), "Tras enviar el dato debe mostrar el resultado calculado");
       instance.destroy();
     });
+
+    test("injectInteractiveInputGuard intercepta scanf sin advertencias y mountCRunnerView pausa en WAIT_INPUT_MARKER", async () => {
+      const rawC = '#include <stdio.h>\nint main(void) {\n  int a, b;\n  printf("Ingrese a:\\n");\n  scanf("%d", &a);\n  printf("Ingrese b:\\n");\n  scanf("%d", &b);\n  printf("Suma: %d\\n", a+b);\n  return 0;\n}';
+      const guarded = injectInteractiveInputGuard(rawC, "hola.c", true);
+
+      assert.ok(guarded.includes("__studio_scanf"), "Debe inyectar __studio_scanf");
+      assert.ok(!guarded.includes("__studio_getchar"), "NO debe inyectar __studio_getchar si no se usa");
+      assert.ok(!guarded.includes("__studio_fgets"), "NO debe inyectar __studio_fgets si no se usa");
+      assert.ok(guarded.includes('#line 1 "hola.c"'), "Debe sincronizar lineas con #line 1");
+
+      const container = document.createElement("div");
+      let step = 0;
+      const runner = mountCRunnerView(container, {
+        activeFile: { path: "hola.c", shortName: "hola.c", content: rawC },
+        fetchFn: async (_url, opts) => {
+          step++;
+          const body = JSON.parse(opts.body);
+          if (step === 1) {
+            assert.equal(body.stdin, "");
+            return new Response(JSON.stringify({
+              status: "0",
+              program_output: `Ingrese a:\n${WAIT_INPUT_MARKER}`,
+              program_error: ""
+            }), { status: 200 });
+          } else if (step === 2) {
+            assert.equal(body.stdin, "10\n");
+            return new Response(JSON.stringify({
+              status: "0",
+              program_output: `Ingrese a:\nIngrese b:\n${WAIT_INPUT_MARKER}`,
+              program_error: ""
+            }), { status: 200 });
+          } else {
+            assert.equal(body.stdin, "10\n20\n");
+            return new Response(JSON.stringify({
+              status: "0",
+              program_output: "Ingrese a:\nIngrese b:\nSuma: 30\n",
+              program_error: ""
+            }), { status: 200 });
+          }
+        }
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+      const statusEl = container.querySelector(".c-term-status");
+      assert.ok(statusEl.textContent.includes("Esperando dato"), "Paso 1 debe estar esperando dato");
+
+      const stdoutText = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
+      assert.ok(stdoutText.includes("Ingrese a:"));
+      assert.ok(!stdoutText.includes("Ingrese b:"), "NO debe mostrar 'Ingrese b:' antes de que el usuario envíe el dato de 'a'");
+      assert.ok(!stdoutText.includes(WAIT_INPUT_MARKER), "NO debe mostrar el marcador interno");
+
+      // Enviamos el primer dato '10'
+      const input = container.querySelector(".c-terminal-input");
+      const btnSend = container.querySelector(".btn-c-send-step");
+      input.value = "10";
+      btnSend.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const stdoutStep2 = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
+      assert.ok(stdoutStep2.includes("Ingrese b:"), "Ahora sí debe mostrar 'Ingrese b:'");
+      assert.ok(!stdoutStep2.includes("Suma:"), "NO debe mostrar la suma aún");
+
+      // Enviamos el segundo dato '20'
+      input.value = "20";
+      btnSend.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const stdoutStep3 = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
+      assert.ok(stdoutStep3.includes("Suma: 30"), "Debe mostrar el resultado final");
+      runner.destroy();
+    });
   });
 });

@@ -216,8 +216,82 @@ export const WAIT_INPUT_MARKER = "\x1e__STUDIO_WAIT_INPUT__";
  * @returns {string}
  */
 export function injectInteractiveInputGuard(code, filePath = "main.c", isC = true) {
-  // Pasamos el código puro del usuario sin alterar para no introducir warnings ni directivas sintéticas
-  return String(code || "");
+  const src = String(code || "");
+  const hasScanf = /\bscanf\s*\(/.test(src);
+  const hasGetchar = /\bgetchar\s*\(/.test(src);
+  const hasFgets = /\bfgets\s*\(/.test(src);
+
+  if (!hasScanf && !hasGetchar && !hasFgets) {
+    return src;
+  }
+
+  const safeFile = String(filePath || (isC ? "main.c" : "main.cpp")).replace(/\\/g, "/").replace(/"/g, "");
+  const lines = [
+    '#pragma GCC diagnostic push',
+    '#pragma GCC diagnostic ignored "-Wunused-function"',
+    '#pragma GCC diagnostic ignored "-Wunused-macros"',
+    '#include <stdio.h>',
+    '#include <stdlib.h>'
+  ];
+
+  if (hasScanf) {
+    lines.push(
+      '#include <stdarg.h>',
+      'static inline int __attribute__((unused)) __studio_scanf(const char *fmt, ...) {',
+      '  va_list args;',
+      '  va_start(args, fmt);',
+      '  int r = vscanf(fmt, args);',
+      '  va_end(args);',
+      '  if (r == EOF) {',
+      '    fflush(stdout);',
+      '    fputs("\\x1e__STUDIO_WAIT_INPUT__", stdout);',
+      '    fflush(stdout);',
+      '    _Exit(0);',
+      '  }',
+      '  return r;',
+      '}',
+      '#define scanf __studio_scanf'
+    );
+  }
+
+  if (hasGetchar) {
+    lines.push(
+      'static inline int __attribute__((unused)) __studio_getchar(void) {',
+      '  int r = getchar();',
+      '  if (r == EOF) {',
+      '    fflush(stdout);',
+      '    fputs("\\x1e__STUDIO_WAIT_INPUT__", stdout);',
+      '    fflush(stdout);',
+      '    _Exit(0);',
+      '  }',
+      '  return r;',
+      '}',
+      '#define getchar __studio_getchar'
+    );
+  }
+
+  if (hasFgets) {
+    lines.push(
+      'static inline char* __attribute__((unused)) __studio_fgets(char *s, int n, FILE *stream) {',
+      '  char *r = fgets(s, n, stream);',
+      '  if (!r && stream == stdin) {',
+      '    fflush(stdout);',
+      '    fputs("\\x1e__STUDIO_WAIT_INPUT__", stdout);',
+      '    fflush(stdout);',
+      '    _Exit(0);',
+      '  }',
+      '  return r;',
+      '}',
+      '#define fgets __studio_fgets'
+    );
+  }
+
+  lines.push(
+    '#pragma GCC diagnostic pop',
+    `#line 1 "${safeFile}"`
+  );
+
+  return `${lines.join("\n")}\n${src}`;
 }
 
 export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
@@ -433,7 +507,10 @@ export function parseGccErrors(output) {
     const line = parseInt(match[1], 10);
     const column = match[2] ? parseInt(match[2], 10) : 1;
     const severity = (match[3] || "error").toLowerCase();
-    const rawMessage = match[4].trim();
+    const rawMessage = match[4].trim()
+      .replace(/__studio_scanf\b/g, "scanf")
+      .replace(/__studio_getchar\b/g, "getchar")
+      .replace(/__studio_fgets\b/g, "fgets");
     if (rawMessage.includes("__studio_")) continue;
     if (!isNaN(line)) {
       errors.push({
@@ -692,12 +769,24 @@ export function mountCRunnerView(containerEl, {
       stdin: effectiveStdin
     });
 
+    if (isCppFamily && !batchValue) {
+      payload.code = injectInteractiveInputGuard(
+        payload.code,
+        activeFile.shortName || activeFile.path,
+        isC
+      );
+    }
+
     const t0 = performance.now();
     try {
       const res = await compileAndRunWandbox(payload, fetchFn);
       if (isDestroyed) return;
       const ms = Math.round(performance.now() - t0);
-      const cleanResStdout = String(res.stdout || "");
+      const rawStdoutWithMarker = String(res.stdout || "");
+      const waitingForInput = rawStdoutWithMarker.includes(WAIT_INPUT_MARKER);
+      const cleanResStdout = waitingForInput
+        ? rawStdoutWithMarker.split(WAIT_INPUT_MARKER).join("")
+        : rawStdoutWithMarker;
 
       const compilerErrors = parseGccErrors(`${res.compilerErr}\n${res.compilerOut}\n${res.stderr}`);
       const blockingErrors = compilerErrors.filter((e) => e.severity !== "warning");
@@ -777,6 +866,11 @@ export function mountCRunnerView(containerEl, {
           outDiv.className = "c-term-stdout";
           outDiv.textContent = cleanStdout;
           termBody.appendChild(outDiv);
+        } else if (waitingForInput) {
+          const waitDiv = document.createElement("div");
+          waitDiv.className = "c-term-hint";
+          waitDiv.textContent = "(El programa espera que ingreses un valor abajo...)";
+          termBody.appendChild(waitDiv);
         } else {
           const emptyDiv = document.createElement("div");
           emptyDiv.className = "c-term-hint";
@@ -827,14 +921,21 @@ export function mountCRunnerView(containerEl, {
 
       termBody.scrollTop = termBody.scrollHeight;
 
-      if (res.status === 0 && !hasInteractiveInput) {
+      if (waitingForInput) {
+        termStatus.className = "c-term-status is-running";
+        termStatus.textContent = sessionInputs.length === 0
+          ? `Esperando dato en consola (${ms} ms)`
+          : `Paso ${sessionInputs.length} — Esperando dato (${ms} ms)`;
+        termInput.placeholder = "Escribí el dato solicitado y presioná Enter...";
+        setTimeout(() => termInput.focus(), 60);
+      } else if (res.status === 0 && !hasInteractiveInput) {
         termStatus.className = "c-term-status is-ok";
         termStatus.textContent = `Código de salida: 0 (Éxito) — ${ms} ms`;
         termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
       } else {
         termStatus.className = "c-term-status is-ok";
-        termStatus.textContent = `Paso ${sessionInputs.length} — Ejecutando (${ms} ms)`;
-        termInput.placeholder = "Escribí tu siguiente respuesta y presioná Enter...";
+        termStatus.textContent = `Paso ${sessionInputs.length} — Finalizado (${ms} ms)`;
+        termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
         setTimeout(() => termInput.focus(), 60);
       }
     } catch (err) {
