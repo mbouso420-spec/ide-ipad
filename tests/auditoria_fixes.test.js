@@ -358,11 +358,11 @@ describe("Verificación de Arreglos de Auditoría (Fases 1, 2, 3 y 4)", () => {
   describe("Fase 4: Ramas de GitHub (fetchRepoBranches y createRepoBranch)", () => {
     test("createRepoBranch rechaza nombres de rama vacíos", async () => {
       await assert.rejects(
-        () => createRepoBranch({ token: "t", owner: "o", repo: "r", branchName: "" }),
+        () => createRepoBranch({ token: "ghp_ValidTestToken1234567890abcdef", owner: "o", repo: "r", branchName: "" }),
         /El nombre de la rama no puede estar vacío/
       );
       await assert.rejects(
-        () => createRepoBranch({ token: "t", owner: "o", repo: "r", branchName: "   " }),
+        () => createRepoBranch({ token: "ghp_ValidTestToken1234567890abcdef", owner: "o", repo: "r", branchName: "   " }),
         /El nombre de la rama no puede estar vacío/
       );
     });
@@ -385,11 +385,11 @@ describe("Verificación de Arreglos de Auditoría (Fases 1, 2, 3 y 4)", () => {
       };
 
       try {
-        const branches = await fetchRepoBranches({ token: "t", owner: "o", repo: "r" });
+        const branches = await fetchRepoBranches({ token: "ghp_ValidTestToken1234567890abcdef", owner: "o", repo: "r" });
         assert.deepEqual(branches.map((b) => b.name), ["main", "develop"]);
 
         const created = await createRepoBranch({
-          token: "t",
+          token: "ghp_ValidTestToken1234567890abcdef",
           owner: "o",
           repo: "r",
           branchName: "feature/nueva",

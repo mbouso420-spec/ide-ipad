@@ -34,6 +34,12 @@ import {
   saveProjectState
 } from "../storage/workspaceDb.js";
 import { exportKeysBundle, getKeyStorageMode, hasStoredCredentials } from "../ai/providers.js";
+import {
+  checkAuthLockout,
+  formatRemainingCooldown,
+  maskCredentialPreview,
+  redactSensitiveTokens
+} from "../security/credentialGuard.js";
 
 /**
  * Controlador del flujo de conexión con GitHub (PAT local + Octokit),
@@ -202,6 +208,33 @@ export function initGithubController({
     if (publishRepoBox) publishRepoBox.hidden = true;
   }
 
+  let lockoutUiTimer = 0;
+
+  function syncTokenPlaceholder(storedToken) {
+    if (!tokenInput) return;
+    tokenInput.value = "";
+    tokenInput.placeholder = storedToken
+      ? `Token guardado (${maskCredentialPreview(storedToken)}) — pegá otro para reemplazar`
+      : "github_pat_…";
+  }
+
+  function syncLockoutUi() {
+    window.clearTimeout(lockoutUiTimer);
+    const lock = checkAuthLockout("github");
+    if (lock.locked) {
+      if (connectBtn) connectBtn.disabled = true;
+      setStatus(
+        authMsgEl,
+        `Bloqueo temporal de seguridad por múltiples intentos fallidos. Reintentá en ${formatRemainingCooldown(lock.remainingMs)}.`,
+        "error"
+      );
+      lockoutUiTimer = window.setTimeout(syncLockoutUi, Math.min(lock.remainingMs + 50, 1000));
+      return true;
+    }
+    if (connectBtn) connectBtn.disabled = false;
+    return false;
+  }
+
   openDialogBtn?.addEventListener("click", async () => {
     if (!dialog) return;
     resetPullConfirm();
@@ -210,11 +243,10 @@ export function initGithubController({
     hidePublishRepoBox();
     await onFlushPendingSaves?.();
     const storedToken = getGithubToken();
-    if (tokenInput) {
-      tokenInput.value = storedToken;
-    }
+    syncTokenPlaceholder(storedToken);
     await refreshSyncPanel();
     dialog.showModal();
+    if (syncLockoutUi()) return;
     if (storedToken) {
       if (!isSessionConnected || reposCache.length === 0) {
         await connectAndLoadRepos(storedToken);
@@ -225,6 +257,7 @@ export function initGithubController({
   });
 
   closeDialogBtn?.addEventListener("click", () => {
+    if (tokenInput) tokenInput.value = "";
     resetPullConfirm();
     resetOpenConfirm();
     hideConflictBox();
@@ -234,6 +267,7 @@ export function initGithubController({
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
+      if (tokenInput) tokenInput.value = "";
       resetPullConfirm();
       resetOpenConfirm();
       hideConflictBox();
@@ -250,7 +284,10 @@ export function initGithubController({
   });
 
   connectBtn?.addEventListener("click", async () => {
-    const token = (tokenInput?.value || "").trim();
+    if (syncLockoutUi()) return;
+
+    const typedToken = (tokenInput?.value || "").trim();
+    const token = typedToken || getGithubToken();
     if (!token) {
       setStatus(authMsgEl, "Pegá un Personal Access Token (PAT) de GitHub.", "error");
       return;
@@ -262,12 +299,20 @@ export function initGithubController({
     const check = await verifyGithubToken(token);
     connectBtn.disabled = false;
 
+    if (check.status === "locked") {
+      if (tokenInput) tokenInput.value = "";
+      syncLockoutUi();
+      return;
+    }
+
     if (check.status === "invalid") {
-      setStatus(authMsgEl, check.message, "error");
+      setStatus(authMsgEl, redactSensitiveTokens(check.message, [token]), "error");
+      syncLockoutUi();
       return;
     }
 
     saveGithubToken(token);
+    syncTokenPlaceholder(token);
     hideTokenWarning();
     try {
       if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
@@ -279,7 +324,7 @@ export function initGithubController({
 
     if (check.status !== "valid") {
       // Sin internet o GitHub sin responder: se guarda para usarlo cuando vuelva la conexión.
-      setStatus(authMsgEl, `${check.message} El token quedó guardado.`, "error");
+      setStatus(authMsgEl, `${redactSensitiveTokens(check.message, [token])} El token quedó guardado.`, "error");
       return;
     }
     await connectAndLoadRepos(token);
@@ -299,7 +344,7 @@ export function initGithubController({
     connectedUserLogin = "";
     isSessionConnected = false;
     onReposListChanged?.([]);
-    if (tokenInput) tokenInput.value = "";
+    syncTokenPlaceholder("");
     if (userStatusEl) userStatusEl.textContent = "Sin sesión";
     if (repoSelect) repoSelect.innerHTML = '<option value="">Conectá tu token para listar repositorios</option>';
     setStatus(authMsgEl, "Token eliminado de este navegador.", "neutral");

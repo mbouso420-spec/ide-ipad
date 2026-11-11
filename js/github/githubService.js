@@ -1,8 +1,22 @@
 import { getKeyStorageMode } from "../ai/providers.js";
 import { toFriendlyNetworkError } from "../net/networkErrors.js";
+import {
+  AuthLockoutError,
+  assertNotLockedOut,
+  checkAuthLockout,
+  CredentialFormatError,
+  formatRemainingCooldown,
+  isTokenRejectedInSession,
+  markTokenRejectedInSession,
+  recordAuthFailure,
+  recordAuthSuccess,
+  redactSensitiveTokens,
+  validateCredentialFormat
+} from "../security/credentialGuard.js";
 import { BINARY_EXTENSIONS } from "../storage/fileImport.js";
 
 const GH_TOKEN_KEY = "ide.github.pat";
+const GH_SCOPE = "github";
 const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
 const GH_USER_CACHE_KEY = "ide.github.userLogin";
 
@@ -17,7 +31,11 @@ export function getGithubToken() {
 }
 
 export function saveGithubToken(token) {
-  const trimmed = token.trim();
+  const raw = String(token || "");
+  if (/[\x00-\x1f\x7f]/.test(raw)) {
+    return;
+  }
+  const trimmed = raw.trim();
   try {
     window.localStorage.removeItem(GH_TOKEN_KEY);
     window.sessionStorage.removeItem(GH_TOKEN_KEY);
@@ -95,22 +113,89 @@ function saveCachedUserRepositories(repos) {
  * Crea un cliente ligero sobre Octokit (@octokit/core vía ESM) con respaldo directo a GitHub REST API v3.
  * @param {string} token
  */
-async function createGithubClient(token) {
-  const raw = await createRawGithubClient(token);
+async function createGithubClient(token, { requireToken = true } = {}) {
+  const isAnonymousPublic = !requireToken && (token === "" || token === undefined || token === null);
+  let cleanToken = "";
+
+  if (!isAnonymousPublic) {
+    // 1. Verificar bloqueo progresivo por fuerza bruta antes de instanciar cliente o abrir red
+    assertNotLockedOut(GH_SCOPE);
+
+    // 2. Validación de formato pre-vuelo (descarta entradas vacías, cortas, prefijos inválidos o caracteres de control)
+    const fmt = validateCredentialFormat("github", token);
+    if (!fmt.valid) {
+      throw new CredentialFormatError(fmt.reason, fmt.code);
+    }
+    cleanToken = fmt.clean;
+
+    // 3. Bloqueo de sesión por huella ya rechazada previamente con 401
+    if (isTokenRejectedInSession(GH_SCOPE, cleanToken)) {
+      const rejectedErr = new Error(
+        "GitHub rechazó este token previamente en esta sesión. Ingresá un nuevo Personal Access Token."
+      );
+      rejectedErr.status = 401;
+      rejectedErr.rejectedInSession = true;
+      throw rejectedErr;
+    }
+  }
+
+  const raw = await createRawGithubClient(cleanToken);
   return {
     async request(route, params = {}) {
+      if (cleanToken) {
+        assertNotLockedOut(GH_SCOPE);
+        if (isTokenRejectedInSession(GH_SCOPE, cleanToken)) {
+          const rejectedErr = new Error(
+            "GitHub rechazó este token previamente en esta sesión. Ingresá un nuevo Personal Access Token."
+          );
+          rejectedErr.status = 401;
+          rejectedErr.rejectedInSession = true;
+          throw rejectedErr;
+        }
+      }
+
       try {
-        return await raw.request(route, params);
+        const data = await raw.request(route, params);
+        if (cleanToken) {
+          recordAuthSuccess(GH_SCOPE);
+        }
+        return data;
       } catch (error) {
-        if (error?.status === 401) {
+        const status = Number(error?.status) || 0;
+        const rawMsg = String(error?.message || "");
+        const lowerMsg = rawMsg.toLowerCase();
+
+        if (status === 401 && cleanToken) {
+          markTokenRejectedInSession(GH_SCOPE, cleanToken);
+          const failure = recordAuthFailure(GH_SCOPE);
+          const lockSuffix = failure.locked
+            ? ` Bloqueo temporal activado (${formatRemainingCooldown(failure.remainingMs)}) tras múltiples intentos fallidos.`
+            : "";
           const authError = new Error(
-            "GitHub rechazó el token (inválido, vencido o revocado). Conectá uno nuevo desde el botón Repositorio."
+            `GitHub rechazó el token (inválido, vencido o revocado). Conectá uno nuevo desde el botón Repositorio.${lockSuffix}`
           );
           authError.status = 401;
+          authError.lockout = failure.locked ? failure : null;
           authError.cause = error;
           throw authError;
         }
-        throw toFriendlyNetworkError(error, "GitHub");
+
+        if ((status === 403 || status === 429) && cleanToken) {
+          const isRateLimit = lowerMsg.includes("rate limit");
+          if (!isRateLimit && status === 403) {
+            markTokenRejectedInSession(GH_SCOPE, cleanToken);
+          }
+          const failure = recordAuthFailure(GH_SCOPE);
+          if (failure.locked) {
+            throw new AuthLockoutError(GH_SCOPE, failure.remainingMs, failure.failedAttempts);
+          }
+        }
+
+        const safeErr = toFriendlyNetworkError(error, "GitHub");
+        if (safeErr instanceof Error && safeErr.message) {
+          safeErr.message = redactSensitiveTokens(safeErr.message, [cleanToken]);
+        }
+        throw safeErr;
       }
     }
   };
@@ -185,7 +270,8 @@ async function createRawGithubClient(token) {
         if (detail.includes("Resource not accessible by personal access token")) {
           detail = "Tu token de GitHub no tiene permiso para este recurso. Para Gists, activá 'Account permissions -> Gists (Read and write)' en GitHub o usá un Token Classic con la casilla 'gist'.";
         }
-        const err = new Error(`GitHub API: ${detail}`);
+        const safeDetail = redactSensitiveTokens(detail, [token]);
+        const err = new Error(`GitHub API: ${safeDetail}`);
         err.status = res.status;
         throw err;
       }
@@ -196,29 +282,67 @@ async function createRawGithubClient(token) {
 
 /**
  * Comprueba un token con GET /user (GitHub responde 401 "Bad credentials" si es inválido, vencido o revocado).
- * @returns {Promise<{ status: "valid", login: string } | { status: "invalid" | "offline" | "unknown", message: string }>}
+ * Aplica bloqueo progresivo ante fuerza bruta, validación de formato pre-vuelo y rechazo por huella en sesión.
+ * @returns {Promise<{ status: "valid", login: string } | { status: "invalid" | "offline" | "unknown" | "locked", message: string, remainingMs?: number }>}
  */
 export async function verifyGithubToken(token) {
-  const clean = String(token || "").trim();
-  if (!clean) {
-    return { status: "invalid", message: "Pegá un Personal Access Token (PAT) de GitHub." };
+  const lockState = checkAuthLockout(GH_SCOPE);
+  if (lockState.locked) {
+    return {
+      status: "locked",
+      remainingMs: lockState.remainingMs,
+      message: new AuthLockoutError(GH_SCOPE, lockState.remainingMs, lockState.failedAttempts).message
+    };
   }
+
+  const fmt = validateCredentialFormat("github", token);
+  if (!fmt.valid) {
+    return { status: "invalid", formatInvalid: true, message: fmt.reason };
+  }
+
+  if (isTokenRejectedInSession(GH_SCOPE, fmt.clean)) {
+    return {
+      status: "invalid",
+      rejectedInSession: true,
+      message: "Este token ya fue rechazado por GitHub en esta sesión. Ingresá un nuevo Personal Access Token."
+    };
+  }
+
   try {
-    const user = await fetchGithubUser(clean);
+    const user = await fetchGithubUser(fmt.clean);
     return { status: "valid", login: String(user?.login || "") };
   } catch (error) {
+    if (error instanceof AuthLockoutError || error?.code === "ERR_AUTH_LOCKOUT") {
+      return {
+        status: "locked",
+        remainingMs: error.remainingMs || 0,
+        message: error.message
+      };
+    }
     if (error?.isNetworkFailure) {
       return { status: "offline", message: "Sin conexión: no se pudo verificar el token con GitHub." };
     }
     if (error?.status === 401) {
+      const postFailureLock = checkAuthLockout(GH_SCOPE);
+      if (postFailureLock.locked) {
+        return {
+          status: "locked",
+          remainingMs: postFailureLock.remainingMs,
+          message: `Token inválido o vencido. Bloqueo temporal activado (${formatRemainingCooldown(postFailureLock.remainingMs)}) tras múltiples intentos fallidos.`
+        };
+      }
       return {
         status: "invalid",
         message: "Token inválido o vencido. Revisá que lo hayas copiado completo o generá uno nuevo en GitHub."
       };
     }
+    const safeMsg = redactSensitiveTokens(
+      error instanceof Error ? error.message : "error desconocido",
+      [fmt.clean]
+    );
     return {
       status: "unknown",
-      message: `No se pudo verificar el token ahora (${error instanceof Error ? error.message : "error desconocido"}).`
+      message: `No se pudo verificar el token ahora (${safeMsg}).`
     };
   }
 }
@@ -276,7 +400,7 @@ export async function fetchRepoBranches(paramsOrToken, maybeOwner, maybeRepo) {
     owner = maybeOwner;
     repo = maybeRepo;
   }
-  const client = await createGithubClient(token);
+  const client = await createGithubClient(token, { requireToken: false });
   return client.request("GET /repos/{owner}/{repo}/branches", {
     owner,
     repo,
@@ -312,7 +436,7 @@ export async function createRepoBranch({ token, owner, repo, branchName, fromSha
  * permitiendo mostrar cualquier repositorio en el Explorador en ~250ms bajo demanda.
  */
 export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
-  const client = await createGithubClient(token);
+  const client = await createGithubClient(token, { requireToken: false });
 
   let branchInfo = null;
   try {
@@ -393,7 +517,7 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
  * Descarga el contenido de un único archivo puntual desde GitHub bajo demanda (~120ms).
  */
 export async function fetchSingleRepoBlob({ token, owner, repo, blobSha }) {
-  const client = await createGithubClient(token);
+  const client = await createGithubClient(token, { requireToken: false });
   const blob = await client.request("GET /repos/{owner}/{repo}/git/blobs/{file_sha}", {
     owner,
     repo,
@@ -406,7 +530,7 @@ export async function fetchSingleRepoBlob({ token, owner, repo, blobSha }) {
  * Descarga en lote una lista de archivos pendientes para dejar el repositorio disponible sin internet.
  */
 export async function downloadBatchBlobs({ token, owner, repo, items, onProgress }) {
-  const client = await createGithubClient(token);
+  const client = await createGithubClient(token, { requireToken: false });
   const results = [];
   let completed = 0;
   const total = items.length;

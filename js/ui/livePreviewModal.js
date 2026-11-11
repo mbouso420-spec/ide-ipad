@@ -1,4 +1,5 @@
 import { normalizePath } from "../storage/workspaceDb.js";
+import { redactSensitiveTokens } from "../security/credentialGuard.js";
 import { instrumentLoops } from "../preview/loopGuard.js";
 import { buildSqlRunnerPreview } from "../preview/sqlRunner.js";
 import { mountCRunnerView } from "../preview/cRunner.js";
@@ -401,7 +402,7 @@ export function initLivePreviewModal({
     while (consoleList.children.length >= MAX_CONSOLE_LINES && consoleList.firstElementChild) {
       consoleList.removeChild(consoleList.firstElementChild);
     }
-    const rawStr = String(text ?? "");
+    const rawStr = redactSensitiveTokens(String(text ?? ""));
     const safeText =
       rawStr.length > MAX_CONSOLE_LINE_CHARS
         ? `${rawStr.slice(0, MAX_CONSOLE_LINE_CHARS)}… [truncado]`

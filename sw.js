@@ -1,4 +1,4 @@
-const SHELL_CACHE = "studio-ide-shell-v26";
+const SHELL_CACHE = "studio-ide-shell-v27";
 const RUNTIME_CACHE = "studio-ide-runtime-v1";
 const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";
 const PYODIDE_ENTRY_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/pyodide.js";
@@ -44,7 +44,8 @@ const APP_SHELL_URLS = [
   "./js/preview/cRunner.js",
   "./js/preview/sqlRunner.js",
   "./js/github/githubService.js",
-  "./js/github/githubController.js"
+  "./js/github/githubController.js",
+  "./js/security/credentialGuard.js"
 ];
 
 const CACHEABLE_CDN_HOSTS = new Set([

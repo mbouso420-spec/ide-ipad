@@ -2,6 +2,7 @@ import "./setup.js";
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
+const { resetAuthSecurityState } = await import("../js/security/credentialGuard.js");
 const backup = await import("../js/storage/emergencyBackup.js");
 const db = await import("../js/storage/workspaceDb.js");
 const { decodeImportedFile } = await import("../js/storage/fileImport.js");
@@ -58,10 +59,12 @@ describe("Errores de red en español", () => {
     await assert.rejects(gh.fetchRepoTreeIndex({ token: "", owner: "o", repo: "r", branch: "main" }), /^Error: Sin conexión con GitHub/);
   });
   test("GitHub: 401 se explica en español y conserva status 401 (requisito actualizado en Vuelta #3)", async () => {
+    resetAuthSecurityState();
     globalThis.fetch = async () => new Response(JSON.stringify({ message: "Bad credentials" }), { status: 401 });
-    await assert.rejects(gh.fetchGithubUser("x"), (e) => /GitHub rechazó el token/.test(e.message) && e.status === 401);
+    await assert.rejects(gh.fetchGithubUser("ghp_InvalidServerRejected1234567890"), (e) => /GitHub rechazó el token/.test(e.message) && e.status === 401);
   });
   test("IA: red caída no reintenta otros modelos y avisa en español", async () => {
+    resetAuthSecurityState();
     let calls = 0;
     globalThis.fetch = async (url) => {
       if (String(url).includes("/models")) throw new TypeError("Load failed");
@@ -69,14 +72,15 @@ describe("Errores de red en español", () => {
       throw new TypeError("Load failed");
     };
     await assert.rejects(
-      ai.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: "k-red", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk() {} }),
+      ai.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: "gsk_ValidFormatGroqKey1234567890abcd", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk() {} }),
       /Sin conexión con Groq/
     );
     assert.equal(calls, 1);
   });
   test("IA: 'Actualizar modelos' sin red avisa en español", async () => {
+    resetAuthSecurityState();
     globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
-    await assert.rejects(ai.fetchLiveFreeModels("mistral", "k"), /Sin conexión con Mistral/);
+    await assert.rejects(ai.fetchLiveFreeModels("mistral", "mistralValidFormatKey1234567890abcd"), /Sin conexión con Mistral/);
   });
 });
 

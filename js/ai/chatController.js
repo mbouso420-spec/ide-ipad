@@ -22,6 +22,14 @@ import {
   streamAiCompletion,
   validateApiKey
 } from "./providers.js";
+import {
+  AuthLockoutError,
+  checkAuthLockout,
+  formatRemainingCooldown,
+  maskCredentialPreview,
+  redactSensitiveTokens,
+  validateCredentialFormat
+} from "../security/credentialGuard.js";
 import { saveCredentialsBackup } from "../storage/workspaceDb.js";
 
 /**
@@ -98,6 +106,21 @@ export function initChatController({
   /** @type {Array<{ role: "user" | "assistant", content: string }>} */
   let conversation = [];
 
+  function syncApiKeyMaskPlaceholder(providerId) {
+    if (!apiKeyInput) return;
+    const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS.gemini;
+    const savedKey = getApiKey(provider.id);
+    apiKeyInput.value = "";
+    apiKeyInput.type = "password";
+    keyVisible = false;
+    if (toggleKeyVisBtn) {
+      toggleKeyVisBtn.innerHTML = icon("eye");
+    }
+    apiKeyInput.placeholder = savedKey
+      ? `Guardada (${maskCredentialPreview(savedKey)}) — pegá otra para cambiar`
+      : provider.keyPlaceholder;
+  }
+
   populateProviderOptions();
   syncSettingsForm();
   renderConversation();
@@ -116,6 +139,17 @@ export function initChatController({
     keyCheckController?.abort();
     keyCheckController = null;
 
+    const lockState = checkAuthLockout(`ai:${providerId}`);
+    if (lockState.locked) {
+      keyChecks.set(providerId, {
+        key: getApiKey(providerId),
+        status: "locked",
+        message: `Bloqueo temporal activo (${formatRemainingCooldown(lockState.remainingMs)}) por intentos fallidos.`
+      });
+      updateModelStrip();
+      return;
+    }
+
     const key = getApiKey(providerId);
     if (!key) {
       keyChecks.delete(providerId);
@@ -126,6 +160,17 @@ export function initChatController({
       }
       return;
     }
+
+    const fmt = validateCredentialFormat(providerId, key);
+    if (!fmt.valid) {
+      keyChecks.set(providerId, { key, status: "invalid", message: fmt.reason });
+      updateModelStrip();
+      if (providerId === activeProviderId && providerHelpEl && announce) {
+        providerHelpEl.textContent = fmt.reason;
+      }
+      return;
+    }
+
     const previous = keyChecks.get(providerId);
     if (!announce && previous && previous.key === key && previous.status !== "checking") {
       updateModelStrip();
@@ -153,10 +198,14 @@ export function initChatController({
       keyChecks.set(providerId, { key, ...result });
       updateModelStrip();
       if (result.status === "valid") {
+        // Limpiar el texto del input tras validar para no dejar el secreto expuesto en el DOM
+        if (providerId === activeProviderId) {
+          syncApiKeyMaskPlaceholder(providerId);
+        }
         void syncLiveModelsSilently(providerId);
       }
       if (providerId === activeProviderId && providerHelpEl && (announce || result.status !== "valid")) {
-        providerHelpEl.textContent = result.message;
+        providerHelpEl.textContent = redactSensitiveTokens(result.message, [key]);
       }
     }, delayMs);
   }
@@ -195,6 +244,9 @@ export function initChatController({
     }
     if (settingsBtn) {
       settingsBtn.setAttribute("aria-expanded", String(settingsOpen));
+    }
+    if (!settingsOpen) {
+      syncApiKeyMaskPlaceholder(activeProviderId);
     }
   }
 
@@ -253,9 +305,19 @@ export function initChatController({
   }
 
   apiKeyInput?.addEventListener("input", () => {
-    saveApiKey(activeProviderId, apiKeyInput.value);
+    const rawVal = apiKeyInput.value;
+    if (!rawVal.trim()) {
+      return;
+    }
+    saveApiKey(activeProviderId, rawVal);
     syncCredentialsBackup();
     scheduleKeyValidation(activeProviderId, 700, true);
+  });
+
+  apiKeyInput?.addEventListener("blur", () => {
+    if (getApiKey(activeProviderId)) {
+      syncApiKeyMaskPlaceholder(activeProviderId);
+    }
   });
 
   toggleKeyVisBtn?.addEventListener("click", () => {
@@ -269,9 +331,7 @@ export function initChatController({
   clearKeyBtn?.addEventListener("click", () => {
     clearApiKey(activeProviderId);
     syncCredentialsBackup();
-    if (apiKeyInput) {
-      apiKeyInput.value = "";
-    }
+    syncApiKeyMaskPlaceholder(activeProviderId);
     scheduleKeyValidation(activeProviderId, 0, false);
   });
 
@@ -527,6 +587,14 @@ export function initChatController({
       return;
     }
 
+    const lockState = checkAuthLockout(`ai:${activeProviderId}`);
+    if (lockState.locked) {
+      appendErrorBanner(
+        `Bloqueo temporal activo para ${AI_PROVIDERS[activeProviderId].name} por múltiples intentos fallidos. Esperá ${formatRemainingCooldown(lockState.remainingMs)}.`
+      );
+      return;
+    }
+
     const apiKey = getApiKey(activeProviderId);
     if (!apiKey) {
       toggleSettings(true);
@@ -534,6 +602,14 @@ export function initChatController({
       appendErrorBanner(
         `Falta la API Key gratuita para ${AI_PROVIDERS[activeProviderId].name}. Pegala arriba (queda guardada en este navegador).`
       );
+      return;
+    }
+
+    const fmt = validateCredentialFormat(activeProviderId, apiKey);
+    if (!fmt.valid) {
+      toggleSettings(true);
+      apiKeyInput?.focus();
+      appendErrorBanner(fmt.reason);
       return;
     }
 
@@ -639,8 +715,20 @@ export function initChatController({
           }
         }
       } else {
-        const message =
+        const rawMessage =
           error instanceof Error ? error.message : "Error de red al conectar con el proveedor gratuito.";
+        const message = redactSensitiveTokens(rawMessage, [apiKey]);
+        if (error instanceof AuthLockoutError || error?.httpStatus === 401 || error?.httpStatus === 403) {
+          const lockNow = checkAuthLockout(`ai:${activeProviderId}`);
+          keyChecks.set(activeProviderId, {
+            key: apiKey,
+            status: lockNow.locked ? "locked" : "invalid",
+            message
+          });
+          if (isVisible()) {
+            updateModelStrip();
+          }
+        }
         if (assistantEntry.content.trim()) {
           // Se conserva lo que ya llegó: perderlo sería peor que mostrarlo incompleto.
           assistantEntry.content += `\n\n*(Respuesta interrumpida: ${message})*`;
@@ -722,8 +810,7 @@ export function initChatController({
     }
 
     if (apiKeyInput) {
-      apiKeyInput.placeholder = provider.keyPlaceholder;
-      apiKeyInput.value = getApiKey(provider.id);
+      syncApiKeyMaskPlaceholder(provider.id);
     }
 
     if (providerHelpEl) {
@@ -743,6 +830,7 @@ export function initChatController({
   function updateModelStrip() {
     const provider = AI_PROVIDERS[activeProviderId] ?? AI_PROVIDERS.gemini;
     const key = getApiKey(provider.id);
+    const lock = checkAuthLockout(`ai:${provider.id}`);
 
     if (currentModelLabel) {
       const displayName = PROVIDER_SHORT_NAMES[provider.id] || provider.name;
@@ -754,7 +842,10 @@ export function initChatController({
       const current = check && check.key === key ? check : null;
       let label = "Falta clave";
       let state = "missing";
-      if (key) {
+      if (lock.locked) {
+        label = `Bloqueada (${formatRemainingCooldown(lock.remainingMs)})`;
+        state = "invalid";
+      } else if (key) {
         if (!current) {
           label = "Clave sin verificar";
           state = "unverified";
@@ -776,7 +867,7 @@ export function initChatController({
       keyStatusBtn.classList.toggle("is-invalid", state === "invalid");
       keyStatusBtn.classList.toggle("is-unverified", state === "unverified" || state === "checking");
       keyStatusBtn.dataset.keyState = state;
-      keyStatusBtn.title = current?.message || "Abrir configuración de API Key";
+      keyStatusBtn.title = redactSensitiveTokens(current?.message || "Abrir configuración de API Key", [key]);
       keyStatusBtn.innerHTML = `${icon("key")}<span>${label}</span>`;
     }
   }

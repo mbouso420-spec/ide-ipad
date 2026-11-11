@@ -335,10 +335,11 @@ app.c:12:3: error: unknown type name 'intt'; did you mean 'int'?
 });
 
 describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
-  test("6.1 Caché Offline: versión oficial studio-ide-shell-v26 declarada en Service Worker", async () => {
+  test("6.1 Caché Offline: versión oficial studio-ide-shell-v27 declarada en Service Worker", async () => {
     const fs = await import("node:fs/promises");
     const swContent = await fs.readFile(new URL("../sw.js", import.meta.url), "utf-8");
-    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v26"'));
+    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v27"'));
+    assert.ok(swContent.includes("credentialGuard.js"));
     assert.ok(swContent.includes("acorn"));
     assert.ok(swContent.includes("PYODIDE_ENTRY_URL"));
   });

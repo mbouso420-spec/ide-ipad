@@ -3,6 +3,11 @@ import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 const p = await import("../js/ai/providers.js");
+const { resetAuthSecurityState } = await import("../js/security/credentialGuard.js");
+
+const TEST_GROQ_KEY = "gsk_ValidFormatGroqKey1234567890abcd1";
+const TEST_MISTRAL_KEY = "mistralValidFormatKey1234567890abcd";
+const TEST_GEMINI_KEY = "AIzaSyValidFormatGeminiKey1234567890";
 
 function sseResponse(lines, status = 200) {
   const enc = new TextEncoder();
@@ -68,6 +73,7 @@ describe("Bóveda de claves", () => {
 
 describe("Streaming SSE OpenAI-compatible", () => {
   test("ensambla deltas partidos en fragmentos arbitrarios, CRLF, comentarios y [DONE]", async () => {
+    resetAuthSecurityState();
     const payloads = ["Hola", " ñandú", " 😀", " fin"].map((t) => `data: ${JSON.stringify({ choices: [{ delta: { content: t } }] })}\r\n\r\n`);
     const raw = `: keep-alive\n\n${payloads.join("")}data: [DONE]\n\n`;
     // Partir en trozos de 7 bytes (corta caracteres multibyte y líneas)
@@ -81,13 +87,14 @@ describe("Streaming SSE OpenAI-compatible", () => {
     };
     let out = "";
     await p.streamAiCompletion({
-      providerId: "groq", model: "llama-3.3-70b-versatile", apiKey: "k", systemPrompt: "s",
+      providerId: "groq", model: "llama-3.3-70b-versatile", apiKey: TEST_GROQ_KEY, systemPrompt: "s",
       history: [{ role: "user", content: "hi" }], onChunk: (t) => { out += t; }
     });
     assert.equal(out, "Hola ñandú 😀 fin");
   });
 
   test("error 401 no reintenta con otros modelos y propaga mensaje", async () => {
+    resetAuthSecurityState();
     let chatCalls = 0;
     globalThis.fetch = async (url) => {
       if (String(url).includes("/models")) return new Response("{}", { status: 401 });
@@ -95,13 +102,14 @@ describe("Streaming SSE OpenAI-compatible", () => {
       return new Response(JSON.stringify({ error: { message: "Invalid API Key" } }), { status: 401 });
     };
     await assert.rejects(
-      p.streamAiCompletion({ providerId: "mistral", model: "codestral-latest", apiKey: "bad", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk() {} }),
+      p.streamAiCompletion({ providerId: "mistral", model: "codestral-latest", apiKey: TEST_MISTRAL_KEY, systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk() {} }),
       /Invalid API Key/
     );
     assert.equal(chatCalls, 1);
   });
 
   test("429 en el primer modelo cae al siguiente", async () => {
+    resetAuthSecurityState();
     const models = [];
     globalThis.fetch = async (url, init) => {
       if (String(url).includes("/models")) return new Response("{}", { status: 500 });
@@ -111,13 +119,14 @@ describe("Streaming SSE OpenAI-compatible", () => {
       return sseResponse([`data: ${JSON.stringify({ choices: [{ delta: { content: "ok" } }] })}\n\n`]);
     };
     let out = "";
-    await p.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: "k2", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } });
+    await p.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: `${TEST_GROQ_KEY}2`, systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } });
     assert.equal(out, "ok");
     assert.equal(models.length, 2);
     assert.notEqual(models[0], models[1]);
   });
 
   test("[BUG-21] si el flujo ya emitió texto y luego falla, no se reintenta con otro modelo (sin texto duplicado)", async () => {
+    resetAuthSecurityState();
     let chatCalls = 0;
     globalThis.fetch = async (url) => {
       if (String(url).includes("/models")) return new Response("{}", { status: 500 });
@@ -138,13 +147,14 @@ describe("Streaming SSE OpenAI-compatible", () => {
     };
     let out = "";
     await assert.rejects(
-      p.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: "k3", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } })
+      p.streamAiCompletion({ providerId: "groq", model: "llama-3.1-8b-instant", apiKey: `${TEST_GROQ_KEY}3`, systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } })
     );
     assert.equal(out, "parcial");
     assert.equal(chatCalls, 1);
   });
 
   test("[BUG-22] la clave de Gemini viaja en cabecera, nunca en la URL", async () => {
+    resetAuthSecurityState();
     const seen = [];
     globalThis.fetch = async (url, init = {}) => {
       seen.push({ url: String(url), headers: init.headers || {} });
@@ -154,12 +164,12 @@ describe("Streaming SSE OpenAI-compatible", () => {
       return sseResponse([`data: ${JSON.stringify({ candidates: [{ content: { parts: [{ text: "hola" }] } }] })}\n\n`]);
     };
     let out = "";
-    await p.streamAiCompletion({ providerId: "gemini", model: "gemini-2.5-flash", apiKey: "AIzaSECRETO", systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } });
+    await p.streamAiCompletion({ providerId: "gemini", model: "gemini-2.5-flash", apiKey: TEST_GEMINI_KEY, systemPrompt: "s", history: [{ role: "user", content: "x" }], onChunk: (t) => { out += t; } });
     assert.equal(out, "hola");
     for (const s of seen) {
-      assert.ok(!s.url.includes("AIzaSECRETO"), `clave expuesta en URL: ${s.url}`);
+      assert.ok(!s.url.includes(TEST_GEMINI_KEY), `clave expuesta en URL: ${s.url}`);
     }
-    assert.ok(seen.some((s) => s.headers["x-goog-api-key"] === "AIzaSECRETO"));
+    assert.ok(seen.some((s) => s.headers["x-goog-api-key"] === TEST_GEMINI_KEY));
   });
 
   describe("Preferencias de IA: Temperatura, Presupuesto y Velocidad de Pensamiento", () => {

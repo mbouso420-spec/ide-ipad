@@ -684,8 +684,9 @@ describe("SOAK & ENDURANCE TEST: Pruebas a Gran Escala y Larga Duración", () =>
         throw new Error(`Fetch inesperado en test Gist: ${u}`);
       };
 
+      const mockToken = "ghp_MockTokenForSoakTest1234567890abcdef";
       try {
-        const saved = await saveProjectToGist("ghp_mock_token", {
+        const saved = await saveProjectToGist(mockToken, {
           projectName: "Soak 1050",
           entries: dataset
         });
@@ -693,7 +694,7 @@ describe("SOAK & ENDURANCE TEST: Pruebas a Gran Escala y Larga Duración", () =>
         assert.ok(capturedManifestJson.length > 1_000_000, "El manifiesto de 1,050 archivos con binarios supera 1 MB");
 
         // Descargamos el respaldo simulando que GitHub devolvió truncated: true
-        const restored = await fetchGistBackupContent("ghp_mock_token", "gist_soak_1050");
+        const restored = await fetchGistBackupContent(mockToken, "gist_soak_1050");
         assert.equal(
           restored.entries.length,
           TOTAL_FILES,
@@ -706,6 +707,7 @@ describe("SOAK & ENDURANCE TEST: Pruebas a Gran Escala y Larga Duración", () =>
 
     test("4.3 Resiliencia GitHub Tree API: árboles truncados (truncated: true) y errores HTTP 403/500/red caída", async () => {
       const origFetch = globalThis.fetch;
+      const mockToken = "ghp_MockTokenForSoakTest1234567890abcdef";
 
       // Caso A: Árbol truncado por GitHub (> 100k entradas o > 7 MB)
       globalThis.fetch = async (url) => {
@@ -730,7 +732,7 @@ describe("SOAK & ENDURANCE TEST: Pruebas a Gran Escala y Larga Duración", () =>
       };
 
       try {
-        const treeRes = await fetchRepoTreeIndex({ token: "t", owner: "u", repo: "r", branch: "main" });
+        const treeRes = await fetchRepoTreeIndex({ token: mockToken, owner: "u", repo: "r", branch: "main" });
         assert.equal(treeRes.isTruncated, true, "Debe propagar la bandera isTruncated: true");
         assert.equal(treeRes.entries.length, 1, "Debe filtrar node_modules y enlaces simbólicos 120000");
         assert.equal(treeRes.entries[0].path, "src/index.js");
@@ -738,21 +740,21 @@ describe("SOAK & ENDURANCE TEST: Pruebas a Gran Escala y Larga Duración", () =>
         // Caso B: Error 403 Rate Limit
         globalThis.fetch = async () => new Response(JSON.stringify({ message: "API rate limit exceeded" }), { status: 403, statusText: "Forbidden" });
         await assert.rejects(
-          async () => fetchRepoTreeIndex({ token: "t", owner: "u", repo: "r", branch: "main" }),
+          async () => fetchRepoTreeIndex({ token: mockToken, owner: "u", repo: "r", branch: "main" }),
           (err) => err && (err.status === 403 || String(err.message).toLowerCase().includes("rate") || String(err.message).includes("403") || String(err.message).includes("permiso"))
         );
 
         // Caso C: Error 500 Server Error
         globalThis.fetch = async () => new Response("Internal Server Error", { status: 500, statusText: "Internal Server Error" });
         await assert.rejects(
-          async () => fetchRepoTreeIndex({ token: "t", owner: "u", repo: "r", branch: "main" }),
+          async () => fetchRepoTreeIndex({ token: mockToken, owner: "u", repo: "r", branch: "main" }),
           (err) => err instanceof Error
         );
 
         // Caso D: Desconexión de red abrupta
         globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
         await assert.rejects(
-          async () => fetchRepoTreeIndex({ token: "t", owner: "u", repo: "r", branch: "main" }),
+          async () => fetchRepoTreeIndex({ token: mockToken, owner: "u", repo: "r", branch: "main" }),
           (err) => err instanceof Error
         );
       } finally {

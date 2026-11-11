@@ -1,5 +1,22 @@
 import { toFriendlyNetworkError } from "../net/networkErrors.js";
+import {
+  AuthLockoutError,
+  assertNotLockedOut,
+  checkAuthLockout,
+  CredentialFormatError,
+  formatRemainingCooldown,
+  isTokenRejectedInSession,
+  markTokenRejectedInSession,
+  recordAuthFailure,
+  recordAuthSuccess,
+  redactSensitiveTokens,
+  validateCredentialFormat
+} from "../security/credentialGuard.js";
 import { saveCredentialsBackup } from "../storage/workspaceDb.js";
+
+function aiScope(providerId) {
+  return `ai:${providerId || "unknown"}`;
+}
 
 const STORAGE_MODE_KEY = "ide.ai.storageMode";
 const ACTIVE_PROVIDER_KEY = "ide.ai.provider";
@@ -225,7 +242,11 @@ export function getApiKey(providerId) {
 
 export function saveApiKey(providerId, apiKey) {
   const k = `${KEY_PREFIX}${providerId}`;
-  const trimmed = apiKey.trim();
+  const raw = String(apiKey || "");
+  if (/[\x00-\x1f\x7f]/.test(raw)) {
+    return;
+  }
+  const trimmed = raw.trim();
   liveSyncedByProvider.delete(providerId);
   try {
     window.localStorage.removeItem(k);
@@ -388,12 +409,33 @@ const KEY_CHECK_ENDPOINTS = {
  * @returns {Promise<{ status: "valid" | "invalid" | "offline" | "unknown", message: string }>}
  */
 export async function validateApiKey(providerId, apiKey, signal) {
-  const cleanKey = String(apiKey || "").trim();
+  const scope = aiScope(providerId);
   const check = KEY_CHECK_ENDPOINTS[providerId];
   const label = providerLabel(providerId);
-  if (!cleanKey) {
-    return { status: "invalid", message: "Falta la clave." };
+
+  const lockState = checkAuthLockout(scope);
+  if (lockState.locked) {
+    return {
+      status: "locked",
+      remainingMs: lockState.remainingMs,
+      message: new AuthLockoutError(scope, lockState.remainingMs, lockState.failedAttempts).message
+    };
   }
+
+  const fmt = validateCredentialFormat(providerId, apiKey);
+  if (!fmt.valid) {
+    return { status: "invalid", formatInvalid: true, message: fmt.reason };
+  }
+  const cleanKey = fmt.clean;
+
+  if (isTokenRejectedInSession(scope, cleanKey)) {
+    return {
+      status: "invalid",
+      rejectedInSession: true,
+      message: `Esta clave de ${label} ya fue rechazada en esta sesión. Probá con otra clave.`
+    };
+  }
+
   if (!check) {
     return { status: "unknown", message: `No hay verificación disponible para ${label}.` };
   }
@@ -417,6 +459,7 @@ export async function validateApiKey(providerId, apiKey, signal) {
 
   if (res.ok || res.status === 429) {
     // 429 = la clave fue reconocida pero llegó al límite momentáneo de consultas.
+    recordAuthSuccess(scope);
     return { status: "valid", message: `Clave de ${label} verificada.` };
   }
 
@@ -433,6 +476,15 @@ export async function validateApiKey(providerId, apiKey, signal) {
     res.status === 403 ||
     (res.status === 400 && /api key|api_key|apikey/i.test(detail));
   if (keyRejected) {
+    markTokenRejectedInSession(scope, cleanKey);
+    const failure = recordAuthFailure(scope);
+    if (failure.locked) {
+      return {
+        status: "locked",
+        remainingMs: failure.remainingMs,
+        message: `${label} rechazó la clave. Bloqueo temporal activado (${formatRemainingCooldown(failure.remainingMs)}) tras múltiples intentos fallidos.`
+      };
+    }
     return {
       status: "invalid",
       message: `${label} rechazó la clave. Revisá que la hayas copiado completa o generá una nueva.`
@@ -441,15 +493,34 @@ export async function validateApiKey(providerId, apiKey, signal) {
   return { status: "unknown", message: `No se pudo verificar la clave de ${label} (respuesta ${res.status}).` };
 }
 
-export async function fetchLiveFreeModels(providerId, apiKey, signal) {
+export async function fetchLiveFreeModels(providerId, apiKey, signal, options = {}) {
   try {
-    return await fetchLiveFreeModelsRaw(providerId, apiKey, signal);
+    return await fetchLiveFreeModelsRaw(providerId, apiKey, signal, options);
   } catch (error) {
-    throw toFriendlyNetworkError(error, providerLabel(providerId));
+    const friendly = toFriendlyNetworkError(error, providerLabel(providerId));
+    if (friendly instanceof Error && friendly.message) {
+      friendly.message = redactSensitiveTokens(friendly.message, [apiKey]);
+    }
+    throw friendly;
   }
 }
 
-async function fetchLiveFreeModelsRaw(providerId, apiKey, signal) {
+async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFailure = true } = {}) {
+  const scope = aiScope(providerId);
+  if (providerId !== "openrouter") {
+    assertNotLockedOut(scope);
+    const fmt = validateCredentialFormat(providerId, apiKey);
+    if (!fmt.valid) {
+      throw new CredentialFormatError(fmt.reason, fmt.code);
+    }
+    if (isTokenRejectedInSession(scope, fmt.clean)) {
+      const err = new Error(`Esta clave de ${providerLabel(providerId)} ya fue rechazada en esta sesión.`);
+      err.httpStatus = 401;
+      throw err;
+    }
+    apiKey = fmt.clean;
+  }
+
   if (providerId === "gemini") {
     if (!apiKey) {
       throw new Error("Pegá primero tu API Key de Google AI Studio.");
@@ -458,8 +529,13 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal) {
     const url = "https://generativelanguage.googleapis.com/v1beta/models";
     const res = await fetch(url, { signal, headers: { "x-goog-api-key": apiKey } });
     if (!res.ok) {
+      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
+        markTokenRejectedInSession(scope, apiKey);
+        recordAuthFailure(scope);
+      }
       throw new Error(`Error al consultar Gemini (${res.status}).`);
     }
+    recordAuthSuccess(scope);
     const data = await res.json();
     const list = Array.isArray(data.models) ? data.models : [];
     const filtered = list
@@ -491,8 +567,13 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal) {
       signal
     });
     if (!res.ok) {
+      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
+        markTokenRejectedInSession(scope, apiKey);
+        recordAuthFailure(scope);
+      }
       throw new Error(`Error al consultar Groq (${res.status}).`);
     }
+    recordAuthSuccess(scope);
     const data = await res.json();
     const list = Array.isArray(data.data) ? data.data : [];
     const filtered = list
@@ -544,8 +625,13 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal) {
       signal
     });
     if (!res.ok) {
+      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
+        markTokenRejectedInSession(scope, apiKey);
+        recordAuthFailure(scope);
+      }
       throw new Error(`Error al consultar Mistral (${res.status}).`);
     }
+    recordAuthSuccess(scope);
     const data = await res.json();
     const list = Array.isArray(data.data) ? data.data : [];
     const filtered = list
@@ -610,11 +696,32 @@ export async function streamAiCompletion({
   signal
 }) {
   const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS.gemini;
+  const scope = aiScope(provider.id);
+
+  // 1. Verificar bloqueo progresivo por fuerza bruta antes de cualquier llamada de red
+  assertNotLockedOut(scope);
+
+  // 2. Validar formato pre-vuelo de la API Key
+  const fmt = validateCredentialFormat(provider.id, apiKey);
+  if (!fmt.valid) {
+    throw new CredentialFormatError(fmt.reason, fmt.code);
+  }
+  const cleanKey = fmt.clean;
+
+  // 3. Impedir reenvío de clave ya rechazada (401/403) en la sesión actual
+  if (isTokenRejectedInSession(scope, cleanKey)) {
+    const err = new Error(
+      `${providerLabel(provider.id)} rechazó esta clave previamente en esta sesión. Ingresá una nueva API Key.`
+    );
+    err.httpStatus = 401;
+    err.rejectedInSession = true;
+    throw err;
+  }
 
   if (provider.protocol === "gemini") {
     return streamGeminiWithFallback({
       model,
-      apiKey,
+      apiKey: cleanKey,
       systemPrompt,
       history,
       onChunk,
@@ -627,7 +734,7 @@ export async function streamAiCompletion({
   return streamOpenAiWithFallback({
     provider,
     model,
-    apiKey,
+    apiKey: cleanKey,
     systemPrompt,
     history,
     onChunk,
@@ -651,12 +758,12 @@ async function streamGeminiWithFallback({
 
   if (liveSyncedByProvider.get("gemini") !== apiKey) {
     try {
-      const live = await fetchLiveFreeModels("gemini", apiKey, signal);
+      const live = await fetchLiveFreeModels("gemini", apiKey, signal, { trackAuthFailure: false });
       if (live.length > 0) {
         onModelsSynced?.("gemini", live);
       }
     } catch {
-      // Seguimos con los modelos 3.x precargados
+      // Seguimos con los modelos 3.x precargados; el endpoint de generación validará la clave
     }
   }
 
@@ -758,7 +865,7 @@ async function streamOpenAiWithFallback({
   const syncToken = provider.id === "openrouter" ? "public" : apiKey;
   if (provider.supportsLiveModels && liveSyncedByProvider.get(provider.id) !== syncToken) {
     try {
-      const live = await fetchLiveFreeModels(provider.id, apiKey, signal);
+      const live = await fetchLiveFreeModels(provider.id, apiKey, signal, { trackAuthFailure: false });
       if (live.length > 0) {
         onModelsSynced?.(provider.id, live);
       }
@@ -885,10 +992,22 @@ async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history
   });
 
   if (!res.ok) {
-    const err = new Error(await extractApiError(res, `Gemini (${cleanModel})`));
+    const errMsg = await extractApiError(res, `Gemini (${cleanModel})`, apiKey);
+    const keyInvalid =
+      res.status === 401 ||
+      res.status === 403 ||
+      (res.status === 400 && /api key|api_key|apikey/i.test(errMsg));
+    if (keyInvalid) {
+      const scope = aiScope("gemini");
+      markTokenRejectedInSession(scope, apiKey);
+      recordAuthFailure(scope);
+    }
+    const err = new Error(errMsg);
     err.httpStatus = res.status;
     throw err;
   }
+
+  recordAuthSuccess(aiScope("gemini"));
 
   await consumeSseStream(res.body, (jsonStr) => {
     const payload = JSON.parse(jsonStr);
@@ -935,10 +1054,18 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
   });
 
   if (!res.ok) {
-    const err = new Error(await extractApiError(res, `${AI_PROVIDERS[providerId]?.name || providerId} (${model})`));
+    const errMsg = await extractApiError(res, `${AI_PROVIDERS[providerId]?.name || providerId} (${model})`, apiKey);
+    if (res.status === 401 || res.status === 403) {
+      const scope = aiScope(providerId);
+      markTokenRejectedInSession(scope, apiKey);
+      recordAuthFailure(scope);
+    }
+    const err = new Error(errMsg);
     err.httpStatus = res.status;
     throw err;
   }
+
+  recordAuthSuccess(aiScope(providerId));
 
   await consumeSseStream(res.body, (jsonStr) => {
     const payload = JSON.parse(jsonStr);
@@ -1059,11 +1186,11 @@ export function setAiContextBudget(mode) {
   } catch (_) {}
 }
 
-async function extractApiError(res, label) {
+async function extractApiError(res, label, secret = "") {
   try {
     const data = await res.json();
     const detail = data?.error?.message || data?.message || JSON.stringify(data);
-    return `${label} (${res.status}): ${detail}`;
+    return redactSensitiveTokens(`${label} (${res.status}): ${detail}`, [secret]);
   } catch {
     return `${label}: error HTTP ${res.status}. Verificá tu clave gratuita o probá otro modelo de la lista.`;
   }

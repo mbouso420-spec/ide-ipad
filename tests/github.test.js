@@ -3,6 +3,9 @@ import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 
 const gh = await import("../js/github/githubService.js");
+const { resetAuthSecurityState } = await import("../js/security/credentialGuard.js");
+const GH_TOK = "ghp_ValidTestToken1234567890abcdef";
+const GH_TOK_BAD = "ghp_InvalidBadToken1234567890abcd";
 
 /** Servidor GitHub falso: registra llamadas y responde según rutas. */
 function installFakeGithub(routes) {
@@ -25,6 +28,7 @@ function installFakeGithub(routes) {
 const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
 
 describe("Cliente REST GitHub (fallback sin Octokit)", () => {
+  beforeEach(() => resetAuthSecurityState());
   test("fetchRepoTreeIndex filtra binarios, >350KB, node_modules, .git y nodos no-blob", async () => {
     installFakeGithub({
       "GET /repos/o/r/branches/main": () => [200, { commit: { sha: "C1", commit: { tree: { sha: "T1" } } } }],
@@ -40,7 +44,7 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
         ]
       }]
     });
-    const idx = await gh.fetchRepoTreeIndex({ token: "t", owner: "o", repo: "r", branch: "main" });
+    const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "main" });
     assert.equal(idx.commitSha, "C1");
     assert.equal(idx.isTruncated, false);
     assert.deepEqual(idx.entries.map((e) => e.path), ["a.js", "src/ñ.py"]);
@@ -56,7 +60,7 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
         ]
       }]
     });
-    const idx = await gh.fetchRepoTreeIndex({ token: "t", owner: "o", repo: "r", branch: "main" });
+    const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "main" });
     assert.equal(idx.isTruncated, true);
     assert.equal(idx.entries.length, 1);
   });
@@ -66,7 +70,7 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
       "GET /repos/o/r/branches/feature/x": () => [200, { commit: { sha: "C", commit: { tree: { sha: "T" } } } }],
       "GET /repos/o/r/git/trees/T": () => [200, { tree: [] }]
     });
-    const idx = await gh.fetchRepoTreeIndex({ token: "t", owner: "o", repo: "r", branch: "feature/x" });
+    const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "feature/x" });
     assert.equal(idx.isEmptyRepo, false);
     assert.ok(calls[0].url.endsWith("/branches/feature/x"));
   });
@@ -76,7 +80,7 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
       "GET /repos/o/r/branches/main": () => [409, { message: "Git Repository is empty." }],
       "GET /repos/o/r": () => [200, { default_branch: "trunk" }]
     });
-    const idx = await gh.fetchRepoTreeIndex({ token: "t", owner: "o", repo: "r", branch: "main" });
+    const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "main" });
     assert.equal(idx.isEmptyRepo, true);
     assert.equal(idx.branch, "trunk");
   });
@@ -84,21 +88,21 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
   test("error 401 se propaga en español conservando status 401 (requisito actualizado en Vuelta #3)", async () => {
     installFakeGithub({ "GET /repos/o/r/branches/main": () => [401, { message: "Bad credentials" }] });
     await assert.rejects(
-      gh.fetchRepoTreeIndex({ token: "x", owner: "o", repo: "r", branch: "main" }),
+      gh.fetchRepoTreeIndex({ token: GH_TOK_BAD, owner: "o", repo: "r", branch: "main" }),
       (e) => /GitHub rechazó el token/.test(e.message) && e.status === 401
     );
   });
 
   test("otros errores de la API (404) conservan el mensaje original de GitHub", async () => {
     installFakeGithub({ "GET /repos/o/r/branches/main": () => [404, { message: "Branch not found" }], "GET /repos/o/r": () => [404, { message: "Not Found" }] });
-    await assert.rejects(gh.fetchRepoTreeIndex({ token: "x", owner: "o", repo: "r", branch: "main" }), /Not Found/);
+    await assert.rejects(gh.fetchRepoTreeIndex({ token: GH_TOK_BAD, owner: "o", repo: "r", branch: "main" }), /Not Found/);
   });
 
   test("fetchSingleRepoBlob decodifica base64 UTF-8 con saltos de línea (ñ, emoji, CJK)", async () => {
     const text = "hola ñandú 😀 文件\nlínea 2\n";
     const encoded = b64(text).replace(/(.{10})/g, "$1\n");
     installFakeGithub({ "GET /repos/o/r/git/blobs/abc": () => [200, { encoding: "base64", content: encoded }] });
-    assert.equal(await gh.fetchSingleRepoBlob({ token: "t", owner: "o", repo: "r", blobSha: "abc" }), text);
+    assert.equal(await gh.fetchSingleRepoBlob({ token: GH_TOK, owner: "o", repo: "r", blobSha: "abc" }), text);
   });
 
   test("downloadBatchBlobs descarga N>concurrencia y reporta progreso monotónico hasta total", async () => {
@@ -109,7 +113,7 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
     };
     const items = Array.from({ length: 15 }, (_, i) => ({ path: `f${i}`, blobSha: `s${i}` }));
     const progress = [];
-    const res = await gh.downloadBatchBlobs({ token: "t", owner: "o", repo: "r", items, onProgress: (d, t) => progress.push([d, t]) });
+    const res = await gh.downloadBatchBlobs({ token: GH_TOK, owner: "o", repo: "r", items, onProgress: (d, t) => progress.push([d, t]) });
     assert.equal(res.length, 15);
     assert.equal(res[7].content, "c-s7");
     assert.deepEqual(progress.at(-1), [15, 15]);
@@ -131,7 +135,7 @@ describe("pushAtomicCommit", () => {
   test("commit atómico: árbol con alta, modificación y borrado (sha:null)", async () => {
     const calls = installFakeGithub(routes);
     const res = await gh.pushAtomicCommit({
-      token: "t", owner: "o", repo: "r", branch: "main", message: "  msg  ",
+      token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "  msg  ",
       expectedBaseSha: "BASE",
       changes: [
         { path: "a.txt", status: "added", content: "A" },
@@ -152,7 +156,7 @@ describe("pushAtomicCommit", () => {
   test("rama remota avanzada -> RemoteAheadError y no se escribe nada", async () => {
     const calls = installFakeGithub(routes);
     await assert.rejects(
-      gh.pushAtomicCommit({ token: "t", owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "VIEJO", changes: [{ path: "a", status: "modified", content: "x" }] }),
+      gh.pushAtomicCommit({ token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "VIEJO", changes: [{ path: "a", status: "modified", content: "x" }] }),
       (e) => e instanceof gh.RemoteAheadError && e.remoteSha === "BASE" && e.expectedSha === "VIEJO"
     );
     assert.ok(!calls.some((c) => c.key.startsWith("POST") || c.key.startsWith("PATCH")));
@@ -160,12 +164,12 @@ describe("pushAtomicCommit", () => {
 
   test("force=true ignora la divergencia", async () => {
     installFakeGithub(routes);
-    const r = await gh.pushAtomicCommit({ token: "t", owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "VIEJO", force: true, changes: [{ path: "a", status: "modified", content: "x" }] });
+    const r = await gh.pushAtomicCommit({ token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "VIEJO", force: true, changes: [{ path: "a", status: "modified", content: "x" }] });
     assert.equal(r.commitSha, "NEWC");
   });
 
   test("sin cambios -> error claro", async () => {
-    await assert.rejects(gh.pushAtomicCommit({ token: "t", owner: "o", repo: "r", branch: "main", message: "m", changes: [] }), /No hay archivos/);
+    await assert.rejects(gh.pushAtomicCommit({ token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "m", changes: [] }), /No hay archivos/);
   });
 
   test("repositorio vacío: primer archivo vía Contents API (UTF-8) y resto en árbol", async () => {
@@ -178,7 +182,7 @@ describe("pushAtomicCommit", () => {
     routes["PUT /repos/o/r/contents/src/a.py"] = () => [201, { commit: { sha: "INIT" } }];
     const calls = installFakeGithub(routes);
     const r = await gh.pushAtomicCommit({
-      token: "t", owner: "o", repo: "r", branch: "main", message: "init",
+      token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "init",
       changes: [{ path: "src/a.py", status: "added", content: "print('ñ')" }, { path: "b.md", status: "added", content: "# B" }]
     });
     assert.equal(r.commitSha, "NEWC");
@@ -191,7 +195,7 @@ describe("pushAtomicCommit", () => {
   test("[BUG-20] modo de archivo ejecutable (100755) se preserva al modificar", async () => {
     const calls = installFakeGithub(routes);
     await gh.pushAtomicCommit({
-      token: "t", owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "BASE",
+      token: GH_TOK, owner: "o", repo: "r", branch: "main", message: "m", expectedBaseSha: "BASE",
       changes: [{ path: "run.sh", status: "modified", content: "#!/bin/sh\necho 2\n", mode: "100755" }]
     });
     const tree = calls.find((c) => c.key === "POST /repos/o/r/git/trees").body;
@@ -209,7 +213,7 @@ describe("pushAtomicCommit", () => {
         ]
       }]
     });
-    const idx = await gh.fetchRepoTreeIndex({ token: "t", owner: "o", repo: "r", branch: "main" });
+    const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "main" });
     assert.deepEqual(idx.entries.map((e) => `${e.path}:${e.mode}`), ["run.sh:100755", "a.txt:100644"]);
   });
 });
@@ -237,6 +241,7 @@ describe("Token de GitHub en almacenamiento", () => {
 
 
 describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
+  beforeEach(() => resetAuthSecurityState());
   test("saveProjectToGist crea un Gist secreto con studio_project.json", async () => {
     const calls = installFakeGithub({
       "POST /gists": () => [201, {
@@ -251,7 +256,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       { path: "README.md", content: "# Demo", isFolder: false }
     ];
 
-    const res = await gh.saveProjectToGist("token-test", {
+    const res = await gh.saveProjectToGist(GH_TOK, {
       projectName: "mi-proyecto-local",
       entries
     });
@@ -276,7 +281,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       }]
     });
 
-    const res = await gh.saveProjectToGist("token-test", {
+    const res = await gh.saveProjectToGist(GH_TOK, {
       projectName: "mi-proyecto-local",
       entries: [{ path: "a.js", content: "console.log(1)", isFolder: false }],
       existingGistId: "gist123"
@@ -296,7 +301,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       ]]
     });
 
-    const list = await gh.fetchUserGistBackups("token-test");
+    const list = await gh.fetchUserGistBackups(GH_TOK);
     assert.equal(list.length, 2, "Debe filtrar solo los 2 gists de Studio IDE");
     assert.equal(list[0].name, "Calculadora C++");
     assert.equal(list[1].name, "Web App");
@@ -322,7 +327,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       }]
     });
 
-    const data = await gh.fetchGistBackupContent("token-test", "g1");
+    const data = await gh.fetchGistBackupContent(GH_TOK, "g1");
     assert.equal(data.projectName, "App Restaurada");
     assert.equal(data.entries.length, 2);
     assert.equal(data.entries[0].path, "main.py");
@@ -372,7 +377,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       }]
     });
 
-    const res = await gh.publishProjectAsNewRepository("token-test", {
+    const res = await gh.publishProjectAsNewRepository(GH_TOK, {
       repoName: "Proyecto Secreto",
       isPrivate: true,
       entries: []
@@ -398,7 +403,7 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
       }]
     });
 
-    const res = await gh.publishProjectAsNewRepository("token-test", {
+    const res = await gh.publishProjectAsNewRepository(GH_TOK, {
       repoName: "Proyecto Open Source",
       isPrivate: false,
       entries: []
