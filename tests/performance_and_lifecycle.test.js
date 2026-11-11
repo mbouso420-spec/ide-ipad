@@ -1269,11 +1269,8 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       assert.ok(fromHeaderPayload["compiler-option-raw"].includes("calc.c"), "Debe enlazar calc.c en compiler-option-raw");
     });
 
-    test("injectInteractiveInputGuard y mountCRunnerView pausan limpiamente en scanf sin entrada y preservan numeración #line 1", async () => {
+    test("mountCRunnerView ejecuta paso a paso la entrada interactiva y acumula la salida", async () => {
       const rawC = '#include <stdio.h>\nint main() {\n  int a;\n  printf("Ingrese numero: ");\n  scanf("%d", &a);\n  printf("Valor: %d\\n", a);\n  return 0;\n}';
-      const guarded = injectInteractiveInputGuard(rawC, "main.c", true);
-      assert.ok(guarded.includes('#line 1 "main.c"'), "Debe inyectar directiva #line 1 para no alterar líneas de error en GCC");
-      assert.ok(guarded.includes("__studio_scanf"), "Debe interceptar scanf para detectar EOF en modo interactivo");
 
       const container = document.createElement("div");
       let stepCall = 0;
@@ -1285,7 +1282,7 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
             return new Response(
               JSON.stringify({
                 status: "0",
-                program_output: `Ingrese numero: ${WAIT_INPUT_MARKER}`,
+                program_output: "Ingrese numero: \n",
                 program_error: ""
               }),
               { status: 200 }
@@ -1294,7 +1291,7 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
           return new Response(
             JSON.stringify({
               status: "0",
-              program_output: "Ingrese numero: Valor: 42\n",
+              program_output: "Ingrese numero: \nValor: 42\n",
               program_error: ""
             }),
             { status: 200 }
@@ -1303,11 +1300,8 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       });
 
       await new Promise((r) => setTimeout(r, 20));
-      const statusEl = container.querySelector(".c-term-status");
       const firstOut = container.querySelector(".c-term-stdout");
-      assert.ok(statusEl.textContent.includes("Esperando entrada"), "En paso 0 con marcador de espera debe indicar que espera entrada del usuario");
       assert.ok(firstOut, "Debe crear el bloque c-term-stdout");
-      assert.ok(!firstOut.textContent.includes(WAIT_INPUT_MARKER), "No debe mostrar el marcador interno en la terminal");
       assert.ok(firstOut.textContent.includes("Ingrese numero:"), "Debe mostrar el prompt previo al scanf");
 
       const input = container.querySelector(".c-terminal-input");
@@ -1319,25 +1313,6 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       const allOuts = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
       assert.ok(allOuts.includes("Valor: 42"), "Tras enviar el dato debe mostrar el resultado calculado");
       instance.destroy();
-    });
-
-    test("injectInteractiveInputGuard utiliza __attribute__((unused)) y parseGccErrors omite warnings del guardián", () => {
-      const cCode = '#include <stdio.h>\nint main() { int x; scanf("%d", &x); return 0; }';
-      const guarded = injectInteractiveInputGuard(cCode, "main.c", true);
-      assert.ok(guarded.includes("__attribute__((unused)) __studio_scanf"));
-      assert.ok(guarded.includes("__attribute__((unused)) __studio_getchar"));
-      assert.ok(guarded.includes("__attribute__((unused)) __studio_fgets"));
-
-      const fakeOutput = [
-        "main.c:12:1: warning: '__studio_getchar' defined but not used [-Wunused-function]",
-        "main.c:17:1: warning: '__studio_fgets' defined but not used [-Wunused-function]",
-        "main.c:25:5: error: expected ';' before '}' token"
-      ].join("\n");
-
-      const errors = parseGccErrors(fakeOutput);
-      assert.equal(errors.length, 1, "Debe omitir advertencias internas de __studio_ y conservar errores reales del usuario");
-      assert.equal(errors[0].line, 25);
-      assert.equal(errors[0].severity, "error");
     });
   });
 });

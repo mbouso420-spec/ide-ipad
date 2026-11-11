@@ -216,39 +216,8 @@ export const WAIT_INPUT_MARKER = "\x1e__STUDIO_WAIT_INPUT__";
  * @returns {string}
  */
 export function injectInteractiveInputGuard(code, filePath = "main.c", isC = true) {
-  const src = String(code || "");
-  if (!/\b(scanf|getchar|fgets)\b/.test(src)) {
-    return src;
-  }
-  const safeFile = String(filePath || (isC ? "main.c" : "main.cpp")).replace(/\\/g, "/").replace(/"/g, "");
-  const guardHeader = [
-    "#include <stdio.h>",
-    "#include <stdarg.h>",
-    "#include <stdlib.h>",
-    "static int __attribute__((unused)) __studio_scanf(const char *fmt, ...) {",
-    "  va_list args;",
-    "  va_start(args, fmt);",
-    "  int r = vscanf(fmt, args);",
-    "  va_end(args);",
-    "  if (r == EOF) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
-    "  return r;",
-    "}",
-    "static int __attribute__((unused)) __studio_getchar(void) {",
-    "  int r = getchar();",
-    "  if (r == EOF) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
-    "  return r;",
-    "}",
-    "static char* __attribute__((unused)) __studio_fgets(char *s, int n, FILE *stream) {",
-    "  char *r = fgets(s, n, stream);",
-    "  if (!r && stream == stdin) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
-    "  return r;",
-    "}",
-    "#define scanf __studio_scanf",
-    "#define getchar __studio_getchar",
-    "#define fgets __studio_fgets",
-    `#line 1 "${safeFile}"`
-  ].join("\n");
-  return `${guardHeader}\n${src}`;
+  // Pasamos el código puro del usuario sin alterar para no introducir warnings ni directivas sintéticas
+  return String(code || "");
 }
 
 export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
@@ -721,23 +690,12 @@ export function mountCRunnerView(containerEl, {
       companionFiles,
       stdin: effectiveStdin
     });
-    if (isCppFamily && !batchValue) {
-      payload.code = injectInteractiveInputGuard(
-        payload.code,
-        activeFile.shortName || activeFile.path,
-        isC
-      );
-    }
 
     const t0 = performance.now();
     try {
       const res = await compileAndRunWandbox(payload, fetchFn);
       const ms = Math.round(performance.now() - t0);
-      const rawStdoutWithMarker = String(res.stdout || "");
-      const waitingForInput = rawStdoutWithMarker.includes(WAIT_INPUT_MARKER);
-      const cleanResStdout = waitingForInput
-        ? rawStdoutWithMarker.split(WAIT_INPUT_MARKER).join("")
-        : rawStdoutWithMarker;
+      const cleanResStdout = String(res.stdout || "");
 
       const compilerErrors = parseGccErrors(`${res.compilerErr}\n${res.compilerOut}\n${res.stderr}`);
       const blockingErrors = compilerErrors.filter((e) => e.severity !== "warning");
@@ -817,11 +775,6 @@ export function mountCRunnerView(containerEl, {
           outDiv.className = "c-term-stdout";
           outDiv.textContent = cleanStdout;
           termBody.appendChild(outDiv);
-        } else if (waitingForInput) {
-          const waitDiv = document.createElement("div");
-          waitDiv.className = "c-term-hint";
-          waitDiv.textContent = "(El programa espera que ingreses un valor abajo...)";
-          termBody.appendChild(waitDiv);
         } else {
           const emptyDiv = document.createElement("div");
           emptyDiv.className = "c-term-hint";
@@ -872,12 +825,7 @@ export function mountCRunnerView(containerEl, {
 
       termBody.scrollTop = termBody.scrollHeight;
 
-      if (waitingForInput) {
-        termStatus.className = "c-term-status is-running";
-        termStatus.textContent = `Esperando entrada en consola (${ms} ms)`;
-        termInput.placeholder = "Escribí el dato solicitado y presioná Enter...";
-        setTimeout(() => termInput.focus(), 60);
-      } else if (res.status === 0 && !hasInteractiveInput) {
+      if (res.status === 0 && !hasInteractiveInput) {
         termStatus.className = "c-term-status is-ok";
         termStatus.textContent = `Código de salida: 0 (Éxito) — ${ms} ms`;
         termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
