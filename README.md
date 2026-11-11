@@ -8,7 +8,7 @@
 
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 434 tests unitarios pasando al 100% (98 suites, 0 fallos).
+- **Suite de pruebas automáticas:** 492 pruebas automatizadas en 115 suites pasando al 100% (tests unitarios, concurrencia multi-pestaña, *Soak & Endurance* y *AppSec Auth Hardening*, 0 fallos).
 
 ---
 
@@ -95,12 +95,17 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v26`):**
+2. **Service Worker (`studio-ide-shell-v27`):**
    - Estrategia **Network-First** para el App Shell propio garantizando la versión más fresca con internet y fallback offline automático.
-   - Pre-cacheo de módulos críticos (incluyendo el analizador sintáctico Acorn y los motores de ejecución de C/C++ y SQL) en `RUNTIME_CACHE` durante el evento `install`.
-3. **Privacidad de credenciales:**
+   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/security/credentialGuard.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn y los motores de ejecución de C/C++ y SQL) durante el evento `install`.
+3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js`):**
+   - **Lockout progresivo y persistente (*Exponential Backoff & Lockout*):** ante intentos fallidos consecutivos (umbral de 4 fallos en `LOCKOUT_THRESHOLD`), bloquea nuevas peticiones por *scope* aislado (`github` y `ai:<providerId>`) con ventanas progresivas de `30s -> 2m -> 5m` (`LOCKOUT_DURATIONS_MS`) persistidas entre recargas (`localStorage` / `sessionStorage`).
+   - **Validación pre-vuelo de formato y entropía:** inspecciona localmente longitud, ausencia de espacios internos, prefijos esperados y entropía antes de ejecutar `fetch()`, bloqueando caracteres de control e inyecciones CRLF (`\r`/`\n`) en cabeceras HTTP.
+   - **Lista negra de sesión por huella criptográfica:** registra huellas irreversibles de 64 bits estilo FNV-1a (`computeTokenFingerprint`) para credenciales rechazadas (`401`/`403`) y evita su reenvío repetido en la sesión sin almacenar el secreto rechazado.
+   - **Higiene y redacción automática de secretos:** sanea mensajes de error, trazas y logs mediante `redactSensitiveTokens` y enmascara vistas previas en el DOM con `maskCredentialPreview`.
+4. **Privacidad de credenciales:**
    Las API Keys y tokens personales (PAT) de GitHub nunca se envían a servidores intermedios; residen exclusivamente en `localStorage` o `sessionStorage` según la preferencia del usuario.
-4. **Empaquetador ZIP Nativo:**
+5. **Empaquetador ZIP Nativo:**
    Implementación pura en JavaScript sin librerías externas para exportar proyectos a `.zip` cumpliendo estrictamente con la CSP y operando 100% fuera de línea.
 
 ---
@@ -111,7 +116,7 @@
 .
 ├── index.html                  # Shell principal, CSP, diálogos modales accesibles y maquetación
 ├── manifest.json               # Manifiesto Web App (PWA standalone para iPadOS y escritorio)
-├── sw.js                       # Service Worker v26 (App Shell + Runtime Cache de Acorn/CDNs)
+├── sw.js                       # Service Worker v27 (App Shell + Runtime Cache de Acorn/CDNs)
 ├── .nojekyll                   # Desactiva el procesamiento de Jekyll en GitHub Pages
 ├── README.md                   # Documentación técnica y arquitectura de la solución
 ├── MANUAL_DE_USUARIO.md        # Manual exhaustivo para el usuario final (iPad y PC)
@@ -146,18 +151,24 @@
 │   ├── net/
 │   │   └── networkErrors.js    # Manejo amigable y categorización de fallas de red
 │   ├── preview/
+│   │   ├── htmlBundler.js      # Empaquetado multi-archivo HTML/CSS/JS y activos para vista previa
 │   │   ├── loopGuard.js        # Protección contra bucles infinitos en JS/HTML vía AST
 │   │   ├── sqlRunner.js        # Motor de bases de datos SQLite interactivo con sql.js (WebAssembly)
 │   │   └── cRunner.js          # Compilador y ejecutor interactivo multi-archivo de C y C++ (Wandbox)
+│   ├── security/
+│   │   └── credentialGuard.js  # Bloqueo anti-fuerza bruta, validación pre-vuelo, huellas y redacción
 │   └── ui/
 │       ├── layout.js           # Re-clamp de paneles, rotación y Stage Manager
 │       ├── explorerController.js # Árbol del explorador, long-press, duplicación y scroll
 │       ├── symbolBar.js        # Barra de símbolos dinámicos según el lenguaje
 │       ├── quickOpenModal.js   # Paleta Cmd+P con soporte de salto a línea (:num)
+│       ├── globalSearchModal.js # Modal de búsqueda y reemplazo global en proyecto
+│       ├── settingsModal.js    # Gestión segura de claves, idioma de interfaz y ajustes
+│       ├── keyboardRouter.js   # Enrutador global de atajos de teclado (Cmd/Ctrl)
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas y switcher de medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 434 pruebas unitarias y E2E
+└── tests/                      # Suite automatizada con 492 pruebas en 115 suites
 ```
 
 ---
@@ -171,10 +182,10 @@ npm --prefix tests test
 ```
 
 Resultado actual:
-- **434 pruebas unitarias y de integración ejecutadas.**
-- **98 suites completadas.**
+- **492 pruebas automatizadas ejecutadas** (tests unitarios, concurrencia multi-pestaña, *Soak & Endurance* y *AppSec Auth Hardening*).
+- **115 suites completadas.**
 - **0 fallos, 0 pruebas canceladas.**
-- Tiempo de ejecución: **~1.5 segundos.**
+- Tiempo de ejecución: **~2.0 segundos.**
 
 ---
 
