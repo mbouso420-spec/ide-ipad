@@ -245,20 +245,13 @@ async function initApp() {
     onInsert(text, cursorBack) {
       if (!activeFileId) return;
       editor.insertAtCursor(text, cursorBack);
-    },
-    onToggle(touchKeyboardVisible) {
-      const hardwareMode = !touchKeyboardVisible;
-      editor.setHardwareKeyboardMode?.(hardwareMode);
-      editorSplit?.setHardwareKeyboardMode?.(hardwareMode);
     }
   });
-  editor.setHardwareKeyboardMode?.(!symbolBar.isVisible());
 
   const settingsModal = initSettingsModal({
     editor,
     getContextSnapshot,
     onHardwareKeyboardChange(hardwareMode) {
-      symbolBar.setVisible?.(!hardwareMode);
       editorSplit?.setHardwareKeyboardMode?.(hardwareMode);
     },
     onSelectProvider(providerId) {

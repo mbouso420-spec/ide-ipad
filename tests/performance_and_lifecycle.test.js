@@ -66,6 +66,13 @@ import {
   MAX_PREVIEW_ASSET_BYTES,
   MAX_TOTAL_INLINED_CSS
 } from "../js/preview/htmlBundler.js";
+import { LANGUAGE_SYMBOLS } from "../js/ui/symbolBar.js";
+import {
+  buildWandboxPayload,
+  injectInteractiveInputGuard,
+  mountCRunnerView,
+  WAIT_INPUT_MARKER
+} from "../js/preview/cRunner.js";
 
 describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
   describe("1. Conversión de Búferes Binarios Grandes (uint8ArrayToBase64)", () => {
@@ -1201,6 +1208,116 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       assert.equal(editor.getValue(), "int main() {\n  printf", "Debe completar 'prin' -> 'printf' conservando el código previo");
 
       editor.destroy();
+    });
+  });
+
+  describe("16. Barra de Teclas Rápidas (\\ y \\n) y Robustez del Compilador (cRunner)", () => {
+    test("LANGUAGE_SYMBOLS incluye barra invertida (\\) y salto de línea (\\n) en todos los lenguajes de programación", () => {
+      const codeLangs = ["cpp", "rust", "go", "java", "csharp", "ts", "js", "python", "text"];
+      for (const lang of codeLangs) {
+        const keys = LANGUAGE_SYMBOLS[lang]?.keys || [];
+        assert.ok(
+          keys.some((k) => k.label === "\\" && k.insert === "\\"),
+          `El lenguaje ${lang} debe incluir la tecla rápida '\\'`
+        );
+        assert.ok(
+          keys.some((k) => k.label === "\\n" && k.insert === "\\n"),
+          `El lenguaje ${lang} debe incluir la tecla rápida '\\n'`
+        );
+      }
+
+      const markupLangs = ["html", "css", "sql", "markdown", "json"];
+      for (const lang of markupLangs) {
+        const keys = LANGUAGE_SYMBOLS[lang]?.keys || [];
+        assert.ok(
+          keys.some((k) => k.label === "\\" && k.insert === "\\"),
+          `El lenguaje ${lang} debe incluir la tecla rápida '\\'`
+        );
+      }
+    });
+
+    test("buildWandboxPayload enlaza libm (-lm) en C/C++, omite -Wall en Rust/Go/Java/C#/TS y promueve main() compañero si se compila desde un header o módulo", () => {
+      // 1. C incluye -lm
+      const cPayload = buildWandboxPayload({
+        activeFile: { path: "main.c", content: "#include <math.h>\nint main(){ return (int)sqrt(16); }" }
+      });
+      assert.ok(cPayload["compiler-option-raw"].includes("-lm"), "Compilación C debe incluir -lm para <math.h>");
+
+      // 2. Rust, Go, Java, C#, TS no reciben -Wall ni -O2
+      const rustPayload = buildWandboxPayload({
+        activeFile: { path: "main.rs", content: "fn main() {}" }
+      });
+      assert.equal(rustPayload["compiler-option-raw"], "");
+
+      const javaPayload = buildWandboxPayload({
+        activeFile: { path: "Main.java", content: "class Main { public static void main(String[] args) {} }" }
+      });
+      assert.equal(javaPayload["compiler-option-raw"], "");
+
+      // 3. Compilar estando parado en un header (.h) o módulo (.c sin main) promueve automáticamente el compañero con main()
+      const fromHeaderPayload = buildWandboxPayload({
+        activeFile: { path: "src/calc.h", shortName: "calc.h", content: "int duplicar(int x);" },
+        companionFiles: [
+          { path: "src/calc.c", shortName: "calc.c", content: '#include "calc.h"\nint duplicar(int x){ return x * 2; }' },
+          { path: "src/main.c", shortName: "main.c", content: '#include <stdio.h>\n#include "calc.h"\nint main(){ printf("%d", duplicar(5)); return 0; }' }
+        ]
+      });
+      assert.ok(fromHeaderPayload.code.includes("int main()"), "Debe promover main.c como archivo principal de compilación");
+      assert.ok(fromHeaderPayload.codes.some((c) => c.file === "calc.h"), "Debe conservar calc.h en codes");
+      assert.ok(fromHeaderPayload.codes.some((c) => c.file === "calc.c"), "Debe conservar calc.c en codes");
+      assert.ok(fromHeaderPayload["compiler-option-raw"].includes("calc.c"), "Debe enlazar calc.c en compiler-option-raw");
+    });
+
+    test("injectInteractiveInputGuard y mountCRunnerView pausan limpiamente en scanf sin entrada y preservan numeración #line 1", async () => {
+      const rawC = '#include <stdio.h>\nint main() {\n  int a;\n  printf("Ingrese numero: ");\n  scanf("%d", &a);\n  printf("Valor: %d\\n", a);\n  return 0;\n}';
+      const guarded = injectInteractiveInputGuard(rawC, "main.c", true);
+      assert.ok(guarded.includes('#line 1 "main.c"'), "Debe inyectar directiva #line 1 para no alterar líneas de error en GCC");
+      assert.ok(guarded.includes("__studio_scanf"), "Debe interceptar scanf para detectar EOF en modo interactivo");
+
+      const container = document.createElement("div");
+      let stepCall = 0;
+      const instance = mountCRunnerView(container, {
+        activeFile: { path: "main.c", shortName: "main.c", content: rawC },
+        fetchFn: async () => {
+          stepCall += 1;
+          if (stepCall === 1) {
+            return new Response(
+              JSON.stringify({
+                status: "0",
+                program_output: `Ingrese numero: ${WAIT_INPUT_MARKER}`,
+                program_error: ""
+              }),
+              { status: 200 }
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              status: "0",
+              program_output: "Ingrese numero: Valor: 42\n",
+              program_error: ""
+            }),
+            { status: 200 }
+          );
+        }
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+      const statusEl = container.querySelector(".c-term-status");
+      const firstOut = container.querySelector(".c-term-stdout");
+      assert.ok(statusEl.textContent.includes("Esperando entrada"), "En paso 0 con marcador de espera debe indicar que espera entrada del usuario");
+      assert.ok(firstOut, "Debe crear el bloque c-term-stdout");
+      assert.ok(!firstOut.textContent.includes(WAIT_INPUT_MARKER), "No debe mostrar el marcador interno en la terminal");
+      assert.ok(firstOut.textContent.includes("Ingrese numero:"), "Debe mostrar el prompt previo al scanf");
+
+      const input = container.querySelector(".c-terminal-input");
+      const btnSend = container.querySelector(".btn-c-send-step");
+      input.value = "42";
+      btnSend.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const allOuts = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
+      assert.ok(allOuts.includes("Valor: 42"), "Tras enviar el dato debe mostrar el resultado calculado");
+      instance.destroy();
     });
   });
 });

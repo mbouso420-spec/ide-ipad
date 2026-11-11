@@ -513,6 +513,12 @@ export function initLivePreviewModal({
         titleEl.textContent = "Compilador Rust (rustc)";
       } else if (ext === "go") {
         titleEl.textContent = "Compilador Go (golang)";
+      } else if (JAVA_EXTENSIONS.has(ext)) {
+        titleEl.textContent = "Compilador Java (OpenJDK)";
+      } else if (CSHARP_EXTENSIONS.has(ext)) {
+        titleEl.textContent = "Compilador C# (.NET)";
+      } else if (TS_EXTENSIONS.has(ext)) {
+        titleEl.textContent = "Compilador TypeScript";
       } else if (ext === "h" || ext === "hpp") {
         titleEl.textContent = ext === "h" ? "Cabecera C (.h)" : "Cabecera C++ (.hpp)";
       } else {
@@ -529,7 +535,7 @@ export function initLivePreviewModal({
     if (iframeWrapper) iframeWrapper.hidden = true;
     if (consolePanel) consolePanel.hidden = true;
     if (jsModeBtn) jsModeBtn.hidden = true;
-    if (reloadBtn) reloadBtn.hidden = true;
+    if (reloadBtn) reloadBtn.hidden = false;
     if (toggleConsoleBtn) toggleConsoleBtn.hidden = true;
 
     if (cRunnerContainer) {
@@ -646,6 +652,9 @@ export function initLivePreviewModal({
       }
 
       hideWebNavigationControls();
+      if (activeFile.isLoaded === false && typeof ensureFileLoaded === "function") {
+        await ensureFileLoaded(activeFile);
+      }
       const compiledJsHtml = buildStandaloneJsPreview(activeFile, guardJs);
       showRunnableIframe({
         headerTitle: "Vista previa de JS",
@@ -695,6 +704,19 @@ export function initLivePreviewModal({
         });
       }
       return;
+    }
+
+    // Asegurar carga de activeFile y archivos compañeros de la carpeta si provienen de GitHub lazy
+    if (activeFile.isLoaded === false && typeof ensureFileLoaded === "function") {
+      await ensureFileLoaded(activeFile);
+    }
+    const unloadedFolderCompanions = sameFolderFiles.filter((f) => f && f.isLoaded === false);
+    if (unloadedFolderCompanions.length > 0) {
+      if (typeof ensureFilesLoaded === "function") {
+        await ensureFilesLoaded(unloadedFolderCompanions);
+      } else if (typeof ensureFileLoaded === "function") {
+        await Promise.all(unloadedFolderCompanions.map((f) => ensureFileLoaded(f)));
+      }
     }
 
     // 4. Pestaña Python: ejecuta Python 3 real en el navegador (Pyodide WebAssembly) con entrada inline sin popups

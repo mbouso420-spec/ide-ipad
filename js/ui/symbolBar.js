@@ -1,4 +1,4 @@
-const SYMBOL_STORAGE_KEY = "ide.touchKeyboard.enabled";
+const SYMBOL_STORAGE_KEY = "ide.symbols.visible";
 
 /**
  * Mapas de símbolos táctiles adaptados al lenguaje activo.
@@ -9,24 +9,28 @@ export const LANGUAGE_SYMBOLS = {
     label: "C / C++",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "[ ]", insert: "[]", cursorBack: 1 },
       { label: ";", insert: ";", cursorBack: 0 },
+      { label: "\" \"", insert: "\"\"", cursorBack: 1 },
       { label: "->", insert: "->", cursorBack: 0 },
       { label: "::", insert: "::", cursorBack: 0 },
       { label: "#include", insert: "#include <>", cursorBack: 1 },
       { label: "std::", insert: "std::", cursorBack: 0 },
       { label: "*", insert: "*", cursorBack: 0 },
       { label: "&", insert: "&", cursorBack: 0 },
-      { label: "=", insert: " = ", cursorBack: 0 },
-      { label: "\" \"", insert: "\"\"", cursorBack: 1 }
+      { label: "=", insert: " = ", cursorBack: 0 }
     ]
   },
   rust: {
     label: "Rust",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "fn", insert: "fn () {\n    \n}", cursorBack: 7 },
@@ -45,6 +49,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "Go",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "func", insert: "func () {\n    \n}", cursorBack: 7 },
@@ -62,6 +68,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "Java",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "public", insert: "public ", cursorBack: 0 },
       { label: "class", insert: "class  {\n    \n}", cursorBack: 7 },
       { label: "void", insert: "void ", cursorBack: 0 },
@@ -79,6 +87,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "C#",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "using", insert: "using System;\n", cursorBack: 0 },
       { label: "namespace", insert: "namespace \n{\n    \n}", cursorBack: 6 },
       { label: "class", insert: "class  {\n    \n}", cursorBack: 7 },
@@ -96,6 +106,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "TypeScript",
     keys: [
       { label: "Tab", insert: "  ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "interface", insert: "interface  {\n  \n}", cursorBack: 5 },
       { label: "type", insert: "type  = ;\n", cursorBack: 4 },
       { label: ": string", insert: ": string", cursorBack: 0 },
@@ -115,6 +127,7 @@ export const LANGUAGE_SYMBOLS = {
       { label: "< >", insert: "<>", cursorBack: 1 },
       { label: "</>", insert: "</>", cursorBack: 1 },
       { label: "/>", insert: " />", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "=\"\"", insert: "=\"\"", cursorBack: 1 },
       { label: "class", insert: "class=\"\"", cursorBack: 1 },
       { label: "id", insert: "id=\"\"", cursorBack: 1 },
@@ -129,6 +142,7 @@ export const LANGUAGE_SYMBOLS = {
       { label: "{ }", insert: " {\n  \n}", cursorBack: 2 },
       { label: ":", insert: ": ", cursorBack: 0 },
       { label: ";", insert: ";", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "var()", insert: "var(--)", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "--", insert: "--", cursorBack: 0 },
@@ -141,6 +155,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "JavaScript",
     keys: [
       { label: "Tab", insert: "  ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "[ ]", insert: "[]", cursorBack: 1 },
@@ -157,6 +173,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "Python",
     keys: [
       { label: "Tab", insert: "    ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: ":", insert: ":", cursorBack: 0 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "[ ]", insert: "[]", cursorBack: 1 },
@@ -183,6 +201,7 @@ export const LANGUAGE_SYMBOLS = {
       { label: ";", insert: ";", cursorBack: 0 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "' '", insert: "''", cursorBack: 1 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "=", insert: " = ", cursorBack: 0 },
       { label: "*", insert: "*", cursorBack: 0 },
       { label: "_", insert: "_", cursorBack: 0 }
@@ -193,6 +212,7 @@ export const LANGUAGE_SYMBOLS = {
     keys: [
       { label: "#", insert: "# ", cursorBack: 0 },
       { label: "##", insert: "## ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "** **", insert: "****", cursorBack: 2 },
       { label: "` `", insert: "``", cursorBack: 1 },
       { label: "```", insert: "```\n\n```", cursorBack: 4 },
@@ -209,6 +229,7 @@ export const LANGUAGE_SYMBOLS = {
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "[ ]", insert: "[]", cursorBack: 1 },
       { label: "\" \"", insert: "\"\"", cursorBack: 1 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
       { label: ":", insert: ": ", cursorBack: 0 },
       { label: ",", insert: ",", cursorBack: 0 },
       { label: "true", insert: "true", cursorBack: 0 },
@@ -220,6 +241,8 @@ export const LANGUAGE_SYMBOLS = {
     label: "Texto",
     keys: [
       { label: "Tab", insert: "  ", cursorBack: 0 },
+      { label: "\\", insert: "\\", cursorBack: 0 },
+      { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "( )", insert: "()", cursorBack: 1 },
       { label: "[ ]", insert: "[]", cursorBack: 1 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
@@ -313,9 +336,10 @@ export function initSymbolBar({ onInsert, onToggle }) {
 }
 
 function readDefaultVisibility() {
-  // Por defecto iniciamos en Modo Teclado Físico (barra táctil oculta e inputmode="none")
-  // para evitar que iPadOS despliegue la barra flotante del teclado virtual al usar teclado físico.
-  return false;
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia("(pointer: coarse)").matches;
+  }
+  return true;
 }
 
 function readStoredBool(key, fallback) {
