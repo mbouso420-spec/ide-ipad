@@ -112,18 +112,34 @@ export function writeEmergencyBackup(items, storage = window.localStorage, proje
       storage.removeItem(targetKey);
       return true;
     }
-    storage.setItem(
-      targetKey,
-      JSON.stringify({
-        savedAt: Date.now(),
-        projectId: projectId || null,
-        instanceId: instanceId || null,
-        items: clean.map(({ projectId: p, filePath, content }) => ({ projectId: p, filePath, content }))
-      })
-    );
-    return true;
+    const payloadStr = JSON.stringify({
+      savedAt: Date.now(),
+      projectId: projectId || null,
+      instanceId: instanceId || null,
+      items: clean.map(({ projectId: p, filePath, content }) => ({ projectId: p, filePath, content }))
+    });
+    try {
+      storage.setItem(targetKey, payloadStr);
+      return true;
+    } catch {
+      const staleCandidates = getAllStorageKeys(storage)
+        .filter((k) => k && k.startsWith(EMERGENCY_BACKUP_PREFIX) && k !== targetKey)
+        .map((k) => ({ key: k, savedAt: parseBackupPayload(storage.getItem(k)).savedAt }))
+        .sort((a, b) => a.savedAt - b.savedAt);
+
+      for (const stale of staleCandidates) {
+        try {
+          storage.removeItem(stale.key);
+          storage.setItem(targetKey, payloadStr);
+          return true;
+        } catch (_) {
+          // Seguir liberando particiones antiguas hasta recuperar espacio
+        }
+      }
+      return false;
+    }
   } catch {
-    // Cuota llena o almacenamiento bloqueado: queda el autoguardado normal como única vía.
+    // Almacenamiento completamente bloqueado: queda el autoguardado normal como única vía.
     return false;
   }
 }

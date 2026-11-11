@@ -546,6 +546,11 @@ export async function upsertEntry(
       existing.contentLoaded === false
   );
 
+  const resolvedIsBinary = !isFolder && Boolean(isBinary);
+  const resolvedBase64 = resolvedIsBinary
+    ? (base64 ?? (existing && !existing.deleted ? existing.base64 : null) ?? null)
+    : null;
+
   const record = {
     key,
     projectId,
@@ -558,8 +563,8 @@ export async function upsertEntry(
     contentLoaded: isFolder ? true : Boolean(contentLoaded),
     trackedInGithub: Boolean(fromGithub || existing?.trackedInGithub),
     forceModified: recreatedOverUnloaded || Boolean(!fromGithub && existing?.forceModified),
-    isBinary: Boolean(isBinary ?? existing?.isBinary),
-    base64: base64 ?? existing?.base64 ?? null,
+    isBinary: resolvedIsBinary,
+    base64: resolvedBase64,
     deleted: false,
     updatedAt: Date.now()
   };
@@ -678,6 +683,8 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
         !item.isFolder && prevTarget && prevTarget.trackedInGithub && prevTarget.contentLoaded === false
       );
       const targetKey = makeFileKey(projectId, targetPath);
+      const targetIsBinary = !item.isFolder && Boolean(item.isBinary);
+      const targetBase64 = targetIsBinary ? (item.base64 ?? null) : null;
 
       store.put({
         key: targetKey,
@@ -691,8 +698,8 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
         contentLoaded: item.isFolder ? true : Boolean(item.contentLoaded ?? true),
         trackedInGithub: Boolean(prevTarget?.trackedInGithub),
         forceModified: recreatedOverUnloaded || Boolean(prevTarget?.forceModified),
-        isBinary: Boolean(item.isBinary ?? prevTarget?.isBinary),
-        base64: item.base64 ?? prevTarget?.base64 ?? null,
+        isBinary: targetIsBinary,
+        base64: targetBase64,
         deleted: false,
         updatedAt: now
       });
@@ -1250,15 +1257,63 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
 
   await putRecord(STORE_PROJECTS, project);
 
+  const records = new Map();
   for (const entry of fileEntries) {
-    await upsertEntry(id, entry.path, {
+    const cleanPath = normalizePath(entry.path);
+    if (!cleanPath) continue;
+    const parts = cleanPath.split("/");
+    let prefix = "";
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+      if (!records.has(prefix)) {
+        records.set(prefix, {
+          key: makeFileKey(id, prefix),
+          projectId: id,
+          path: prefix,
+          isFolder: true,
+          content: "",
+          baseContent: "",
+          contentLoaded: true,
+          trackedInGithub: false,
+          forceModified: false,
+          isBinary: false,
+          base64: null,
+          deleted: false,
+          updatedAt: now
+        });
+      }
+    }
+    const isBinary = Boolean(entry.isBinary);
+    records.set(cleanPath, {
+      key: makeFileKey(id, cleanPath),
+      projectId: id,
+      path: cleanPath,
       isFolder: false,
-      content: entry.content || "",
-      isBinary: Boolean(entry.isBinary),
-      base64: entry.base64 || null,
-      allowOverwrite: true,
+      content: isBinary ? "" : (entry.content || ""),
+      baseContent: "",
+      blobSha: null,
       mode: entry.mode || null,
-      silent: true
+      contentLoaded: true,
+      trackedInGithub: false,
+      forceModified: false,
+      isBinary,
+      base64: isBinary ? (entry.base64 || null) : null,
+      deleted: false,
+      updatedAt: now
+    });
+  }
+
+  if (records.size > 0) {
+    const db = await openDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_FILES, "readwrite");
+      const store = tx.objectStore(STORE_FILES);
+      for (const record of records.values()) {
+        store.put(record);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("La transacción de restauración de Gist se canceló."));
     });
   }
 

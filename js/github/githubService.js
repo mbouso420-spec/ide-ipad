@@ -804,15 +804,32 @@ export async function fetchGistBackupContent(token, gistId) {
   const gist = await client.request("GET /gists/{gist_id}", { gist_id: gistId });
   const manifestFile = gist.files && gist.files["studio_project.json"];
 
-  if (manifestFile && manifestFile.content) {
-    try {
-      const parsed = JSON.parse(manifestFile.content);
-      return {
-        projectName: parsed.projectName || gist.description || "proyecto-restaurado",
-        entries: Array.isArray(parsed.entries) ? parsed.entries : []
-      };
-    } catch {
-      // Fallback a archivos planos
+  if (manifestFile) {
+    let manifestRawContent = manifestFile.content || "";
+    if ((manifestFile.truncated || !manifestRawContent) && manifestFile.raw_url) {
+      try {
+        const rawUrl = String(manifestFile.raw_url);
+        if (/^https:\/\/(gist\.githubusercontent\.com|api\.github\.com)\//i.test(rawUrl)) {
+          const rawRes = await fetch(rawUrl);
+          if (rawRes.ok) {
+            manifestRawContent = await rawRes.text();
+          }
+        }
+      } catch (_) {
+        // Fallback a contenido parcial o archivos planos
+      }
+    }
+
+    if (manifestRawContent) {
+      try {
+        const parsed = JSON.parse(manifestRawContent);
+        return {
+          projectName: parsed.projectName || gist.description || "proyecto-restaurado",
+          entries: Array.isArray(parsed.entries) ? parsed.entries : []
+        };
+      } catch {
+        // Fallback a archivos planos
+      }
     }
   }
 
