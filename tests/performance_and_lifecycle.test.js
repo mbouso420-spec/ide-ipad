@@ -71,6 +71,7 @@ import {
   buildWandboxPayload,
   injectInteractiveInputGuard,
   mountCRunnerView,
+  parseGccErrors,
   WAIT_INPUT_MARKER
 } from "../js/preview/cRunner.js";
 
@@ -1318,6 +1319,25 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       const allOuts = Array.from(container.querySelectorAll(".c-term-stdout")).map((el) => el.textContent).join("\n");
       assert.ok(allOuts.includes("Valor: 42"), "Tras enviar el dato debe mostrar el resultado calculado");
       instance.destroy();
+    });
+
+    test("injectInteractiveInputGuard utiliza __attribute__((unused)) y parseGccErrors omite warnings del guardián", () => {
+      const cCode = '#include <stdio.h>\nint main() { int x; scanf("%d", &x); return 0; }';
+      const guarded = injectInteractiveInputGuard(cCode, "main.c", true);
+      assert.ok(guarded.includes("__attribute__((unused)) __studio_scanf"));
+      assert.ok(guarded.includes("__attribute__((unused)) __studio_getchar"));
+      assert.ok(guarded.includes("__attribute__((unused)) __studio_fgets"));
+
+      const fakeOutput = [
+        "main.c:12:1: warning: '__studio_getchar' defined but not used [-Wunused-function]",
+        "main.c:17:1: warning: '__studio_fgets' defined but not used [-Wunused-function]",
+        "main.c:25:5: error: expected ';' before '}' token"
+      ].join("\n");
+
+      const errors = parseGccErrors(fakeOutput);
+      assert.equal(errors.length, 1, "Debe omitir advertencias internas de __studio_ y conservar errores reales del usuario");
+      assert.equal(errors[0].line, 25);
+      assert.equal(errors[0].severity, "error");
     });
   });
 });

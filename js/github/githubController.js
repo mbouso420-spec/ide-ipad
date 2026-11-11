@@ -11,6 +11,7 @@ import {
   fetchSingleRepoBlob,
   fetchUserGistBackups,
   fetchUserRepositories,
+  getCachedGithubUserLogin,
   getCachedUserRepositories,
   getGithubToken,
   publishProjectAsNewRepository,
@@ -125,12 +126,46 @@ export function initGithubController({
   });
 
   let reposCache = [];
+  let connectedUserLogin = getCachedGithubUserLogin();
+  let isSessionConnected = false;
   let pendingPullConfirm = false;
   let pullConfirmTimer = 0;
   /** @type {"live" | "clone" | null} */
   let pendingOpenConfirmKind = null;
   let openConfirmTimer = 0;
   let activeConflict = null;
+
+  function applyConnectedSessionUi(login, repos) {
+    const cleanLogin = String(login || "").trim();
+    if (userStatusEl && cleanLogin) {
+      userStatusEl.textContent = `@${cleanLogin}`;
+    }
+    const list = Array.isArray(repos) ? repos : [];
+    const repoCount = list.length;
+    if (cleanLogin) {
+      setStatus(
+        authMsgEl,
+        `Conectado como @${cleanLogin} (${repoCount} ${repoCount === 1 ? "repositorio disponible" : "repositorios disponibles"}).`,
+        "ok"
+      );
+    }
+    if (repoSelect && list.length > 0) {
+      const prevSelected = repoSelect.value;
+      repoSelect.innerHTML = "";
+      for (const r of list) {
+        const opt = document.createElement("option");
+        opt.value = r.full_name;
+        opt.textContent = `${r.full_name}${r.private ? " (privado)" : ""}`;
+        repoSelect.appendChild(opt);
+      }
+      if (prevSelected && list.some((r) => r.full_name === prevSelected)) {
+        repoSelect.value = prevSelected;
+      }
+    }
+    if (list.length > 0 && manualRepoInput && !manualRepoInput.value.trim()) {
+      manualRepoInput.value = list[0].full_name;
+    }
+  }
 
   function resetPullConfirm() {
     pendingPullConfirm = false;
@@ -180,8 +215,12 @@ export function initGithubController({
     }
     await refreshSyncPanel();
     dialog.showModal();
-    if (storedToken && reposCache.length === 0) {
-      await connectAndLoadRepos(storedToken);
+    if (storedToken) {
+      if (!isSessionConnected || reposCache.length === 0) {
+        await connectAndLoadRepos(storedToken);
+      } else {
+        applyConnectedSessionUi(connectedUserLogin, reposCache);
+      }
     }
   });
 
@@ -257,6 +296,8 @@ export function initGithubController({
       }
     } catch {}
     reposCache = [];
+    connectedUserLogin = "";
+    isSessionConnected = false;
     onReposListChanged?.([]);
     if (tokenInput) tokenInput.value = "";
     if (userStatusEl) userStatusEl.textContent = "Sin sesión";
@@ -755,7 +796,7 @@ export function initGithubController({
   });
 
   async function connectAndLoadRepos(token) {
-    connectBtn.disabled = true;
+    if (connectBtn) connectBtn.disabled = true;
     setStatus(authMsgEl, "Verificando cuenta y repositorios en GitHub…", "neutral");
     try {
       const [user, repos] = await Promise.all([
@@ -763,27 +804,10 @@ export function initGithubController({
         fetchUserRepositories(token)
       ]);
       reposCache = Array.isArray(repos) ? repos : [];
+      connectedUserLogin = user?.login || connectedUserLogin || "";
+      isSessionConnected = true;
       onReposListChanged?.(reposCache);
-
-      if (userStatusEl) {
-        userStatusEl.textContent = `@${user.login}`;
-      }
-      const repoCount = reposCache.length;
-      setStatus(
-        authMsgEl,
-        `Conectado como @${user.login} (${repoCount} ${repoCount === 1 ? "repositorio disponible" : "repositorios disponibles"}).`,
-        "ok"
-      );
-
-      if (repoSelect) {
-        repoSelect.innerHTML = "";
-        for (const r of reposCache) {
-          const opt = document.createElement("option");
-          opt.value = r.full_name;
-          opt.textContent = `${r.full_name}${r.private ? " (privado)" : ""}`;
-          repoSelect.appendChild(opt);
-        }
-      }
+      applyConnectedSessionUi(connectedUserLogin, reposCache);
 
       if (reposCache.length > 0) {
         if (manualRepoInput) manualRepoInput.value = reposCache[0].full_name;
@@ -791,13 +815,14 @@ export function initGithubController({
       }
     } catch (error) {
       if (error?.status === 401) {
+        isSessionConnected = false;
         setStatus(authMsgEl, INVALID_TOKEN_MSG, "error");
         showTokenWarning("Tu token de GitHub venció o fue revocado. Conectá uno nuevo para ver tus repos y hacer push.");
       } else {
         setStatus(authMsgEl, error instanceof Error ? error.message : "Token inválido o sin permisos.", "error");
       }
     } finally {
-      connectBtn.disabled = false;
+      if (connectBtn) connectBtn.disabled = false;
     }
   }
 
@@ -1194,13 +1219,27 @@ export function initGithubController({
       reposCache = cached;
       onReposListChanged?.(cached);
     }
+    const cachedUser = getCachedGithubUserLogin();
+    if (cachedUser) {
+      connectedUserLogin = cachedUser;
+      isSessionConnected = true;
+      applyConnectedSessionUi(cachedUser, reposCache);
+    }
 
     try {
-      const liveRepos = await fetchUserRepositories(token);
+      const [liveUser, liveRepos] = await Promise.all([
+        fetchGithubUser(token),
+        fetchUserRepositories(token)
+      ]);
+      if (liveUser?.login) {
+        connectedUserLogin = liveUser.login;
+        isSessionConnected = true;
+      }
       if (Array.isArray(liveRepos)) {
         reposCache = liveRepos;
         onReposListChanged?.(liveRepos);
       }
+      applyConnectedSessionUi(connectedUserLogin, reposCache);
       hideTokenWarning();
     } catch (error) {
       if (error?.status === 401) {

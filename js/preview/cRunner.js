@@ -225,7 +225,7 @@ export function injectInteractiveInputGuard(code, filePath = "main.c", isC = tru
     "#include <stdio.h>",
     "#include <stdarg.h>",
     "#include <stdlib.h>",
-    "static int __studio_scanf(const char *fmt, ...) {",
+    "static int __attribute__((unused)) __studio_scanf(const char *fmt, ...) {",
     "  va_list args;",
     "  va_start(args, fmt);",
     "  int r = vscanf(fmt, args);",
@@ -233,12 +233,12 @@ export function injectInteractiveInputGuard(code, filePath = "main.c", isC = tru
     "  if (r == EOF) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
     "  return r;",
     "}",
-    "static int __studio_getchar(void) {",
+    "static int __attribute__((unused)) __studio_getchar(void) {",
     "  int r = getchar();",
     "  if (r == EOF) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
     "  return r;",
     "}",
-    "static char* __studio_fgets(char *s, int n, FILE *stream) {",
+    "static char* __attribute__((unused)) __studio_fgets(char *s, int n, FILE *stream) {",
     "  char *r = fgets(s, n, stream);",
     "  if (!r && stream == stdin) { fflush(stdout); fputs(\"\\x1e__STUDIO_WAIT_INPUT__\", stdout); fflush(stdout); _Exit(0); }",
     "  return r;",
@@ -436,15 +436,17 @@ export async function compileAndRunWandbox(payload, fetchFn = (typeof window !==
   }
 
   const data = await res.json();
-  const statusCode = Number(data.status ?? (data.compiler_error || data.compiler_output ? 1 : 0));
+  const rawCompilerErr = String(data.compiler_error || "");
+  const hasRealCompileError = /(?:^|:|\s)(?:fatal error|error(?:\[[^\]]+\])?):/i.test(rawCompilerErr);
+  const statusCode = Number(data.status ?? (hasRealCompileError ? 1 : 0));
 
   return {
     status: statusCode,
-    success: statusCode === 0 && !data.compiler_error,
+    success: statusCode === 0 && !hasRealCompileError,
     stdout: data.program_output || "",
     stderr: data.program_error || "",
     compilerOut: data.compiler_output || "",
-    compilerErr: data.compiler_error || ""
+    compilerErr: rawCompilerErr
   };
 }
 
@@ -463,6 +465,7 @@ export function parseGccErrors(output) {
     const column = match[2] ? parseInt(match[2], 10) : 1;
     const severity = (match[3] || "error").toLowerCase();
     const rawMessage = match[4].trim();
+    if (rawMessage.includes("__studio_")) continue;
     if (!isNaN(line)) {
       errors.push({
         line,
@@ -737,8 +740,9 @@ export function mountCRunnerView(containerEl, {
         : rawStdoutWithMarker;
 
       const compilerErrors = parseGccErrors(`${res.compilerErr}\n${res.compilerOut}\n${res.stderr}`);
+      const blockingErrors = compilerErrors.filter((e) => e.severity !== "warning");
 
-      if (compilerErrors.length > 0 || !res.success) {
+      if (blockingErrors.length > 0 || !res.success) {
         termStatus.className = "c-term-status is-err";
         termStatus.textContent = `Falló compilación / ejecución (código ${res.status}) — ${ms} ms`;
         termBody.innerHTML = "";

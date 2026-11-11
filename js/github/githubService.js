@@ -4,6 +4,7 @@ import { BINARY_EXTENSIONS } from "../storage/fileImport.js";
 
 const GH_TOKEN_KEY = "ide.github.pat";
 const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
+const GH_USER_CACHE_KEY = "ide.github.userLogin";
 
 const MAX_TEXT_FILE_BYTES = 350000;
 
@@ -23,6 +24,8 @@ export function saveGithubToken(token) {
     if (!trimmed) {
       window.localStorage.removeItem(GH_REPOS_CACHE_KEY);
       window.sessionStorage.removeItem(GH_REPOS_CACHE_KEY);
+      window.localStorage.removeItem(GH_USER_CACHE_KEY);
+      window.sessionStorage.removeItem(GH_USER_CACHE_KEY);
       return;
     }
     const store = getKeyStorageMode() === "session" ? window.sessionStorage : window.localStorage;
@@ -34,6 +37,31 @@ export function saveGithubToken(token) {
 
 export function clearGithubToken() {
   saveGithubToken("");
+}
+
+export function getCachedGithubUserLogin() {
+  try {
+    return (
+      window.sessionStorage.getItem(GH_USER_CACHE_KEY) ||
+      window.localStorage.getItem(GH_USER_CACHE_KEY) ||
+      ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+export function saveCachedGithubUserLogin(login) {
+  const clean = String(login || "").trim();
+  try {
+    window.localStorage.removeItem(GH_USER_CACHE_KEY);
+    window.sessionStorage.removeItem(GH_USER_CACHE_KEY);
+    if (!clean) return;
+    const store = getKeyStorageMode() === "session" ? window.sessionStorage : window.localStorage;
+    store.setItem(GH_USER_CACHE_KEY, clean);
+  } catch {
+    // Ignorar cuota de almacenamiento
+  }
 }
 
 export function getCachedUserRepositories() {
@@ -197,7 +225,11 @@ export async function verifyGithubToken(token) {
 
 export async function fetchGithubUser(token) {
   const client = await createGithubClient(token);
-  return client.request("GET /user");
+  const user = await client.request("GET /user");
+  if (user?.login) {
+    saveCachedGithubUserLogin(user.login);
+  }
+  return user;
 }
 
 export async function fetchUserRepositories(token) {
