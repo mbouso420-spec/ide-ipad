@@ -661,6 +661,7 @@ export function mountCRunnerView(containerEl, {
   let lastRawStdout = "";
   let initialMenuSnapshot = "";
   let isCompiling = false;
+  let isDestroyed = false;
 
   async function executeStep(userInput = null) {
     if (isCompiling) return;
@@ -694,6 +695,7 @@ export function mountCRunnerView(containerEl, {
     const t0 = performance.now();
     try {
       const res = await compileAndRunWandbox(payload, fetchFn);
+      if (isDestroyed) return;
       const ms = Math.round(performance.now() - t0);
       const cleanResStdout = String(res.stdout || "");
 
@@ -836,6 +838,7 @@ export function mountCRunnerView(containerEl, {
         setTimeout(() => termInput.focus(), 60);
       }
     } catch (err) {
+      if (isDestroyed) return;
       termStatus.className = "c-term-status is-err";
       termStatus.textContent = "Error de red / API";
       const errDiv = document.createElement("div");
@@ -942,6 +945,7 @@ export function mountCRunnerView(containerEl, {
 
   return {
     destroy() {
+      isDestroyed = true;
       if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
         window.removeEventListener("keydown", handleKeydown);
       }

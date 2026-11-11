@@ -87,6 +87,8 @@ class MockElement {
     this._innerHTML = String(v);
     if (v === "") this.children = [];
   }
+  get firstElementChild() { return this.children[0] || null; }
+  get lastElementChild() { return this.children[this.children.length - 1] || null; }
   get textContent() { return this._textContent; }
   set textContent(v) { this._textContent = String(v); }
   appendChild(child) {
