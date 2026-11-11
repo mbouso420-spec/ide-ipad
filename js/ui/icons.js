@@ -51,6 +51,7 @@ const ICONS = {
   chevronLeft: '<path d="m15 18-6-6 6-6"></path>',
   chevronRight: '<path d="m9 18 6-6-6-6"></path>',
   layout: '<rect width="18" height="18" x="3" y="3" rx="2"></rect><path d="M3 9h18"></path><path d="M9 21V9"></path>',
+  alignLeft: '<line x1="21" x2="3" y1="6" y2="6"></line><line x1="15" x2="3" y1="12" y2="12"></line><line x1="17" x2="3" y1="18" y2="18"></line>',
   fileSearch: '<path d="M14 2v4a2 2 0 0 0 2 2h4"></path><path d="M4.268 21a2 2 0 0 0 1.732 1H18a2 2 0 0 0 2-2V7l-5-5H6a2 2 0 0 0-2 2v3"></path><circle cx="5" cy="14" r="3"></circle><path d="m9 18-1.5-1.5"></path>'
 };
 

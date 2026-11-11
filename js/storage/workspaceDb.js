@@ -1130,6 +1130,160 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
   });
 }
 
+/**
+ * Aplica un plan transaccional de Pull e integración remota en IndexedDB:
+ * actualiza archivos no conflictivos, elimina archivos borrados en remoto,
+ * reancla archivos locales conservados al nuevo commit base y actualiza commitSha.
+ *
+ * @param {string} projectId
+ * @param {{
+ *   newCommitSha: string,
+ *   updates?: Array<{ path: string, blobSha?: string | null, content?: string, contentLoaded?: boolean, mode?: string | null, isBinary?: boolean, base64?: string | null }>,
+ *   deletions?: Array<string>,
+ *   keepLocalRebases?: Array<{ path: string, remoteRemoved?: boolean, remoteBlobSha?: string | null, remoteContent?: string | null }>
+ * }} plan
+ */
+export async function applyRemotePullPlan(
+  projectId,
+  { newCommitSha, updates = [], deletions = [], keepLocalRebases = [] }
+) {
+  const project = await getProject(projectId);
+  if (!project || !project.github) {
+    throw new Error("Proyecto GitHub no encontrado.");
+  }
+
+  const allRaw = await getAllRawProjectEntries(projectId);
+  const rawByPath = new Map(allRaw.map((entry) => [entry.path, entry]));
+  const deletedSet = new Set(deletions.map((p) => normalizePath(p)).filter(Boolean));
+  const now = Date.now();
+  const recordsToPut = new Map();
+  const keysToDelete = new Set();
+
+  function ensureFolderParents(cleanPath) {
+    const parts = cleanPath.split("/");
+    let prefix = "";
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+      if (!rawByPath.has(prefix) && !recordsToPut.has(prefix)) {
+        recordsToPut.set(prefix, {
+          key: makeFileKey(projectId, prefix),
+          projectId,
+          path: prefix,
+          isFolder: true,
+          content: "",
+          baseContent: "",
+          contentLoaded: true,
+          deleted: false,
+          updatedAt: now
+        });
+      }
+    }
+  }
+
+  for (const delPath of deletedSet) {
+    const existing = rawByPath.get(delPath);
+    keysToDelete.add(existing?.key || makeFileKey(projectId, delPath));
+  }
+
+  for (const upd of updates) {
+    const cleanPath = normalizePath(upd?.path);
+    if (!cleanPath) continue;
+    deletedSet.delete(cleanPath);
+    keysToDelete.delete(makeFileKey(projectId, cleanPath));
+    ensureFolderParents(cleanPath);
+
+    const existing = rawByPath.get(cleanPath);
+    const loaded = upd.contentLoaded !== false;
+    const textContent = loaded ? String(upd.content ?? "") : "";
+    recordsToPut.set(cleanPath, {
+      key: makeFileKey(projectId, cleanPath),
+      projectId,
+      path: cleanPath,
+      isFolder: false,
+      content: textContent,
+      baseContent: textContent,
+      blobSha: upd.blobSha || null,
+      mode: upd.mode || existing?.mode || null,
+      contentLoaded: loaded,
+      trackedInGithub: true,
+      forceModified: false,
+      isBinary: Boolean(upd.isBinary),
+      base64: upd.base64 ?? null,
+      deleted: false,
+      updatedAt: now
+    });
+  }
+
+  for (const rebase of keepLocalRebases) {
+    const cleanPath = normalizePath(rebase?.path);
+    if (!cleanPath) continue;
+    const existing = rawByPath.get(cleanPath);
+    if (!existing || existing.isFolder) continue;
+
+    if (rebase.remoteRemoved) {
+      if (existing.deleted) {
+        keysToDelete.add(existing.key);
+      } else {
+        recordsToPut.set(cleanPath, {
+          ...existing,
+          trackedInGithub: false,
+          baseContent: "",
+          blobSha: null,
+          forceModified: false,
+          updatedAt: now
+        });
+      }
+      continue;
+    }
+
+    const nextBase =
+      typeof rebase.remoteContent === "string"
+        ? rebase.remoteContent
+        : existing.baseContent || "";
+    recordsToPut.set(cleanPath, {
+      ...existing,
+      baseContent: nextBase,
+      blobSha: rebase.remoteBlobSha || existing.blobSha || null,
+      trackedInGithub: true,
+      forceModified: !existing.deleted && existing.content !== nextBase,
+      updatedAt: now
+    });
+  }
+
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    for (const key of keysToDelete) {
+      store.delete(key);
+    }
+    for (const rec of recordsToPut.values()) {
+      store.put(rec);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de IndexedDB se canceló."));
+  });
+
+  if (newCommitSha) {
+    project.github.commitSha = newCommitSha;
+  }
+  const nextTabs = (project.openTabIds || []).filter((id) => !deletedSet.has(normalizePath(id)));
+  project.openTabIds = nextTabs;
+  if (project.activeFileId && deletedSet.has(normalizePath(project.activeFileId))) {
+    project.activeFileId = nextTabs[0] || null;
+  }
+  project.updatedAt = now;
+  await putRecord(STORE_PROJECTS, project);
+
+  return {
+    project,
+    updatesCount: updates.length,
+    deletionsCount: deletedSet.size,
+    keptLocalCount: keepLocalRebases.length
+  };
+}
+
 function getRecord(storeName, key) {
   return openDb().then(
     (db) =>

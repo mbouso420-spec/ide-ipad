@@ -22,6 +22,7 @@ import {
   verifyGithubToken
 } from "./githubService.js";
 import {
+  applyRemotePullPlan,
   convertLocalProjectToGithub,
   createProjectFromGistBackup,
   getPendingGithubChanges,
@@ -33,6 +34,7 @@ import {
   saveCredentialsBackup,
   saveProjectState
 } from "../storage/workspaceDb.js";
+import { classifyRemotePullChanges, buildRemotePullPlan } from "./githubMerge.js";
 import { exportKeysBundle, getKeyStorageMode, hasStoredCredentials } from "../ai/providers.js";
 import {
   checkAuthLockout,
@@ -89,6 +91,8 @@ export function initGithubController({
   const conflictBox = document.getElementById("gh-conflict-box");
   const conflictMsg = document.getElementById("gh-conflict-msg");
   const conflictList = document.getElementById("gh-conflict-list");
+  const conflictMergeBtn = document.getElementById("btn-gh-conflict-merge");
+  const conflictApplyBtn = document.getElementById("btn-gh-conflict-apply");
   const conflictViewBtn = document.getElementById("btn-gh-conflict-view");
   const conflictForceBtn = document.getElementById("btn-gh-conflict-force");
 
@@ -131,6 +135,12 @@ export function initGithubController({
     }, 50);
   });
 
+  window?.addEventListener?.("studio-credentials-updated", () => {
+    const updatedToken = getGithubToken();
+    syncTokenPlaceholder(updatedToken);
+    if (updatedToken) hideTokenWarning();
+  });
+
   let reposCache = [];
   let connectedUserLogin = getCachedGithubUserLogin();
   let isSessionConnected = false;
@@ -140,6 +150,7 @@ export function initGithubController({
   let pendingOpenConfirmKind = null;
   let openConfirmTimer = 0;
   let activeConflict = null;
+  let activeMergeClassification = null;
 
   function applyConnectedSessionUi(login, repos) {
     const cleanLogin = String(login || "").trim();
@@ -197,7 +208,9 @@ export function initGithubController({
 
   function hideConflictBox() {
     activeConflict = null;
+    activeMergeClassification = null;
     if (conflictBox) conflictBox.hidden = true;
+    if (conflictApplyBtn) conflictApplyBtn.hidden = true;
     if (conflictList) {
       conflictList.hidden = true;
       conflictList.innerHTML = "";
@@ -641,13 +654,65 @@ export function initGithubController({
       project,
       token
     };
+    activeMergeClassification = null;
+    if (conflictApplyBtn) conflictApplyBtn.hidden = true;
     if (conflictBox) conflictBox.hidden = false;
     if (conflictMsg) {
       const baseShort = (error.expectedSha || "inicial").slice(0, 7);
       const remoteShort = (error.remoteSha || "").slice(0, 7);
-      conflictMsg.textContent = `Push bloqueado: GitHub avanzó a ${remoteShort} desde tu última versión (${baseShort}). Podés ver qué cambió en remoto antes de decidir o forzar el envío con tu versión local.`;
+      conflictMsg.textContent = `Push bloqueado: GitHub avanzó a ${remoteShort} desde tu última versión (${baseShort}). Podés traer e integrar cambios sin perder los tuyos, inspeccionar el Diff o forzar el envío.`;
     }
     setStatus(pushStatusEl, "Hay commits nuevos en GitHub que no tenés localmente.", "error");
+  }
+
+  async function openRemoteVsLocalDiff(file) {
+    if (!activeConflict) return;
+    const allEntries = await getProjectEntries(activeConflict.project.id);
+    const localFile = allEntries.find((f) => f.path === file.path);
+    let remoteContent = "";
+    if (file.blobSha) {
+      try {
+        remoteContent = await fetchSingleRepoBlob({
+          token: activeConflict.token,
+          owner: activeConflict.project.github.owner,
+          repo: activeConflict.project.github.repo,
+          blobSha: file.blobSha
+        });
+      } catch {
+        remoteContent = "(No se pudo descargar el archivo remoto)";
+      }
+    }
+    let localContent = "(Archivo no existe localmente)";
+    if (localFile) {
+      if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
+        localContent = localFile.content;
+      } else if (localFile.blobSha) {
+        try {
+          localContent = await fetchSingleRepoBlob({
+            token: activeConflict.token,
+            owner: activeConflict.project.github.owner,
+            repo: activeConflict.project.github.repo,
+            blobSha: localFile.blobSha
+          });
+        } catch {
+          localContent = "(No se pudo descargar el archivo local)";
+        }
+      }
+    }
+    onOpenDiff?.({
+      title: `Remoto (${file.path}) vs Local`,
+      oldCode: remoteContent,
+      newCode: localContent
+    });
+  }
+
+  function createDiffPreviewButton(file) {
+    const viewBtn = document.createElement("button");
+    viewBtn.type = "button";
+    viewBtn.className = "btn btn-ghost btn-sm";
+    viewBtn.innerHTML = `${icon("gitCompare")}<span>Diff</span>`;
+    viewBtn.addEventListener("click", () => void openRemoteVsLocalDiff(file));
+    return viewBtn;
   }
 
   commitMsgInput?.addEventListener("keydown", (event) => {
@@ -663,6 +728,11 @@ export function initGithubController({
 
   conflictViewBtn?.addEventListener("click", async () => {
     if (!activeConflict || !conflictList) return;
+    if (!activeConflict.expectedSha) {
+      setStatus(pushStatusEl, "Sin commit base local para comparar automáticamente.", "error");
+      return;
+    }
+    if (conflictApplyBtn) conflictApplyBtn.hidden = true;
     conflictViewBtn.disabled = true;
     try {
       const diffFiles = await compareRemoteCommits({
@@ -690,50 +760,7 @@ export function initGithubController({
           const actionWrap = document.createElement("div");
           actionWrap.className = "gh-change-actions";
 
-          const viewBtn = document.createElement("button");
-          viewBtn.type = "button";
-          viewBtn.className = "btn btn-ghost btn-sm";
-          viewBtn.innerHTML = `${icon("gitCompare")}<span>Diff</span>`;
-          viewBtn.addEventListener("click", async () => {
-            const allEntries = await getProjectEntries(activeConflict.project.id);
-            const localFile = allEntries.find((f) => f.path === file.path);
-            let remoteContent = "";
-            if (file.blobSha) {
-              try {
-                remoteContent = await fetchSingleRepoBlob({
-                  token: activeConflict.token,
-                  owner: activeConflict.project.github.owner,
-                  repo: activeConflict.project.github.repo,
-                  blobSha: file.blobSha
-                });
-              } catch {
-                remoteContent = "(No se pudo descargar el archivo remoto)";
-              }
-            }
-            let localContent = "(Archivo no existe localmente)";
-            if (localFile) {
-              if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
-                localContent = localFile.content;
-              } else if (localFile.blobSha) {
-                try {
-                  localContent = await fetchSingleRepoBlob({
-                    token: activeConflict.token,
-                    owner: activeConflict.project.github.owner,
-                    repo: activeConflict.project.github.repo,
-                    blobSha: localFile.blobSha
-                  });
-                } catch {
-                  localContent = "(No se pudo descargar el archivo local)";
-                }
-              }
-            }
-            onOpenDiff?.({
-              title: `Remoto (${file.path}) vs Local`,
-              oldCode: remoteContent,
-              newCode: localContent
-            });
-          });
-
+          const viewBtn = createDiffPreviewButton(file);
           const tag = document.createElement("span");
           tag.className = `gh-change-tag ${file.status === "added" ? "is-added" : file.status === "removed" ? "is-deleted" : "is-modified"}`;
           tag.textContent = file.status;
@@ -747,6 +774,151 @@ export function initGithubController({
       setStatus(pushStatusEl, err instanceof Error ? err.message : "No se pudo comparar con GitHub.", "error");
     } finally {
       conflictViewBtn.disabled = false;
+    }
+  });
+
+  conflictMergeBtn?.addEventListener("click", async () => {
+    if (!activeConflict || !conflictList) return;
+    if (!activeConflict.expectedSha) {
+      setStatus(pushStatusEl, "No hay commit base previo; usá Actualizar remoto o Forzar igual.", "error");
+      return;
+    }
+    conflictMergeBtn.disabled = true;
+    setStatus(pushStatusEl, "Analizando diferencias remotas frente a tus cambios locales…", "neutral");
+    try {
+      const [diffFiles, localEntries, localPendingChanges] = await Promise.all([
+        compareRemoteCommits({
+          token: activeConflict.token,
+          owner: activeConflict.project.github.owner,
+          repo: activeConflict.project.github.repo,
+          base: activeConflict.expectedSha,
+          head: activeConflict.remoteSha
+        }),
+        getProjectEntries(activeConflict.project.id),
+        getPendingGithubChanges(activeConflict.project.id)
+      ]);
+
+      const classification = classifyRemotePullChanges({
+        localEntries,
+        localPendingChanges,
+        remoteDiffFiles: diffFiles
+      });
+      activeMergeClassification = classification;
+
+      conflictList.innerHTML = "";
+      conflictList.hidden = false;
+
+      const { safeUpdates, safeDeletions, conflicts } = classification;
+      if (safeUpdates.length > 0 || safeDeletions.length > 0) {
+        const infoLi = document.createElement("li");
+        infoLi.className = "gh-change-item";
+        infoLi.textContent = `Sin conflicto (se integran automático): +${safeUpdates.length} actualizado(s), -${safeDeletions.length} eliminado(s).`;
+        conflictList.appendChild(infoLi);
+      }
+
+      if (conflicts.length === 0) {
+        const okLi = document.createElement("li");
+        okLi.className = "gh-change-item";
+        okLi.textContent = "Cero archivos en conflicto: tus cambios locales se conservarán intactos.";
+        conflictList.appendChild(okLi);
+      } else {
+        for (const conflict of conflicts) {
+          const li = document.createElement("li");
+          li.className = "gh-change-item";
+
+          const nameSpan = document.createElement("span");
+          nameSpan.className = "code-font gh-change-path";
+          nameSpan.textContent = `${conflict.path} (${conflict.localStatus} vs ${conflict.remoteStatus})`;
+
+          const actionWrap = document.createElement("div");
+          actionWrap.className = "gh-change-actions";
+
+          const diffBtn = createDiffPreviewButton(conflict);
+          const btnLocal = document.createElement("button");
+          btnLocal.type = "button";
+          btnLocal.className = "gh-conflict-choice is-active";
+          btnLocal.textContent = "Conservar local";
+          btnLocal.setAttribute("aria-pressed", "true");
+
+          const btnRemote = document.createElement("button");
+          btnRemote.type = "button";
+          btnRemote.className = "gh-conflict-choice";
+          btnRemote.textContent = "Usar remoto";
+          btnRemote.setAttribute("aria-pressed", "false");
+
+          btnLocal.addEventListener("click", () => {
+            conflict.resolution = "keep-local";
+            btnLocal.classList.add("is-active");
+            btnLocal.setAttribute("aria-pressed", "true");
+            btnRemote.classList.remove("is-active");
+            btnRemote.setAttribute("aria-pressed", "false");
+          });
+          btnRemote.addEventListener("click", () => {
+            conflict.resolution = "take-remote";
+            btnRemote.classList.add("is-active");
+            btnRemote.setAttribute("aria-pressed", "true");
+            btnLocal.classList.remove("is-active");
+            btnLocal.setAttribute("aria-pressed", "false");
+          });
+
+          actionWrap.append(diffBtn, btnLocal, btnRemote);
+          li.append(nameSpan, actionWrap);
+          conflictList.appendChild(li);
+        }
+      }
+
+      if (conflictApplyBtn) conflictApplyBtn.hidden = false;
+      setStatus(
+        pushStatusEl,
+        conflicts.length > 0
+          ? `Revisá ${conflicts.length} conflicto(s) abajo y tocá "Aplicar integración".`
+          : 'Sin conflictos superpuestos. Tocá "Aplicar integración" para actualizar tu base.',
+        conflicts.length > 0 ? "neutral" : "ok"
+      );
+    } catch (err) {
+      setStatus(pushStatusEl, err instanceof Error ? err.message : "No se pudo preparar la integración.", "error");
+    } finally {
+      conflictMergeBtn.disabled = false;
+    }
+  });
+
+  conflictApplyBtn?.addEventListener("click", async () => {
+    if (!activeConflict || !activeMergeClassification) return;
+    conflictApplyBtn.disabled = true;
+    setStatus(pushStatusEl, "Aplicando integración segura en el workspace…", "neutral");
+    try {
+      const targetProject = activeConflict.project;
+      const targetToken = activeConflict.token;
+      const remoteSha = activeConflict.remoteSha;
+      const localEntries = await getProjectEntries(targetProject.id);
+
+      const plan = await buildRemotePullPlan({
+        project: targetProject,
+        localEntries,
+        classification: activeMergeClassification,
+        newCommitSha: remoteSha,
+        fetchBlob: (blobSha) =>
+          fetchSingleRepoBlob({
+            token: targetToken,
+            owner: targetProject.github.owner,
+            repo: targetProject.github.repo,
+            blobSha
+          })
+      });
+
+      const result = await applyRemotePullPlan(targetProject.id, plan);
+      hideConflictBox();
+      await onProjectClonedOrSynced?.(targetProject.id);
+      await refreshSyncPanel();
+      setStatus(
+        pushStatusEl,
+        `Integración aplicada (${result.updatesCount} actualizado(s), ${result.deletionsCount} eliminado(s), ${result.keptLocalCount} conflicto(s) conservando local). Ya podés hacer Commit y Push.`,
+        "ok"
+      );
+    } catch (err) {
+      setStatus(pushStatusEl, err instanceof Error ? err.message : "Error al aplicar la integración.", "error");
+    } finally {
+      conflictApplyBtn.disabled = false;
     }
   });
 

@@ -335,13 +335,43 @@ app.c:12:3: error: unknown type name 'intt'; did you mean 'int'?
 });
 
 describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
-  test("6.1 Caché Offline: versión oficial studio-ide-shell-v27 declarada en Service Worker", async () => {
+  test("6.1 Caché Offline: versión vigente studio-ide-shell-v28 y 100% de módulos js/css/assets precacheados en sw.js", async () => {
     const fs = await import("node:fs/promises");
-    const swContent = await fs.readFile(new URL("../sw.js", import.meta.url), "utf-8");
-    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v27"'));
+    const path = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const swContent = await fs.readFile(path.join(rootDir, "sw.js"), "utf-8");
+    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v28"'));
     assert.ok(swContent.includes("credentialGuard.js"));
+    assert.ok(swContent.includes("keyVaultCrypto.js"));
+    assert.ok(swContent.includes("githubMerge.js"));
+    assert.ok(swContent.includes("codeFormatter.js"));
+    assert.ok(swContent.includes("tsTranspiler.js"));
     assert.ok(swContent.includes("acorn"));
     assert.ok(swContent.includes("PYODIDE_ENTRY_URL"));
+
+    async function listRelative(dirName) {
+      const out = [];
+      async function walk(rel) {
+        const entries = await fs.readdir(path.join(rootDir, rel), { withFileTypes: true });
+        for (const e of entries) {
+          const next = `${rel}/${e.name}`;
+          if (e.isDirectory()) await walk(next);
+          else out.push(`./${next}`);
+        }
+      }
+      await walk(dirName);
+      return out;
+    }
+
+    const expectedAssets = [
+      ...(await listRelative("js")),
+      ...(await listRelative("css")),
+      ...(await listRelative("assets"))
+    ];
+    for (const relPath of expectedAssets) {
+      assert.ok(swContent.includes(`"${relPath}"`), `Falta precachear ${relPath} en sw.js`);
+    }
   });
 
   test("6.2 Rotación iPadOS y Stage Manager: event listeners de orientación presentes en layout.js", async () => {

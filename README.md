@@ -8,7 +8,7 @@
 
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 492 pruebas automatizadas en 115 suites pasando al 100% (tests unitarios, concurrencia multi-pestaña, *Soak & Endurance* y *AppSec Auth Hardening*, 0 fallos).
+- **Suite de pruebas automáticas:** 515 pruebas automatizadas en 119 suites + suite E2E real en Chromium (`npm --prefix tests run test:e2e`) pasando al 100% (tests unitarios, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y navegador real, 0 fallos).
 
 ---
 
@@ -95,14 +95,15 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v27`):**
+2. **Service Worker (`studio-ide-shell-v28`):**
    - Estrategia **Network-First** para el App Shell propio garantizando la versión más fresca con internet y fallback offline automático.
-   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/security/credentialGuard.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn y los motores de ejecución de C/C++ y SQL) durante el evento `install`.
-3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js`):**
+   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/security/credentialGuard.js`, `js/security/keyVaultCrypto.js`, `js/github/githubMerge.js`, `js/editor/codeFormatter.js`, `js/preview/tsTranspiler.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn y los motores de ejecución de C/C++ y SQL) durante el evento `install`.
+3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js` y `js/security/keyVaultCrypto.js`):**
    - **Lockout progresivo y persistente (*Exponential Backoff & Lockout*):** ante intentos fallidos consecutivos (umbral de 4 fallos en `LOCKOUT_THRESHOLD`), bloquea nuevas peticiones por *scope* aislado (`github` y `ai:<providerId>`) con ventanas progresivas de `30s -> 2m -> 5m` (`LOCKOUT_DURATIONS_MS`) persistidas entre recargas (`localStorage` / `sessionStorage`).
    - **Validación pre-vuelo de formato y entropía:** inspecciona localmente longitud, ausencia de espacios internos, prefijos esperados y entropía antes de ejecutar `fetch()`, bloqueando caracteres de control e inyecciones CRLF (`\r`/`\n`) en cabeceras HTTP.
    - **Lista negra de sesión por huella criptográfica:** registra huellas irreversibles de 64 bits estilo FNV-1a (`computeTokenFingerprint`) para credenciales rechazadas (`401`/`403`) y evita su reenvío repetido en la sesión sin almacenar el secreto rechazado.
    - **Higiene y redacción automática de secretos:** sanea mensajes de error, trazas y logs mediante `redactSensitiveTokens` y enmascara vistas previas en el DOM con `maskCredentialPreview`.
+   - **Portabilidad cifrada AES-GCM 256 (`keyVaultCrypto.js`):** exportación e importación de credenciales protegida con contraseña maestra (`PBKDF2-HMAC-SHA256` + `AES-GCM-256` vía Web Crypto API) desde Configuración → Almacenamiento.
 4. **Privacidad de credenciales:**
    Las API Keys y tokens personales (PAT) de GitHub nunca se envían a servidores intermedios; residen exclusivamente en `localStorage` o `sessionStorage` según la preferencia del usuario.
 5. **Empaquetador ZIP Nativo:**
@@ -116,7 +117,8 @@
 .
 ├── index.html                  # Shell principal, CSP, diálogos modales accesibles y maquetación
 ├── manifest.json               # Manifiesto Web App (PWA standalone para iPadOS y escritorio)
-├── sw.js                       # Service Worker v27 (App Shell + Runtime Cache de Acorn/CDNs)
+├── sw.js                       # Service Worker v28 (App Shell + Runtime Cache de Acorn/CDNs)
+├── .github/workflows/ci.yml    # CI automático en GitHub Actions (lint, Node QA y E2E en navegador)
 ├── .nojekyll                   # Desactiva el procesamiento de Jekyll en GitHub Pages
 ├── README.md                   # Documentación técnica y arquitectura de la solución
 ├── MANUAL_DE_USUARIO.md        # Manual exhaustivo para el usuario final (iPad y PC)
@@ -135,7 +137,9 @@
 ├── js/
 │   ├── app.js                  # Orquestador central de estado, atajos globales y diálogos
 │   ├── editor/
-│   │   └── editorManager.js    # Motor CodeMirror 6, auto-wrap y ciclo de vida de estados (dropFileState)
+│   │   ├── editorManager.js    # Motor CodeMirror 6, auto-wrap y ciclo de vida de estados (dropFileState)
+│   │   ├── minimap.js          # Minimapa lateral de código
+│   │   └── codeFormatter.js    # Formateador offline determinista (Shift+Alt+F)
 │   ├── storage/
 │   │   ├── workspaceDb.js      # Persistencia IndexedDB y modelo de diferencias locales
 │   │   ├── emergencyBackup.js  # Respaldo síncrono para suspensiones de Safari
@@ -147,16 +151,19 @@
 │   │   └── chatController.js   # Chat contextual, contador de tokens y saneamiento
 │   ├── github/
 │   │   ├── githubService.js    # Cliente REST GitHub (árboles, ramas, blobs y push atómico)
+│   │   ├── githubMerge.js      # Pull 3-way seguro y resolución selectiva de conflictos
 │   │   └── githubController.js # Interfaz de usuario para repositorios, ramas y sincronización
 │   ├── net/
 │   │   └── networkErrors.js    # Manejo amigable y categorización de fallas de red
 │   ├── preview/
-│   │   ├── htmlBundler.js      # Empaquetado multi-archivo HTML/CSS/JS y activos para vista previa
+│   │   ├── htmlBundler.js      # Empaquetado multi-archivo HTML/CSS/JS/TS y Mini-REPL
+│   │   ├── tsTranspiler.js     # Transpilador ligero 100% offline para TypeScript y JSX/TSX
 │   │   ├── loopGuard.js        # Protección contra bucles infinitos en JS/HTML vía AST
 │   │   ├── sqlRunner.js        # Motor de bases de datos SQLite interactivo con sql.js (WebAssembly)
 │   │   └── cRunner.js          # Compilador y ejecutor interactivo multi-archivo de C y C++ (Wandbox)
 │   ├── security/
-│   │   └── credentialGuard.js  # Bloqueo anti-fuerza bruta, validación pre-vuelo, huellas y redacción
+│   │   ├── credentialGuard.js  # Bloqueo anti-fuerza bruta, validación pre-vuelo, huellas y redacción
+│   │   └── keyVaultCrypto.js   # Cifrado portátil AES-GCM 256 + PBKDF2-SHA256 de credenciales
 │   └── ui/
 │       ├── layout.js           # Re-clamp de paneles, rotación y Stage Manager
 │       ├── explorerController.js # Árbol del explorador, long-press, duplicación y scroll
@@ -166,9 +173,9 @@
 │       ├── settingsModal.js    # Gestión segura de claves, idioma de interfaz y ajustes
 │       ├── keyboardRouter.js   # Enrutador global de atajos de teclado (Cmd/Ctrl)
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
-│       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas y switcher de medidas
+│       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas, REPL y medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 492 pruebas en 115 suites
+└── tests/                      # Suite automatizada con 515 pruebas en 119 suites + E2E navegador
 ```
 
 ---
@@ -178,14 +185,16 @@
 Para ejecutar la suite completa de pruebas unitarias y de integración sobre Node.js:
 
 ```bash
+node --test tests/lint.test.js
 npm --prefix tests test
+npm --prefix tests run test:e2e
 ```
 
 Resultado actual:
-- **492 pruebas automatizadas ejecutadas** (tests unitarios, concurrencia multi-pestaña, *Soak & Endurance* y *AppSec Auth Hardening*).
-- **115 suites completadas.**
+- **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js` y `sw.js`.
+- **515 pruebas automatizadas en Node** distribuidas en **119 suites** (unitarias, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX).
+- **Suite E2E en navegador real (`tests/browser.e2e.mjs`):** arranque, IndexedDB, formateador + Undo, TSX offline, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium/Edge headless.
 - **0 fallos, 0 pruebas canceladas.**
-- Tiempo de ejecución: **~2.0 segundos.**
 
 ---
 

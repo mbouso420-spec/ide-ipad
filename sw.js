@@ -1,4 +1,4 @@
-const SHELL_CACHE = "studio-ide-shell-v27";
+const SHELL_CACHE = "studio-ide-shell-v28";
 const RUNTIME_CACHE = "studio-ide-runtime-v1";
 const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";
 const PYODIDE_ENTRY_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/pyodide.js";
@@ -30,6 +30,7 @@ const APP_SHELL_URLS = [
   "./js/ui/livePreviewModal.js",
   "./js/editor/editorManager.js",
   "./js/editor/minimap.js",
+  "./js/editor/codeFormatter.js",
   "./js/search/projectSearch.js",
   "./js/ai/providers.js",
   "./js/ai/chatController.js",
@@ -40,12 +41,15 @@ const APP_SHELL_URLS = [
   "./js/storage/zipExporter.js",
   "./js/net/networkErrors.js",
   "./js/preview/loopGuard.js",
+  "./js/preview/tsTranspiler.js",
   "./js/preview/htmlBundler.js",
   "./js/preview/cRunner.js",
   "./js/preview/sqlRunner.js",
   "./js/github/githubService.js",
+  "./js/github/githubMerge.js",
   "./js/github/githubController.js",
-  "./js/security/credentialGuard.js"
+  "./js/security/credentialGuard.js",
+  "./js/security/keyVaultCrypto.js"
 ];
 
 const CACHEABLE_CDN_HOSTS = new Set([

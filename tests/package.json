@@ -1,11 +1,12 @@
 {
   "name": "studio-ide-tests",
-  "version": "1.0.0",
+  "version": "1.1.0-dev",
   "private": true,
   "type": "module",
   "description": "Suite de QA automatizada de Studio IDE (no forma parte de la app publicada).",
   "scripts": {
-    "test": "node --test --test-reporter=spec ./*.test.js"
+    "test": "node --test --test-reporter=spec ./*.test.js",
+    "test:e2e": "node --test --test-reporter=spec ./browser.e2e.mjs"
   },
   "devDependencies": {
     "acorn": "^8.14.0",

@@ -60,6 +60,7 @@ import {
   findTargetHtmlFile,
   bundleHtmlWithFolderAssets,
   buildStandaloneJsPreview,
+  buildStandaloneTsPreview,
   buildStandalonePythonPreview,
   buildMarkdownPreview
 } from "../preview/htmlBundler.js";
@@ -100,6 +101,8 @@ export function initLivePreviewModal({
   const consolePanel = document.getElementById("preview-console-panel");
   const consoleTitleEl = document.getElementById("preview-console-title");
   const consoleList = document.getElementById("preview-console-list");
+  const replForm = document.getElementById("preview-repl-form");
+  const replInput = document.getElementById("preview-repl-input");
   const iframeWrapper = document.getElementById("preview-iframe-wrapper");
   const iframe = document.getElementById("preview-iframe");
   const cRunnerContainer = document.getElementById("preview-c-runner");
@@ -111,9 +114,14 @@ export function initLivePreviewModal({
   let consoleVisible = true;
   let previewRunSeq = 0;
   let currentPreviewPath = null;
+  let activePreviewExt = "";
   /** @type {"auto" | "standalone" | "folder"} */
   let jsRunOverride = "auto";
+  /** @type {"browser" | "compiler"} */
+  let tsRunOverride = "browser";
   let activeCRunnerDestroy = null;
+  const replHistory = [];
+  let replHistoryIdx = -1;
 
   let historyStack = [];
   let historyIndex = -1;
@@ -329,8 +337,44 @@ export function initLivePreviewModal({
   });
 
   jsModeBtn?.addEventListener("click", () => {
-    jsRunOverride = jsRunOverride === "folder" ? "standalone" : "folder";
+    if (TS_EXTENSIONS.has(activePreviewExt)) {
+      tsRunOverride = tsRunOverride === "browser" ? "compiler" : "browser";
+    } else {
+      jsRunOverride = jsRunOverride === "folder" ? "standalone" : "folder";
+    }
     void renderActiveTabPreview();
+  });
+
+  replForm?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const code = String(replInput?.value || "").trim();
+    if (!code || !iframe?.contentWindow) return;
+    if (replHistory[replHistory.length - 1] !== code) {
+      replHistory.push(code);
+      if (replHistory.length > 50) replHistory.shift();
+    }
+    replHistoryIdx = replHistory.length;
+    iframe.contentWindow.postMessage(
+      { source: "studio-ide-repl", action: "eval", code },
+      "*"
+    );
+    if (replInput) replInput.value = "";
+  });
+
+  replInput?.addEventListener("keydown", (event) => {
+    if (replHistory.length === 0) return;
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (replHistoryIdx < 0 || replHistoryIdx > replHistory.length) {
+        replHistoryIdx = replHistory.length;
+      }
+      replHistoryIdx = Math.max(0, replHistoryIdx - 1);
+      replInput.value = replHistory[replHistoryIdx] || "";
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      replHistoryIdx = Math.min(replHistory.length, replHistoryIdx + 1);
+      replInput.value = replHistoryIdx < replHistory.length ? replHistory[replHistoryIdx] : "";
+    }
   });
 
   reloadBtn?.addEventListener("click", () => {
@@ -449,6 +493,7 @@ export function initLivePreviewModal({
     if (iframeWrapper) iframeWrapper.hidden = true;
     if (cRunnerContainer) cRunnerContainer.hidden = true;
     if (consolePanel) consolePanel.hidden = true;
+    if (replForm) replForm.hidden = true;
 
     if (unavailableTitleEl) unavailableTitleEl.textContent = messageTitle;
     if (unavailableDescEl) unavailableDescEl.textContent = messageDesc;
@@ -461,7 +506,9 @@ export function initLivePreviewModal({
     compiledHtml,
     siblingHtml,
     consoleTitle = "Consola JS",
-    hasConsole = true
+    hasConsole = true,
+    hasRepl = true,
+    modeLabel = null
   }) {
     clearConsoleOutput();
     if (cRunnerContainer) cRunnerContainer.hidden = true;
@@ -488,9 +535,15 @@ export function initLivePreviewModal({
     if (consolePanel) {
       consolePanel.hidden = !hasConsole || !consoleVisible;
     }
+    if (replForm) {
+      replForm.hidden = !(hasConsole && hasRepl);
+    }
 
     if (jsModeBtn) {
-      if (siblingHtml) {
+      if (modeLabel) {
+        jsModeBtn.hidden = false;
+        jsModeBtn.textContent = modeLabel;
+      } else if (siblingHtml) {
         jsModeBtn.hidden = false;
         jsModeBtn.textContent =
           jsRunOverride === "folder"
@@ -535,7 +588,15 @@ export function initLivePreviewModal({
     if (iframe) iframe.hidden = true;
     if (iframeWrapper) iframeWrapper.hidden = true;
     if (consolePanel) consolePanel.hidden = true;
-    if (jsModeBtn) jsModeBtn.hidden = true;
+    if (replForm) replForm.hidden = true;
+    if (jsModeBtn) {
+      if (TS_EXTENSIONS.has(ext)) {
+        jsModeBtn.hidden = false;
+        jsModeBtn.textContent = "Ejecutar offline (TS/JSX)";
+      } else {
+        jsModeBtn.hidden = true;
+      }
+    }
     if (reloadBtn) reloadBtn.hidden = false;
     if (toggleConsoleBtn) toggleConsoleBtn.hidden = true;
 
@@ -591,6 +652,7 @@ export function initLivePreviewModal({
     currentPreviewPath = activeFile.path;
 
     const ext = getFileExtension(activeFile.path);
+    activePreviewExt = ext;
     const extLabel = ext ? `.${ext}` : "sin extensión";
     const folder = getParentFolder(activeFile.path);
     const sameFolderFiles = filterFolderScopeFiles(files, folder);
@@ -759,20 +821,67 @@ export function initLivePreviewModal({
         compiledHtml: compiledSqlHtml,
         siblingHtml: null,
         consoleTitle: "Consola SQL",
-        hasConsole: true
+        hasConsole: true,
+        hasRepl: false
       });
       return;
     }
 
-    // 7. Pestaña C / C++ / Rust / Go / Java / C# / TypeScript: Runner nativo sin iframe
+    // 7. TypeScript / TSX (.ts / .tsx): ejecución offline en navegador o compilador remoto
+    if (TS_EXTENSIONS.has(ext)) {
+      if (tsRunOverride === "compiler") {
+        showCRunnerView(activeFile, sameFolderFiles);
+        return;
+      }
+      const savedHtml = getSavedPreviewHtml(projectId);
+      const bestHtml = findBestHtmlEntrypoint(files, activeFile, savedHtml);
+      if (bestHtml) {
+        currentPreviewPath = bestHtml.path;
+        historyStack = [bestHtml.path];
+        historyIndex = 0;
+        updateNavButtons();
+        syncPageSelect(files, bestHtml.path);
+
+        const { html, assetMap } = await prepareHtmlForPreview(bestHtml, files);
+        assetMap.set(normalizePath(activeFile.path), activeFile);
+        const compiledHtml = bundleHtmlWithFolderAssets(
+          bestHtml.path,
+          html,
+          assetMap,
+          activeFile,
+          guardJs,
+          null,
+          true
+        );
+        showRunnableIframe({
+          headerTitle: ext === "tsx" ? "Vista previa de TSX (Offline)" : "Vista previa de TypeScript (Offline)",
+          badgeText: `${activeFile.path} (${bestHtml.shortName || bestHtml.path})`,
+          compiledHtml,
+          siblingHtml: bestHtml,
+          modeLabel: "Usar compilador remoto (tsc)"
+        });
+        return;
+      }
+      hideWebNavigationControls();
+      const compiledTsHtml = buildStandaloneTsPreview(activeFile, guardJs);
+      showRunnableIframe({
+        headerTitle: ext === "tsx" ? "Vista previa de TSX (Offline)" : "Vista previa de TypeScript (Offline)",
+        badgeText: activeFile.path,
+        compiledHtml: compiledTsHtml,
+        siblingHtml: null,
+        modeLabel: "Usar compilador remoto (tsc)"
+      });
+      return;
+    }
+
+    // 8. Pestaña C / C++ / Rust / Go / Java / C#: Runner nativo sin iframe
     if (
       C_EXTENSIONS.has(ext) ||
       CPP_EXTENSIONS.has(ext) ||
       RUST_EXTENSIONS.has(ext) ||
       GO_EXTENSIONS.has(ext) ||
       JAVA_EXTENSIONS.has(ext) ||
-      CSHARP_EXTENSIONS.has(ext) ||
-      TS_EXTENSIONS.has(ext)
+      CSHARP_EXTENSIONS.has(ext)
     ) {
       showCRunnerView(activeFile, sameFolderFiles);
       return;

@@ -9,6 +9,7 @@ import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
 import { computeSmartReplacement, createEditorManager } from "./editor/editorManager.js";
+import { formatCode } from "./editor/codeFormatter.js";
 import { initChatController } from "./ai/chatController.js";
 import { initGithubController } from "./github/githubController.js";
 import {
@@ -125,6 +126,7 @@ async function initApp() {
   const btnUndo = document.getElementById("btn-editor-undo");
   const btnRedo = document.getElementById("btn-editor-redo");
   const btnSearch = document.getElementById("btn-editor-search");
+  const btnFormat = document.getElementById("btn-editor-format");
   const btnWrap = document.getElementById("btn-editor-wrap");
   const btnMinimap = document.getElementById("btn-editor-minimap");
   const btnEditorSplit = document.getElementById("btn-editor-split");
@@ -1162,9 +1164,31 @@ async function initApp() {
   keyboardRouter.registerGlobalShortcut("ctrl+\\", () => void toggleEditorSplit());
   keyboardRouter.registerGlobalShortcut("meta+\\", () => void toggleEditorSplit());
 
+  function formatActiveDocument() {
+    if (!activeFileId) return;
+    const target = filesOnly.find((f) => f.id === activeFileId);
+    if (!target || target.contentLoaded === false || isBinaryFile(target)) return;
+    const current = editor.getValue();
+    const lang = target.lang || inferFileMeta(target.path).lang;
+    const result = formatCode(current, lang);
+    if (!result.ok) {
+      explorer.setAutosaveStatus(result.error);
+      return;
+    }
+    if (!result.changed) {
+      explorer.setAutosaveStatus("El archivo ya está correctamente formateado");
+      return;
+    }
+    editor.replaceEntireDocument(result.formatted, { preserveCursorLine: true });
+    explorer.setAutosaveStatus("Documento formateado (Cmd/Ctrl+Z para deshacer)");
+  }
+
+  keyboardRouter.registerGlobalShortcut("alt+shift+f", () => formatActiveDocument());
+
   btnUndo?.addEventListener("click", () => editor.triggerUndo());
   btnRedo?.addEventListener("click", () => editor.triggerRedo());
   btnSearch?.addEventListener("click", () => editor.triggerSearch());
+  btnFormat?.addEventListener("click", () => formatActiveDocument());
   btnWrap?.addEventListener("click", () => {
     const enabled = editor.toggleWordWrap();
     btnWrap.setAttribute("aria-pressed", String(enabled));

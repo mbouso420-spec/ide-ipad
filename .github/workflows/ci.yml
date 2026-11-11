@@ -1,0 +1,59 @@
+name: Studio IDE CI
+
+on:
+  push:
+    branches: [main, "v1.*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-unit-tests:
+    name: Lint, PWA Integrity & QA Suites
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Install test dependencies
+        run: npm --prefix tests ci
+
+      - name: Run static analysis (ESLint on js/ and sw.js)
+        run: node --test tests/lint.test.js
+
+      - name: Run automated unit, concurrency, soak & AppSec suites
+        run: npm --prefix tests test
+
+  e2e-browser:
+    name: Real Browser E2E (Headless Chrome)
+    runs-on: ubuntu-latest
+    needs: lint-and-unit-tests
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: tests/package-lock.json
+
+      - name: Install test dependencies
+        run: npm --prefix tests ci
+
+      - name: Verify Chrome or Chromium availability
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v chromium >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium
+          fi
+
+      - name: Run real browser E2E suite
+        run: npm --prefix tests run test:e2e

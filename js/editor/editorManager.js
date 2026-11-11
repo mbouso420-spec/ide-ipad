@@ -1803,16 +1803,27 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
     emitSelection(view.state);
   }
 
-  function replaceEntireDocument(text) {
+  function replaceEntireDocument(text, { preserveCursorLine = false } = {}) {
     if (!view) {
       return;
     }
+    const prevLine = preserveCursorLine
+      ? view.state.doc.lineAt(view.state.selection.main.head).number
+      : 1;
     // Reemplaza todo el rango del documento (from: 0, to: length) en lugar de insertar en el cursor
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: text },
       selection: { anchor: 0, head: 0 },
       scrollIntoView: true
     });
+    if (preserveCursorLine && prevLine > 1 && view.state?.doc?.lines) {
+      const clampedLine = Math.max(1, Math.min(prevLine, view.state.doc.lines));
+      const targetLine = view.state.doc.line(clampedLine);
+      view.dispatch({
+        selection: { anchor: targetLine.from, head: targetLine.from },
+        scrollIntoView: true
+      });
+    }
     view.focus();
     emitSelection(view.state);
   }
@@ -2283,20 +2294,20 @@ function createFallbackEditor({
       textarea.value = file.content;
       fallbackMinimap?.render();
       fallbackMinimap?.updateSlider();
-      onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
+      onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     },
     clearActiveFile() {
       activeFileId = null;
       textarea.value = "";
       this.clearErrorMarkers();
-      onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
+      onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     },
     dropFileState(fileId) {
       if (activeFileId === fileId) {
         activeFileId = null;
         textarea.value = "";
         this.clearErrorMarkers();
-        onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
+        onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
       }
     },
     purgeViewDocument() {
@@ -2340,11 +2351,24 @@ function createFallbackEditor({
       if (activeFileId) onDocChange(activeFileId, textarea.value);
       emitSel();
     },
-    replaceEntireDocument(text) {
+    replaceEntireDocument(text, { preserveCursorLine = false } = {}) {
+      let prevLine = 1;
+      if (preserveCursorLine) {
+        const head = textarea.selectionStart || 0;
+        prevLine = textarea.value.slice(0, head).split("\n").length;
+      }
       textarea.value = text;
-      textarea.setSelectionRange(0, 0);
+      let nextOffset = 0;
+      if (preserveCursorLine && prevLine > 1) {
+        const lines = text.split("\n");
+        const clamped = Math.max(1, Math.min(prevLine, lines.length));
+        for (let i = 0; i < clamped - 1; i += 1) {
+          nextOffset += lines[i].length + 1;
+        }
+      }
+      textarea.setSelectionRange(nextOffset, nextOffset);
       if (activeFileId) {
-        onDocChange(activeFileId, text);
+        onDocChange?.(activeFileId, text);
       }
       emitSel();
     },
@@ -2400,11 +2424,11 @@ function createFallbackEditor({
     },
     triggerUndo() {
       textarea.focus();
-      document.execCommand("undo");
+      document.execCommand?.("undo");
     },
     triggerRedo() {
       textarea.focus();
-      document.execCommand("redo");
+      document.execCommand?.("redo");
     },
     triggerSearch() {
       textarea.focus();

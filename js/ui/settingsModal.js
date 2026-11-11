@@ -2,10 +2,16 @@ import { keyboardRouter } from "./keyboardRouter.js";
 import { getStorageQuotaEstimate, formatStorageBytes } from "../storage/storageQuota.js";
 import { saveCredentialsBackup } from "../storage/workspaceDb.js";
 import {
+  encryptKeysPayload,
+  decryptKeysPayload,
+  isEncryptedKeyVault
+} from "../security/keyVaultCrypto.js";
+import {
   AI_PROVIDERS,
   getKeyStorageMode,
   setKeyStorageMode,
   exportKeysBundle,
+  importKeysBundle,
   hasStoredCredentials,
   getApiKey,
   getSavedModel,
@@ -24,6 +30,7 @@ export const KEYBOARD_SHORTCUTS = [
   { combo: "Cmd/Ctrl + P", desc: "Apertura rápida de archivo y salto directo a línea (ej. app.js:145)", category: "Navegación" },
   { combo: "Cmd/Ctrl + Shift + F", desc: "Búsqueda global de texto y expresiones regulares en todo el proyecto", category: "Búsqueda" },
   { combo: "Cmd/Ctrl + S", desc: "Forzar guardado inmediato en almacenamiento local IndexedDB", category: "Archivo" },
+  { combo: "Shift + Alt + F", desc: "Formatear e indentar el archivo activo (100% offline)", category: "Editor" },
   { combo: "Cmd/Ctrl + W / Alt + W", desc: "Cerrar pestaña activa (Alt+W prioritario en iPad Safari PWA)", category: "Editor" },
   { combo: "Cmd/Ctrl + B", desc: "Alternar visibilidad del panel lateral del Explorador", category: "Paneles" },
   { combo: "Cmd/Ctrl + J", desc: "Alternar visibilidad del panel lateral del Asistente IA", category: "Paneles" },
@@ -65,6 +72,11 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
   const selectAiThinkingSpeed = document.getElementById("setting-ai-thinking-speed");
   const modelsListEl = document.getElementById("settings-active-models-list");
   const quotaTextEl = document.getElementById("setting-quota-text");
+  const vaultPassphraseInput = document.getElementById("vault-passphrase-input");
+  const btnExportVault = document.getElementById("btn-export-keys-encrypted");
+  const btnImportVault = document.getElementById("btn-import-keys-encrypted");
+  const vaultFileInput = document.getElementById("vault-import-file");
+  const vaultStatusEl = document.getElementById("vault-transfer-status");
   const shortcutsFilter = document.getElementById("setting-shortcuts-filter");
   const shortcutsListEl = document.getElementById("setting-shortcuts-list");
 
@@ -76,6 +88,8 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
     syncControlsWithState();
     refreshStorageInfo();
     renderShortcutsList("");
+    if (vaultPassphraseInput) vaultPassphraseInput.value = "";
+    setVaultStatus("", "neutral");
     if (!dialog.open) {
       dialog.showModal();
     }
@@ -86,6 +100,7 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
   }
 
   function close() {
+    if (vaultPassphraseInput) vaultPassphraseInput.value = "";
     keyboardRouter.popModal("settings-dialog");
     if (dialog?.open) {
       dialog.close();
@@ -479,6 +494,117 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
         btn.classList.toggle("is-active", active);
         btn.setAttribute("aria-checked", String(active));
       });
+    }
+  });
+
+  function setVaultStatus(message, type = "neutral") {
+    if (!vaultStatusEl) return;
+    vaultStatusEl.hidden = !message;
+    vaultStatusEl.textContent = message || "";
+    vaultStatusEl.className =
+      type === "error"
+        ? "gh-status-msg is-error"
+        : type === "ok"
+          ? "gh-status-msg is-ok"
+          : "gh-status-msg";
+  }
+
+  function triggerVaultDownload(encryptedJson) {
+    const blob = new Blob([encryptedJson], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "studio-ide-claves.vault.json";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function readSelectedFileText(file) {
+    if (file && typeof file.text === "function") {
+      return file.text();
+    }
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("No se pudo leer el archivo seleccionado."));
+      reader.readAsText(file);
+    });
+  }
+
+  btnExportVault?.addEventListener("click", async () => {
+    if (!hasStoredCredentials()) {
+      setVaultStatus("No hay API keys ni token de GitHub guardados para exportar.", "error");
+      return;
+    }
+    const passphrase = vaultPassphraseInput?.value || "";
+    if (btnExportVault) btnExportVault.disabled = true;
+    setVaultStatus("Cifrando credenciales con AES-GCM 256…", "neutral");
+    try {
+      const bundleJson = exportKeysBundle();
+      const encryptedJson = await encryptKeysPayload(bundleJson, passphrase);
+      triggerVaultDownload(encryptedJson);
+      if (vaultPassphraseInput) vaultPassphraseInput.value = "";
+      setVaultStatus("Bóveda cifrada descargada correctamente (studio-ide-claves.vault.json).", "ok");
+    } catch (err) {
+      setVaultStatus(err instanceof Error ? err.message : "No se pudo cifrar la bóveda.", "error");
+    } finally {
+      if (btnExportVault) btnExportVault.disabled = false;
+    }
+  });
+
+  async function importVaultText(rawText, passphrase) {
+    let payloadJson = rawText;
+    if (isEncryptedKeyVault(rawText)) {
+      payloadJson = await decryptKeysPayload(rawText, passphrase);
+    } else {
+      throw new Error("Solo se admite importar archivos cifrados de bóveda Studio IDE (.vault.json).");
+    }
+    const count = importKeysBundle(payloadJson);
+    if (getKeyStorageMode() === "local" && hasStoredCredentials()) {
+      void saveCredentialsBackup(exportKeysBundle());
+    }
+    refreshTokensMeter();
+    if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
+      window.dispatchEvent(new CustomEvent("studio-credentials-updated"));
+    }
+    if (vaultPassphraseInput) vaultPassphraseInput.value = "";
+    setVaultStatus(
+      count > 0
+        ? `Se restauraron ${count} credencial(es) desde la bóveda cifrada.`
+        : "Bóveda descifrada sin credenciales activas.",
+      count > 0 ? "ok" : "neutral"
+    );
+  }
+
+  btnImportVault?.addEventListener("click", () => {
+    const passphrase = vaultPassphraseInput?.value || "";
+    if (!passphrase || passphrase.length < 6) {
+      setVaultStatus("Ingresá la contraseña maestra (mínimo 6 caracteres) antes de elegir el archivo cifrado.", "error");
+      vaultPassphraseInput?.focus();
+      return;
+    }
+    if (vaultFileInput) {
+      vaultFileInput.value = "";
+      vaultFileInput.click();
+    }
+  });
+
+  vaultFileInput?.addEventListener("change", async () => {
+    const file = vaultFileInput.files?.[0];
+    if (!file) return;
+    const passphrase = vaultPassphraseInput?.value || "";
+    if (btnImportVault) btnImportVault.disabled = true;
+    setVaultStatus("Descifrando bóveda de credenciales…", "neutral");
+    try {
+      const rawText = await readSelectedFileText(file);
+      await importVaultText(rawText, passphrase);
+    } catch (err) {
+      setVaultStatus(err instanceof Error ? err.message : "No se pudo importar la bóveda.", "error");
+    } finally {
+      vaultFileInput.value = "";
+      if (btnImportVault) btnImportVault.disabled = false;
     }
   });
 

@@ -208,6 +208,9 @@
             <button type="button" id="btn-editor-search" class="btn btn-ghost btn-sm btn-icon" aria-label="Buscar en archivo" title="Buscar y reemplazar (Cmd/Ctrl + F)">
               <span data-icon="search"></span>
             </button>
+            <button type="button" id="btn-editor-format" class="btn btn-ghost btn-sm btn-icon" aria-label="Formatear código" title="Formatear documento (Shift + Alt + F)">
+              <span data-icon="alignLeft"></span>
+            </button>
             <button
               type="button"
               id="btn-toggle-symbols"
@@ -692,6 +695,14 @@
             <p id="gh-conflict-msg" class="gh-conflict-msg"></p>
             <ul id="gh-conflict-list" class="gh-changes-list" hidden></ul>
             <div class="field-row gh-open-actions">
+              <button type="button" id="btn-gh-conflict-merge" class="btn btn-primary btn-sm">
+                <span data-icon="refreshCw"></span>
+                <span>Traer e integrar</span>
+              </button>
+              <button type="button" id="btn-gh-conflict-apply" class="btn btn-primary btn-sm" hidden>
+                <span data-icon="check"></span>
+                <span>Aplicar integración</span>
+              </button>
               <button type="button" id="btn-gh-conflict-view" class="btn btn-sm">
                 <span data-icon="gitCompare"></span>
                 <span>Ver qué cambió</span>
@@ -885,6 +896,20 @@
             <button type="button" id="btn-preview-clear-console" class="btn btn-ghost btn-sm">Limpiar</button>
           </div>
           <div id="preview-console-list" class="preview-console-list code-font"></div>
+          <form id="preview-repl-form" class="preview-repl-form" hidden>
+            <span class="preview-repl-prompt code-font" aria-hidden="true">&gt;</span>
+            <input
+              type="text"
+              id="preview-repl-input"
+              class="preview-repl-input code-font"
+              placeholder="Evaluar expresión en vivo…"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <button type="submit" id="btn-preview-repl-run" class="btn btn-primary btn-sm">Ejecutar</button>
+          </form>
         </section>
       </div>
     </div>
@@ -1053,6 +1078,36 @@
             <div class="setting-info-block">
               <span class="setting-info-title">Estado de Almacenamiento Local (IndexedDB)</span>
               <span id="setting-quota-text" class="setting-info-desc">Calculando espacio disponible…</span>
+            </div>
+
+            <div class="setting-info-block setting-vault-block">
+              <span class="setting-info-title">Portabilidad cifrada de credenciales (AES-GCM 256)</span>
+              <span class="setting-info-desc">
+                Exportá o restaurá tus API keys de IA y token de GitHub en un archivo cifrado con contraseña maestra (PBKDF2 + AES-GCM).
+              </span>
+              <input
+                type="password"
+                id="vault-passphrase-input"
+                class="field-control"
+                placeholder="Contraseña maestra (mínimo 6 caracteres)…"
+                autocomplete="new-password"
+                spellcheck="false"
+              />
+              <div class="field-row">
+                <button type="button" id="btn-export-keys-encrypted" class="btn btn-primary btn-sm">
+                  Exportar bóveda cifrada
+                </button>
+                <button type="button" id="btn-import-keys-encrypted" class="btn btn-ghost btn-sm">
+                  Importar bóveda
+                </button>
+                <input
+                  type="file"
+                  id="vault-import-file"
+                  accept=".json,.vault,application/json"
+                  hidden
+                />
+              </div>
+              <p id="vault-transfer-status" class="gh-status-msg" hidden></p>
             </div>
           </div>
         </div>

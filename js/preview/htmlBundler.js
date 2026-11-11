@@ -1,6 +1,7 @@
 import { normalizePath } from "../storage/workspaceDb.js";
 import { getImageMimeType } from "../storage/fileImport.js";
 import { buildLoopGuardRuntime } from "./loopGuard.js";
+import { transpileTypeScriptAndJsx } from "./tsTranspiler.js";
 
 export const HTML_EXTENSIONS = new Set(["html", "htm"]);
 export const JS_EXTENSIONS = new Set(["js", "mjs", "cjs"]);
@@ -452,6 +453,23 @@ ${buildLoopGuardRuntime()}
   window.addEventListener("unhandledrejection", function (e) {
     send("error", ["Promesa rechazada: " + (e.reason && e.reason.message ? e.reason.message : String(e.reason))]);
   });
+  // Mini-REPL interactivo conectado al panel Consola JS de Studio IDE
+  window.addEventListener("message", function (ev) {
+    var d = ev.data;
+    if (!d || d.source !== "studio-ide-repl" || d.action !== "eval") return;
+    if (ev.source !== window.parent) return;
+    var code = String(d.code || "").trim();
+    if (!code) return;
+    send("log", ["> " + code]);
+    try {
+      var res = (0, eval)(code);
+      if (res !== undefined) {
+        send("log", [res]);
+      }
+    } catch (err) {
+      send("error", [err && err.message ? err.message : String(err)]);
+    }
+  });
   // Interceptor total de navegación local en enlaces
   document.addEventListener("click", function (e) {
     var a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
@@ -695,15 +713,47 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
+  function compileScriptContent(rawCode, sourcePath, explicitType = "", isModule = false) {
+    const ext = getFileExtension(sourcePath || "");
+    const t = String(explicitType || "").trim().toLowerCase();
+    const isTsOrJsxType =
+      t === "text/typescript" ||
+      t === "application/typescript" ||
+      t === "text/tsx" ||
+      t === "text/jsx" ||
+      t === "text/babel";
+    const needsTranspile = TS_EXTENSIONS.has(ext) || ext === "jsx" || isTsOrJsxType;
+    let executable = String(rawCode || "");
+    if (needsTranspile) {
+      const enableJsx = ext === "tsx" || ext === "jsx" || t === "text/tsx" || t === "text/jsx" || t === "text/babel";
+      executable = transpileTypeScriptAndJsx(executable, {
+        jsx: enableJsx,
+        fileName: sourcePath || "inline.tsx"
+      }).code;
+    }
+    return transformJs(executable, isModule).replace(/<\/script>/gi, "<\\/script>");
+  }
+
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (fullTag, attrs, inlineCode) => {
     const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
     if (!srcMatch) {
       const typeMatch = attrs.match(/\btype=["']([^"']*)["']/i);
       const type = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
-      const isJs = !type || type === "module" || type === "text/javascript" || type === "application/javascript";
-      if (!isJs || !inlineCode.trim()) return fullTag;
-      const safeInline = transformJs(inlineCode, type === "module").replace(/<\/script>/gi, "<\\/script>");
-      return `<script${attrs}>${safeInline}</script>`;
+      const isJsOrTs =
+        !type ||
+        type === "module" ||
+        type === "text/javascript" ||
+        type === "application/javascript" ||
+        type === "text/typescript" ||
+        type === "application/typescript" ||
+        type === "text/tsx" ||
+        type === "text/jsx" ||
+        type === "text/babel";
+      if (!isJsOrTs || !inlineCode.trim()) return fullTag;
+      const isMod = type === "module";
+      const safeInline = compileScriptContent(inlineCode, "inline.js", type, isMod);
+      const outAttrs = type && type !== "module" ? attrs.replace(/\btype=["'][^"']*["']/i, "").trim() : attrs.trim();
+      return `<script${outAttrs ? " " + outAttrs : ""}>${safeInline}</script>`;
     }
     const asset = resolveAsset(srcMatch[1]);
     if (!asset) return fullTag;
@@ -717,7 +767,7 @@ export function bundleHtmlWithFolderAssets(
 
     const isModule = /\btype=["']module["']/i.test(attrs);
     const hasDefer = /\bdefer\b/i.test(attrs);
-    const safeJs = transformJs(asset.content, isModule).replace(/<\/script>/gi, "<\\/script>");
+    const safeJs = compileScriptContent(asset.content, asset.path, "", isModule);
 
     if (!isModule && hasDefer) {
       deferredScripts.push(`<script data-source="${escapeAttr(asset.path)}">\n${safeJs}\n</script>`);
@@ -728,7 +778,7 @@ export function bundleHtmlWithFolderAssets(
   });
 
   if (ensureJsFile && !inlinedActiveJs) {
-    const safeExtraJs = transformJs(ensureJsFile.content, false).replace(/<\/script>/gi, "<\\/script>");
+    const safeExtraJs = compileScriptContent(ensureJsFile.content, ensureJsFile.path, "", false);
     deferredScripts.push(`<script data-source="${escapeAttr(ensureJsFile.path)}">\n${safeExtraJs}\n</script>`);
   }
 
@@ -746,6 +796,22 @@ export function bundleHtmlWithFolderAssets(
     return html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${bridge}`);
   }
   return `${bridge}\n${html}`;
+}
+
+export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code) {
+  const ext = getFileExtension(tsFile?.path || "");
+  const isJsx = ext === "tsx" || ext === "jsx";
+  const compiled = transpileTypeScriptAndJsx(tsFile?.content || "", {
+    jsx: isJsx,
+    fileName: tsFile?.path || "main.ts"
+  });
+  return buildStandaloneJsPreview(
+    {
+      ...tsFile,
+      content: compiled.code
+    },
+    transformJs
+  );
 }
 
 export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code) {
@@ -943,9 +1009,10 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "    raise _StudioPauseForInput(texto)",
     "builtins.input = __studio_input",
     "_result = {'status': 'ok'}",
-    "_ns = {'__name__': '__main__', '__file__': __studio_entry_name}",
+    "global _studio_repl_ns",
+    "_studio_repl_ns = {'__name__': '__main__', '__file__': __studio_entry_name}",
     "try:",
-    "    exec(compile(__studio_entry_code, __studio_entry_name, 'exec'), _ns)",
+    "    exec(compile(__studio_entry_code, __studio_entry_name, 'exec'), _studio_repl_ns)",
     "except _StudioPauseForInput as _pause:",
     "    _result = {'status': 'need_input', 'prompt': _pause.prompt_text}",
     "except SystemExit:",
@@ -1172,7 +1239,40 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     }
     self.onmessage = async function (event) {
       var job = event.data;
-      if (!job || job.type !== "run") return;
+      if (!job) return;
+      if (job.type === "eval") {
+        try {
+          var pyEval = await ensurePyodide();
+          pyEval.globals.set("__studio_eval_code", String(job.code || ""));
+          var evalScript = [
+            "import json, sys, traceback",
+            "_er = {'status': 'ok'}",
+            "try:",
+            "    _v = eval(compile(__studio_eval_code, '<repl>', 'eval'), _studio_repl_ns)",
+            "    if _v is not None:",
+            "        print(repr(_v))",
+            "except SyntaxError:",
+            "    try:",
+            "        exec(compile(__studio_eval_code, '<repl>', 'exec'), _studio_repl_ns)",
+            "    except Exception as _ex:",
+            "        _er = {'status': 'error'}",
+            "        print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
+            "except Exception as _ex:",
+            "    _er = {'status': 'error'}",
+            "    print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
+            "sys.stdout.flush()",
+            "sys.stderr.flush()",
+            "json.dumps(_er)"
+          ].join("\\n");
+          var evalRaw = await pyEval.runPythonAsync(evalScript);
+          send({ type: "eval_done", outcome: JSON.parse(String(evalRaw || '{"status":"ok"}')) });
+        } catch (err) {
+          send({ type: "out", level: "error", text: err && err.message ? String(err.message) : String(err) });
+          send({ type: "eval_done", outcome: { status: "error" } });
+        }
+        return;
+      }
+      if (job.type !== "run") return;
       try {
         var py = await ensurePyodide();
         send({ type: "status", text: "running" });
@@ -1342,6 +1442,9 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           emit("error", msg.message);
           return;
         }
+        if (msg.type === "eval_done") {
+          return;
+        }
         if (msg.type === "result") {
           setRunning(false);
           var outcome = msg.outcome || { status: "ok" };
@@ -1418,6 +1521,21 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           executePass();
         });
       }
+
+      window.addEventListener("message", function (ev) {
+        var d = ev.data;
+        if (!d || d.source !== "studio-ide-repl" || d.action !== "eval") return;
+        if (ev.source !== window.parent) return;
+        var code = String(d.code || "").trim();
+        if (!code) return;
+        emit("log", ">>> " + code);
+        if (running) {
+          emit("error", "Esperá a que termine la ejecución actual antes de evaluar en el REPL.");
+          return;
+        }
+        if (!runner) runner = createRunner();
+        runner.post({ type: "eval", code: code });
+      });
 
       executePass();
     })();

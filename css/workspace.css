@@ -431,6 +431,23 @@
   border-color: var(--color-error);
 }
 
+.gh-conflict-choice {
+  padding: 2px 8px;
+  border-radius: var(--radius-control);
+  border: var(--rule-hair) solid var(--color-rule-strong);
+  background: var(--color-paper);
+  color: var(--color-ink-2);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.gh-conflict-choice.is-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft, rgba(59, 130, 246, 0.18));
+  color: var(--color-ink);
+  font-weight: 600;
+}
+
 /* Extensiones de Diálogos: Visor de Diferencias (Diff) y Vista Previa Web en Vivo */
 .ide-dialog-wide {
   width: min(780px, calc(100% - var(--space-lg)));
@@ -767,6 +784,44 @@
 .preview-log-item.is-error {
   background: var(--color-error-soft);
   color: var(--color-ink);
+}
+
+.preview-repl-form {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding-block: var(--space-2xs);
+  padding-inline: var(--space-sm);
+  border-top: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-2);
+}
+
+.preview-repl-form[hidden] {
+  display: none;
+}
+
+.preview-repl-prompt {
+  color: var(--color-accent-text);
+  font-weight: 700;
+  font-size: var(--text-sm);
+  user-select: none;
+}
+
+.preview-repl-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 30px;
+  padding: 4px 8px;
+  border-radius: var(--radius-control);
+  border: var(--rule-hair) solid var(--color-rule-strong);
+  background: var(--color-paper);
+  color: var(--color-ink);
+  font-size: max(var(--text-xs), 14px);
+}
+
+.preview-repl-input:focus {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
 }
 
 /* Apertura rápida de archivos (Cmd/Ctrl + P y lupa del Explorador) */
