@@ -95,8 +95,11 @@ La aplicación organiza el espacio de trabajo en **3 islas ergonómicas**:
    - Si intentás cerrar una pestaña que tiene cambios locales aún no sincronizados con GitHub, el IDE abre un diálogo de confirmación accesible antes de purgar el estado de memoria del archivo.
 5. **Adaptación fluida a la rotación de pantalla:**
    - Si rotás el iPad de horizontal a vertical o reacomodás el tamaño de ventana en Stage Manager, los paneles laterales se re-ajustan proporcionalmente al instante para que nunca desborden la pantalla ni queden cortados.
-6. **Guardia de seguridad para imágenes y archivos binarios:**
-   - Si abrís una imagen (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.ico`), el panel central monta una previsualización visual con sus dimensiones en píxeles, peso formateado y botón de descarga directa.
+6. **Soporte y gestión de imágenes y archivos binarios:**
+   - Si abrís una imagen (`.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, `.ico`), el panel central monta una previsualización visual con sus dimensiones en píxeles, peso formateado, botón de descarga directa y botón para **Cargar / Reemplazar imagen**.
+   - **Arrastrar y soltar (Drag & Drop):** Podés arrastrar archivos de imagen directamente sobre la tarjeta del editor o sobre el árbol del explorador para cargarlos en el proyecto al instante.
+   - **Pegar desde el portapapeles (`Ctrl+V` / `Cmd+V`):** Si tomás una captura de pantalla o copiás una imagen en tu iPad o PC, al pulsar `Ctrl+V` teniendo un archivo de imagen abierto se guardará automáticamente en el proyecto.
+   - Si creás un archivo de imagen nuevo con **+ Archivo** (ej. `logo.png`), el editor te presentará un asistente visual con acceso directo para seleccionar una imagen de tu disco o arrastrarla.
    - Si abrís cualquier otro archivo binario (`.pdf`, `.zip`, `.wasm`), el IDE presenta una ficha técnica con su peso y opción de descarga, protegiendo a CodeMirror y a la memoria del navegador de corrupciones por texto plano.
 
 ---
@@ -143,6 +146,18 @@ En la barra superior del modal de vista previa podés alternar el tamaño de pan
 - **390px (Móvil):** simula la visualización en teléfonos modernos.
 - **820px (Tablet / iPad):** ajusta el contenedor al ancho clásico de tablets.
 - **100% (Escritorio):** aprovecha todo el ancho disponible del diálogo.
+
+### Soporte Integral de Imágenes en Vista Previa y HTML
+- **Incrustación automática en HTML:** Cuando visualizás un archivo HTML, el bundler incrusta automáticamente como Data URLs (Base64/SVG) todas las imágenes locales referenciadas en:
+  - Etiquetas `<img>` (`src` y `srcset` responsivo con descriptores `1x`, `2x`).
+  - Etiquetas `<picture>` y `<source srcset="...">`.
+  - Iconos de favoritos `<link rel="icon">` y `apple-touch-icon`.
+  - Posters de video `<video poster="...">`.
+  - Botones de formulario `<input type="image" src="...">`.
+  - Gráficos vectoriales SVG `<image href="...">`.
+  - Estilos inline con imágenes de fondo (`style="background: url('...');"`).
+- **Vista previa contextual o directa de imágenes:** Si abrís la Vista Previa teniendo un archivo de imagen seleccionado, el visor te permite alternar entre ver la imagen aplicada en el HTML del proyecto o abrir el visor dedicado de imágenes (con controles de zoom *Ajustar*, *100%* y *200%* sobre cuadrícula de transparencia y dimensiones exactas en px).
+- **Imágenes en Markdown:** Los documentos `.md` previsualizan imágenes locales escritas con sintaxis estándar `![Alt](./foto.png "Título")` o URLs externas (`https://...`).
 
 ### Base de Datos SQLite Interactiva en Vivo (`.sql`)
 - Al abrir una pestaña con un archivo `.sql` y tocar **Vista previa**, se inicia una base de datos SQLite completa en memoria vía WebAssembly (`sql.js`).

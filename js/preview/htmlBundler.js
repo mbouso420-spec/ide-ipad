@@ -1,5 +1,5 @@
 import { normalizePath } from "../storage/workspaceDb.js";
-import { getImageMimeType } from "../storage/fileImport.js";
+import { getImageMimeType, IMAGE_EXTENSIONS } from "../storage/fileImport.js";
 import { buildLoopGuardRuntime } from "./loopGuard.js";
 import { transpileTypeScriptAndJsx } from "./tsTranspiler.js";
 import {
@@ -135,35 +135,76 @@ export function buildWorkspaceAssetMap(allFiles) {
 }
 
 /**
- * Extrae todas las rutas relativas de hojas CSS y scripts JS referenciados por el HTML.
+ * Extrae todas las rutas relativas de hojas CSS, scripts JS, imágenes y recursos referenciados por el HTML.
  */
-export function extractReferencedAssetPaths(entryPath, rawHtml) {
+export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
   if (!rawHtml || typeof rawHtml !== "string") return [];
   const dir = getParentFolder(entryPath);
   const paths = new Set();
+  const includeMedia = Boolean(options?.includeMedia);
 
-  const linkRegex = /<link\b[^>]*rel=["']stylesheet["'][^>]*>/gi;
+  const addCandidateRef = (rawRef) => {
+    if (!rawRef || typeof rawRef !== "string") return;
+    const clean = rawRef.trim().split("?")[0].split("#")[0];
+    if (!clean || /^(https?:|data:|blob:|\/\/|#)/i.test(clean)) return;
+    const resolved = resolveRelativePath(dir, clean);
+    if (resolved) paths.add(resolved);
+    const rootClean = normalizePath(clean);
+    if (rootClean) paths.add(rootClean);
+  };
+
+  // 1. <link rel="stylesheet"> (o iconos favoritos si includeMedia es true)
+  const linkRegex = /<link\b[^>]*>/gi;
   let match;
   while ((match = linkRegex.exec(rawHtml)) !== null) {
-    const hrefMatch = match[0].match(/href=["']([^"']+)["']/i);
-    if (hrefMatch && hrefMatch[1] && !/^(https?:|data:|blob:|\/\/)/i.test(hrefMatch[1])) {
-      const cleanRef = hrefMatch[1].split("?")[0].split("#")[0];
-      const resolved = resolveRelativePath(dir, cleanRef);
-      if (resolved) paths.add(resolved);
-      const rootClean = normalizePath(cleanRef);
-      if (rootClean) paths.add(rootClean);
+    const isStyle = /\brel=["']stylesheet["']/i.test(match[0]);
+    const isIcon = includeMedia && /\brel=["'](?:icon|shortcut\s+icon|apple-touch-icon)["']/i.test(match[0]);
+    if (isStyle || isIcon) {
+      const hrefMatch = match[0].match(/href=["']([^"']+)["']/i);
+      if (hrefMatch && hrefMatch[1]) addCandidateRef(hrefMatch[1]);
     }
   }
 
+  // 2. <script src="...">
   const scriptRegex = /<script\b[^>]*src=["']([^"']+)["'][^>]*>/gi;
   while ((match = scriptRegex.exec(rawHtml)) !== null) {
-    const srcMatch = match[0].match(/src=["']([^"']+)["']/i);
-    if (srcMatch && srcMatch[1] && !/^(https?:|data:|blob:|\/\/)/i.test(srcMatch[1])) {
-      const cleanRef = srcMatch[1].split("?")[0].split("#")[0];
-      const resolved = resolveRelativePath(dir, cleanRef);
-      if (resolved) paths.add(resolved);
-      const rootClean = normalizePath(cleanRef);
-      if (rootClean) paths.add(rootClean);
+    if (match[1]) addCandidateRef(match[1]);
+  }
+
+  if (includeMedia) {
+    // 3. <img src="...">, <source src="...">, <input src="...">
+    const mediaSrcRegex = /<(?:img|source|input)\b[^>]*src=["']([^"']+)["'][^>]*>/gi;
+    while ((match = mediaSrcRegex.exec(rawHtml)) !== null) {
+      if (match[1]) addCandidateRef(match[1]);
+    }
+
+    // 4. srcset="..." en <img> y <source>
+    const srcsetRegex = /\bsrcset=["']([^"']+)["']/gi;
+    while ((match = srcsetRegex.exec(rawHtml)) !== null) {
+      const entries = match[1].split(",");
+      for (const e of entries) {
+        const url = e.trim().split(/\s+/)[0];
+        if (url) addCandidateRef(url);
+      }
+    }
+
+    // 5. <video poster="...">
+    const videoRegex = /<video\b[^>]*poster=["']([^"']+)["'][^>]*>/gi;
+    while ((match = videoRegex.exec(rawHtml)) !== null) {
+      if (match[1]) addCandidateRef(match[1]);
+    }
+
+    // 6. <image href="..." xlink:href="..."> en SVG
+    const svgImgRegex = /<image\b[^>]*\b(?:xlink:)?href=["']([^"']+)["'][^>]*>/gi;
+    while ((match = svgImgRegex.exec(rawHtml)) !== null) {
+      if (match[1]) addCandidateRef(match[1]);
+    }
+
+    // 7. url(...) en estilos inline o bloques <style>
+    const urlRegex = /url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)/gi;
+    while ((match = urlRegex.exec(rawHtml)) !== null) {
+      const url = match[1] || match[2];
+      if (url) addCandidateRef(url);
     }
   }
 
@@ -1108,27 +1149,112 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
-  // Incrustar imágenes locales (<img src="...">) almacenadas en Base64 o SVG dentro del proyecto
-  html = html.replace(/<img\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
-    const entry = resolveRawEntry(rawSrc);
-    if (!entry) return fullTag;
-    const ext = getFileExtension(entry.path || rawSrc);
+  function resolveEntryToDataUrl(rawUrl, baseDir = dir) {
+    if (!rawUrl || typeof rawUrl !== "string") return null;
+    const cleanUrl = rawUrl.trim();
+    if (!cleanUrl || /^(https?:|data:|blob:|#|\/\/)/i.test(cleanUrl)) return null;
+    const entry = resolveEntryFromDir(cleanUrl, baseDir);
+    if (!entry) return null;
+    const ext = getFileExtension(entry.path || cleanUrl);
     const b64Payload = typeof entry.base64 === "string" && entry.base64.length > 0
       ? entry.base64
       : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
         ? entry.content
         : null;
     if (b64Payload) {
-      const mime = getImageMimeType(entry.path || rawSrc);
-      return `<img${beforeSrc}src=${quote}data:${mime};base64,${b64Payload}${quote}${afterSrc}>`;
+      const mime = getImageMimeType(entry.path || cleanUrl);
+      return `data:${mime};base64,${b64Payload}`;
     }
     if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
       const encodedSvg = encodeURIComponent(entry.content)
         .replace(/'/g, "%27")
         .replace(/"/g, "%22");
-      return `<img${beforeSrc}src=${quote}data:image/svg+xml;charset=utf-8,${encodedSvg}${quote}${afterSrc}>`;
+      return `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+    }
+    return null;
+  }
+
+  function inlineSrcsetString(rawSrcset, baseDir = dir) {
+    if (!rawSrcset || typeof rawSrcset !== "string") return rawSrcset;
+    return rawSrcset.replace(/([^\s,]+)(\s+[^\s,]+)?/g, (match, url, descriptor) => {
+      const dataUrl = resolveEntryToDataUrl(url, baseDir);
+      if (dataUrl) {
+        return descriptor ? `${dataUrl}${descriptor}` : dataUrl;
+      }
+      return match;
+    });
+  }
+
+  // Incrustar imágenes locales (<img src="...">) almacenadas en Base64 o SVG dentro del proyecto
+  html = html.replace(/<img\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+    const dataUrl = resolveEntryToDataUrl(rawSrc);
+    if (dataUrl) {
+      return `<img${beforeSrc}src=${quote}${dataUrl}${quote}${afterSrc}>`;
     }
     return fullTag;
+  });
+
+  // Incrustar srcset en <img> y <source>
+  html = html.replace(/\bsrcset=(["'])([^"']+)\1/gi, (fullAttr, quote, rawSrcset) => {
+    const inlined = inlineSrcsetString(rawSrcset);
+    return `srcset=${quote}${inlined}${quote}`;
+  });
+
+  // Incrustar fuentes alternativas <source src="...">
+  html = html.replace(/<source\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+    const dataUrl = resolveEntryToDataUrl(rawSrc);
+    if (dataUrl) {
+      return `<source${beforeSrc}src=${quote}${dataUrl}${quote}${afterSrc}>`;
+    }
+    return fullTag;
+  });
+
+  // Incrustar iconos favoritos (<link rel="icon|apple-touch-icon" href="...">)
+  html = html.replace(/<link\b([^>]*?)\bhref=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeHref, quote, rawHref, afterHref) => {
+    if (!/\brel=(["'])(?:shortcut\s+icon|icon|apple-touch-icon)\1/i.test(fullTag)) {
+      return fullTag;
+    }
+    const dataUrl = resolveEntryToDataUrl(rawHref);
+    if (dataUrl) {
+      return `<link${beforeHref}href=${quote}${dataUrl}${quote}${afterHref}>`;
+    }
+    return fullTag;
+  });
+
+  // Incrustar posters de video (<video poster="...">)
+  html = html.replace(/<video\b([^>]*?)\bposter=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforePoster, quote, rawPoster, afterPoster) => {
+    const dataUrl = resolveEntryToDataUrl(rawPoster);
+    if (dataUrl) {
+      return `<video${beforePoster}poster=${quote}${dataUrl}${quote}${afterPoster}>`;
+    }
+    return fullTag;
+  });
+
+  // Incrustar inputs de tipo imagen (<input type="image" src="...">)
+  html = html.replace(/<input\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+    if (!/\btype=(["'])image\1/i.test(fullTag)) return fullTag;
+    const dataUrl = resolveEntryToDataUrl(rawSrc);
+    if (dataUrl) {
+      return `<input${beforeSrc}src=${quote}${dataUrl}${quote}${afterSrc}>`;
+    }
+    return fullTag;
+  });
+
+  // Incrustar imágenes SVG (<image href="..." xlink:href="...">)
+  html = html.replace(/<image\b([^>]*?)\b(?:xlink:)?href=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeHref, quote, rawHref, afterHref) => {
+    const dataUrl = resolveEntryToDataUrl(rawHref);
+    if (dataUrl) {
+      return `<image${beforeHref}href=${quote}${dataUrl}${quote}${afterHref}>`;
+    }
+    return fullTag;
+  });
+
+  // Incrustar imágenes en atributos de estilo inline: style="...url('...')..."
+  html = html.replace(/\bstyle=(["'])([\s\S]*?)\1/gi, (fullAttr, quote, styleBody) => {
+    if (!styleBody || !styleBody.includes("url(")) return fullAttr;
+    const inlined = inlineCssUrls(styleBody, dir);
+    const safeInlined = quote === '"' ? inlined.replace(/"/g, "'") : inlined.replace(/'/g, '"');
+    return `style=${quote}${safeInlined}${quote}`;
   });
 
   const exactModuleMap = buildExactModuleMap(fileMap);
@@ -1551,6 +1677,224 @@ ${safeJs}
     <div id="__js_screen_log" class="js-screen-log"></div>
   </div>
   ${scriptSnippet}
+</body>
+</html>`;
+}
+
+export { IMAGE_EXTENSIONS };
+
+/**
+ * Genera el documento HTML interactivo para la previsualización directa de imágenes.
+ * Soporta PNG, JPEG, GIF, WebP, SVG, AVIF, BMP e ICO con cuadrícula de transparencia y controles de zoom.
+ */
+export function buildStandaloneImagePreview(imageFile) {
+  const ext = getFileExtension(imageFile?.path || "");
+  const mime = getImageMimeType(imageFile?.path || "");
+  const safeName = escapeHtmlText(imageFile?.shortName || imageFile?.path || "Imagen");
+  const b64 = typeof imageFile?.base64 === "string" && imageFile.base64.length > 0
+    ? imageFile.base64
+    : imageFile?.isBinary && typeof imageFile.content === "string" && imageFile.content.length > 0
+      ? imageFile.content
+      : null;
+
+  let imgSrc = "";
+  if (b64) {
+    imgSrc = `data:${mime};base64,${b64}`;
+  } else if (ext === "svg" && typeof imageFile?.content === "string" && imageFile.content.trim().length > 0) {
+    const encodedSvg = encodeURIComponent(imageFile.content)
+      .replace(/'/g, "%27")
+      .replace(/"/g, "%22");
+    imgSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+  }
+
+  let sizeFormatted = "";
+  if (b64) {
+    const bytesLen = Math.floor((b64.length * 3) / 4);
+    sizeFormatted = bytesLen < 1024
+      ? `${bytesLen} B`
+      : bytesLen < 1024 * 1024
+        ? `${(bytesLen / 1024).toFixed(1)} KB`
+        : `${(bytesLen / (1024 * 1024)).toFixed(2)} MB`;
+  } else if (ext === "svg" && typeof imageFile?.content === "string") {
+    const bytesLen = imageFile.content.length;
+    sizeFormatted = bytesLen < 1024
+      ? `${bytesLen} B`
+      : `${(bytesLen / 1024).toFixed(1)} KB`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>${safeName}</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #181a20;
+      --border: #282c37;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #79c0ff;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    .img-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 14px;
+      background: var(--card);
+      border-bottom: 1px solid var(--border);
+      font-size: 13px;
+      gap: 12px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .img-meta-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .badge {
+      background: #21262d;
+      border: 1px solid var(--border);
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--accent);
+      text-transform: uppercase;
+    }
+    .img-dim, .img-size {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+    .img-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn-ctrl {
+      background: #21262d;
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 3px 9px;
+      border-radius: 5px;
+      font-size: 12px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .btn-ctrl:hover {
+      background: #30363d;
+    }
+    .btn-ctrl.is-active {
+      background: var(--accent);
+      color: #0d1117;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+    .img-canvas-wrap {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      overflow: auto;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: repeating-conic-gradient(#1c2128 0% 25%, #161b22 0% 50%) 50% / 20px 20px;
+    }
+    .preview-img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+      border-radius: 4px;
+      transition: transform 0.15s ease;
+      cursor: zoom-in;
+    }
+    .preview-img.mode-100 {
+      max-width: none;
+      max-height: none;
+      cursor: zoom-out;
+    }
+    .preview-img.mode-200 {
+      max-width: none;
+      max-height: none;
+      transform: scale(2);
+      transform-origin: center;
+      cursor: zoom-out;
+    }
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: var(--text-muted);
+      font-size: 14px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="img-toolbar">
+    <div class="img-meta-group">
+      <span class="badge">${ext || "IMG"}</span>
+      <span class="img-name">${safeName}</span>
+      <span class="img-size">${sizeFormatted}</span>
+      <span id="dim-text" class="img-dim"></span>
+    </div>
+    <div class="img-controls">
+      <button type="button" class="btn-ctrl is-active" id="btn-fit">Ajustar</button>
+      <button type="button" class="btn-ctrl" id="btn-100">100%</button>
+      <button type="button" class="btn-ctrl" id="btn-200">200%</button>
+    </div>
+  </div>
+  <div class="img-canvas-wrap">
+    ${imgSrc ? `<img id="main-img" class="preview-img" src="${imgSrc}" alt="${safeName}">` : '<div class="empty-state">Esta imagen está vacía o no contiene datos binarios válidos.</div>'}
+  </div>
+  <script>
+    const img = document.getElementById("main-img");
+    const dim = document.getElementById("dim-text");
+    const btnFit = document.getElementById("btn-fit");
+    const btn100 = document.getElementById("btn-100");
+    const btn200 = document.getElementById("btn-200");
+    if (img && dim) {
+      img.addEventListener("load", () => {
+        dim.textContent = img.naturalWidth + " × " + img.naturalHeight + " px";
+      });
+      if (img.complete && img.naturalWidth) {
+        dim.textContent = img.naturalWidth + " × " + img.naturalHeight + " px";
+      }
+      function setMode(mode) {
+        img.classList.remove("mode-100", "mode-200");
+        btnFit?.classList.toggle("is-active", mode === "fit");
+        btn100?.classList.toggle("is-active", mode === "100");
+        btn200?.classList.toggle("is-active", mode === "200");
+        if (mode === "100") img.classList.add("mode-100");
+        if (mode === "200") img.classList.add("mode-200");
+      }
+      btnFit?.addEventListener("click", () => setMode("fit"));
+      btn100?.addEventListener("click", () => setMode("100"));
+      btn200?.addEventListener("click", () => setMode("200"));
+      img.addEventListener("click", () => {
+        if (img.classList.contains("mode-100")) setMode("fit");
+        else setMode("100");
+      });
+    }
+  </script>
 </body>
 </html>`;
 }

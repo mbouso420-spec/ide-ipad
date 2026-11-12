@@ -260,6 +260,14 @@ body[data-right-open="false"] #panel-assistant .panel-title {
   display: flex;
   flex-direction: column;
   gap: var(--space-3xs);
+  transition: outline var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.file-tree.is-drag-over {
+  outline: 2px dashed var(--color-accent);
+  outline-offset: -4px;
+  background-color: var(--color-paper-2);
+  border-radius: var(--radius-control);
 }
 
 .file-tree-name {

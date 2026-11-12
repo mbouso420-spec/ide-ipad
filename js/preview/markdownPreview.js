@@ -2,10 +2,13 @@
  * Renderizador seguro 100% offline de documentos Markdown (.md / README.md) para Vista Previa.
  */
 
-import { escapeHtml } from "./previewUtils.js";
+import { escapeHtml, resolveRelativePath } from "./previewUtils.js";
+import { normalizePath } from "../storage/workspaceDb.js";
+import { getImageMimeType } from "../storage/fileImport.js";
 
-export function buildMarkdownPreview(mdFile) {
-  const renderedBody = renderMarkdownDocumentHtml(mdFile.content || "");
+export function buildMarkdownPreview(mdFile, assetMap = null) {
+  const baseDir = mdFile?.path ? mdFile.path.split("/").slice(0, -1).join("/") : "";
+  const renderedBody = renderMarkdownDocumentHtml(mdFile.content || "", { assetMap, baseDir });
   const safeTitle = escapeHtml(mdFile.shortName);
 
   return `<!DOCTYPE html>
@@ -105,6 +108,15 @@ export function buildMarkdownPreview(mdFile) {
       color: var(--muted);
       font-style: italic;
     }
+    .md-image, .md-article img {
+      max-width: 100%;
+      height: auto;
+      border-radius: 6px;
+      margin: 12px 0;
+      border: 1px solid var(--border);
+      background: repeating-conic-gradient(var(--card) 0% 25%, transparent 0% 50%) 50% / 12px 12px;
+      display: block;
+    }
   </style>
 </head>
 <body>
@@ -187,7 +199,7 @@ export function splitMarkdownCodeFences(rawMd) {
   return blocks;
 }
 
-export function renderMarkdownDocumentHtml(rawMd) {
+export function renderMarkdownDocumentHtml(rawMd, options = {}) {
   const blocks = splitMarkdownCodeFences(rawMd);
 
   return blocks
@@ -195,13 +207,13 @@ export function renderMarkdownDocumentHtml(rawMd) {
       if (b.type === "code") {
         return `<pre><code>${escapeHtml(b.code)}</code></pre>`;
       }
-      return b.text.trim() ? renderMarkdownProseBlock(b.text) : "";
+      return b.text.trim() ? renderMarkdownProseBlock(b.text, options) : "";
     })
     .filter(Boolean)
     .join("\n");
 }
 
-function renderMarkdownProseBlock(text) {
+function renderMarkdownProseBlock(text, options = {}) {
   const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
   const out = [];
   let para = [];
@@ -211,7 +223,7 @@ function renderMarkdownProseBlock(text) {
 
   const flushPara = () => {
     if (para.length > 0) {
-      out.push(`<p>${para.map(formatMdInline).join("<br>")}</p>`);
+      out.push(`<p>${para.map((line) => formatMdInline(line, options)).join("<br>")}</p>`);
       para = [];
     }
   };
@@ -233,10 +245,10 @@ function renderMarkdownProseBlock(text) {
     const hasSep = parsed.length >= 2 && parsed[1].every((c) => /^:?-{2,}:?$/.test(c));
     const head = parsed[0];
     const body = hasSep ? parsed.slice(2) : parsed.slice(1);
-    const thead = `<thead><tr>${head.map((h) => `<th>${formatMdInline(h)}</th>`).join("")}</tr></thead>`;
+    const thead = `<thead><tr>${head.map((h) => `<th>${formatMdInline(h, options)}</th>`).join("")}</tr></thead>`;
     const tbody =
       body.length > 0
-        ? `<tbody>${body.map((row) => `<tr>${row.map((c) => `<td>${formatMdInline(c)}</td>`).join("")}</tr>`).join("")}</tbody>`
+        ? `<tbody>${body.map((row) => `<tr>${row.map((c) => `<td>${formatMdInline(c, options)}</td>`).join("")}</tr>`).join("")}</tbody>`
         : "";
     out.push(`<table>${thead}${tbody}</table>`);
     tableRows = [];
@@ -271,7 +283,7 @@ function renderMarkdownProseBlock(text) {
       flushPara();
       flushList();
       const lvl = hMatch[1].length;
-      out.push(`<h${lvl}>${formatMdInline(hMatch[2])}</h${lvl}>`);
+      out.push(`<h${lvl}>${formatMdInline(hMatch[2], options)}</h${lvl}>`);
       continue;
     }
 
@@ -279,7 +291,7 @@ function renderMarkdownProseBlock(text) {
     if (qMatch) {
       flushPara();
       flushList();
-      out.push(`<blockquote>${formatMdInline(qMatch[1])}</blockquote>`);
+      out.push(`<blockquote>${formatMdInline(qMatch[1], options)}</blockquote>`);
       continue;
     }
 
@@ -288,7 +300,7 @@ function renderMarkdownProseBlock(text) {
       flushPara();
       if (listTag && listTag !== "ul") flushList();
       listTag = "ul";
-      listItems.push(`<li>${formatMdInline(ulMatch[1])}</li>`);
+      listItems.push(`<li>${formatMdInline(ulMatch[1], options)}</li>`);
       continue;
     }
 
@@ -297,7 +309,7 @@ function renderMarkdownProseBlock(text) {
       flushPara();
       if (listTag && listTag !== "ol") flushList();
       listTag = "ol";
-      listItems.push(`<li>${formatMdInline(olMatch[1])}</li>`);
+      listItems.push(`<li>${formatMdInline(olMatch[1], options)}</li>`);
       continue;
     }
 
@@ -311,9 +323,13 @@ function renderMarkdownProseBlock(text) {
   return out.join("\n");
 }
 
-export function formatMdInline(str) {
+export function formatMdInline(str, options = {}) {
   const codes = [];
   const links = [];
+  const images = [];
+  const assetMap = options?.assetMap || null;
+  const baseDir = typeof options?.baseDir === "string" ? options.baseDir : "";
+
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
   const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
@@ -327,6 +343,45 @@ export function formatMdInline(str) {
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
 
   let safe = escapeHtml(masked);
+
+  // Imágenes Markdown: ![alt](url "title")
+  safe = safe.replace(
+    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+(?:"([^"]*)"|'([^']*)'|&quot;([^&]*)&quot;|&#39;([^&]*)&#39;))?\)/g,
+    (_, alt, rawUrl, t1, t2, t3, t4) => {
+      const title = t1 || t2 || t3 || t4 || "";
+      let resolvedSrc = rawUrl;
+      if (assetMap) {
+        const cleanRef = rawUrl.trim().split("?")[0].split("#")[0];
+        const relPath = resolveRelativePath(baseDir, cleanRef);
+        const normRef = normalizePath(cleanRef);
+        const entry = assetMap.get(relPath) || assetMap.get(normRef) || assetMap.get(cleanRef) || null;
+        if (entry) {
+          const ext = (entry.path || cleanRef).split(".").pop().toLowerCase();
+          const b64 = typeof entry.base64 === "string" && entry.base64.length > 0
+            ? entry.base64
+            : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
+              ? entry.content
+              : null;
+          if (b64) {
+            const mime = getImageMimeType(entry.path || cleanRef);
+            resolvedSrc = `data:${mime};base64,${b64}`;
+          } else if (ext === "svg" && typeof entry.content === "string") {
+            const encodedSvg = encodeURIComponent(entry.content)
+              .replace(/'/g, "%27")
+              .replace(/"/g, "%22");
+            resolvedSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+          }
+        }
+      }
+      const safeSrc = /^(https?:|data:image\/|blob:)/i.test(resolvedSrc) ? resolvedSrc : escapeHtml(resolvedSrc);
+      const safeAlt = escapeHtml(alt);
+      const safeTitle = title ? ` title="${escapeHtml(title)}"` : "";
+      const i = images.length;
+      images.push(`<img src="${safeSrc}" alt="${safeAlt}"${safeTitle} class="md-image">`);
+      return `\u0000I${i}\u0000`;
+    }
+  );
+
   safe = safe.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
     (_, label, url) => {
@@ -345,6 +400,7 @@ export function formatMdInline(str) {
   );
   safe = applyEmphasis(safe);
   safe = safe.replace(/\u0000L(\d+)\u0000/g, (_, i) => links[Number(i)] || "");
+  safe = safe.replace(/\u0000I(\d+)\u0000/g, (_, i) => images[Number(i)] || "");
   safe = safe.replace(/\u0000C(\d+)\u0000/g, (_, i) => codes[Number(i)] || "");
   return safe;
 }

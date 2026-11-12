@@ -319,10 +319,8 @@ export function initExplorerController({
     importInput?.click();
   }, listenOpts);
 
-  importInput?.addEventListener("change", async () => {
-    const fileList = importInput.files ? [...importInput.files] : [];
-    importInput.value = "";
-    if (fileList.length === 0) return;
+  async function processImportFileList(fileList) {
+    if (!fileList || fileList.length === 0) return;
 
     const imported = [];
     const rejected = [];
@@ -373,6 +371,33 @@ export function initExplorerController({
       await onImportFiles(imported);
       if (rejectedMsg) setAutosaveStatus(rejectedMsg);
     }, rejectedMsg);
+  }
+
+  importInput?.addEventListener("change", async () => {
+    const fileList = importInput.files ? [...importInput.files] : [];
+    importInput.value = "";
+    await processImportFileList(fileList);
+  }, listenOpts);
+
+  treeContainer?.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    treeContainer.classList.add("is-drag-over");
+  }, listenOpts);
+
+  treeContainer?.addEventListener("dragleave", (event) => {
+    if (event.target === treeContainer || !treeContainer.contains(event.relatedTarget)) {
+      treeContainer.classList.remove("is-drag-over");
+    }
+  }, listenOpts);
+
+  treeContainer?.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    treeContainer.classList.remove("is-drag-over");
+    const fileList = event.dataTransfer?.files ? [...event.dataTransfer.files] : [];
+    if (fileList.length > 0) {
+      await processImportFileList(fileList);
+    }
   }, listenOpts);
 
   function openImportOverwriteConfirm(conflictPaths, onConfirm, rejectedMsg) {

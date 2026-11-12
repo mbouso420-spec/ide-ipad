@@ -39,16 +39,61 @@ export function sanitizeSvgMarkup(svgMarkup) {
  * Renderiza la tarjeta de inspección visual para imágenes y archivos binarios
  * que no deben abrirse como texto en CodeMirror.
  */
-export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
+export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateFileContent }) {
+  let currentActiveFile = null;
+
   function hide() {
+    currentActiveFile = null;
     if (binaryPreviewEl) {
       binaryPreviewEl.hidden = true;
       binaryPreviewEl.innerHTML = "";
     }
   }
 
+  function handleFileSelected(file, selectedFileBlob) {
+    if (!selectedFileBlob || !onUpdateFileContent) return;
+    const ext = (file.path || "").split(".").pop().toLowerCase();
+    if (ext === "svg") {
+      const reader = new FileReader();
+      reader.onload = () => {
+        void onUpdateFileContent(file, { text: String(reader.result || "") });
+      };
+      reader.readAsText(selectedFileBlob, "utf-8");
+    } else {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const res = String(reader.result || "");
+        const commaIdx = res.indexOf(",");
+        const base64 = commaIdx !== -1 ? res.slice(commaIdx + 1) : res;
+        void onUpdateFileContent(file, { base64 });
+      };
+      reader.readAsDataURL(selectedFileBlob);
+    }
+  }
+
+  // Listener para pegar imágenes desde el portapapeles (Ctrl+V / Cmd+V)
+  if (typeof window !== "undefined") {
+    window.addEventListener("paste", (event) => {
+      if (!binaryPreviewEl || binaryPreviewEl.hidden || !currentActiveFile) return;
+      if (!isImageFile(currentActiveFile) || typeof onUpdateFileContent !== "function") return;
+      const items = event.clipboardData?.items;
+      if (!items) return;
+      for (const item of items) {
+        if (item.type && item.type.startsWith("image/")) {
+          const blob = item.getAsFile();
+          if (blob) {
+            event.preventDefault();
+            handleFileSelected(currentActiveFile, blob);
+            break;
+          }
+        }
+      }
+    });
+  }
+
   function render(file) {
     if (!binaryPreviewEl) return;
+    currentActiveFile = file;
     binaryPreviewEl.hidden = false;
     binaryPreviewEl.innerHTML = "";
 
@@ -72,9 +117,44 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
       }
     }
 
-    const safeSvg = !safeBase64 && ext === "svg" && typeof file.content === "string"
+    const safeSvg = !safeBase64 && ext === "svg" && typeof file.content === "string" && file.content.trim().length > 0
       ? sanitizeSvgMarkup(file.content)
       : null;
+
+    // Soporte de Drag & Drop sobre la tarjeta
+    card.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+      card.classList.add("is-drag-over");
+    });
+
+    card.addEventListener("dragleave", (event) => {
+      if (event.target === card || !card.contains(event.relatedTarget)) {
+        card.classList.remove("is-drag-over");
+      }
+    });
+
+    card.addEventListener("drop", (event) => {
+      event.preventDefault();
+      card.classList.remove("is-drag-over");
+      const droppedFile = event.dataTransfer?.files?.[0];
+      if (droppedFile && isImg) {
+        handleFileSelected(file, droppedFile);
+      }
+    });
+
+    const fileInput = document.createElement("input");
+    fileInput.type = "file";
+    fileInput.accept = isImg ? "image/*" : "*/*";
+    fileInput.style.display = "none";
+    fileInput.addEventListener("change", () => {
+      const selected = fileInput.files?.[0];
+      if (selected) {
+        handleFileSelected(file, selected);
+      }
+      fileInput.value = "";
+    });
+    card.appendChild(fileInput);
 
     if (isImg && (safeBase64 || safeSvg)) {
       const mime = getImageMimeType(file.path);
@@ -122,6 +202,41 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
 
       info.appendChild(meta);
       card.appendChild(info);
+    } else if (isImg && !safeBase64 && !safeSvg) {
+      // Imagen vacía: asistente para cargar o pegar imagen
+      const mark = document.createElement("div");
+      mark.className = "editor-empty-mark";
+      mark.innerHTML = icon("image");
+      card.appendChild(mark);
+
+      const info = document.createElement("div");
+      info.className = "editor-binary-info";
+
+      const title = document.createElement("h2");
+      title.className = "editor-binary-title";
+      title.textContent = file.shortName;
+      info.appendChild(title);
+
+      const meta = document.createElement("div");
+      meta.className = "editor-binary-meta";
+
+      const badge = document.createElement("span");
+      badge.className = "editor-binary-badge";
+      badge.textContent = ext ? ext.toUpperCase() : "IMG";
+      meta.appendChild(badge);
+
+      const stateSpan = document.createElement("span");
+      stateSpan.textContent = "Archivo vacío";
+      meta.appendChild(stateSpan);
+
+      info.appendChild(meta);
+
+      const desc = document.createElement("p");
+      desc.className = "editor-binary-desc";
+      desc.textContent = "Este archivo de imagen todavía no contiene datos. Podés cargar un archivo desde tu dispositivo, arrastrar una imagen aquí o pegarla con Ctrl+V.";
+      info.appendChild(desc);
+
+      card.appendChild(info);
     } else {
       const mark = document.createElement("div");
       mark.className = "editor-empty-mark";
@@ -162,6 +277,17 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
 
     const actions = document.createElement("div");
     actions.className = "editor-binary-actions";
+
+    if (isImg && typeof onUpdateFileContent === "function") {
+      const uploadBtn = document.createElement("button");
+      uploadBtn.type = "button";
+      uploadBtn.className = (safeBase64 || safeSvg) ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm";
+      uploadBtn.innerHTML = `${icon("upload")} <span>${(safeBase64 || safeSvg) ? "Reemplazar imagen" : "Cargar imagen"}</span>`;
+      uploadBtn.addEventListener("click", () => {
+        fileInput.click();
+      });
+      actions.appendChild(uploadBtn);
+    }
 
     const dlBtn = document.createElement("button");
     dlBtn.type = "button";

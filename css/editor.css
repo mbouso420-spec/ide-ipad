@@ -294,6 +294,14 @@
   border: var(--rule-hair) solid var(--color-rule);
   text-align: center;
   box-shadow: var(--shadow-card);
+  transition: border-color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.editor-binary-card.is-drag-over {
+  border-color: var(--color-accent) !important;
+  background: var(--color-paper-3);
+  outline: 2px dashed var(--color-accent);
+  outline-offset: -4px;
 }
 
 .editor-binary-image-container {

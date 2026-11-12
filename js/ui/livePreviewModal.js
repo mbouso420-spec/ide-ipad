@@ -64,7 +64,9 @@ import {
   buildStandaloneJsPreview,
   buildStandaloneTsPreview,
   buildStandalonePythonPreview,
-  buildMarkdownPreview
+  buildMarkdownPreview,
+  IMAGE_EXTENSIONS,
+  buildStandaloneImagePreview
 } from "../preview/htmlBundler.js";
 
 export * from "../preview/htmlBundler.js";
@@ -129,6 +131,8 @@ export function initLivePreviewModal({
   let jsRunOverride = "auto";
   /** @type {"auto" | "browser" | "compiler"} */
   let tsRunOverride = "auto";
+  /** @type {"auto" | "standalone" | "folder"} */
+  let imageRunOverride = "auto";
   let activeCRunnerDestroy = null;
   const replHistory = [];
   let replHistoryIdx = -1;
@@ -384,6 +388,7 @@ export function initLivePreviewModal({
   openBtn?.addEventListener("click", async () => {
     jsRunOverride = "auto";
     tsRunOverride = "auto";
+    imageRunOverride = "auto";
     await loadAcorn();
     await openPreview();
   }, listenOpts);
@@ -410,6 +415,8 @@ export function initLivePreviewModal({
   jsModeBtn?.addEventListener("click", () => {
     if (TS_EXTENSIONS.has(activePreviewExt)) {
       tsRunOverride = tsRunOverride === "compiler" ? "browser" : "compiler";
+    } else if (IMAGE_EXTENSIONS.has(activePreviewExt)) {
+      imageRunOverride = imageRunOverride === "folder" ? "standalone" : "folder";
     } else {
       jsRunOverride = jsRunOverride === "folder" ? "standalone" : "folder";
     }
@@ -901,7 +908,7 @@ export function initLivePreviewModal({
     // 5. Pestaña Markdown (.md / README.md): documento formateado limpio
     if (MARKDOWN_EXTENSIONS.has(ext)) {
       hideWebNavigationControls();
-      const compiledMdHtml = buildMarkdownPreview(activeFile);
+      const compiledMdHtml = buildMarkdownPreview(activeFile, buildWorkspaceAssetMap(files));
       showRunnableIframe({
         headerTitle: "Vista previa de Markdown",
         badgeText: activeFile.path,
@@ -993,13 +1000,68 @@ export function initLivePreviewModal({
       return;
     }
 
-    // 8. Extensiones no soportadas
+    // 9. Pestaña Imagen (.png, .jpg, .jpeg, .gif, .webp, .avif, .ico, .bmp, .svg)
+    if (IMAGE_EXTENSIONS.has(ext)) {
+      const savedHtml = getSavedPreviewHtml(projectId);
+      const bestHtml = findBestHtmlEntrypoint(files, activeFile, savedHtml);
+
+      if (imageRunOverride === "auto") {
+        imageRunOverride = bestHtml ? "folder" : "standalone";
+      }
+
+      if (imageRunOverride === "folder" && bestHtml) {
+        currentPreviewPath = bestHtml.path;
+        historyStack = [bestHtml.path];
+        historyIndex = 0;
+        updateNavButtons();
+        syncPageSelect(files, bestHtml.path);
+
+        const { html, assetMap } = await prepareHtmlForPreview(bestHtml, files);
+        if (isStale()) return;
+        assetMap.set(normalizePath(activeFile.path), activeFile);
+
+        const compiledHtml = bundleHtmlWithFolderAssets(
+          bestHtml.path,
+          html,
+          assetMap,
+          null,
+          guardJs,
+          null,
+          true
+        );
+        showRunnableIframe({
+          headerTitle: "Vista previa de Imagen en HTML",
+          badgeText: `${activeFile.path} (${bestHtml.shortName || bestHtml.path})`,
+          compiledHtml,
+          siblingHtml: bestHtml,
+          modeLabel: "Ver imagen individual"
+        });
+        return;
+      }
+
+      hideWebNavigationControls();
+      if (isFileContentUnloaded(activeFile) && typeof ensureFileLoaded === "function") {
+        await ensureFileLoaded(activeFile);
+        if (isStale()) return;
+      }
+      const compiledImgHtml = buildStandaloneImagePreview(activeFile);
+      showRunnableIframe({
+        headerTitle: "Vista previa de Imagen",
+        badgeText: activeFile.path,
+        compiledHtml: compiledImgHtml,
+        siblingHtml: bestHtml,
+        modeLabel: bestHtml ? "Ver en HTML del proyecto" : ""
+      });
+      return;
+    }
+
+    // 10. Extensiones no soportadas
     hideWebNavigationControls();
     showUnavailableState({
       headerTitle: "Vista previa",
       badgeText: activeFile.path,
       messageTitle: `La vista previa no está disponible para este archivo ${extLabel}`,
-      messageDesc: "La vista previa en vivo ejecuta archivos .html, .js, .ts, .css (en conjunto con el proyecto web), scripts .py de Python, bases de datos .sql de SQLite, código C/C++, Java, C# y documentos .md."
+      messageDesc: "La vista previa en vivo ejecuta archivos .html, .js, .ts, .css (en conjunto con el proyecto web), imágenes (.png, .jpg, .webp, .svg…), scripts .py de Python, bases de datos .sql de SQLite, código C/C++, Java, C# y documentos .md."
     });
   }
 

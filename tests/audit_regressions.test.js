@@ -12,9 +12,10 @@ import { initLayoutController } from "../js/ui/layout.js";
 import { initQuickOpenModal } from "../js/ui/quickOpenModal.js";
 import { createMinimapController } from "../js/editor/minimap.js";
 import { formatInlineMarkdown } from "../js/ai/chatController.js";
-import { formatMdInline } from "../js/preview/markdownPreview.js";
+import { formatMdInline, buildMarkdownPreview } from "../js/preview/markdownPreview.js";
 import { buildZipArchive } from "../js/storage/zipExporter.js";
-import { bundleHtmlWithFolderAssets } from "../js/preview/htmlBundler.js";
+import { bundleHtmlWithFolderAssets, extractReferencedAssetPaths, buildStandaloneImagePreview } from "../js/preview/htmlBundler.js";
+import { createBinaryPreview } from "../js/ui/binaryPreview.js";
 import { inspectModuleUsage, buildVirtualModuleBundle } from "../js/preview/moduleBundler.js";
 import { transpileTypeScriptAndJsx } from "../js/preview/tsTranspiler.js";
 import {
@@ -399,6 +400,118 @@ describe("Regresiones de Auditoría Integral", () => {
       });
       assert.equal(bundle.isAsync, false);
       assert.deepEqual(bundle.externalSpecifiers, ["https://cdn.example/static.js"]);
+    });
+
+    test("soporta imágenes completas: inlining en HTML (img, picture, srcset, favicon, poster, inline style, SVG), extracción de assets, Markdown preview y visor standalone", () => {
+      const assetMap = new Map([
+        ["logo.png", { path: "logo.png", content: "", isBinary: true, base64: "AQID" }],
+        ["hero.webp", { path: "hero.webp", content: "", isBinary: true, base64: "BAUG" }],
+        ["hero-2x.webp", { path: "hero-2x.webp", content: "", isBinary: true, base64: "BwgJ" }],
+        ["favicon.ico", { path: "favicon.ico", content: "", isBinary: true, base64: "CgsM" }],
+        ["video-poster.jpg", { path: "video-poster.jpg", content: "", isBinary: true, base64: "DQ4P" }],
+        ["btn.png", { path: "btn.png", content: "", isBinary: true, base64: "EBES" }],
+        ["badge.svg", { path: "badge.svg", content: '<svg width="20" height="20"></svg>', isBinary: false }],
+        ["bg.png", { path: "bg.png", content: "", isBinary: true, base64: "ExQV" }]
+      ]);
+
+      const rawHtml = [
+        '<!DOCTYPE html>',
+        '<html>',
+        '<head>',
+        '  <link rel="icon" href="favicon.ico">',
+        '</head>',
+        '<body>',
+        '  <div style="background-image: url(\'bg.png\');">',
+        '    <img src="logo.png" alt="Logo">',
+        '    <picture>',
+        '      <source srcset="hero.webp 1x, hero-2x.webp 2x">',
+        '      <img src="logo.png" alt="Hero">',
+        '    </picture>',
+        '    <video poster="video-poster.jpg"></video>',
+        '    <input type="image" src="btn.png">',
+        '    <svg><image href="badge.svg"></image></svg>',
+        '  </div>',
+        '</body>',
+        '</html>'
+      ].join("\n");
+
+      // 1. Bundle HTML con imágenes inlined
+      const bundled = bundleHtmlWithFolderAssets("index.html", rawHtml, assetMap);
+      assert.ok(bundled.includes('data:image/x-icon;base64,CgsM'), "favicon inlined");
+      assert.ok(bundled.includes('data:image/png;base64,ExQV'), "inline style inlined");
+      assert.ok(bundled.includes('data:image/png;base64,AQID'), "img inlined");
+      assert.ok(bundled.includes('data:image/webp;base64,BAUG 1x'), "srcset 1x inlined");
+      assert.ok(bundled.includes('data:image/webp;base64,BwgJ 2x'), "srcset 2x inlined");
+      assert.ok(bundled.includes('data:image/jpeg;base64,DQ4P'), "video poster inlined");
+      assert.ok(bundled.includes('data:image/png;base64,EBES'), "input image inlined");
+      assert.ok(bundled.includes('data:image/svg+xml;charset=utf-8'), "svg image inlined");
+
+      // 2. Extracción de dependencias transitivas completas
+      const extracted = extractReferencedAssetPaths("index.html", rawHtml, { includeMedia: true });
+      assert.ok(extracted.includes("favicon.ico"));
+      assert.ok(extracted.includes("bg.png"));
+      assert.ok(extracted.includes("logo.png"));
+      assert.ok(extracted.includes("hero.webp"));
+      assert.ok(extracted.includes("hero-2x.webp"));
+      assert.ok(extracted.includes("video-poster.jpg"));
+      assert.ok(extracted.includes("btn.png"));
+      assert.ok(extracted.includes("badge.svg"));
+
+      // 3. Previsualización de imágenes en Markdown
+      const mdDoc = {
+        path: "README.md",
+        shortName: "README.md",
+        content: '# Guía\n\n![Logotipo](./logo.png "Mi Logo")\n\n![Remoto](https://example.com/ext.png)'
+      };
+      const renderedMd = buildMarkdownPreview(mdDoc, assetMap);
+      assert.ok(renderedMd.includes('data:image/png;base64,AQID'), "markdown local image inlined");
+      assert.ok(renderedMd.includes('title="Mi Logo"'));
+      assert.ok(renderedMd.includes('class="md-image"'));
+      assert.ok(renderedMd.includes('src="https://example.com/ext.png"'));
+
+      // 4. Visor standalone de imágenes
+      const standalone = buildStandaloneImagePreview({
+        path: "logo.png",
+        shortName: "logo.png",
+        base64: "AQID",
+        isBinary: true
+      });
+      assert.ok(standalone.includes("<!DOCTYPE html>"));
+      assert.ok(standalone.includes("data:image/png;base64,AQID"));
+      assert.ok(standalone.includes('id="btn-fit"'));
+      assert.ok(standalone.includes('id="btn-100"'));
+      assert.ok(standalone.includes('id="btn-200"'));
+
+      // 5. Binary preview card para archivo de imagen vacío con callback de actualización
+      const mockContainer = {
+        hidden: true,
+        innerHTML: "",
+        appendChild(child) {
+          this.child = child;
+        }
+      };
+      let updatedPayload = null;
+      const binController = createBinaryPreview({
+        binaryPreviewEl: mockContainer,
+        onDownloadFile: () => {},
+        onUpdateFileContent: (file, payload) => {
+          updatedPayload = payload;
+        }
+      });
+      binController.render({
+        path: "empty.png",
+        shortName: "empty.png",
+        isBinary: true,
+        base64: null,
+        content: ""
+      });
+      assert.equal(mockContainer.hidden, false);
+      assert.ok(mockContainer.child);
+      assert.equal(updatedPayload, null);
+      const desc = mockContainer.child.querySelector(".editor-binary-desc");
+      assert.ok(desc && desc.textContent.includes("imagen"));
+      const uploadBtn = mockContainer.child.querySelector(".btn-primary");
+      assert.ok(uploadBtn);
     });
   });
 

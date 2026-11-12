@@ -64,7 +64,7 @@ import {
 } from "./storage/workspaceDb.js";
 import { keyboardRouter } from "./ui/keyboardRouter.js";
 import { restoreEmergencyBackup } from "./storage/emergencyBackup.js";
-import { base64ToUint8Array, isBinaryFile } from "./storage/fileImport.js";
+import { base64ToUint8Array, isBinaryFile, isImageFile } from "./storage/fileImport.js";
 import { downloadBlob } from "./utils/dom.js";
 import { readStoredValue } from "./utils/storage.js";
 import { createAutosaveManager } from "./workspace/autosaveManager.js";
@@ -138,7 +138,36 @@ async function initApp() {
 
   const binaryPreview = createBinaryPreview({
     binaryPreviewEl: document.getElementById("editor-binary-preview"),
-    onDownloadFile: downloadCurrentActiveFile
+    onDownloadFile: downloadCurrentActiveFile,
+    async onUpdateFileContent(file, payload) {
+      if (!activeProject || !file) return;
+      await autosaveManager.flushPendingSaves();
+      const isSvgText = typeof payload?.text === "string";
+      const base64 = isSvgText ? null : (payload?.base64 || null);
+      const content = isSvgText ? payload.text : "";
+      const isBinary = !isSvgText;
+
+      await upsertEntry(activeProject.id, file.path, {
+        isFolder: false,
+        content,
+        isBinary,
+        base64
+      });
+
+      file.content = content;
+      file.base64 = base64;
+      file.isBinary = isBinary;
+      file.contentLoaded = true;
+
+      editor.dropFileState(file.path);
+      await reloadProjectEntries();
+      const updated = filesOnly.find((f) => f.id === file.id);
+      if (updated) {
+        binaryPreview.render(updated);
+      }
+      explorer.setAutosaveStatus("Imagen guardada en el proyecto");
+      await github.refreshTopbarBadge();
+    }
   });
 
   /** @type {ReturnType<typeof createSplitEditorController> | null} */
@@ -549,9 +578,12 @@ async function initApp() {
     },
     async onCreateEntry(path, isFolder) {
       await autosaveManager.flushPendingSaves();
+      const isImg = !isFolder && isImageFile(path) && !path.toLowerCase().endsWith(".svg");
       await upsertEntry(activeProject.id, path, {
         isFolder,
-        content: isFolder ? "" : defaultStarterTemplate(path),
+        content: isFolder ? "" : (isImg ? "" : defaultStarterTemplate(path)),
+        isBinary: isImg,
+        base64: null,
         allowOverwrite: false
       });
       await reloadProjectEntries();
