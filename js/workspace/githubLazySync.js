@@ -1,3 +1,5 @@
+import { isImageFile } from "../storage/fileImport.js";
+
 const PREVIEWABLE_LANGS = new Set([
   "html",
   "js",
@@ -179,9 +181,10 @@ export function createGithubLazySync({
   async function preloadForPreview(activeFile) {
     const activeProject = getActiveProject();
     if (!activeProject || activeProject.kind !== "github" || !activeFile) return;
-    if (!PREVIEWABLE_LANGS.has(activeFile.lang)) return;
+    const activeIsImage = isImageFile(activeFile);
+    if (!activeIsImage && !PREVIEWABLE_LANGS.has(activeFile.lang)) return;
 
-    if (activeFile.lang === "markdown") {
+    if (activeIsImage || activeFile.lang === "markdown") {
       if (activeFile.contentLoaded === false && activeFile.blobSha) {
         try {
           await ensureFileContentLoaded(activeFile);
@@ -189,7 +192,9 @@ export function createGithubLazySync({
           // Se muestra con el estado actual en memoria
         }
       }
-      return;
+      if (activeIsImage) {
+        return;
+      }
     }
 
     const lastSlash = activeFile.path.lastIndexOf("/");
@@ -203,7 +208,10 @@ export function createGithubLazySync({
 
     const needed = getFilesOnly().filter((f) => {
       if (f.contentLoaded !== false || !f.blobSha) return false;
-      if (!isWeb && folderPrefix && !f.path.startsWith(folderPrefix)) return false;
+      if (!isWeb && activeFile.lang !== "markdown" && folderPrefix && !f.path.startsWith(folderPrefix)) return false;
+      if (activeFile.lang === "markdown") {
+        return isImageFile(f);
+      }
       if (activeFile.lang === "python") {
         return f.lang === "python";
       }
@@ -226,7 +234,8 @@ export function createGithubLazySync({
         f.lang === "ts" ||
         f.lang === "tsx" ||
         f.lang === "css" ||
-        f.path.endsWith(".json")
+        f.path.endsWith(".json") ||
+        isImageFile(f)
       );
     });
 

@@ -1,3 +1,5 @@
+import { downloadBlob } from "../utils/dom.js";
+
 /**
  * Exportador puro de proyectos a archivos .zip estándar (PKZIP 2.0).
  * 100% Offline, sin dependencias externas ni CDNs (cumple estrictamente con la CSP).
@@ -51,7 +53,7 @@ export function getDosDateTime(date = new Date()) {
 function sanitizeZipDownloadFilename(filename) {
   const clean = String(filename || "")
     .replace(/[\x00-\x1f\x7f]/g, "")
-    .replace(/[\/\\:*?"<>|]/g, "_")
+    .replace(/[/\\:*?"<>|]/g, "_")
     .replace(/^\.+/, "")
     .trim();
   const base = clean || "proyecto.zip";
@@ -254,12 +256,5 @@ export function downloadZip(zipBytesOrBlob, filename = "proyecto.zip") {
     typeof Blob !== "undefined" && zipBytesOrBlob instanceof Blob
       ? zipBytesOrBlob
       : new Blob([zipBytesOrBlob], { type: "application/zip" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = sanitizeZipDownloadFilename(filename);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return downloadBlob(blob, sanitizeZipDownloadFilename(filename), { revokeDelayMs: 1000 });
 }

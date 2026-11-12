@@ -9,7 +9,7 @@
 - **Versión actual:** `1.2.0`
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 590 pruebas automatizadas en 139 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
+- **Suite de pruebas automáticas:** 599 pruebas automatizadas en 140 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
 
 ---
 

@@ -11,6 +11,7 @@ export const DEFAULT_PBKDF2_ITERATIONS = 210_000;
 export const MIN_PBKDF2_ITERATIONS = 10_000;
 export const MAX_PBKDF2_ITERATIONS = 2_000_000;
 export const MIN_PASSPHRASE_LENGTH = 6;
+export const MAX_PASSPHRASE_LENGTH = 512;
 export const MAX_VAULT_JSON_BYTES = 1024 * 1024; // 1 MB límite seguro antes de JSON.parse
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
@@ -34,6 +35,11 @@ function validatePassphrase(passphrase) {
   if (typeof passphrase !== "string" || passphrase.length < MIN_PASSPHRASE_LENGTH) {
     throw new Error(
       `La contraseña maestra debe tener al menos ${MIN_PASSPHRASE_LENGTH} caracteres.`
+    );
+  }
+  if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
+    throw new Error(
+      `La contraseña maestra no puede superar los ${MAX_PASSPHRASE_LENGTH} caracteres.`
     );
   }
   if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(passphrase)) {
@@ -106,6 +112,9 @@ function buildVaultAad(iterations, kdf = "PBKDF2-SHA256", cipher = "AES-GCM-256"
 export async function encryptKeysPayload(plainJson, passphrase, options = {}) {
   if (typeof plainJson !== "string" || !plainJson.trim()) {
     throw new Error("No hay credenciales para cifrar.");
+  }
+  if (plainJson.length > MAX_VAULT_JSON_BYTES) {
+    throw new Error("Las credenciales exceden el tamaño máximo permitido para cifrar.");
   }
   validatePassphrase(passphrase);
 

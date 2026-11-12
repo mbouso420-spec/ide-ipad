@@ -11,18 +11,20 @@ export function initDiffModal() {
   const cancelBtn = document.getElementById("btn-diff-cancel");
   const confirmBtn = document.getElementById("btn-diff-confirm");
 
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
   let pendingConfirmAction = null;
 
-  closeBtn?.addEventListener("click", () => close());
-  cancelBtn?.addEventListener("click", () => close());
+  closeBtn?.addEventListener("click", () => close(), listenOpts);
+  cancelBtn?.addEventListener("click", () => close(), listenOpts);
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
       close();
     }
-  });
+  }, listenOpts);
   dialog?.addEventListener("close", () => {
     pendingConfirmAction = null;
-  });
+  }, listenOpts);
 
   confirmBtn?.addEventListener("click", () => {
     const action = pendingConfirmAction;
@@ -30,7 +32,7 @@ export function initDiffModal() {
     if (typeof action === "function") {
       action();
     }
-  });
+  }, listenOpts);
 
   function close() {
     pendingConfirmAction = null;
@@ -131,6 +133,10 @@ export function initDiffModal() {
         newCode,
         onConfirm: null
       });
+    },
+    destroy() {
+      pendingConfirmAction = null;
+      listenerController?.abort();
     }
   };
 }

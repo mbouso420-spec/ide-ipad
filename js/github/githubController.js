@@ -110,19 +110,22 @@ export function initGithubController({
     if (tokenWarning) tokenWarning.hidden = true;
   }
 
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
+
   tokenReconnectBtn?.addEventListener("click", () => {
     openDialogBtn?.click();
     window.setTimeout(() => {
       tokenInput?.focus();
       tokenInput?.select();
     }, 50);
-  });
+  }, listenOpts);
 
   window?.addEventListener?.("studio-credentials-updated", () => {
     const updatedToken = getGithubToken();
     syncTokenPlaceholder(updatedToken);
     if (updatedToken) hideTokenWarning();
-  });
+  }, listenOpts);
 
   let reposCache = [];
   let connectedUserLogin = getCachedGithubUserLogin();
@@ -1347,6 +1350,11 @@ export function initGithubController({
 
   return {
     refreshTopbarBadge,
-    syncExplorerReposInBackground
+    syncExplorerReposInBackground,
+    destroy() {
+      window.clearTimeout(pullConfirmTimer);
+      window.clearTimeout(openConfirmTimer);
+      listenerController?.abort();
+    }
   };
 }

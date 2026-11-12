@@ -3,8 +3,9 @@
  */
 
 import { normalizePath } from "../storage/workspaceDb.js";
+import { escapeHtml } from "../utils/dom.js";
 
-export { normalizePath };
+export { normalizePath, escapeHtml };
 
 export const HTML_EXTENSIONS = new Set(["html", "htm"]);
 export const JS_EXTENSIONS = new Set(["js", "mjs", "cjs"]);
@@ -65,18 +66,6 @@ export function resolveRelativePath(baseDir, relPath) {
     }
   }
   return stack.join("/");
-}
-
-/**
- * Escapa texto para inserción segura en HTML y atributos (incluye comilla simple).
- */
-export function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 export function escapeAttr(str) {

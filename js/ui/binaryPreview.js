@@ -1,5 +1,10 @@
 import { icon } from "./icons.js";
-import { getImageMimeType, isImageFile } from "../storage/fileImport.js";
+import {
+  getImageMimeType,
+  isImageFile,
+  MAX_IMPORT_FILE_BYTES
+} from "../storage/fileImport.js";
+import { formatStorageBytes } from "../storage/storageQuota.js";
 
 const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
@@ -25,11 +30,11 @@ export function sanitizeSvgMarkup(svgMarkup) {
     .replace(/<script\b[^>]*\/?>/gi, "")
     .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
     .replace(/<foreignObject\b[^>]*\/?>/gi, "")
-    .replace(/<(iframe|object|embed|applet|meta|base)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-    .replace(/<(iframe|object|embed|applet|meta|base)\b[^>]*\/?>/gi, "")
-    .replace(/\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-    .replace(/(href|xlink:href|src)\s*=\s*(?:"\s*(?:javascript|vbscript|data\s*:\s*text\/html)[^"]*"|'\s*(?:javascript|vbscript|data\s*:\s*text\/html)[^']*'|[^\s>]*javascript:[^\s>]*)/gi, '$1="#"');
-  if (!/<svg[\s>]/i.test(cleaned)) {
+    .replace(/<(iframe|object|embed|applet|meta|base|set|animate)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+    .replace(/<(iframe|object|embed|applet|meta|base|set|animate)\b[^>]*\/?>/gi, "")
+    .replace(/[\s/]+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, " ")
+    .replace(/(href|xlink:href|src|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data\s*:\s*(?:text\/html|image\/svg\+xml))[^"]*"|'\s*(?:javascript|vbscript|data\s*:\s*(?:text\/html|image\/svg\+xml))[^']*'|[^\s>]*(?:javascript|vbscript):[^\s>]*)/gi, '$1="#"');
+  if (!/<svg[\s>/]/i.test(cleaned)) {
     return null;
   }
   return cleaned;
@@ -41,6 +46,8 @@ export function sanitizeSvgMarkup(svgMarkup) {
  */
 export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateFileContent }) {
   let currentActiveFile = null;
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
 
   function hide() {
     currentActiveFile = null;
@@ -50,13 +57,48 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     }
   }
 
+  function destroy() {
+    listenerController?.abort();
+    hide();
+  }
+
+  function showInlineUploadError(message) {
+    if (!binaryPreviewEl) return;
+    let msgEl = binaryPreviewEl.querySelector(".editor-binary-error");
+    if (!msgEl) {
+      msgEl = document.createElement("div");
+      msgEl.className = "editor-binary-error";
+      msgEl.setAttribute("role", "alert");
+      if (typeof binaryPreviewEl.prepend === "function") {
+        binaryPreviewEl.prepend(msgEl);
+      } else {
+        binaryPreviewEl.appendChild(msgEl);
+      }
+    }
+    msgEl.textContent = message;
+  }
+
   function handleFileSelected(file, selectedFileBlob) {
     if (!selectedFileBlob || !onUpdateFileContent) return;
+    if (typeof selectedFileBlob.size === "number" && selectedFileBlob.size > MAX_IMPORT_FILE_BYTES) {
+      showInlineUploadError("La imagen supera el límite seguro de 5 MB por archivo.");
+      return;
+    }
     const ext = (file.path || "").split(".").pop().toLowerCase();
     if (ext === "svg") {
       const reader = new FileReader();
       reader.onload = () => {
-        void onUpdateFileContent(file, { text: String(reader.result || "") });
+        const text = String(reader.result || "");
+        if (/^\s*(?:<!doctype\s+html\b|<html\b)/i.test(text)) {
+          showInlineUploadError("El archivo contiene marcado HTML disfrazado de SVG y fue rechazado.");
+          return;
+        }
+        const safeSvg = sanitizeSvgMarkup(text);
+        if (!safeSvg) {
+          showInlineUploadError("El archivo seleccionado no es un SVG válido.");
+          return;
+        }
+        void onUpdateFileContent(file, { text: safeSvg });
       };
       reader.readAsText(selectedFileBlob, "utf-8");
     } else {
@@ -65,7 +107,30 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
         const res = String(reader.result || "");
         const commaIdx = res.indexOf(",");
         const base64 = commaIdx !== -1 ? res.slice(commaIdx + 1) : res;
-        void onUpdateFileContent(file, { base64 });
+        const cleanB64 = sanitizeBase64Payload(base64);
+        if (!cleanB64) {
+          showInlineUploadError("La imagen seleccionada no contiene datos binarios válidos.");
+          return;
+        }
+        try {
+          if (typeof atob === "function") {
+            const headB64Len = Math.min(cleanB64.length, 1368);
+            const paddedHead = cleanB64.slice(0, headB64Len - (headB64Len % 4));
+            const headText = paddedHead ? atob(paddedHead).replace(/^\uFEFF|^\xEF\xBB\xBF/, "").trimStart() : "";
+            if (
+              headText &&
+              !headText.includes("\u0000") &&
+              (/^(?:<!doctype\s+html\b|<html\b|<script\b|<svg\b)/i.test(headText) ||
+                /^<\?xml\b[\s\S]{0,256}<(?:svg|script)\b/i.test(headText))
+            ) {
+              showInlineUploadError("El archivo contiene marcado HTML/SVG/script disfrazado de imagen y fue rechazado.");
+              return;
+            }
+          }
+        } catch {
+          // Si atob falla sobre el prefijo parcial, delegamos al guardado normal
+        }
+        void onUpdateFileContent(file, { base64: cleanB64 });
       };
       reader.readAsDataURL(selectedFileBlob);
     }
@@ -88,7 +153,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
           }
         }
       }
-    });
+    }, listenOpts);
   }
 
   function render(file) {
@@ -107,14 +172,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
 
     let sizeFormatted = "";
     if (safeBase64) {
-      const bytesLen = Math.floor((safeBase64.length * 3) / 4);
-      if (bytesLen < 1024) {
-        sizeFormatted = `${bytesLen} B`;
-      } else if (bytesLen < 1024 * 1024) {
-        sizeFormatted = `${(bytesLen / 1024).toFixed(1)} KB`;
-      } else {
-        sizeFormatted = `${(bytesLen / (1024 * 1024)).toFixed(2)} MB`;
-      }
+      sizeFormatted = formatStorageBytes(Math.floor((safeBase64.length * 3) / 4));
     }
 
     const safeSvg = !safeBase64 && ext === "svg" && typeof file.content === "string" && file.content.trim().length > 0
@@ -302,5 +360,5 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     binaryPreviewEl.appendChild(card);
   }
 
-  return { hide, render };
+  return { hide, render, destroy };
 }

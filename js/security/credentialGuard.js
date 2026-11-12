@@ -282,17 +282,6 @@ export function isTokenRejectedInSession(scope, rawToken) {
 }
 
 /**
- * Elimina un token específico de la lista negra de sesión (p. ej. si fue renovado).
- * @param {string} scope
- * @param {string} rawToken
- */
-export function clearRejectedTokenFromSession(scope, rawToken) {
-  const clean = String(rawToken || "").trim();
-  if (!clean) return;
-  rejectedHashesByScope.get(scope)?.delete(computeTokenFingerprint(scope, clean));
-}
-
-/**
  * Valida localmente formato, longitud mínima, ausencia de caracteres de control/espacios,
  * prefijo y entropía mínima ANTES de disparar cualquier petición HTTP.
  *

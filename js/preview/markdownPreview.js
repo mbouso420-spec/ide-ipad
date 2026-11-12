@@ -2,7 +2,7 @@
  * Renderizador seguro 100% offline de documentos Markdown (.md / README.md) para Vista Previa.
  */
 
-import { escapeHtml, resolveRelativePath } from "./previewUtils.js";
+import { escapeHtml, isBlockedPreviewUrlScheme, normalizePreviewUrlRef, resolveRelativePath } from "./previewUtils.js";
 import { normalizePath } from "../storage/workspaceDb.js";
 import { getImageMimeType } from "../storage/fileImport.js";
 
@@ -346,7 +346,7 @@ export function formatMdInline(str, options = {}) {
 
   // Imágenes Markdown: ![alt](url "title")
   safe = safe.replace(
-    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+(?:"([^"]*)"|'([^']*)'|&quot;([^&]*)&quot;|&#39;([^&]*)&#39;))?\)/g,
+    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+(?:"([^"]*)"|'([^']*)'|&quot;((?:(?!&quot;).)*)&quot;|&#39;((?:(?!&#39;).)*)&#39;))?\)/g,
     (_, alt, rawUrl, t1, t2, t3, t4) => {
       const title = t1 || t2 || t3 || t4 || "";
       let resolvedSrc = rawUrl;
@@ -357,11 +357,13 @@ export function formatMdInline(str, options = {}) {
         const entry = assetMap.get(relPath) || assetMap.get(normRef) || assetMap.get(cleanRef) || null;
         if (entry) {
           const ext = (entry.path || cleanRef).split(".").pop().toLowerCase();
-          const b64 = typeof entry.base64 === "string" && entry.base64.length > 0
+          const rawB64 = typeof entry.base64 === "string" && entry.base64.length > 0
             ? entry.base64
             : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
               ? entry.content
               : null;
+          const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
+          const b64 = compactB64 && /^[A-Za-z0-9+/_=-]+$/.test(compactB64) ? compactB64 : null;
           if (b64) {
             const mime = getImageMimeType(entry.path || cleanRef);
             resolvedSrc = `data:${mime};base64,${b64}`;
@@ -373,11 +375,16 @@ export function formatMdInline(str, options = {}) {
           }
         }
       }
-      const safeSrc = /^(https?:|data:image\/|blob:)/i.test(resolvedSrc) ? resolvedSrc : escapeHtml(resolvedSrc);
-      const safeAlt = escapeHtml(alt);
-      const safeTitle = title ? ` title="${escapeHtml(title)}"` : "";
+      const normCandidate = normalizePreviewUrlRef(resolvedSrc);
+      const isSafeDataImage = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|ico|svg\+xml)[;,]/i.test(normCandidate);
+      if (isBlockedPreviewUrlScheme(normCandidate) && !isSafeDataImage) {
+        const safeLabel = escapeHtml(alt || "imagen bloqueada");
+        return `<span class="md-blocked-img">[${safeLabel}]</span>`;
+      }
+      const safeSrc = resolvedSrc;
+      const safeTitle = title ? ` title="${title}"` : "";
       const i = images.length;
-      images.push(`<img src="${safeSrc}" alt="${safeAlt}"${safeTitle} class="md-image">`);
+      images.push(`<img src="${safeSrc}" alt="${alt}"${safeTitle} class="md-image">`);
       return `\u0000I${i}\u0000`;
     }
   );

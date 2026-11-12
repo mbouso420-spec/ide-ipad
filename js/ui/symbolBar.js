@@ -266,6 +266,9 @@ export function initSymbolBar({ onInsert, onToggle }) {
   const langPill = document.getElementById("symbol-lang-pill");
   const toggleBtn = document.getElementById("btn-toggle-symbols");
 
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
+
   const defaultVisible = readDefaultVisibility();
   let visible = readStoredBool(SYMBOL_STORAGE_KEY, defaultVisible);
 
@@ -273,7 +276,7 @@ export function initSymbolBar({ onInsert, onToggle }) {
 
   toggleBtn?.addEventListener("click", () => {
     setVisible(!visible);
-  });
+  }, listenOpts);
 
   function setVisible(nextState) {
     visible = Boolean(nextState);
@@ -333,7 +336,10 @@ export function initSymbolBar({ onInsert, onToggle }) {
   return {
     setLanguage,
     isVisible: () => visible,
-    setVisible
+    setVisible,
+    destroy() {
+      listenerController?.abort();
+    }
   };
 }
 

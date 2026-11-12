@@ -1,5 +1,6 @@
 import { normalizePath } from "../storage/workspaceDb.js";
 import { getImageMimeType, IMAGE_EXTENSIONS } from "../storage/fileImport.js";
+import { formatStorageBytes } from "../storage/storageQuota.js";
 import { buildLoopGuardRuntime } from "./loopGuard.js";
 import { transpileTypeScriptAndJsx } from "./tsTranspiler.js";
 import {
@@ -719,6 +720,37 @@ export function bundleHtmlWithFolderAssets(
     return getImageMimeType(filePath);
   }
 
+  function sanitizeBase64Payload(raw) {
+    if (typeof raw !== "string" || raw.length === 0) return null;
+    const compact = raw.replace(/\s+/g, "");
+    if (!compact || !/^[A-Za-z0-9+/_=-]+$/.test(compact)) return null;
+    return compact;
+  }
+
+  function buildEntryDataUrl(entry, refPath, mimeResolver = getImageMimeType) {
+    if (!entry) return null;
+    const targetPath = entry.path || refPath || "";
+    const ext = getFileExtension(targetPath);
+    const rawB64 =
+      typeof entry.base64 === "string" && entry.base64.length > 0
+        ? entry.base64
+        : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
+          ? entry.content
+          : null;
+    const safeB64 = sanitizeBase64Payload(rawB64);
+    if (safeB64) {
+      const mime = mimeResolver(targetPath);
+      return `data:${mime};base64,${safeB64}`;
+    }
+    if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
+      const encodedSvg = encodeURIComponent(entry.content)
+        .replace(/'/g, "%27")
+        .replace(/"/g, "%22");
+      return `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+    }
+    return null;
+  }
+
   function inlineCssUrls(cssText, cssDir) {
     return String(cssText || "").replace(
       /(\/\*[\s\S]*?\*\/)|url\(\s*(?:(["'])([^"']+)\2|([^)"'\s]+))\s*\)/gi,
@@ -728,25 +760,9 @@ export function bundleHtmlWithFolderAssets(
         }
         const rawUrl = (quotedUrl || bareUrl || "").trim();
         const entry = resolveEntryFromDir(rawUrl, cssDir);
-        if (!entry) {
-          return fullMatch;
-        }
-        const ext = getFileExtension(entry.path || rawUrl);
-        const b64Payload =
-          typeof entry.base64 === "string" && entry.base64.length > 0
-            ? entry.base64
-            : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
-              ? entry.content
-              : null;
-        if (b64Payload) {
-          const mime = resolveCssAssetMime(entry.path || rawUrl);
-          return `url("data:${mime};base64,${b64Payload}")`;
-        }
-        if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
-          const encodedSvg = encodeURIComponent(entry.content)
-            .replace(/'/g, "%27")
-            .replace(/"/g, "%22");
-          return `url("data:image/svg+xml;charset=utf-8,${encodedSvg}")`;
+        const dataUrl = buildEntryDataUrl(entry, rawUrl, resolveCssAssetMime);
+        if (dataUrl) {
+          return `url("${dataUrl}")`;
         }
         return fullMatch;
       }
@@ -1154,24 +1170,7 @@ export function bundleHtmlWithFolderAssets(
     const cleanUrl = rawUrl.trim();
     if (!cleanUrl || /^(https?:|data:|blob:|#|\/\/)/i.test(cleanUrl)) return null;
     const entry = resolveEntryFromDir(cleanUrl, baseDir);
-    if (!entry) return null;
-    const ext = getFileExtension(entry.path || cleanUrl);
-    const b64Payload = typeof entry.base64 === "string" && entry.base64.length > 0
-      ? entry.base64
-      : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
-        ? entry.content
-        : null;
-    if (b64Payload) {
-      const mime = getImageMimeType(entry.path || cleanUrl);
-      return `data:${mime};base64,${b64Payload}`;
-    }
-    if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
-      const encodedSvg = encodeURIComponent(entry.content)
-        .replace(/'/g, "%27")
-        .replace(/"/g, "%22");
-      return `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-    }
-    return null;
+    return buildEntryDataUrl(entry, cleanUrl, getImageMimeType);
   }
 
   function inlineSrcsetString(rawSrcset, baseDir = dir) {
@@ -1691,11 +1690,14 @@ export function buildStandaloneImagePreview(imageFile) {
   const ext = getFileExtension(imageFile?.path || "");
   const mime = getImageMimeType(imageFile?.path || "");
   const safeName = escapeHtmlText(imageFile?.shortName || imageFile?.path || "Imagen");
-  const b64 = typeof imageFile?.base64 === "string" && imageFile.base64.length > 0
+  const safeExtLabel = escapeHtmlText(ext || "IMG");
+  const rawB64 = typeof imageFile?.base64 === "string" && imageFile.base64.length > 0
     ? imageFile.base64
     : imageFile?.isBinary && typeof imageFile.content === "string" && imageFile.content.length > 0
       ? imageFile.content
       : null;
+  const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
+  const b64 = compactB64 && /^[A-Za-z0-9+/_=-]+$/.test(compactB64) ? compactB64 : null;
 
   let imgSrc = "";
   if (b64) {
@@ -1709,17 +1711,9 @@ export function buildStandaloneImagePreview(imageFile) {
 
   let sizeFormatted = "";
   if (b64) {
-    const bytesLen = Math.floor((b64.length * 3) / 4);
-    sizeFormatted = bytesLen < 1024
-      ? `${bytesLen} B`
-      : bytesLen < 1024 * 1024
-        ? `${(bytesLen / 1024).toFixed(1)} KB`
-        : `${(bytesLen / (1024 * 1024)).toFixed(2)} MB`;
+    sizeFormatted = formatStorageBytes(Math.floor((b64.length * 3) / 4));
   } else if (ext === "svg" && typeof imageFile?.content === "string") {
-    const bytesLen = imageFile.content.length;
-    sizeFormatted = bytesLen < 1024
-      ? `${bytesLen} B`
-      : `${(bytesLen / 1024).toFixed(1)} KB`;
+    sizeFormatted = formatStorageBytes(imageFile.content.length);
   }
 
   return `<!DOCTYPE html>
@@ -1851,9 +1845,9 @@ export function buildStandaloneImagePreview(imageFile) {
 <body>
   <div class="img-toolbar">
     <div class="img-meta-group">
-      <span class="badge">${ext || "IMG"}</span>
+      <span class="badge">${safeExtLabel}</span>
       <span class="img-name">${safeName}</span>
-      <span class="img-size">${sizeFormatted}</span>
+      <span class="img-size">${escapeHtmlText(sizeFormatted)}</span>
       <span id="dim-text" class="img-dim"></span>
     </div>
     <div class="img-controls">
@@ -1863,7 +1857,7 @@ export function buildStandaloneImagePreview(imageFile) {
     </div>
   </div>
   <div class="img-canvas-wrap">
-    ${imgSrc ? `<img id="main-img" class="preview-img" src="${imgSrc}" alt="${safeName}">` : '<div class="empty-state">Esta imagen está vacía o no contiene datos binarios válidos.</div>'}
+    ${imgSrc ? `<img id="main-img" class="preview-img" src="${escapeAttr(imgSrc)}" alt="${safeName}">` : '<div class="empty-state">Esta imagen está vacía o no contiene datos binarios válidos.</div>'}
   </div>
   <script>
     const img = document.getElementById("main-img");

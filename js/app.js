@@ -66,7 +66,7 @@ import { keyboardRouter } from "./ui/keyboardRouter.js";
 import { restoreEmergencyBackup } from "./storage/emergencyBackup.js";
 import { base64ToUint8Array, isBinaryFile, isImageFile } from "./storage/fileImport.js";
 import { downloadBlob } from "./utils/dom.js";
-import { readStoredValue } from "./utils/storage.js";
+import { readStoredValue, removeStoredValue, saveStoredValue } from "./utils/storage.js";
 import { createAutosaveManager } from "./workspace/autosaveManager.js";
 import { createTabManager } from "./workspace/tabManager.js";
 import { createGithubLazySync } from "./workspace/githubLazySync.js";
@@ -433,7 +433,7 @@ async function initApp() {
           shortcut: "",
           run: () => {
             delete document.documentElement.dataset.theme;
-            localStorage.removeItem("studio_theme");
+            removeStoredValue(THEME_STORAGE_KEY);
           }
         },
         {
@@ -444,7 +444,7 @@ async function initApp() {
           shortcut: "",
           run: () => {
             document.documentElement.dataset.theme = "dracula";
-            localStorage.setItem("studio_theme", "dracula");
+            saveStoredValue(THEME_STORAGE_KEY, "dracula");
           }
         },
         {
@@ -455,7 +455,7 @@ async function initApp() {
           shortcut: "",
           run: () => {
             document.documentElement.dataset.theme = "nord";
-            localStorage.setItem("studio_theme", "nord");
+            saveStoredValue(THEME_STORAGE_KEY, "nord");
           }
         },
         {
@@ -466,7 +466,7 @@ async function initApp() {
           shortcut: "",
           run: () => {
             document.documentElement.dataset.theme = "monokai";
-            localStorage.setItem("studio_theme", "monokai");
+            saveStoredValue(THEME_STORAGE_KEY, "monokai");
           }
         },
         {
@@ -1497,6 +1497,12 @@ async function initApp() {
       autosaveManager?.destroy?.();
       statusBar?.destroy?.();
       splitController?.destroy?.();
+      symbolBar?.destroy?.();
+      diffModal?.destroy?.();
+      binaryPreview?.destroy?.();
+      editor?.destroy?.();
+      chat?.destroy?.();
+      github?.destroy?.();
       explorer?.destroy?.();
       quickOpenModal?.destroy?.();
       globalSearchModal?.destroy?.();
@@ -1577,7 +1583,7 @@ function registerPwaServiceWorker() {
     if (document.readyState === "complete") {
       startRegistration();
     } else {
-      window.addEventListener("load", startRegistration);
+      window.addEventListener("load", startRegistration, { once: true });
     }
   }
 }

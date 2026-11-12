@@ -246,7 +246,7 @@ export function initLivePreviewModal({
     if (!file || typeof file.content !== "string") return [];
     const ext = getFileExtension(file.path);
     if (HTML_EXTENSIONS.has(ext)) {
-      return extractReferencedAssetPaths(file.path, file.content);
+      return extractReferencedAssetPaths(file.path, file.content, { includeMedia: true });
     }
     if (ext === "css") {
       return extractCssImportPaths(file.path, file.content);
@@ -1050,7 +1050,9 @@ export function initLivePreviewModal({
         badgeText: activeFile.path,
         compiledHtml: compiledImgHtml,
         siblingHtml: bestHtml,
-        modeLabel: bestHtml ? "Ver en HTML del proyecto" : ""
+        modeLabel: bestHtml ? "Ver en HTML del proyecto" : "",
+        hasConsole: false,
+        hasRepl: false
       });
       return;
     }
