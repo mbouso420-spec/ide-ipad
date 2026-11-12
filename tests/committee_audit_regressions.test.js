@@ -11,7 +11,9 @@ import * as credentialGuard from "../js/security/credentialGuard.js";
 import {
   buildStandaloneImagePreview,
   buildWorkspaceAssetMap,
-  bundleHtmlWithFolderAssets
+  bundleHtmlWithFolderAssets,
+  extractCssImportPaths,
+  extractReferencedAssetPaths
 } from "../js/preview/htmlBundler.js";
 import { renderMarkdownDocumentHtml } from "../js/preview/markdownPreview.js";
 import { createBinaryPreview, sanitizeSvgMarkup } from "../js/ui/binaryPreview.js";
@@ -447,5 +449,31 @@ describe("Auditoría Comité Multi-Agente — AppSec, Higiene, Ciclo de Vida y S
       assert.equal(md.includes('title="T &amp;'), true);
       assert.ok(sanitizeSvgMarkup(`<svg width="${i}"><rect/></svg>`));
     }
+  });
+
+  test("htmlBundler resuelve imágenes con %20, mayúsculas/minúsculas, \\, src sin comillas y url() en CSS", () => {
+    const files = [
+      { path: "sitio/img/mi foto.png", shortName: "mi foto.png", isBinary: true, base64: "iVBORw0KGgo=" },
+      { path: "sitio/assets/Logo.jpg", shortName: "Logo.jpg", isBinary: true, base64: "/9j/4AAQ" }
+    ];
+    const map = buildWorkspaceAssetMap(files);
+    const html = [
+      '<img src="img/mi%20foto.png">',
+      '<img src = "ASSETS/logo.JPG">',
+      '<img src=img\\mi%20foto.png>',
+      '<img src="/assets/Logo.jpg">'
+    ].join("\n");
+
+    const refs = extractReferencedAssetPaths("sitio/index.html", html, { includeMedia: true });
+    assert.equal(refs.includes("sitio/img/mi foto.png"), true);
+
+    const bundled = bundleHtmlWithFolderAssets("sitio/index.html", html, map, null, (c) => c, null, true);
+    assert.equal((bundled.match(/data:image\/png;base64,iVBORw0KGgo=/g) || []).length, 2);
+    assert.equal((bundled.match(/data:image\/jpeg;base64,\/9j\/4AAQ/g) || []).length, 2);
+
+    const cssDeps = extractCssImportPaths("sitio/css/main.css", 'body { background: url("../img/mi%20foto.png"); }', {
+      includeMedia: true
+    });
+    assert.equal(cssDeps.includes("sitio/img/mi foto.png"), true);
   });
 });

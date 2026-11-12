@@ -249,7 +249,7 @@ export function initLivePreviewModal({
       return extractReferencedAssetPaths(file.path, file.content, { includeMedia: true });
     }
     if (ext === "css") {
-      return extractCssImportPaths(file.path, file.content);
+      return extractCssImportPaths(file.path, file.content, { includeMedia: true });
     }
     if (JS_EXTENSIONS.has(ext) || TS_EXTENSIONS.has(ext) || ext === "jsx") {
       return extractModuleDependencyPaths(file.path, file.content, allFiles, {

@@ -138,6 +138,22 @@ export function buildWorkspaceAssetMap(allFiles) {
 /**
  * Extrae todas las rutas relativas de hojas CSS, scripts JS, imágenes y recursos referenciados por el HTML.
  */
+function decodePreviewPathRef(rawRef) {
+  const stripped = String(rawRef || "")
+    .trim()
+    .split("?")[0]
+    .split("#")[0]
+    .replace(/\\/g, "/");
+  if (!stripped || !stripped.includes("%")) {
+    return stripped;
+  }
+  try {
+    return decodeURIComponent(stripped).replace(/\\/g, "/");
+  } catch {
+    return stripped;
+  }
+}
+
 export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
   if (!rawHtml || typeof rawHtml !== "string") return [];
   const dir = getParentFolder(entryPath);
@@ -146,12 +162,19 @@ export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
 
   const addCandidateRef = (rawRef) => {
     if (!rawRef || typeof rawRef !== "string") return;
-    const clean = rawRef.trim().split("?")[0].split("#")[0];
-    if (!clean || /^(https?:|data:|blob:|\/\/|#)/i.test(clean)) return;
-    const resolved = resolveRelativePath(dir, clean);
-    if (resolved) paths.add(resolved);
-    const rootClean = normalizePath(clean);
-    if (rootClean) paths.add(rootClean);
+    const rawTrimmed = rawRef.trim().split("?")[0].split("#")[0];
+    if (!rawTrimmed || /^(https?:|data:|blob:|\/\/|#)/i.test(rawTrimmed)) return;
+    const candidates = [rawTrimmed.replace(/\\/g, "/")];
+    const decoded = decodePreviewPathRef(rawRef);
+    if (decoded && decoded !== candidates[0]) {
+      candidates.push(decoded);
+    }
+    for (const clean of candidates) {
+      const resolved = resolveRelativePath(dir, clean);
+      if (resolved) paths.add(resolved);
+      const rootClean = normalizePath(clean);
+      if (rootClean) paths.add(rootClean);
+    }
   };
 
   // 1. <link rel="stylesheet"> (o iconos favoritos si includeMedia es true)
@@ -320,10 +343,19 @@ export function wrapCssWithConditions(cssContent, { layerClause = "", supportsCo
  * @param {string} cssContent Contenido textual de la hoja de estilo.
  * @returns {string[]} Lista de rutas normalizadas de archivos a incrustar.
  */
-export function extractCssImportPaths(cssPath, cssContent) {
+export function extractCssImportPaths(cssPath, cssContent, options = {}) {
   if (!cssContent || typeof cssContent !== "string") return [];
   const dir = getParentFolder(cssPath);
   const paths = new Set();
+  const addCssCandidate = (rawUrl) => {
+    if (!rawUrl || /^(https?:|data:|blob:|\/\/|#)/i.test(rawUrl.trim())) return;
+    const cleanRef = decodePreviewPathRef(rawUrl);
+    if (!cleanRef) return;
+    const resolved = resolveRelativePath(dir, cleanRef);
+    if (resolved) paths.add(resolved);
+    const rootClean = normalizePath(cleanRef);
+    if (rootClean) paths.add(rootClean);
+  };
   // Ignorar comentarios /* ... */ para no extraer @import comentados
   const importRegex =
     /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
@@ -331,12 +363,13 @@ export function extractCssImportPaths(cssPath, cssContent) {
   while ((match = importRegex.exec(cssContent)) !== null) {
     if (match[1]) continue;
     const importUrl = match[2] || match[3] || match[4];
-    if (importUrl && !/^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
-      const cleanRef = importUrl.split("?")[0].split("#")[0];
-      const resolved = resolveRelativePath(dir, cleanRef);
-      if (resolved) paths.add(resolved);
-      const rootClean = normalizePath(cleanRef);
-      if (rootClean) paths.add(rootClean);
+    addCssCandidate(importUrl);
+  }
+  if (options?.includeMedia) {
+    const urlRegex = /(\/\*[\s\S]*?\*\/)|url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)/gi;
+    while ((match = urlRegex.exec(cssContent)) !== null) {
+      if (match[1]) continue;
+      addCssCandidate(match[2] || match[3]);
     }
   }
   return Array.from(paths);
@@ -667,11 +700,28 @@ export function bundleHtmlWithFolderAssets(
     return false;
   };
 
+  let lowerFileMap = null;
+  const lookupEntry = (key) => {
+    if (!key) return null;
+    const direct = fileMap.get(key);
+    if (direct) return direct;
+    if (!lowerFileMap) {
+      lowerFileMap = new Map();
+      for (const [k, v] of fileMap.entries()) {
+        const lowerKey = String(k || "").toLowerCase();
+        if (lowerKey && !lowerFileMap.has(lowerKey)) {
+          lowerFileMap.set(lowerKey, v);
+        }
+      }
+    }
+    return lowerFileMap.get(key.toLowerCase()) || null;
+  };
+
   const resolveEntryFromDir = (rawHref, baseDir) => {
-    if (!rawHref || /^(https?:|data:|blob:|#|\/\/)/i.test(rawHref)) {
+    if (!rawHref || /^(https?:|data:|blob:|#|\/\/)/i.test(rawHref.trim())) {
       return null;
     }
-    const cleanRef = rawHref.split("?")[0].split("#")[0];
+    const cleanRef = decodePreviewPathRef(rawHref);
     if (!cleanRef) {
       return null;
     }
@@ -679,12 +729,15 @@ export function bundleHtmlWithFolderAssets(
       return null;
     }
     const resolved = resolveRelativePath(baseDir, cleanRef);
-    let asset = fileMap.get(resolved) || null;
+    let asset = lookupEntry(resolved);
     if (!asset && cleanRef.startsWith("./")) {
-      asset = fileMap.get(resolveRelativePath(baseDir, cleanRef.slice(2))) || null;
+      asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.slice(2)));
+    }
+    if (!asset && cleanRef.startsWith("/") && baseDir) {
+      asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.replace(/^\/+/, "")));
     }
     if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("./") && !cleanRef.startsWith("../")) {
-      const candidate = fileMap.get(normalizePath(cleanRef)) || null;
+      const candidate = lookupEntry(normalizePath(cleanRef));
       if (candidate) {
         const candPath = normalizePath(candidate.path || "");
         if (!baseDir || allowParentTraversal || candPath.startsWith(`${baseDir}/`)) {
@@ -1184,11 +1237,13 @@ export function bundleHtmlWithFolderAssets(
     });
   }
 
-  // Incrustar imágenes locales (<img src="...">) almacenadas en Base64 o SVG dentro del proyecto
-  html = html.replace(/<img\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+  // Incrustar imágenes locales (<img src="..."> o sin comillas) almacenadas en Base64 o SVG dentro del proyecto
+  html = html.replace(/<img\b([^>]*?)\bsrc\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
+    const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
     if (dataUrl) {
-      return `<img${beforeSrc}src=${quote}${dataUrl}${quote}${afterSrc}>`;
+      const outQuote = quote || '"';
+      return `<img${beforeSrc}src=${outQuote}${dataUrl}${outQuote}${afterSrc}>`;
     }
     return fullTag;
   });
