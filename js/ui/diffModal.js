@@ -20,6 +20,9 @@ export function initDiffModal() {
       close();
     }
   });
+  dialog?.addEventListener("close", () => {
+    pendingConfirmAction = null;
+  });
 
   confirmBtn?.addEventListener("click", () => {
     const action = pendingConfirmAction;

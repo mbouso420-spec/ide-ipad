@@ -104,11 +104,15 @@ function normalizeLineEndings(text) {
   return String(text ?? "").replace(/\r\n?/g, "\n");
 }
 
-function finalizeOutput(lines) {
+function finalizeOutput(lines, rawLineIndices = null) {
   const out = [];
   let consecutiveBlanks = 0;
-  for (const line of lines) {
-    if (line === "") {
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (rawLineIndices?.has(i)) {
+      consecutiveBlanks = 0;
+      out.push(line);
+    } else if (line === "") {
       consecutiveBlanks += 1;
       if (consecutiveBlanks <= 1) {
         out.push("");
@@ -124,10 +128,29 @@ function finalizeOutput(lines) {
   return `${out.join("\n")}\n`;
 }
 
-function canStartRegexLiteral(prevNonSpace) {
+const REGEX_PREFIX_KEYWORDS = new Set([
+  "return",
+  "case",
+  "throw",
+  "await",
+  "typeof",
+  "void",
+  "delete",
+  "in",
+  "instanceof",
+  "new",
+  "yield",
+  "else",
+  "do",
+  "of",
+  "default"
+]);
+
+function canStartRegexLiteral(prevNonSpace, prevWord = "") {
   return (
     prevNonSpace === "" ||
-    "=([,:;!&|?~^+-*/%<>{\n".includes(prevNonSpace)
+    "=([,:;!&|?~^+-*/%<>{\n".includes(prevNonSpace) ||
+    REGEX_PREFIX_KEYWORDS.has(prevWord)
   );
 }
 
@@ -138,6 +161,7 @@ function formatBraceCode(code, lang, indentSize) {
   const hasRegexLiterals = lang === "js" || lang === "ts" || lang === "tsx";
 
   const out = [];
+  const rawLineIndices = new Set();
   let braceDepth = 0;
   const caseStack = [];
   let inBlockComment = false;
@@ -149,6 +173,7 @@ function formatBraceCode(code, lang, indentSize) {
       templateStack[templateStack.length - 1].exprDepth === 0;
 
     if (insideLiteralTemplate) {
+      rawLineIndices.add(out.length);
       out.push(rawLine);
     } else if (inBlockComment) {
       const trimmed = rawLine.trim();
@@ -209,6 +234,7 @@ function formatBraceCode(code, lang, indentSize) {
     // Avanzar el escáner léxico sobre la línea cruda para actualizar estado hacia la siguiente línea
     let quote = "";
     let prevNonSpace = "";
+    let prevWord = "";
     const trimmedForCase = rawLine.trim();
     const startsCase =
       !inBlockComment &&
@@ -239,12 +265,16 @@ function formatBraceCode(code, lang, indentSize) {
         if (ch === "`") {
           templateStack.pop();
           prevNonSpace = ")";
+          prevWord = "";
           continue;
         }
         if (ch === "$" && next === "{") {
           templateStack[templateStack.length - 1].exprDepth = 1;
+          braceDepth += 1;
+          caseStack.push(false);
           i += 1;
           prevNonSpace = "{";
+          prevWord = "";
           continue;
         }
         continue;
@@ -258,6 +288,7 @@ function formatBraceCode(code, lang, indentSize) {
         if (ch === quote) {
           quote = "";
           prevNonSpace = ")";
+          prevWord = "";
         }
         continue;
       }
@@ -272,13 +303,15 @@ function formatBraceCode(code, lang, indentSize) {
       }
       if (ch === "'" || ch === '"') {
         quote = ch;
+        prevWord = "";
         continue;
       }
       if (ch === "`" && hasRegexLiterals) {
         templateStack.push({ exprDepth: 0 });
+        prevWord = "";
         continue;
       }
-      if (ch === "/" && hasRegexLiterals && canStartRegexLiteral(prevNonSpace)) {
+      if (ch === "/" && hasRegexLiterals && canStartRegexLiteral(prevNonSpace, prevWord)) {
         // Consumir regex literal hasta / sin escapar
         let inRegexClass = false;
         let j = i + 1;
@@ -300,6 +333,7 @@ function formatBraceCode(code, lang, indentSize) {
         if (closed) {
           i = j;
           prevNonSpace = ")";
+          prevWord = "";
           continue;
         }
       }
@@ -313,10 +347,25 @@ function formatBraceCode(code, lang, indentSize) {
         } else if (ch === "}") {
           templateStack[templateStack.length - 1].exprDepth -= 1;
           if (templateStack[templateStack.length - 1].exprDepth === 0) {
+            if (braceDepth > 0) braceDepth -= 1;
+            if (caseStack.length > 0) caseStack.pop();
             prevNonSpace = "";
+            prevWord = "";
             continue;
           }
         }
+      }
+
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = i + 1;
+        while (j < rawLine.length && /[A-Za-z0-9_$]/.test(rawLine[j])) {
+          j += 1;
+        }
+        const word = rawLine.slice(i, j);
+        prevWord = prevNonSpace === "." ? "" : word;
+        prevNonSpace = word[word.length - 1];
+        i = j - 1;
+        continue;
       }
 
       if (ch === "{") {
@@ -328,6 +377,7 @@ function formatBraceCode(code, lang, indentSize) {
       }
 
       if (!/\s/.test(ch)) {
+        prevWord = "";
         prevNonSpace = ch;
       }
     }
@@ -337,7 +387,7 @@ function formatBraceCode(code, lang, indentSize) {
     }
   }
 
-  return finalizeOutput(out);
+  return finalizeOutput(out, rawLineIndices);
 }
 
 function formatCss(code, indentSize) {
@@ -484,10 +534,82 @@ function formatCss(code, indentSize) {
   return finalizeOutput(out);
 }
 
+function scanHtmlTagsInLine(trimmed, startIdx = 0) {
+  let delta = 0;
+  let inComment = false;
+  let rawTag = null;
+
+  for (let i = startIdx; i < trimmed.length; i += 1) {
+    if (inComment) {
+      if (trimmed.startsWith("-->", i)) {
+        inComment = false;
+        i += 2;
+      }
+      continue;
+    }
+    if (trimmed.startsWith("<!--", i)) {
+      inComment = true;
+      i += 3;
+      continue;
+    }
+    if (trimmed[i] !== "<") continue;
+
+    const headMatch = trimmed.slice(i).match(/^<(\/?)([!a-zA-Z][a-zA-Z0-9:-]*)/);
+    if (!headMatch) continue;
+
+    const isClosing = Boolean(headMatch[1]);
+    const tagName = headMatch[2].toLowerCase();
+    let j = i + headMatch[0].length;
+    let attrQuote = "";
+
+    while (j < trimmed.length) {
+      const ch = trimmed[j];
+      if (attrQuote) {
+        if (ch === attrQuote) attrQuote = "";
+      } else if (ch === '"' || ch === "'") {
+        attrQuote = ch;
+      } else if (ch === ">") {
+        break;
+      }
+      j += 1;
+    }
+
+    if (j >= trimmed.length) break;
+
+    const attrs = trimmed.slice(i + headMatch[0].length, j);
+    if (isClosing) {
+      delta -= 1;
+      i = j;
+      continue;
+    }
+    if (VOID_HTML_TAGS.has(tagName) || /\/\s*$/.test(attrs.trim())) {
+      i = j;
+      continue;
+    }
+
+    delta += 1;
+    if (RAW_HTML_TAGS.has(tagName)) {
+      const closeRe = new RegExp(`</${tagName}\\s*>`, "i");
+      const closeMatch = closeRe.exec(trimmed.slice(j + 1));
+      if (closeMatch) {
+        delta -= 1;
+        i = j + 1 + closeMatch.index + closeMatch[0].length - 1;
+        continue;
+      }
+      rawTag = tagName;
+      break;
+    }
+    i = j;
+  }
+
+  return { delta, inComment, rawTag };
+}
+
 function formatHtml(code, indentSize) {
   const unit = " ".repeat(indentSize);
   const lines = normalizeLineEndings(code).split("\n");
   const out = [];
+  const rawLineIndices = new Set();
   let depth = 0;
   let inComment = false;
   let rawTag = null;
@@ -500,6 +622,9 @@ function formatHtml(code, indentSize) {
         if (depth > 0) depth -= 1;
         out.push(rawLine.trim().startsWith("</") ? `${unit.repeat(depth)}${rawLine.trim()}` : rawLine);
       } else {
+        if (rawTag === "pre" || rawTag === "textarea") {
+          rawLineIndices.add(out.length);
+        }
         out.push(rawLine);
       }
       continue;
@@ -508,7 +633,14 @@ function formatHtml(code, indentSize) {
     if (inComment) {
       const trimmed = rawLine.trim();
       out.push(trimmed ? `${unit.repeat(depth)}${trimmed}` : "");
-      if (trimmed.includes("-->")) inComment = false;
+      const endIdx = trimmed.indexOf("-->");
+      if (endIdx !== -1) {
+        inComment = false;
+        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3);
+        depth = Math.max(0, depth + scannedAfter.delta);
+        inComment = scannedAfter.inComment;
+        rawTag = scannedAfter.rawTag;
+      }
       continue;
     }
 
@@ -520,7 +652,15 @@ function formatHtml(code, indentSize) {
 
     if (trimmed.startsWith("<!--")) {
       out.push(`${unit.repeat(depth)}${trimmed}`);
-      if (!trimmed.includes("-->")) inComment = true;
+      const endIdx = trimmed.indexOf("-->");
+      if (endIdx === -1) {
+        inComment = true;
+      } else {
+        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3);
+        depth = Math.max(0, depth + scannedAfter.delta);
+        inComment = scannedAfter.inComment;
+        rawTag = scannedAfter.rawTag;
+      }
       continue;
     }
 
@@ -532,37 +672,13 @@ function formatHtml(code, indentSize) {
     const lineDepth = Math.max(0, depth - leadingCloses);
     out.push(`${unit.repeat(lineDepth)}${trimmed}`);
 
-    // Contar tags abiertos/cerrados en esta línea fuera de strings/atributos y comentarios
-    let delta = 0;
-    const strippedComments = trimmed.replace(/<!--[\s\S]*?-->/g, "");
-    const tagRegex = /<\/?([!a-zA-Z][a-zA-Z0-9:-]*)([^>]*)>/g;
-    let match;
-    while ((match = tagRegex.exec(strippedComments)) !== null) {
-      const fullTag = match[0];
-      const tagName = match[1].toLowerCase();
-      const attrs = match[2] || "";
-      if (fullTag.startsWith("</")) {
-        delta -= 1;
-        continue;
-      }
-      if (VOID_HTML_TAGS.has(tagName) || /\/\s*$/.test(attrs)) {
-        continue;
-      }
-      delta += 1;
-      if (RAW_HTML_TAGS.has(tagName)) {
-        const hasCloseInSameLine = new RegExp(`</${tagName}\\s*>`, "i").test(
-          strippedComments.slice(tagRegex.lastIndex)
-        );
-        if (!hasCloseInSameLine) {
-          rawTag = tagName;
-        }
-      }
-    }
-
-    depth = Math.max(0, depth + delta);
+    const scanned = scanHtmlTagsInLine(trimmed, 0);
+    inComment = scanned.inComment;
+    rawTag = scanned.rawTag;
+    depth = Math.max(0, depth + scanned.delta);
   }
 
-  return finalizeOutput(out);
+  return finalizeOutput(out, rawLineIndices);
 }
 
 function formatSql(code) {

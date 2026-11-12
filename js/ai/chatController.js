@@ -106,16 +106,21 @@ export function initChatController({
   /** @type {Array<{ role: "user" | "assistant", content: string }>} */
   let conversation = [];
 
+  function syncKeyVisibilityButton(visible) {
+    if (!toggleKeyVisBtn) return;
+    toggleKeyVisBtn.innerHTML = icon(visible ? "eyeOff" : "eye");
+    toggleKeyVisBtn.setAttribute("aria-pressed", String(Boolean(visible)));
+    toggleKeyVisBtn.setAttribute("aria-label", visible ? "Ocultar clave" : "Mostrar clave");
+  }
+
   function syncApiKeyMaskPlaceholder(providerId) {
+    keyVisible = false;
+    syncKeyVisibilityButton(false);
     if (!apiKeyInput) return;
     const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS.gemini;
     const savedKey = getApiKey(provider.id);
     apiKeyInput.value = "";
     apiKeyInput.type = "password";
-    keyVisible = false;
-    if (toggleKeyVisBtn) {
-      toggleKeyVisBtn.innerHTML = icon("eye");
-    }
     apiKeyInput.placeholder = savedKey
       ? `Guardada (${maskCredentialPreview(savedKey)}) — pegá otra para cambiar`
       : provider.keyPlaceholder;
@@ -325,7 +330,7 @@ export function initChatController({
     if (apiKeyInput) {
       apiKeyInput.type = keyVisible ? "text" : "password";
     }
-    toggleKeyVisBtn.innerHTML = icon(keyVisible ? "eyeOff" : "eye");
+    syncKeyVisibilityButton(keyVisible);
   });
 
   clearKeyBtn?.addEventListener("click", () => {
@@ -636,9 +641,11 @@ export function initChatController({
       promptToSend = `[COMANDO RÁPIDO /test]: Diseñá una suite completa de pruebas unitarias con casos normales, límites y de error para este código.${rest ? ` Requisitos: ${rest}` : ""}`;
     }
 
-    // La respuesta queda atada a ESTA conversación aunque el usuario cambie de proyecto mientras llega.
+    // La respuesta queda atada a ESTA conversación y proveedor aunque el usuario cambie en vuelo.
     const key = conversationKey;
     const convo = conversation;
+    const streamProviderId = activeProviderId;
+    const streamModelId = activeModelId;
     convo.push({ role: "user", content: userText });
     const assistantEntry = { role: "assistant", content: "" };
     convo.push(assistantEntry);
@@ -665,13 +672,13 @@ export function initChatController({
       });
     };
 
-    const messagesForAi = cleanHistoryForAi(convo.slice(0, -1));
+    const messagesForAi = cleanHistoryForAi(convo.slice(0, -2));
     messagesForAi.push({ role: "user", content: promptToSend });
 
     try {
       await streamAiCompletion({
-        providerId: activeProviderId,
-        model: activeModelId,
+        providerId: streamProviderId,
+        model: streamModelId,
         apiKey,
         systemPrompt,
         history: messagesForAi,
@@ -689,7 +696,7 @@ export function initChatController({
         onFallbackNotice(noticeText) {
           if (!isVisible()) return;
           currentStreamStatus = noticeText;
-          if (providerHelpEl) {
+          if (providerHelpEl && activeProviderId === streamProviderId) {
             providerHelpEl.textContent = noticeText;
           }
           scheduleRender();
@@ -719,8 +726,8 @@ export function initChatController({
           error instanceof Error ? error.message : "Error de red al conectar con el proveedor gratuito.";
         const message = redactSensitiveTokens(rawMessage, [apiKey]);
         if (error instanceof AuthLockoutError || error?.httpStatus === 401 || error?.httpStatus === 403) {
-          const lockNow = checkAuthLockout(`ai:${activeProviderId}`);
-          keyChecks.set(activeProviderId, {
+          const lockNow = checkAuthLockout(`ai:${streamProviderId}`);
+          keyChecks.set(streamProviderId, {
             key: apiKey,
             status: lockNow.locked ? "locked" : "invalid",
             message
@@ -1016,11 +1023,25 @@ export function initChatController({
         btnApplyAll.innerHTML = `${icon("refreshCw")}<span>Aplicando lote…</span>`;
         if (typeof onApplyMultiFile === "function") {
           try {
-            await onApplyMultiFile(multiFiles.map((m) => ({ path: m.filePath, code: m.code, lang: m.lang })));
-            btnApplyAll.innerHTML = `${icon("check")}<span>¡${multiFiles.length} archivos aplicados!</span>`;
+            const applied = await onApplyMultiFile(multiFiles.map((m) => ({ path: m.filePath, code: m.code, lang: m.lang })));
+            if (applied === false) {
+              btnApplyAll.disabled = false;
+              btnApplyAll.innerHTML = `${icon("x")}<span>Sin cambios aplicados</span>`;
+              window.setTimeout(() => {
+                btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+              }, 1500);
+            } else {
+              btnApplyAll.innerHTML = `${icon("check")}<span>¡${multiFiles.length} archivos aplicados!</span>`;
+            }
           } catch {
+            btnApplyAll.disabled = false;
             btnApplyAll.innerHTML = `${icon("x")}<span>Error al aplicar</span>`;
+            window.setTimeout(() => {
+              btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+            }, 1500);
           }
+        } else {
+          btnApplyAll.disabled = false;
         }
       });
 
@@ -1136,8 +1157,11 @@ export function initChatController({
       btnApplyAction = createCodeActionButton("fileCheck", `Aplicar a ${baseName}`, `Aplicar o crear archivo ${filePath}`, async () => {
         btnApplyAction.disabled = true;
         try {
-          await onApplyToFile(filePath, code, lang);
-          btnApplyAction.innerHTML = `${icon("check")}<span>Guardado</span>`;
+          const applied = await onApplyToFile(filePath, code, lang);
+          btnApplyAction.innerHTML =
+            applied === false
+              ? `${icon("x")}<span>Cancelado</span>`
+              : `${icon("check")}<span>Guardado</span>`;
         } catch {
           btnApplyAction.innerHTML = `${icon("x")}<span>Error</span>`;
         }
@@ -1201,6 +1225,27 @@ export function initChatController({
     }
   }
 
+  /**
+   * Genera un delimitador de backticks más largo que cualquier secuencia en `content` para evitar escapes de prompt.
+   * @param {string} content
+   */
+  function getSafeBacktickFence(content) {
+    const matches = String(content || "").match(/`+/g);
+    let maxRun = 2;
+    if (matches) {
+      for (const run of matches) {
+        if (run.length > maxRun) {
+          maxRun = run.length;
+        }
+      }
+    }
+    return "`".repeat(maxRun + 1);
+  }
+
+  function sanitizePromptLabel(value) {
+    return String(value || "").replace(/[\r\n`]+/g, " ").trim();
+  }
+
   function buildSystemPrompt(snapshot) {
     const budget = getAiContextBudget();
     const parts = [
@@ -1211,23 +1256,30 @@ export function initChatController({
     if (snapshot.activeFile) {
       const safeActiveContent = truncateCodeContent(snapshot.activeFile.content, budget);
       const cursorLine = snapshot.selection?.cursorLine || 1;
+      const activeFence = getSafeBacktickFence(safeActiveContent);
+      const activeLang = sanitizePromptLabel(snapshot.activeFile.lang);
+      const activeName = sanitizePromptLabel(snapshot.activeFile.name);
       parts.push(
-        `\n--- ARCHIVO ACTIVO EN EL EDITOR: ${snapshot.activeFile.name} (${snapshot.activeFile.lang}, cursor en línea ${cursorLine}) ---\n\`\`\`${snapshot.activeFile.lang}\n${safeActiveContent}\n\`\`\``
+        `\n--- ARCHIVO ACTIVO EN EL EDITOR: ${activeName} (${activeLang}, cursor en línea ${cursorLine}) ---\n${activeFence}${activeLang}\n${safeActiveContent}\n${activeFence}`
       );
     }
 
     if (snapshot.selection && snapshot.selection.text) {
       const safeSelection = truncateCodeContent(snapshot.selection.text, 10000);
+      const selFence = getSafeBacktickFence(safeSelection);
       parts.push(
-        `\n--- FRAGMENTO SELECCIONADO POR EL USUARIO (${snapshot.selection.lineCount} líneas) ---\n\`\`\`\n${safeSelection}\n\`\`\``
+        `\n--- FRAGMENTO SELECCIONADO POR EL USUARIO (${snapshot.selection.lineCount} líneas) ---\n${selFence}\n${safeSelection}\n${selFence}`
       );
     }
 
     const attachedFiles = snapshot.otherOpenFiles.filter((f) => attachedTabIds.has(f.id));
     for (const extra of attachedFiles) {
       const safeExtraContent = truncateCodeContent(extra.content, 6000);
+      const extraFence = getSafeBacktickFence(safeExtraContent);
+      const extraLang = sanitizePromptLabel(extra.lang);
+      const extraName = sanitizePromptLabel(extra.name);
       parts.push(
-        `\n--- PESTAÑA ADJUNTA DE REFERENCIA: ${extra.name} (${extra.lang}) ---\n\`\`\`${extra.lang}\n${safeExtraContent}\n\`\`\``
+        `\n--- PESTAÑA ADJUNTA DE REFERENCIA: ${extraName} (${extraLang}) ---\n${extraFence}${extraLang}\n${safeExtraContent}\n${extraFence}`
       );
     }
 
@@ -1372,9 +1424,12 @@ export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = 
   }
 
   const firstLine = (code || "").trim().split(/\r?\n/)[0] || "";
-  const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s*>-]+)/i);
+  const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s]+)/i);
   if (commentMatch) {
-    return commentMatch[1];
+    const cleaned = commentMatch[1].replace(/(?:\*\/|-->)+$/g, "");
+    if (cleaned) {
+      return cleaned;
+    }
   }
 
   if (precedingProse) {
@@ -1389,32 +1444,48 @@ export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = 
   return null;
 }
 
+/**
+ * Segmenta Markdown respetando longitud y cierre de fences por línea para soportar bloques anidados.
+ * @param {string} raw
+ */
 export function parseMarkdownSegments(raw) {
   const segments = [];
-  const fenceRegex = /```([^\r\n]*)\r?\n?([\s\S]*?)(?:```|$)/g;
-  let lastIndex = 0;
-  let match;
+  const source = String(raw || "");
+  if (!source) {
+    return segments;
+  }
 
-  while ((match = fenceRegex.exec(raw)) !== null) {
-    let lastProseContent = "";
-    if (match.index > lastIndex) {
-      const prose = raw.slice(lastIndex, match.index).trim();
-      if (prose) {
-        lastProseContent = prose;
-        segments.push({ type: "prose", content: prose });
-      }
+  const lines = source.split(/\r?\n/);
+  const proseLines = [];
+  let inFence = false;
+  let fenceLen = 0;
+  let rawHeader = "";
+  let codeLines = [];
+  let lastProseContent = "";
+
+  const flushProse = () => {
+    const prose = proseLines.join("\n").trim();
+    proseLines.length = 0;
+    if (prose) {
+      lastProseContent = prose;
+      segments.push({ type: "prose", content: prose });
     } else if (segments.length > 0 && segments[segments.length - 1].type === "prose") {
       lastProseContent = segments[segments.length - 1].content;
+    } else {
+      lastProseContent = "";
     }
+  };
 
-    const rawHeader = (match[1] || "").trim();
+  const pushCodeSegment = (unclosed) => {
     let lang = (rawHeader.split(/\s+/)[0] || "").toLowerCase();
     if (lang.includes(":")) {
       lang = lang.split(":")[0];
     }
-    const code = (match[2] || "").replace(/\n$/, "");
+    let code = codeLines.join("\n");
+    if (unclosed) {
+      code = code.replace(/\n$/, "");
+    }
     const filePath = detectFilePathFromCodeSegment(rawHeader, code, lastProseContent);
-
     const segment = {
       type: "code",
       lang,
@@ -1424,14 +1495,38 @@ export function parseMarkdownSegments(raw) {
       segment.filePath = filePath;
     }
     segments.push(segment);
-    lastIndex = fenceRegex.lastIndex;
-    if (!raw.slice(match.index).includes("```", 3)) {
-      break;
+  };
+
+  for (const line of lines) {
+    if (!inFence) {
+      const openMatch = line.match(/^ {0,3}(`{3,})([^`]*)$/);
+      if (openMatch) {
+        flushProse();
+        inFence = true;
+        fenceLen = openMatch[1].length;
+        rawHeader = openMatch[2].trim();
+        codeLines = [];
+        continue;
+      }
+      proseLines.push(line);
+    } else {
+      const closeMatch = line.match(/^ {0,3}(`{3,})[ \t]*$/);
+      if (closeMatch && closeMatch[1].length >= fenceLen) {
+        pushCodeSegment(false);
+        inFence = false;
+        fenceLen = 0;
+        rawHeader = "";
+        codeLines = [];
+        continue;
+      }
+      codeLines.push(line);
     }
   }
 
-  if (lastIndex < raw.length) {
-    const tail = raw.slice(lastIndex).trim();
+  if (inFence) {
+    pushCodeSegment(true);
+  } else {
+    const tail = proseLines.join("\n").trim();
     if (tail) {
       segments.push({ type: "prose", content: tail });
     }
@@ -1537,6 +1632,7 @@ export function estimateTokens(charCount) {
 
 export function formatInlineMarkdown(str) {
   const codeTokens = [];
+  const linkTokens = [];
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
   const withPlaceholders = cleanStr.replace(/`([^`]+)`/g, (_, code) => {
     const idx = codeTokens.length;
@@ -1544,13 +1640,24 @@ export function formatInlineMarkdown(str) {
     return `\u0000CODE${idx}\u0000`;
   });
 
+  const applyEmphasis = (text) =>
+    text
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+
   let safe = escapeHtml(withPlaceholders);
   safe = safe.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer" class="chat-link">$1</a>'
+    (_, label, url) => {
+      const idx = linkTokens.length;
+      linkTokens.push(
+        `<a href="${url}" target="_blank" rel="noopener noreferrer" class="chat-link">${applyEmphasis(label)}</a>`
+      );
+      return `\u0000LINK${idx}\u0000`;
+    }
   );
-  safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  safe = safe.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  safe = applyEmphasis(safe);
+  safe = safe.replace(/\u0000LINK(\d+)\u0000/g, (_, idx) => linkTokens[Number(idx)] || "");
   safe = safe.replace(/\u0000CODE(\d+)\u0000/g, (_, idx) => codeTokens[Number(idx)] || "");
   return safe;
 }

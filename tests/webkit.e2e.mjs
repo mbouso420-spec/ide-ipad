@@ -71,7 +71,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
     await new Promise((resolve) => server?.close(resolve));
   });
 
-  test("Render iPadOS táctil, IndexedDB, SW v29, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
+  test("Render iPadOS táctil, IndexedDB, SW v30, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
     const page = await context.newPage();
     const pageErrors = [];
     const coldBootRequests = [];
@@ -93,14 +93,14 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
       "WebKit no debe descargar runtimes pesados (Pyodide/SQLite/tsc) durante el arranque en frío"
     );
 
-    // 1. Verificar Service Worker v29 accesible y sin desborde horizontal en iPad vertical (820x1180)
+    // 1. Verificar Service Worker v30 accesible y sin desborde horizontal en iPad vertical (820x1180)
     const swAssetOk = await page.evaluate(async () => {
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v29");
+      return text.includes("studio-ide-shell-v30");
     });
-    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v29 en WebKit");
+    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v30 en WebKit");
 
     const portraitOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth > window.innerWidth

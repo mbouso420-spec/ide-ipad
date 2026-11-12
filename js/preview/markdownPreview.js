@@ -256,6 +256,7 @@ function renderMarkdownProseBlock(text) {
 
 export function formatMdInline(str) {
   const codes = [];
+  const links = [];
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
   const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
@@ -263,14 +264,30 @@ export function formatMdInline(str) {
     return `\u0000C${i}\u0000`;
   });
 
+  const applyEmphasis = (text) =>
+    text
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+
   let safe = escapeHtmlText(masked);
   safe = safe.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+    (_, label, url) => {
+      const i = links.length;
+      links.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${applyEmphasis(label)}</a>`);
+      return `\u0000L${i}\u0000`;
+    }
   );
-  safe = safe.replace(/\[([^\]]+)\]\((#[a-zA-Z0-9_-]+)\)/g, '<a href="$2">$1</a>');
-  safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  safe = safe.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+  safe = safe.replace(
+    /\[([^\]]+)\]\((#[a-zA-Z0-9_-]+)\)/g,
+    (_, label, hash) => {
+      const i = links.length;
+      links.push(`<a href="${hash}">${applyEmphasis(label)}</a>`);
+      return `\u0000L${i}\u0000`;
+    }
+  );
+  safe = applyEmphasis(safe);
+  safe = safe.replace(/\u0000L(\d+)\u0000/g, (_, i) => links[Number(i)] || "");
   safe = safe.replace(/\u0000C(\d+)\u0000/g, (_, i) => codes[Number(i)] || "");
   return safe;
 }

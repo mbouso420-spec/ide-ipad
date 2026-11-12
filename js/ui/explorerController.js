@@ -95,6 +95,37 @@ export function initExplorerController({
   let currentEntries = [];
   let currentActiveFileId = null;
   let contextMenuEl = null;
+  let cancelActiveLongPress = null;
+
+  const explorerPanelBody =
+    treeContainer?.closest?.(".panel-body") ||
+    (typeof document.querySelector === "function"
+      ? document.querySelector("#panel-explorer .panel-body")
+      : null);
+
+  function handleTreeContainerScroll() {
+    cancelActiveLongPress?.();
+    closeContextMenu();
+  }
+
+  explorerPanelBody?.addEventListener?.("scroll", handleTreeContainerScroll, { passive: true });
+  treeContainer?.addEventListener?.("scroll", handleTreeContainerScroll, { passive: true });
+
+  treeContainer?.addEventListener?.("keydown", (event) => {
+    if (event.key !== "Escape") return;
+    if (contextMenuEl && !contextMenuEl.hidden) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeContextMenu();
+      return;
+    }
+    if (pendingDeletePath) {
+      event.preventDefault();
+      event.stopPropagation();
+      pendingDeletePath = null;
+      renderTree(currentEntries, currentActiveFileId);
+    }
+  });
 
   function closeContextMenu() {
     if (contextMenuEl) {
@@ -116,13 +147,19 @@ export function initExplorerController({
       }
     });
 
-    window.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && contextMenuEl && !contextMenuEl.hidden) {
-        closeContextMenu();
-      }
-    });
+    window.addEventListener(
+      "keydown",
+      (event) => {
+        if (event.key === "Escape" && contextMenuEl && !contextMenuEl.hidden) {
+          event.preventDefault();
+          event.stopPropagation();
+          closeContextMenu();
+        }
+      },
+      { capture: true }
+    );
 
-    window.addEventListener("scroll", closeContextMenu, { passive: true });
+    window.addEventListener("scroll", handleTreeContainerScroll, { passive: true });
     window.addEventListener("blur", closeContextMenu);
 
     return contextMenuEl;
@@ -366,9 +403,17 @@ export function initExplorerController({
       close();
       await onConfirm();
     });
-    cancelBtn.addEventListener("click", () => {
+    const handleCancel = () => {
       close();
       setAutosaveStatus(rejectedMsg ? `Importación cancelada. ${rejectedMsg}` : "Importación cancelada");
+    };
+    cancelBtn.addEventListener("click", handleCancel);
+    box.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        handleCancel();
+      }
     });
 
     actions.append(replaceBtn, cancelBtn);
@@ -436,6 +481,7 @@ export function initExplorerController({
     form.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopPropagation();
         close();
       } else if (event.key === "Tab") {
         const focusable = [input, okBtn, cancelBtn];
@@ -581,6 +627,16 @@ export function initExplorerController({
       let longPressTimer = null;
       let longPressTriggered = false;
 
+      const clearLongPress = () => {
+        if (longPressTimer) {
+          clearTimeout(longPressTimer);
+          longPressTimer = null;
+        }
+        if (cancelActiveLongPress === clearLongPress) {
+          cancelActiveLongPress = null;
+        }
+      };
+
       row.addEventListener("contextmenu", (event) => {
         event.preventDefault();
         event.stopPropagation();
@@ -588,44 +644,52 @@ export function initExplorerController({
       });
 
       row.addEventListener("pointerdown", (event) => {
-        if (event.pointerType === "touch") {
-          touchStartX = event.clientX;
-          touchStartY = event.clientY;
-          longPressTriggered = false;
-          if (longPressTimer) clearTimeout(longPressTimer);
-          longPressTimer = window.setTimeout(() => {
-            longPressTriggered = true;
-            openContextMenu(node, touchStartX, touchStartY);
-          }, 500);
+        if (event.pointerType !== "touch" || event.isPrimary === false) return;
+        if (event.target?.closest?.(".tree-node-actions, .tree-confirm-bar, form, input")) {
+          clearLongPress();
+          return;
         }
+        touchStartX = event.clientX;
+        touchStartY = event.clientY;
+        longPressTriggered = false;
+        cancelActiveLongPress?.();
+        cancelActiveLongPress = clearLongPress;
+        longPressTimer = window.setTimeout(() => {
+          longPressTimer = null;
+          if (cancelActiveLongPress === clearLongPress) {
+            cancelActiveLongPress = null;
+          }
+          longPressTriggered = true;
+          openContextMenu(node, touchStartX, touchStartY);
+        }, 500);
       });
 
       row.addEventListener("pointermove", (event) => {
         if (longPressTimer && event.pointerType === "touch") {
           const dist = Math.hypot(event.clientX - touchStartX, event.clientY - touchStartY);
           if (dist > 8) {
-            clearTimeout(longPressTimer);
-            longPressTimer = null;
+            clearLongPress();
           }
         }
       });
 
       row.addEventListener("pointerup", (event) => {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
+        clearLongPress();
         if (longPressTriggered) {
           event.preventDefault();
           event.stopPropagation();
+          window.setTimeout(() => {
+            longPressTriggered = false;
+          }, 350);
         }
       });
 
       row.addEventListener("pointercancel", () => {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
+        clearLongPress();
+        longPressTriggered = false;
+      });
+      row.addEventListener("pointerleave", () => {
+        clearLongPress();
       });
 
       const mainBtn = document.createElement("button");
@@ -777,6 +841,7 @@ export function initExplorerController({
     form.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
+        event.stopPropagation();
         cancel();
       } else if (event.key === "Tab") {
         const focusable = [input, okBtn, cancelBtn];
@@ -851,11 +916,13 @@ export function initExplorerController({
 
     btnOfflineRepo.disabled = busy;
     btnOfflineRepo.classList.toggle("is-offline-ready", Boolean(isOfflineReady));
-    btnOfflineRepo.title = isOfflineReady
+    const statusLabel = isOfflineReady
       ? "Copia completa guardada en el iPad (disponible sin internet)"
       : pendingCount > 0
         ? `Guardar copia offline en el iPad (${pendingCount} archivos restantes)`
         : "Guardar copia offline en el iPad";
+    btnOfflineRepo.title = statusLabel;
+    btnOfflineRepo.setAttribute("aria-label", statusLabel);
   }
 
   return {

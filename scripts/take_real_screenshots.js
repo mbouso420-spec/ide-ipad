@@ -1,13 +1,22 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
 const OUT_DIR = path.join(ROOT_DIR, "docs", "screenshots");
 
-const puppeteerModulePath = path.join(ROOT_DIR, "tests", "node_modules", "puppeteer-core", "lib", "puppeteer", "puppeteer-core.js");
+const puppeteerModulePath = path.join(
+  ROOT_DIR,
+  "tests",
+  "node_modules",
+  "puppeteer-core",
+  "lib",
+  "puppeteer",
+  "puppeteer-core.js"
+);
 const { default: puppeteer } = await import(pathToFileURL(puppeteerModulePath).href);
 
 const MIME_TYPES = {
@@ -23,73 +32,135 @@ const MIME_TYPES = {
   ".webmanifest": "application/manifest+json"
 };
 
-// 1. Static HTTP Server
-const server = http.createServer((req, res) => {
-  const urlPath = req.url.split("?")[0];
-  let filePath = path.join(ROOT_DIR, urlPath === "/" ? "index.html" : urlPath);
-
-  if (!fs.existsSync(filePath)) {
-    res.writeHead(404);
-    res.end("Not found");
-    return;
+function findBrowserExecutable() {
+  const envCandidates = [process.env.CHROME_PATH, process.env.PUPPETEER_EXECUTABLE_PATH].filter(Boolean);
+  for (const candidate of envCandidates) {
+    if (fs.existsSync(candidate)) return candidate;
   }
 
-  const stat = fs.statSync(filePath);
-  if (stat.isDirectory()) {
-    filePath = path.join(filePath, "index.html");
+  const platformCandidates = {
+    win32: [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+    ],
+    darwin: [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+      "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    ],
+    linux: [
+      "/usr/bin/google-chrome",
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium"
+    ]
+  };
+
+  for (const candidate of platformCandidates[process.platform] || []) {
+    if (fs.existsSync(candidate)) return candidate;
   }
 
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType = MIME_TYPES[ext] || "application/octet-stream";
+  if (process.platform !== "win32") {
+    for (const bin of ["google-chrome", "chromium-browser", "chromium"]) {
+      try {
+        const resolved = execFileSync("which", [bin], { encoding: "utf8" }).trim();
+        if (resolved && fs.existsSync(resolved)) return resolved;
+      } catch {
+        // Probar siguiente candidato en PATH
+      }
+    }
+  }
 
-  res.writeHead(200, {
-    "Content-Type": contentType,
-    "Cache-Control": "no-cache"
-  });
-  fs.createReadStream(filePath).pipe(res);
-});
+  throw new Error(
+    "No se encontró Chrome, Chromium ni Edge. Definí CHROME_PATH o PUPPETEER_EXECUTABLE_PATH."
+  );
+}
 
-await new Promise((resolve) => server.listen(8088, "127.0.0.1", resolve));
-console.log("Local HTTP server running at http://127.0.0.1:8088");
-
-// Detect Chrome or Edge
-const chromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const edgePath = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
-const executablePath = fs.existsSync(chromePath) ? chromePath : edgePath;
-
-console.log("Launching browser from:", executablePath);
-
-const tempUserDataDir = path.join(ROOT_DIR, "scripts", `chrome_ud_${Date.now()}`);
-fs.mkdirSync(tempUserDataDir, { recursive: true });
-
-const browser = await puppeteer.launch({
-  executablePath,
-  headless: true,
-  userDataDir: tempUserDataDir,
-  args: [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--window-size=1280,820"
-  ]
-});
+let server = null;
+let browser = null;
+let tempUserDataDir = null;
 
 try {
+  server = http.createServer((req, res) => {
+    const urlPath = (req.url || "/").split("?")[0];
+    let filePath = path.join(ROOT_DIR, urlPath === "/" ? "index.html" : urlPath);
+
+    if (!fs.existsSync(filePath)) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    const stat = fs.statSync(filePath);
+    if (stat.isDirectory()) {
+      filePath = path.join(filePath, "index.html");
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = MIME_TYPES[ext] || "application/octet-stream";
+
+    res.writeHead(200, {
+      "Content-Type": contentType,
+      "Cache-Control": "no-cache"
+    });
+    fs.createReadStream(filePath).pipe(res);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(8088, "127.0.0.1", resolve);
+  });
+  console.log("Local HTTP server running at http://127.0.0.1:8088");
+
+  const executablePath = findBrowserExecutable();
+  console.log("Launching browser from:", executablePath);
+
+  tempUserDataDir = path.join(ROOT_DIR, "scripts", `chrome_ud_${Date.now()}`);
+  fs.mkdirSync(tempUserDataDir, { recursive: true });
+
+  browser = await puppeteer.launch({
+    executablePath,
+    headless: true,
+    userDataDir: tempUserDataDir,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-gpu",
+      "--disable-dev-shm-usage",
+      "--window-size=1280,820"
+    ]
+  });
+
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 820, deviceScaleFactor: 2 });
 
   console.log("Navigating to Studio IDE...");
   await page.goto("http://127.0.0.1:8088/index.html", { waitUntil: "networkidle0", timeout: 15000 });
-  
-  // Wait for workspace and editor to initialize
+
   await page.waitForSelector(".ide-workspace", { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 2500));
 
-  // Ensure screenshots directory exists
   if (!fs.existsSync(OUT_DIR)) {
     fs.mkdirSync(OUT_DIR, { recursive: true });
   }
+
+  const clickEntryByExtension = async (extensions) =>
+    page.evaluate((exts) => {
+      const candidates = Array.from(
+        document.querySelectorAll("#file-tree .tree-node-btn, #editor-tabs .editor-tab-trigger")
+      );
+      const match = candidates.find((el) => {
+        const nameEl = el.querySelector(".file-tree-name") || el;
+        const label = (nameEl.textContent || "").trim().toLowerCase();
+        return exts.some((ext) => label.endsWith(ext));
+      });
+      if (!match) return false;
+      match.click();
+      return true;
+    }, extensions);
 
   // 1. CAPTURE MAIN OVERVIEW
   console.log("Capturing 01-studio-ide-overview.png...");
@@ -97,11 +168,7 @@ try {
 
   // 2. CAPTURE LIVE PREVIEW (WEB)
   console.log("Opening web preview...");
-  await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll(".tree-label, .tree-item, .tab-item, span"));
-    const htmlFile = items.find((el) => (el.textContent || "").trim().endsWith(".html"));
-    if (htmlFile) htmlFile.click();
-  });
+  await clickEntryByExtension([".html"]);
   await new Promise((r) => setTimeout(r, 800));
 
   await page.click("#btn-live-preview");
@@ -111,17 +178,12 @@ try {
   console.log("Capturing 02-live-preview-responsive.png...");
   await page.screenshot({ path: path.join(OUT_DIR, "02-live-preview-responsive.png") });
 
-  // Close preview dialog
   await page.click("#btn-close-preview");
   await new Promise((r) => setTimeout(r, 800));
 
   // 3. CAPTURE C/C++ RUNNER PREVIEW
   console.log("Opening C/C++ runner preview...");
-  await page.evaluate(() => {
-    const items = Array.from(document.querySelectorAll(".tree-label, .tree-item, .tab-item, span"));
-    const cppFile = items.find((el) => (el.textContent || "").trim().endsWith(".cpp") || (el.textContent || "").trim().endsWith(".c"));
-    if (cppFile) cppFile.click();
-  });
+  await clickEntryByExtension([".cpp", ".c"]);
   await new Promise((r) => setTimeout(r, 800));
 
   await page.click("#btn-live-preview");
@@ -131,14 +193,13 @@ try {
   console.log("Capturing 03-c-runner-interactive.png...");
   await page.screenshot({ path: path.join(OUT_DIR, "03-c-runner-interactive.png") });
 
-  // Close preview dialog
   await page.click("#btn-close-preview");
   await new Promise((r) => setTimeout(r, 800));
 
   // 4. CAPTURE AI ASSISTANT IN ACTION
   console.log("Preparing AI Assistant chat panel...");
   await page.evaluate(() => {
-    const chatInput = document.getElementById("chat-input");
+    const chatInput = document.getElementById("chat-prompt-input");
     if (chatInput) {
       chatInput.value = "¿Podrías optimizar este código en C++ para que use memoria dinámica eficientemente?";
       chatInput.dispatchEvent(new Event("input", { bubbles: true }));
@@ -163,15 +224,13 @@ try {
 
   // 6. CAPTURE QUICK OPEN PALETTE (Cmd+P)
   console.log("Opening Quick Open palette...");
+  await page.click("#btn-quick-open");
+  await page.waitForSelector("#quick-open-dialog[open]", { timeout: 8000 });
   await page.evaluate(() => {
-    const dlg = document.getElementById("quick-open-dialog");
     const input = document.getElementById("quick-open-input");
-    if (dlg) {
-      dlg.showModal();
-      if (input) {
-        input.value = ":15";
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      }
+    if (input) {
+      input.value = ":15";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
     }
   });
   await new Promise((r) => setTimeout(r, 800));
@@ -179,13 +238,24 @@ try {
   console.log("Capturing 06-quick-open.png...");
   await page.screenshot({ path: path.join(OUT_DIR, "06-quick-open.png") });
 
+  await page.click("#btn-close-quick-open").catch(() => undefined);
+
   console.log("All real browser screenshots captured successfully!");
 } catch (err) {
   console.error("Error capturing screenshots:", err);
+  process.exitCode = 1;
 } finally {
-  await browser.close();
-  server.close();
-  try {
-    fs.rmSync(tempUserDataDir, { recursive: true, force: true });
-  } catch {}
+  if (browser) {
+    await browser.close().catch(() => undefined);
+  }
+  if (server) {
+    server.close();
+  }
+  if (tempUserDataDir) {
+    try {
+      fs.rmSync(tempUserDataDir, { recursive: true, force: true });
+    } catch {
+      // Ignorar limpieza residual en Windows si Chrome aún libera handles
+    }
+  }
 }

@@ -24,11 +24,11 @@ jobs:
       - name: Install test dependencies
         run: npm --prefix tests ci
 
-      - name: Run static analysis (ESLint on js/ and sw.js)
+      - name: Run static analysis (ESLint on js/, sw.js, scripts/ and tests/)
         run: node --test tests/lint.test.js
 
       - name: Run automated unit, concurrency, soak & AppSec suites
-        run: npm --prefix tests test
+        run: find tests -maxdepth 1 -name '*.test.js' ! -name 'lint.test.js' -print0 | sort -z | xargs -0 node --test --expose-gc --test-reporter=spec
 
   e2e-browser:
     name: Real Browser E2E (Headless Chrome)

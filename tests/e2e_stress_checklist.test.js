@@ -4,13 +4,12 @@ import assert from "node:assert/strict";
 
 import { createEditorManager, wrapTextWithDelimiters } from "../js/editor/editorManager.js";
 import { decodeImportedFile, MAX_IMPORT_FILE_BYTES } from "../js/storage/fileImport.js";
-import { getStorageQuotaEstimate, formatStorageBytes } from "../js/storage/storageQuota.js";
 import { buildZipArchive, computeCrc32, getDosDateTime } from "../js/storage/zipExporter.js";
-import { truncateCodeContent, estimateTokens, formatInlineMarkdown } from "../js/ai/chatController.js";
+import { truncateCodeContent, formatInlineMarkdown } from "../js/ai/chatController.js";
 import { findBestHtmlEntrypoint, findTargetHtmlFile } from "../js/ui/livePreviewModal.js";
-import { parseGccErrors, buildWandboxPayload, hasMainFunction } from "../js/preview/cRunner.js";
+import { parseGccErrors, hasMainFunction } from "../js/preview/cRunner.js";
 import { convertResultsToCsv, convertResultsToJson, buildSqlRunnerPreview } from "../js/preview/sqlRunner.js";
-import { fetchRepoBranches, createRepoBranch } from "../js/github/githubService.js";
+import { createRepoBranch } from "../js/github/githubService.js";
 
 describe("BLOQUE 1 — Editor de Código, Memoria y Ergonomía Táctil", () => {
   test("1.1 Gestión de Memoria en CM6: abrir y cerrar 20 archivos libera estados (dropFileState)", async () => {
@@ -335,14 +334,14 @@ app.c:12:3: error: unknown type name 'intt'; did you mean 'int'?
 });
 
 describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
-  test("6.1 Caché Offline: versión vigente studio-ide-shell-v29 y 100% de módulos js/css/assets + importmap precacheados en sw.js", async () => {
+  test("6.1 Caché Offline: versión vigente studio-ide-shell-v30 y 100% de módulos js/css/assets + importmap precacheados en sw.js", async () => {
     const fs = await import("node:fs/promises");
     const path = await import("node:path");
     const { fileURLToPath } = await import("node:url");
     const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     const swContent = await fs.readFile(path.join(rootDir, "sw.js"), "utf-8");
     const htmlContent = await fs.readFile(path.join(rootDir, "index.html"), "utf-8");
-    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v29"'));
+    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v30"'));
     assert.ok(swContent.includes("credentialGuard.js"));
     assert.ok(swContent.includes("keyVaultCrypto.js"));
     assert.ok(swContent.includes("githubMerge.js"));

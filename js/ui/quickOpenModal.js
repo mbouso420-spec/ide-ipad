@@ -1,4 +1,5 @@
 import { icon } from "./icons.js";
+import { keyboardRouter } from "./keyboardRouter.js";
 
 /**
  * Parsea una consulta de apertura rápida separando el nombre de archivo de la línea de salto opcional.
@@ -49,12 +50,18 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
     if (!dialog.open) {
       dialog.showModal();
     }
+    keyboardRouter.pushModal({
+      id: "quick-open-dialog",
+      blockGlobalShortcuts: true,
+      onEscape: () => close()
+    });
     window.requestAnimationFrame(() => {
       input?.focus();
     });
   }
 
   function close() {
+    keyboardRouter.popModal("quick-open-dialog");
     dialog?.close();
   }
 
@@ -100,6 +107,9 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
 
   window.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
+      if (keyboardRouter.shouldBlockGlobalShortcuts("quick-open-dialog")) {
+        return;
+      }
       event.preventDefault();
       if (dialog?.open) {
         close();

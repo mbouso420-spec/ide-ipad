@@ -586,9 +586,36 @@ export function getLanguageCompletions(lang, query, docText = "", limit = 8) {
  * Controlador visual de la barra inferior de sugerencias en vivo (`#editor-autocomplete-bar`),
  * que muestra opciones para elegir con un toque o con Tab mientras el usuario escribe.
  */
-export function createAutocompleteBarController({ mountEl, onAccept }) {
-  let barEl = typeof document !== "undefined" ? document.getElementById("editor-autocomplete-bar") : null;
-  let trackEl = typeof document !== "undefined" ? document.getElementById("editor-autocomplete-track") : null;
+export function createAutocompleteBarController({
+  mountEl,
+  onAccept,
+  enabled = true,
+  sharedGlobalBar = true
+}) {
+  if (!enabled) {
+    return {
+      update() {},
+      hide() {},
+      moveSelection() {
+        return false;
+      },
+      acceptCurrent() {
+        return false;
+      },
+      isOpen: () => false,
+      getItems: () => [],
+      destroy() {}
+    };
+  }
+
+  let barEl =
+    sharedGlobalBar && typeof document !== "undefined"
+      ? document.getElementById("editor-autocomplete-bar")
+      : null;
+  let trackEl =
+    sharedGlobalBar && typeof document !== "undefined"
+      ? document.getElementById("editor-autocomplete-track")
+      : null;
   let createdLocally = false;
 
   if (!barEl && mountEl && typeof document !== "undefined") {

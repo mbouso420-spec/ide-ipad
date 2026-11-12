@@ -25,8 +25,8 @@ import {
   hydrateLazyGithubProject,
   makeGithubProjectId,
   markProjectSynced,
-  saveCredentialsBackup,
-  saveProjectState
+  migrateGithubProjectBranch,
+  saveCredentialsBackup
 } from "../storage/workspaceDb.js";
 import { classifyRemotePullChanges, buildRemotePullPlan } from "./githubMerge.js";
 import { initGithubLocalBackupPanel, setGithubStatus as setStatus } from "./githubLocalBackupPanel.js";
@@ -131,6 +131,7 @@ export function initGithubController({
   let openConfirmTimer = 0;
   let activeConflict = null;
   let activeMergeClassification = null;
+  let isPushing = false;
 
   function applyConnectedSessionUi(login, repos) {
     const cleanLogin = String(login || "").trim();
@@ -574,35 +575,39 @@ export function initGithubController({
   });
 
   async function executePush(force = false) {
+    if (isPushing) return;
     const project = getActiveProject();
     if (!project || project.kind !== "github" || !project.github) return;
 
-    await onFlushPendingSaves?.();
-
-    const token = getGithubToken();
-    if (!token) {
-      setStatus(pushStatusEl, "Necesitás conectar tu Personal Access Token arriba para hacer push.", "error");
-      return;
-    }
-
-    const message = (commitMsgInput?.value || "").trim();
-    if (!message) {
-      commitMsgInput?.focus();
-      setStatus(pushStatusEl, "Escribí un mensaje descriptivo para el commit.", "error");
-      return;
-    }
-
-    const changes = await getPendingGithubChanges(project.id);
-    if (changes.length === 0) {
-      setStatus(pushStatusEl, "No hay cambios pendientes frente al repositorio.", "neutral");
-      return;
-    }
-
-    pushBtn.disabled = true;
+    isPushing = true;
+    if (pushBtn) pushBtn.disabled = true;
     if (conflictForceBtn) conflictForceBtn.disabled = true;
-    setStatus(pushStatusEl, `Enviando commit con ${changes.length} archivo(s) a ${project.github.branch}…`, "neutral");
+    let token = "";
 
     try {
+      await onFlushPendingSaves?.();
+
+      token = getGithubToken();
+      if (!token) {
+        setStatus(pushStatusEl, "Necesitás conectar tu Personal Access Token arriba para hacer push.", "error");
+        return;
+      }
+
+      const message = (commitMsgInput?.value || "").trim();
+      if (!message) {
+        commitMsgInput?.focus();
+        setStatus(pushStatusEl, "Escribí un mensaje descriptivo para el commit.", "error");
+        return;
+      }
+
+      const changes = await getPendingGithubChanges(project.id);
+      if (changes.length === 0) {
+        setStatus(pushStatusEl, "No hay cambios pendientes frente al repositorio.", "neutral");
+        return;
+      }
+
+      setStatus(pushStatusEl, `Enviando commit con ${changes.length} archivo(s) a ${project.github.branch}…`, "neutral");
+
       const { commitSha } = await pushAtomicCommit({
         token,
         owner: project.github.owner,
@@ -631,7 +636,8 @@ export function initGithubController({
         setStatus(pushStatusEl, error instanceof Error ? error.message : "Error al publicar commit.", "error");
       }
     } finally {
-      pushBtn.disabled = false;
+      isPushing = false;
+      if (pushBtn) pushBtn.disabled = false;
       if (conflictForceBtn) conflictForceBtn.disabled = false;
     }
   }
@@ -654,6 +660,13 @@ export function initGithubController({
     setStatus(pushStatusEl, "Hay commits nuevos en GitHub que no tenés localmente.", "error");
   }
 
+  function formatFetchedForDiff(fetched) {
+    if (fetched && typeof fetched === "object" && fetched.isBinary) {
+      return `[Archivo binario (${(fetched.base64 || "").length} caracteres Base64)]`;
+    }
+    return String(fetched ?? "");
+  }
+
   async function openRemoteVsLocalDiff(file) {
     if (!activeConflict) return;
     const allEntries = await getProjectEntries(activeConflict.project.id);
@@ -661,28 +674,34 @@ export function initGithubController({
     let remoteContent = "";
     if (file.blobSha) {
       try {
-        remoteContent = await fetchSingleRepoBlob({
+        const fetched = await fetchSingleRepoBlob({
           token: activeConflict.token,
           owner: activeConflict.project.github.owner,
           repo: activeConflict.project.github.repo,
-          blobSha: file.blobSha
+          blobSha: file.blobSha,
+          path: file.path
         });
+        remoteContent = formatFetchedForDiff(fetched);
       } catch {
         remoteContent = "(No se pudo descargar el archivo remoto)";
       }
     }
     let localContent = "(Archivo no existe localmente)";
     if (localFile) {
-      if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
+      if (localFile.isBinary) {
+        localContent = `[Archivo binario local (${(localFile.base64 || "").length} caracteres Base64)]`;
+      } else if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
         localContent = localFile.content;
       } else if (localFile.blobSha) {
         try {
-          localContent = await fetchSingleRepoBlob({
+          const fetchedLocal = await fetchSingleRepoBlob({
             token: activeConflict.token,
             owner: activeConflict.project.github.owner,
             repo: activeConflict.project.github.repo,
-            blobSha: localFile.blobSha
+            blobSha: localFile.blobSha,
+            path: localFile.path
           });
+          localContent = formatFetchedForDiff(fetchedLocal);
         } catch {
           localContent = "(No se pudo descargar el archivo local)";
         }
@@ -707,13 +726,18 @@ export function initGithubController({
   commitMsgInput?.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
+      if (isPushing) return;
       void executePush(false);
     }
   });
 
-  pushBtn?.addEventListener("click", () => executePush(false));
+  pushBtn?.addEventListener("click", () => {
+    if (!isPushing) void executePush(false);
+  });
 
-  conflictForceBtn?.addEventListener("click", () => executePush(true));
+  conflictForceBtn?.addEventListener("click", () => {
+    if (!isPushing) void executePush(true);
+  });
 
   conflictViewBtn?.addEventListener("click", async () => {
     if (!activeConflict || !conflictList) return;
@@ -886,18 +910,19 @@ export function initGithubController({
         localEntries,
         classification: activeMergeClassification,
         newCommitSha: remoteSha,
-        fetchBlob: (blobSha) =>
+        fetchBlob: (blobSha, filePath) =>
           fetchSingleRepoBlob({
             token: targetToken,
             owner: targetProject.github.owner,
             repo: targetProject.github.repo,
-            blobSha
+            blobSha,
+            path: filePath
           })
       });
 
       const result = await applyRemotePullPlan(targetProject.id, plan);
       hideConflictBox();
-      await onProjectClonedOrSynced?.(targetProject.id);
+      await onProjectClonedOrSynced?.(result?.project?.id || targetProject.id);
       await refreshSyncPanel();
       setStatus(
         pushStatusEl,
@@ -963,20 +988,26 @@ export function initGithubController({
     }
 
     try {
-      await createRepoBranch({
+      await onFlushPendingSaves?.();
+      const createdBranch = await createRepoBranch({
         token,
         owner: project.github.owner,
         repo: project.github.repo,
         branchName,
-        fromSha: project.github.commitSha || project.github.baseCommitSha
+        fromSha: project.github.commitSha
       });
-      project.github.branch = branchName;
-      await saveProjectState(project);
+      const migrated = await migrateGithubProjectBranch(
+        project.id,
+        branchName,
+        createdBranch?.commitSha || project.github.commitSha || null
+      );
       if (newBranchBox) {
         newBranchBox.hidden = true;
         if (newBranchInput) newBranchInput.value = "";
       }
+      await onProjectClonedOrSynced?.(migrated.id);
       if (branchStatusEl) {
+        branchStatusEl.hidden = false;
         branchStatusEl.textContent = `Rama "${branchName}" creada y activa.`;
       }
       await refreshSyncPanel();
@@ -993,12 +1024,51 @@ export function initGithubController({
   syncBranchSelect?.addEventListener("change", async () => {
     const project = getActiveProject();
     if (!project || !project.github) return;
+    const prevBranch = project.github.branch;
     const chosen = syncBranchSelect.value;
-    if (!chosen || chosen === project.github.branch) return;
+    if (!chosen || chosen === prevBranch) return;
 
-    project.github.branch = chosen;
-    await saveProjectState(project);
-    await refreshSyncPanel();
+    await onFlushPendingSaves?.();
+    const pendingChanges = await getPendingGithubChanges(project.id);
+    if (pendingChanges.length > 0) {
+      syncBranchSelect.value = prevBranch;
+      setStatus(
+        pushStatusEl,
+        `Tenés ${pendingChanges.length} cambio(s) locales pendientes en "${prevBranch}". Hacé commit/push o creá una nueva rama (+) para no mezclar bases.`,
+        "error"
+      );
+      return;
+    }
+
+    const token = getGithubToken();
+    const { owner, repo } = project.github;
+    syncBranchSelect.disabled = true;
+    setStatus(pushStatusEl, `Cambiando y sincronizando rama "${chosen}" desde GitHub…`, "neutral");
+    try {
+      const updated = project.offlineCached
+        ? await (() =>
+            downloadRepoFiles({ token, owner, repo, branch: chosen }).then(({ commitSha, files }) =>
+              hydrateGithubProject({ owner, repo, branch: chosen, commitSha, files })
+            ))()
+        : await (() =>
+            fetchRepoTreeIndex({ token, owner, repo, branch: chosen }).then((idx) =>
+              hydrateLazyGithubProject({
+                owner,
+                repo,
+                branch: idx.branch || chosen,
+                commitSha: idx.commitSha,
+                entries: idx.entries
+              })
+            ))();
+      await onProjectClonedOrSynced?.(updated.id);
+      await refreshSyncPanel();
+      setStatus(pushStatusEl, `Rama activa cambiada a "${chosen}".`, "ok");
+    } catch (error) {
+      syncBranchSelect.value = prevBranch;
+      setStatus(pushStatusEl, error instanceof Error ? error.message : "No se pudo cambiar de rama.", "error");
+    } finally {
+      syncBranchSelect.disabled = false;
+    }
   });
 
   async function connectAndLoadRepos(token) {

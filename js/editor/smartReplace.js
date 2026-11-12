@@ -89,6 +89,65 @@ export function scoreLineSimilarity(docLine, snippetLine) {
  *   mode: "selection" | "single-line" | "block" | "full"
  * }}
  */
+function findBalancedBraceBlockEnd(lines, startIdx) {
+  let depth = 0;
+  let sawOpen = false;
+  let quote = "";
+  let inBlockComment = false;
+
+  for (let k = startIdx; k < lines.length; k++) {
+    const line = lines[k];
+    if (!sawOpen && k - startIdx > 4) {
+      return -1;
+    }
+    let inLineComment = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      const next = line[i + 1] || "";
+      if (inLineComment) break;
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          i += 1;
+        }
+        continue;
+      }
+      if (quote) {
+        if (ch === "\\") {
+          i += 1;
+          continue;
+        }
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === "/" && next === "/") {
+        inLineComment = true;
+        continue;
+      }
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        i += 1;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        quote = ch;
+        continue;
+      }
+      if (ch === "{") {
+        depth += 1;
+        sawOpen = true;
+      } else if (ch === "}" && sawOpen) {
+        depth -= 1;
+        if (depth === 0) {
+          return k;
+        }
+      }
+    }
+    if (quote === "'" || quote === '"') quote = "";
+  }
+  return -1;
+}
+
 export function computeSmartReplacement(docText, newSnippet, options = {}) {
   const rawDoc = String(docText ?? "");
   const rawSnippet = String(newSnippet ?? "").replace(/\r\n/g, "\n").replace(/\n$/, "");
@@ -285,25 +344,36 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     // Determinar fin del bloque en docLines a partir de bestStartIdx
     let matchedEndIdx = -1;
     const expectedEnd = Math.min(docLines.length - 1, bestStartIdx + snippetLines.length - 1);
-    const searchFrom = Math.max(bestStartIdx + 1, expectedEnd - 6);
-    const searchTo = Math.min(docLines.length - 1, expectedEnd + 8);
+    const trimmedLastSnippet = lastSnippetLine.trim();
+    const closesBraceBlock = trimmedLastSnippet === "}" || trimmedLastSnippet === "};" || trimmedLastSnippet === "},";
 
-    // Si el bloque abre llaves { ... }, podemos buscar la línea de cierre balanceada con misma sangría
-    const startIndent = (docLines[bestStartIdx].match(/^[ \t]*/) || [""])[0];
-    if (lastSnippetLine.trim() === "}" || lastSnippetLine.trim() === "};") {
-      for (let k = bestStartIdx + 1; k <= searchTo; k++) {
-        const lineIndent = (docLines[k].match(/^[ \t]*/) || [""])[0];
-        if ((docLines[k].trim() === "}" || docLines[k].trim() === "};") && lineIndent === startIndent) {
-          matchedEndIdx = k;
-          break;
+    if (closesBraceBlock) {
+      matchedEndIdx = findBalancedBraceBlockEnd(docLines, bestStartIdx);
+      if (matchedEndIdx === -1) {
+        const startIndent = (docLines[bestStartIdx].match(/^[ \t]*/) || [""])[0];
+        for (let k = bestStartIdx + 1; k < docLines.length; k++) {
+          const lineIndent = (docLines[k].match(/^[ \t]*/) || [""])[0];
+          const kTrim = docLines[k].trim();
+          if ((kTrim === "}" || kTrim === "};") && lineIndent === startIndent) {
+            matchedEndIdx = k;
+            break;
+          }
         }
       }
     }
 
     if (matchedEndIdx === -1) {
+      const searchFrom = bestStartIdx + 1;
+      const searchTo = Math.min(
+        docLines.length - 1,
+        Math.max(expectedEnd + 24, bestStartIdx + snippetLines.length * 4 + 8)
+      );
       let bestEndScore = 0;
       for (let k = searchFrom; k <= searchTo; k++) {
-        const s = scoreLineSimilarity(docLines[k], lastSnippetLine);
+        const sim = scoreLineSimilarity(docLines[k], lastSnippetLine);
+        if (sim <= 0) continue;
+        const proximityBonus = 0.02 / (1 + Math.abs(k - expectedEnd));
+        const s = sim + proximityBonus;
         if (s > bestEndScore) {
           bestEndScore = s;
           matchedEndIdx = k;
@@ -329,10 +399,15 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     }
   }
 
-  // Si el snippet es claramente un fragmento corto respecto al archivo total (ej. 2 a 6 líneas en un archivo grande)
+  // Si el snippet es claramente un fragmento corto respecto al archivo total (incluyendo archivos cortos de < 6 líneas)
+  const maxFragmentLines =
+    docLines.length >= 6
+      ? Math.max(4, Math.floor(nonEmptyDocLines * 0.45))
+      : Math.max(1, Math.floor(nonEmptyDocLines * 0.5));
   const isSmallFragment =
-    docLines.length >= 6 &&
-    nonEmptySnippetLines <= Math.max(4, Math.floor(nonEmptyDocLines * 0.45)) &&
+    nonEmptyDocLines >= 3 &&
+    nonEmptySnippetLines < nonEmptyDocLines &&
+    nonEmptySnippetLines <= maxFragmentLines &&
     scoreLineSimilarity(docLines[0], firstSnippetLine) < 0.7;
 
   if (isSmallFragment) {

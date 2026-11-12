@@ -9,7 +9,7 @@
 - **Versión actual:** `1.2.0`
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 525 pruebas automatizadas en 120 suites + suites E2E reales en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) pasando al 100% (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v29, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y navegadores reales, 0 fallos).
+- **Suite de pruebas automáticas:** 563 pruebas automatizadas en 129 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
 
 ---
 
@@ -22,7 +22,7 @@
   - **Menú contextual táctil (`Long-Press` ~500ms y clic derecho):** menú flotante para renombrar, duplicar inteligentemente (ej. `archivo.copia.js`, `archivo.copia 2.js`), descargar y eliminar.
   - **Trampa de foco accesible:** navegación fluida con `Tab` / `Shift+Tab` dentro de los formularios inline.
   - **Exportación e importación segura:** descarga del proyecto completo en formato `.zip` estándar (PKZIP 2.0 nativo 100% offline) y límite de seguridad de 5 MB en importaciones con detección de codificación.
-  - **Monitor de almacenamiento persistente:** indicador en vivo de cuota y uso (`navigator.storage.estimate`) en la barra inferior del explorador.
+  - **Monitor de almacenamiento persistente:** indicador en vivo de cuota y uso (`navigator.storage.estimate`) y respaldo en Gist privado en la barra superior del explorador.
 - **Isla central (Editor CodeMirror 6 con fallback resiliente):**
   - Soporte de pestañas múltiples con liberación inmediata de memoria (`dropFileState`) al cerrarlas.
   - **Atajos de cierre rápido:** `Alt + W`, `Cmd + W`, `Ctrl + W` o clic central del mouse/trackpad (`auxclick`).
@@ -96,13 +96,13 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v29`):**
-   - Estrategia **Network-First** para el App Shell propio garantizando la versión más fresca con internet y fallback offline automático.
-   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/preview/moduleBundler.js`, `js/security/credentialGuard.js`, `js/security/keyVaultCrypto.js`, `js/github/githubMerge.js`, `js/editor/codeFormatter.js`, `js/preview/tsTranspiler.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn, las 16 dependencias CDN del importmap CodeMirror/Octokit con precalentamiento acotado de sub-chunks de `esm.sh` y Pyodide) durante el evento `install`.
+2. **Service Worker (`studio-ide-shell-v30` y `studio-ide-runtime-v2`):**
+   - Estrategia **Network-First** para el App Shell propio con reintento/fallback en precacheo, soporte `{ ignoreSearch: true }`, y protección contra respuestas HTTP 5xx sobre caché válido.
+   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/preview/moduleBundler.js`, `js/security/credentialGuard.js`, `js/security/keyVaultCrypto.js`, `js/github/githubMerge.js`, `js/editor/codeFormatter.js`, `js/preview/tsTranspiler.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn, las 16 dependencias CDN del importmap CodeMirror/Octokit con precalentamiento acotado de sub-chunks de `esm.sh` y Pyodide en best-effort) durante el evento `install`, y revalidación SWR CDN con `event.waitUntil` sin almacenar respuestas `opaque`.
 3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js` y `js/security/keyVaultCrypto.js`):**
    - **Lockout progresivo y persistente (*Exponential Backoff & Lockout*):** ante intentos fallidos consecutivos (umbral de 4 fallos en `LOCKOUT_THRESHOLD`), bloquea nuevas peticiones por *scope* aislado (`github` y `ai:<providerId>`) con ventanas progresivas de `30s -> 2m -> 5m` (`LOCKOUT_DURATIONS_MS`) persistidas entre recargas (`localStorage` / `sessionStorage`).
    - **Validación pre-vuelo de formato y entropía:** inspecciona localmente longitud, ausencia de espacios internos, prefijos esperados y entropía antes de ejecutar `fetch()`, bloqueando caracteres de control e inyecciones CRLF (`\r`/`\n`) en cabeceras HTTP.
-   - **Lista negra de sesión por huella criptográfica:** registra huellas irreversibles de 64 bits estilo FNV-1a (`computeTokenFingerprint`) para credenciales rechazadas (`401`/`403`) y evita su reenvío repetido en la sesión sin almacenar el secreto rechazado.
+   - **Lista negra de sesión por huella criptográfica:** registra huellas irreversibles de 96 bits (`fp_<24 hex>` sin fuga de longitud, `computeTokenFingerprint`) para credenciales rechazadas (`401`/`403`) y evita su reenvío repetido en la sesión sin almacenar el secreto rechazado.
    - **Higiene y redacción automática de secretos:** sanea mensajes de error, trazas y logs mediante `redactSensitiveTokens` y enmascara vistas previas en el DOM con `maskCredentialPreview`.
    - **Portabilidad cifrada AES-GCM 256 (`keyVaultCrypto.js`):** exportación e importación de credenciales protegida con contraseña maestra (`PBKDF2-HMAC-SHA256` + `AES-GCM-256` vía Web Crypto API) desde Configuración → Almacenamiento.
 4. **Privacidad de credenciales:**
@@ -118,23 +118,23 @@
 .
 ├── index.html                  # Shell principal, CSP, diálogos modales accesibles y maquetación
 ├── manifest.json               # Manifiesto Web App (PWA standalone para iPadOS y escritorio)
-├── sw.js                       # Service Worker v29 (App Shell + Runtime Cache de Acorn/Importmap/CDNs)
+├── sw.js                       # Service Worker v30 (App Shell + Runtime Cache v2 de Acorn/Importmap/CDNs)
 ├── .github/workflows/ci.yml    # CI en GitHub Actions (lint, Node QA, Chromium E2E y WebKit E2E)
 ├── .nojekyll                   # Desactiva el procesamiento de Jekyll en GitHub Pages
 ├── README.md                   # Documentación técnica y arquitectura de la solución
 ├── MANUAL_DE_USUARIO.md        # Manual exhaustivo para el usuario final (iPad y PC)
 ├── assets/
-│   ├── icon.svg                # Isotipo vectorial
+│   ├── icon.svg                # Isotipo vectorial (full-bleed en zona segura para maskable)
 │   ├── apple-touch-icon.png    # Icono 180x180 para inicio de iPadOS
 │   └── icon-512.png            # Icono 512x512 para instalación PWA
 ├── css/
-│   ├── tokens.css              # Tokens de diseño (oklch, tipografía, espaciado, elevación)
+│   ├── tokens.css              # Tokens de diseño (OKLCH con contraste WCAG 2.1 AA en los 4 temas, tipografía, espaciado)
 │   ├── base.css                # Reset accesible, focus visible y reglas base
 │   ├── layout.css              # 3 islas, drawers para Stage Manager y gestión de visualViewport
 │   ├── editor.css              # Estilos de pestañas, CodeMirror 6 y scrollbars
 │   ├── chat.css                # Panel de IA, medidor de tokens y Markdown con enlaces seguros
 │   ├── workspace.css           # Árbol de archivos, menú contextual, modal de ramas, Diff, visor y terminal
-│   └── app.css                 # Importador central y utilidades globales
+│   └── app.css                 # Importador central, utilidades globales y cascada táctil iOS/iPadOS
 ├── js/
 │   ├── app.js                  # Orquestador central de estado, atajos globales y diálogos
 │   ├── editor/
@@ -185,7 +185,7 @@
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas, REPL y medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 525 pruebas en 120 suites + E2E Chromium y WebKit
+└── tests/                      # Suite automatizada con 563 pruebas en 129 suites + E2E Chromium y WebKit
 ```
 
 ---
@@ -202,11 +202,10 @@ npm --prefix tests run test:e2e:webkit
 ```
 
 Resultado actual:
-- **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js` y `sw.js`.
-- **525 pruebas automatizadas en Node** distribuidas en **120 suites** (unitarias, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v29, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX).
-- **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v29, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless.
-- **Suite E2E Cross-Engine en WebKit (`tests/webkit.e2e.mjs`):** render táctil iPadOS portrait/landscape sin desbordes, IndexedDB, formateador, ES Modules multi-archivo en CSP y WebCrypto verificados en motor WebKit (Playwright).
-- **0 fallos, 0 pruebas canceladas.**
+- **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js`, `sw.js`, `scripts/*.js` y `tests/*.{js,mjs}` (`no-undef` + `no-unused-vars`).
+- **563 pruebas automatizadas en Node** distribuidas en **129 suites** (`npm --prefix tests test`: unitarias, regresiones de auditoría y ronda 2, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX), **0 fallos, 0 pruebas canceladas**.
+- **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v30, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless (ejecutada en CI fuera de sandbox).
+- **Suite E2E Cross-Engine en WebKit (`tests/webkit.e2e.mjs`):** render táctil iPadOS portrait/landscape sin desbordes, IndexedDB, formateador, ES Modules multi-archivo en CSP y WebCrypto verificados en motor WebKit (Playwright, ejecutada en CI fuera de sandbox).
 
 ---
 

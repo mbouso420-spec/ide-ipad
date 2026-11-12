@@ -30,8 +30,10 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
   let sliderEl = null;
   let containerEl = null;
   let isDragging = false;
+  let activePointerId = null;
   let animFrameId = null;
   let sliderRaf = null;
+  let resizeObserver = null;
 
   const handlePointerMove = (e) => {
     if (!isDragging) return;
@@ -41,8 +43,15 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
 
   const handlePointerUp = () => {
     isDragging = false;
+    if (activePointerId !== null) {
+      try {
+        containerEl?.releasePointerCapture?.(activePointerId);
+      } catch (_) {}
+      activePointerId = null;
+    }
     window.removeEventListener("pointermove", handlePointerMove);
     window.removeEventListener("pointerup", handlePointerUp);
+    window.removeEventListener("pointercancel", handlePointerUp);
   };
 
   function initDOM() {
@@ -64,7 +73,48 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     containerEl.appendChild(sliderEl);
     mountEl.appendChild(containerEl);
 
+    if (typeof ResizeObserver === "function") {
+      resizeObserver = new ResizeObserver(() => {
+        if (isVisible) {
+          requestRender();
+        }
+      });
+      resizeObserver.observe(containerEl);
+      if (mountEl && mountEl !== containerEl) {
+        resizeObserver.observe(mountEl);
+      }
+    }
+
     setupEvents();
+  }
+
+  function isElementHidden(el) {
+    if (!el || el.hidden || el.isConnected === false) return true;
+    if (typeof getComputedStyle === "function") {
+      try {
+        const style = getComputedStyle(el);
+        if (style && (style.display === "none" || style.visibility === "hidden")) {
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function getRenderDimensions() {
+    if (!isVisible || !canvas || !ctx || !containerEl) return null;
+    if (isElementHidden(containerEl) || isElementHidden(mountEl)) return null;
+    if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+      try {
+        if (window.matchMedia("(max-width: 48rem)").matches) {
+          return null;
+        }
+      } catch (_) {}
+    }
+    const width = Number(containerEl.clientWidth) || 0;
+    const height = Number(containerEl.clientHeight) || 0;
+    if (width <= 0 || height <= 1) return null;
+    return { width, height };
   }
 
   function setupEvents() {
@@ -73,9 +123,16 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     const handlePointerDown = (e) => {
       e.preventDefault();
       isDragging = true;
+      activePointerId = e.pointerId ?? null;
+      if (activePointerId !== null) {
+        try {
+          containerEl.setPointerCapture?.(activePointerId);
+        } catch (_) {}
+      }
       updateScrollFromPointer(e);
       window.addEventListener("pointermove", handlePointerMove);
       window.addEventListener("pointerup", handlePointerUp);
+      window.addEventListener("pointercancel", handlePointerUp);
     };
 
     containerEl.addEventListener("pointerdown", handlePointerDown);
@@ -91,16 +148,23 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
   }
 
   function render() {
-    if (!isVisible || !canvas || !ctx || !containerEl) return;
+    const dims = getRenderDimensions();
+    if (!dims) return;
 
-    const width = containerEl.clientWidth || 64;
-    const height = containerEl.clientHeight || 400;
+    const { width, height } = dims;
+    const rawDpr = typeof window !== "undefined" ? window.devicePixelRatio : 1;
+    const dpr = Math.max(1, Math.min(3, Number(rawDpr) || 1));
+    const pixelWidth = Math.round(width * dpr);
+    const pixelHeight = Math.round(height * dpr);
 
-    if (canvas.width !== width || canvas.height !== height) {
-      canvas.width = width;
-      canvas.height = height;
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
     }
 
+    if (typeof ctx.setTransform === "function") {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
     ctx.clearRect(0, 0, width, height);
 
     const lines = typeof getDocLines === "function" ? getDocLines() : [];
@@ -135,9 +199,10 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     if (sliderRaf) return;
     sliderRaf = safeRequestAnim(() => {
       sliderRaf = null;
-      if (!sliderEl || !containerEl) return;
+      if (!sliderEl || !getRenderDimensions()) return;
       const viewport = typeof getViewport === "function" ? getViewport() : { top: 0, height: 100, totalHeight: 100 };
-      const containerH = containerEl.clientHeight || 1;
+      const containerH = containerEl.clientHeight || 0;
+      if (containerH <= 1) return;
 
       const totalH = Math.max(1, viewport.totalHeight);
       const topRatio = Math.max(0, Math.min(1, viewport.top / totalH));
@@ -176,8 +241,13 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
   function destroy() {
     if (animFrameId) safeCancelAnim(animFrameId);
     if (sliderRaf) safeCancelAnim(sliderRaf);
+    if (resizeObserver) {
+      resizeObserver.disconnect();
+      resizeObserver = null;
+    }
     window.removeEventListener("pointermove", handlePointerMove);
     window.removeEventListener("pointerup", handlePointerUp);
+    window.removeEventListener("pointercancel", handlePointerUp);
     containerEl?.remove();
   }
 

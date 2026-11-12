@@ -109,8 +109,20 @@ export function initGithubLocalBackupPanel({
           }
           if (restoreGistBtn) restoreGistBtn.disabled = true;
         })
-        .catch(() => {
-          gistSelect.innerHTML = '<option value="">No se pudieron listar los Gists (revisá tu conexión)</option>';
+        .catch((err) => {
+          const msg = String(err?.message || "");
+          const isPermission403 =
+            err?.status === 403 &&
+            (msg.includes("Resource not accessible") ||
+              msg.includes("permiso") ||
+              msg.toLowerCase().includes("gist") ||
+              msg.toLowerCase().includes("scope"));
+          if (isPermission403 || msg.includes("permiso para Gists")) {
+            gistSelect.innerHTML =
+              '<option value="">Tu token no tiene permiso para Gists (podés publicar en repositorio)</option>';
+          } else {
+            gistSelect.innerHTML = '<option value="">No se pudieron listar los Gists (revisá tu conexión)</option>';
+          }
           if (restoreGistBtn) restoreGistBtn.disabled = true;
         });
     }
@@ -238,15 +250,16 @@ export function initGithubLocalBackupPanel({
         entries
       });
 
-      await convertLocalProjectToGithub(project.id, {
+      const converted = await convertLocalProjectToGithub(project.id, {
         owner: res.owner,
         repo: res.repo,
-        branch: res.branch
+        branch: res.branch,
+        commitSha: res.commitSha || null
       });
 
       hidePublishRepoBox();
       setGithubStatus(localBackupStatus, `¡Publicado con éxito como ${res.fullName} (${visibilityLabel})!`, "ok");
-      await onProjectClonedOrSynced?.(project.id);
+      await onProjectClonedOrSynced?.(converted?.id || project.id);
       await onRefreshSyncPanel?.();
     } catch (err) {
       const msg = err?.message || "No se pudo crear el repositorio en GitHub.";

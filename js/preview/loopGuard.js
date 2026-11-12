@@ -44,19 +44,19 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
     return { code: source, loops: 0, instrumented: false };
   }
 
-  /** @type {Array<{ pos: number, text: string }>} */
-  const edits = [];
+  /** @type {Array<{ line: number, body: any }>} */
+  const loopsList = [];
+  let hasShadowRisk = Boolean(module);
   const visit = (node) => {
     if (!node || typeof node.type !== "string") return;
+    if (node.type === "WithStatement" || (node.type === "Identifier" && node.name === "__studioLoopGuard")) {
+      hasShadowRisk = true;
+    }
     if (LOOP_TYPES.has(node.type) && node.body) {
-      const line = node.loc?.start?.line ?? 0;
-      const call = `__studioLoopGuard(${line});`;
-      if (node.body.type === "BlockStatement") {
-        edits.push({ pos: node.body.start + 1, text: call });
-      } else {
-        edits.push({ pos: node.body.start, text: `{${call}` });
-        edits.push({ pos: node.body.end, text: "}" });
-      }
+      loopsList.push({
+        line: node.loc?.start?.line ?? 0,
+        body: node.body
+      });
     }
     for (const key of Object.keys(node)) {
       if (key === "loc") continue;
@@ -70,8 +70,21 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
   };
   visit(ast);
 
-  if (edits.length === 0) {
+  if (loopsList.length === 0) {
     return { code: source, loops: 0, instrumented: false };
+  }
+
+  const guardCallee = hasShadowRisk ? "globalThis.__studioLoopGuard" : "__studioLoopGuard";
+  /** @type {Array<{ pos: number, text: string }>} */
+  const edits = [];
+  for (const item of loopsList) {
+    const call = `${guardCallee}(${item.line});`;
+    if (item.body.type === "BlockStatement") {
+      edits.push({ pos: item.body.start + 1, text: call });
+    } else {
+      edits.push({ pos: item.body.start, text: `{${call}` });
+      edits.push({ pos: item.body.end, text: "}" });
+    }
   }
 
   // Aplicar de atrás hacia adelante para no desplazar posiciones pendientes
@@ -80,30 +93,95 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
   for (const edit of edits) {
     out = out.slice(0, edit.pos) + edit.text + out.slice(edit.pos);
   }
-  const loops = edits.filter((e) => e.text.startsWith("__studioLoopGuard") || e.text.startsWith("{__studioLoopGuard")).length;
-  return { code: out, loops, instrumented: true };
+  return { code: out, loops: loopsList.length, instrumented: true };
 }
 
 /**
  * Código del guardián que se inyecta en la página de la vista previa (antes de cualquier script del usuario).
- * Mide el tiempo bloqueado con un temporizador que solo corre cuando la página está libre.
+ * Mide el tiempo bloqueado con un temporizador protegido contra clearInterval/redeclaración.
  */
 export function buildLoopGuardRuntime(limitMs = LOOP_GUARD_LIMIT_MS) {
+  const numericLimit = Number(limitMs) || 2500;
+  const formattedSeconds = (numericLimit / 1000).toLocaleString("es-AR");
   return `(function () {
-  var lastFree = Date.now();
-  setInterval(function () { lastFree = Date.now(); }, 100);
+  var _Date = Date;
+  var _DateNow = typeof _Date.now === "function" ? _Date.now : null;
+  var _Error = Error;
+  var _setInterval = typeof setInterval === "function" ? setInterval : null;
+  var _clearInterval = typeof clearInterval === "function" ? clearInterval : null;
+  var _clearTimeout = typeof clearTimeout === "function" ? clearTimeout : null;
+  var _console = typeof console !== "undefined" ? console : null;
+  var _now = function () { return _DateNow ? _DateNow.call(_Date) : +new _Date(); };
+  var limit = ${numericLimit};
+  var lastFree = _now();
+  var tripped = false;
+  var guardTimerId = _setInterval ? _setInterval(function () {
+    lastFree = _now();
+    tripped = false;
+  }, 100) : null;
+  if (_clearInterval) {
+    var safeClearInterval = function (id) {
+      if (guardTimerId !== null && guardTimerId !== undefined && id === guardTimerId) return;
+      return _clearInterval(id);
+    };
+    try { window.clearInterval = safeClearInterval; } catch (_) {}
+    if (typeof globalThis !== "undefined" && globalThis !== window) {
+      try { globalThis.clearInterval = safeClearInterval; } catch (_) {}
+    }
+  }
+  if (_clearTimeout) {
+    var safeClearTimeout = function (id) {
+      if (guardTimerId !== null && guardTimerId !== undefined && id === guardTimerId) return;
+      return _clearTimeout(id);
+    };
+    try { window.clearTimeout = safeClearTimeout; } catch (_) {}
+    if (typeof globalThis !== "undefined" && globalThis !== window) {
+      try { globalThis.clearTimeout = safeClearTimeout; } catch (_) {}
+    }
+  }
   // El tiempo con un alert/confirm/prompt abierto no cuenta como bloqueo
   ["alert", "confirm", "prompt"].forEach(function (name) {
     var original = window[name];
     if (typeof original !== "function") return;
     window[name] = function () {
-      try { return original.apply(window, arguments); } finally { lastFree = Date.now(); }
+      try { return original.apply(window, arguments); } finally { lastFree = _now(); tripped = false; }
     };
   });
-  window.__studioLoopGuard = function (line) {
-    if (Date.now() - lastFree > ${Number(limitMs) || 2500}) {
-      throw new Error("Bucle detenido en la línea " + line + ": la página quedó bloqueada más de ${((Number(limitMs) || 2500) / 1000).toLocaleString("es-AR")} s (posible bucle infinito). Se cortó para que el iPad no se congele.");
+  var __guardFn = function (line) {
+    if (tripped || _now() - lastFree > limit) {
+      var msg = "Bucle detenido en la línea " + line + ": la página quedó bloqueada más de ${formattedSeconds} s (posible bucle infinito). Se cortó para que el iPad no se congele.";
+      if (!tripped) {
+        tripped = true;
+        if (_console && typeof _console.error === "function") {
+          try { _console.error("[LoopGuard]", msg); } catch (_) {}
+        }
+      }
+      var err = new _Error(msg);
+      try { err.isLoopGuardError = true; } catch (_) {}
+      throw err;
     }
   };
+  var __root = typeof globalThis !== "undefined" ? globalThis : window;
+  try {
+    Object.defineProperty(__root, "__studioLoopGuard", {
+      value: __guardFn,
+      writable: false,
+      configurable: false,
+      enumerable: false
+    });
+    if (typeof window !== "undefined" && window !== __root) {
+      Object.defineProperty(window, "__studioLoopGuard", {
+        value: __guardFn,
+        writable: false,
+        configurable: false,
+        enumerable: false
+      });
+    }
+  } catch (_) {}
+  if (typeof window !== "undefined" && !window.__studioLoopGuard) {
+    window.__studioLoopGuard = function (line) {
+      return __guardFn(line);
+    };
+  }
 })();`;
 }

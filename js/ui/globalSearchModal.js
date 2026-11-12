@@ -1,4 +1,5 @@
 import { searchInFiles } from "../search/projectSearch.js";
+import { hydrateIcons } from "./icons.js";
 import { keyboardRouter } from "./keyboardRouter.js";
 
 /**
@@ -38,6 +39,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
     }
     keyboardRouter.pushModal({
       id: "global-search-dialog",
+      blockGlobalShortcuts: true,
       onEscape: () => close()
     });
     window.requestAnimationFrame(() => {
@@ -180,6 +182,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
     resultsEl.innerHTML = "";
     resultsEl.appendChild(container);
+    hydrateIcons(container);
   }
 
   function highlightSnippet(text, start, end) {

@@ -6,7 +6,6 @@ import * as acorn from "acorn";
 // Módulos bajo prueba de esfuerzo y caos
 import {
   parseGccErrors,
-  buildWandboxPayload,
   hasMainFunction,
   sanitizeLoopOutput,
   compileAndRunWandbox,
@@ -17,24 +16,20 @@ import {
   convertResultsToCsv,
   convertResultsToJson,
   applySqlPagination,
-  hasLimitClause,
-  isSelectQuery,
   buildCountQuery,
   buildSqlRunnerPreview
 } from "../js/preview/sqlRunner.js";
 
 import {
   bundleHtmlWithFolderAssets,
-  MAX_PREVIEW_ASSET_BYTES,
-  MAX_TOTAL_INLINED_CSS
+  MAX_PREVIEW_ASSET_BYTES
 } from "../js/preview/htmlBundler.js";
 
-import { instrumentLoops, LOOP_GUARD_LIMIT_MS } from "../js/preview/loopGuard.js";
+import { instrumentLoops } from "../js/preview/loopGuard.js";
 import { createEditorManager } from "../js/editor/editorManager.js";
 import {
   writeEmergencyBackup,
-  readEmergencyBackup,
-  getEmergencyBackupKey
+  readEmergencyBackup
 } from "../js/storage/emergencyBackup.js";
 import {
   upsertEntry,

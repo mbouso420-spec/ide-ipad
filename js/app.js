@@ -34,6 +34,7 @@ import {
   deleteProjectEntry,
   ensureInitialWorkspace,
   entryExists,
+  getEntryRecord,
   getProject,
   getProjectEntries,
   getSavedActiveProjectId,
@@ -82,16 +83,6 @@ async function initApp() {
     }
     if (selectThemeEl) {
       selectThemeEl.value = savedTheme;
-      selectThemeEl.addEventListener("change", (e) => {
-        const chosen = e.target.value;
-        if (chosen === "default") {
-          delete document.documentElement.dataset.theme;
-          localStorage.removeItem(THEME_STORAGE_KEY);
-        } else {
-          document.documentElement.dataset.theme = chosen;
-          localStorage.setItem(THEME_STORAGE_KEY, chosen);
-        }
-      });
     }
   } catch {
     // Entorno restringido o sin localStorage
@@ -159,7 +150,12 @@ async function initApp() {
   // Recuperar lo escrito justo antes de un cierre/recarga abrupta (ver emergencyBackup.js)
   let restoredFromBackup = 0;
   try {
-    restoredFromBackup = await restoreEmergencyBackup({ entryExists, updateFileContent });
+    restoredFromBackup = await restoreEmergencyBackup({
+      entryExists,
+      getEntryRecord,
+      getProjectEntries,
+      updateFileContent
+    });
   } catch {
     // Si falla, el respaldo queda en localStorage y se reintenta en la próxima apertura
   }
@@ -247,6 +243,8 @@ async function initApp() {
   const symbolBar = initSymbolBar({
     onInsert(text, cursorBack) {
       if (!activeFileId) return;
+      const activeFile = filesOnly.find((f) => f.id === activeFileId);
+      if (!activeFile || isBinaryFile(activeFile)) return;
       editor.insertAtCursor(text, cursorBack);
     }
   });
@@ -294,7 +292,9 @@ async function initApp() {
     document.body.appendChild(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => {
+      URL.revokeObjectURL(url);
+    }, 1000);
   }
 
   async function downloadCurrentActiveFile() {
@@ -626,7 +626,22 @@ async function initApp() {
     }
   });
 
-  const PREVIEWABLE_LANGS = new Set(["html", "js", "css", "python", "markdown", "c", "cpp", "sql", "rust", "go"]);
+  const PREVIEWABLE_LANGS = new Set([
+    "html",
+    "js",
+    "ts",
+    "tsx",
+    "css",
+    "python",
+    "markdown",
+    "c",
+    "cpp",
+    "java",
+    "csharp",
+    "sql",
+    "rust",
+    "go"
+  ]);
 
   initLivePreviewModal({
     getWorkspaceSnapshot() {
@@ -688,7 +703,12 @@ async function initApp() {
 
       const lastSlash = activeFile.path.lastIndexOf("/");
       const folderPrefix = lastSlash === -1 ? "" : `${activeFile.path.slice(0, lastSlash + 1)}`;
-      const isWeb = activeFile.lang === "html" || activeFile.lang === "js" || activeFile.lang === "css";
+      const isWeb =
+        activeFile.lang === "html" ||
+        activeFile.lang === "js" ||
+        activeFile.lang === "ts" ||
+        activeFile.lang === "tsx" ||
+        activeFile.lang === "css";
 
       const needed = filesOnly.filter((f) => {
         if (f.contentLoaded !== false || !f.blobSha) return false;
@@ -696,7 +716,14 @@ async function initApp() {
         if (activeFile.lang === "python") {
           return f.lang === "python";
         }
-        if (activeFile.lang === "c" || activeFile.lang === "cpp" || activeFile.lang === "rust" || activeFile.lang === "go") {
+        if (
+          activeFile.lang === "c" ||
+          activeFile.lang === "cpp" ||
+          activeFile.lang === "rust" ||
+          activeFile.lang === "go" ||
+          activeFile.lang === "java" ||
+          activeFile.lang === "csharp"
+        ) {
           return f.lang === activeFile.lang || f.path.endsWith(".h") || f.path.endsWith(".hpp");
         }
         if (activeFile.lang === "sql") {
@@ -705,6 +732,8 @@ async function initApp() {
         return (
           f.lang === "html" ||
           f.lang === "js" ||
+          f.lang === "ts" ||
+          f.lang === "tsx" ||
           f.lang === "css" ||
           f.path.endsWith(".json")
         );
@@ -817,11 +846,12 @@ async function initApp() {
       });
     },
     async onApplyToFile(targetPath, code) {
+      const rawPath = String(targetPath || "").trim().replace(/^(?:\.\/)+/, "");
       let norm;
       try {
-        norm = validateUserPath(targetPath);
+        norm = validateUserPath(rawPath);
       } catch {
-        norm = normalizePath(targetPath);
+        return false;
       }
       if (!norm) return false;
       let targetFile = filesOnly.find((f) => normalizePath(f.path) === norm);
@@ -849,21 +879,23 @@ async function initApp() {
       if (!Array.isArray(filesToApply) || filesToApply.length === 0) return false;
       let firstValidNorm = null;
       for (const item of filesToApply) {
+        const rawPath = String(item?.path || "").trim().replace(/^(?:\.\/)+/, "");
         let norm;
         try {
-          norm = validateUserPath(item.path);
+          norm = validateUserPath(rawPath);
         } catch {
-          norm = normalizePath(item.path);
+          continue;
         }
-        if (!norm || /[\x00-\x1f:*?"<>|]/.test(norm)) continue;
+        if (!norm) continue;
         if (!firstValidNorm) firstValidNorm = norm;
         const existing = filesOnly.find((f) => normalizePath(f.path) === norm);
         if (existing) {
           existing.content = item.code;
           await updateFileContent(activeProject.id, norm, item.code);
-          scheduleAutosave(activeProject.id, existing.id, item.code);
           if (activeFileId === existing.id) {
             editor.replaceEntireDocument(item.code);
+          } else {
+            editor.dropFileState(existing.id);
           }
           splitController?.replaceIfActive(existing.id, item.code);
         } else {
@@ -875,11 +907,10 @@ async function initApp() {
         }
       }
       await reloadProjectEntries();
-      if (firstValidNorm) {
-        const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
-        if (firstTarget) {
-          await openOrFocusFile(firstTarget.id);
-        }
+      if (!firstValidNorm) return false;
+      const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
+      if (firstTarget) {
+        await openOrFocusFile(firstTarget.id);
       }
       renderTabs();
       return true;
@@ -916,6 +947,9 @@ async function initApp() {
   // Atajo universal Cmd+S / Ctrl+S para forzar volcado inmediato a IndexedDB sin diálogo del navegador
   window.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "s") {
+      if (keyboardRouter.shouldBlockGlobalShortcuts()) {
+        return;
+      }
       event.preventDefault();
       void (async () => {
         await flushPendingSaves();
@@ -966,12 +1000,19 @@ async function initApp() {
         // Invalida el estado cacheado en statesByFile y reabre limpiamente desde IndexedDB sin recargar toda la UI
         editor.dropFileState(event.path);
         if (isBinaryFile(updated)) {
+          if (editorMountEl) editorMountEl.hidden = true;
           binaryPreview.render(updated);
+          symbolBar.setLanguage(updated.lang);
+          setEditorToolbarDisabled(false, true);
         } else {
           binaryPreview.hide();
+          if (editorMountEl) editorMountEl.hidden = false;
           editor.openFile(updated);
+          symbolBar.setLanguage(updated.lang);
+          setEditorToolbarDisabled(false, false);
         }
         renderTabs();
+        updateStatusBar();
       } else {
         // Invalida el estado en segundo plano para que al hacer clic se lea el contenido fresco
         editor.dropFileState(event.path);
@@ -979,13 +1020,104 @@ async function initApp() {
       }
 
       splitController?.handleRemoteFileUpdated(event.path, updated);
+      await github.refreshTopbarBadge();
       return;
     }
 
-    // Para cambios estructurales (creación, renombrado, borrado): volcar primero ediciones pendientes locales
+    let tabsChanged = false;
+
+    // Para cambios estructurales (creación, renombrado, borrado): descartar timers y actualizar estado local
+    if (event.type === "ENTRY_DELETED" && event.path && activeProject) {
+      const deletedPrefix = `${event.path}/`;
+      const isDeletedTarget = (p) =>
+        p === event.path || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(deletedPrefix));
+
+      for (const [key, item] of [...saveTimers.entries()]) {
+        if (item.projectId === activeProject.id && isDeletedTarget(item.filePath)) {
+          if (item.timerId) {
+            window.clearTimeout(item.timerId);
+          }
+          saveTimers.delete(key);
+        }
+      }
+
+      const nextTabs = [];
+      for (const tabId of openTabIds) {
+        if (isDeletedTarget(tabId)) {
+          editor.dropFileState(tabId);
+          tabsChanged = true;
+        } else {
+          nextTabs.push(tabId);
+        }
+      }
+      if (tabsChanged) {
+        openTabIds = nextTabs;
+      }
+      splitController?.dropFileState(event.path, Boolean(event.isFolder));
+      if (isDeletedTarget(activeFileId)) {
+        activeFileId = openTabIds[0] || null;
+        tabsChanged = true;
+      }
+    } else if (event.type === "ENTRY_RENAMED" && event.oldPath && activeProject) {
+      const oldPrefix = `${event.oldPath}/`;
+      const matchesOld = (p) =>
+        p === event.oldPath || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(oldPrefix));
+
+      for (const [key, item] of [...saveTimers.entries()]) {
+        if (item.projectId === activeProject.id && matchesOld(item.filePath)) {
+          if (item.timerId) {
+            window.clearTimeout(item.timerId);
+          }
+          saveTimers.delete(key);
+        }
+      }
+
+      if (event.newPath) {
+        const remapPath = (p) => {
+          if (!p) return p;
+          if (p === event.oldPath) return event.newPath;
+          if (event.isFolder && p.startsWith(oldPrefix)) {
+            return `${event.newPath}${p.slice(event.oldPath.length)}`;
+          }
+          return p;
+        };
+
+        const remappedTabs = [];
+        for (const tabId of openTabIds) {
+          const nextId = remapPath(tabId);
+          if (nextId !== tabId) tabsChanged = true;
+          if (!remappedTabs.includes(nextId)) {
+            remappedTabs.push(nextId);
+          }
+        }
+        openTabIds = remappedTabs;
+
+        if (activeFileId) {
+          const nextActive = remapPath(activeFileId);
+          if (nextActive !== activeFileId) {
+            activeFileId = nextActive;
+            tabsChanged = true;
+          }
+        }
+
+        editor.renameFileStates(event.oldPath, event.newPath, Boolean(event.isFolder));
+        splitController?.handleEntryRenamed(event.oldPath, event.newPath, Boolean(event.isFolder));
+      }
+    }
+
+    // Volcar ediciones pendientes locales restantes antes de recargar
     await flushPendingSaves();
     await reloadProjectEntries();
+    if (tabsChanged) {
+      const validIds = new Set(filesOnly.map((f) => f.id));
+      openTabIds = openTabIds.filter((id) => validIds.has(id));
+      if (activeFileId && !validIds.has(activeFileId)) {
+        activeFileId = openTabIds[0] || null;
+      }
+      await persistTabsState();
+    }
     renderWorkspaceView();
+    await github.refreshTopbarBadge();
   });
 
   // Autoguardado inmediato si Safari en iPad suspende la app o cambia en Stage Manager.
@@ -1028,6 +1160,7 @@ async function initApp() {
     getActiveFileId: () => activeFileId,
     getFilesOnly: () => filesOnly,
     getOpenTabIds: () => openTabIds,
+    ensureFileContentLoaded,
     isFileDirtyForProject,
     renderTabs,
     scheduleAutosave,
@@ -1089,6 +1222,21 @@ async function initApp() {
     }
   }
 
+  function hasPendingSavesForProject(projectId) {
+    if (!projectId) return false;
+    for (const item of saveTimers.values()) {
+      if (item && item.projectId === projectId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function clearProjectEmergencyBackupIfIdle(projectId) {
+    if (!projectId || hasPendingSavesForProject(projectId)) return;
+    clearEmergencyBackup(window.localStorage, projectId, tabInstanceId);
+  }
+
   function scheduleAutosave(projectId, filePath, content) {
     const delay = getAutosaveDelay();
     const timerKey = `${projectId}::${filePath}`;
@@ -1114,6 +1262,7 @@ async function initApp() {
         if (saveTimers.get(timerKey) === item) {
           saveTimers.delete(timerKey);
         }
+        clearProjectEmergencyBackupIfIdle(projectId);
         explorer.setAutosaveStatus("Autoguardado en IndexedDB");
         explorer.refreshStorageIndicator?.();
         await github.refreshTopbarBadge();
@@ -1131,6 +1280,7 @@ async function initApp() {
   async function flushPendingSaves() {
     if (saveTimers.size === 0) return;
     const entries = [...saveTimers.entries()];
+    const flushedProjectIds = new Set();
     for (const [key, item] of entries) {
       if (item && item.timerId) {
         window.clearTimeout(item.timerId);
@@ -1138,15 +1288,19 @@ async function initApp() {
       }
       if (item && item.projectId && item.filePath && typeof item.content === "string") {
         await updateFileContent(item.projectId, item.filePath, item.content);
+        flushedProjectIds.add(item.projectId);
       }
       if (saveTimers.get(key) === item) {
         saveTimers.delete(key);
       }
     }
+    for (const pid of flushedProjectIds) {
+      clearProjectEmergencyBackupIfIdle(pid);
+    }
     explorer.setAutosaveStatus("Autoguardado en IndexedDB");
   }
 
-  async function switchProject(projectId, _forceClearCache = false) {
+  async function switchProject(projectId) {
     const nextProj = await getProject(projectId);
     if (!nextProj) return;
 
@@ -1248,30 +1402,21 @@ async function initApp() {
     // Fijar el proyecto ANTES de esperar a la red: si el usuario cambia de proyecto mientras se descarga,
     // el contenido debe guardarse en el repositorio de origen y nunca en el proyecto que quedó activo.
     const sourceProjectId = activeProject.id;
-    const content = await fetchSingleRepoBlob({
+    const blobPayload = await fetchSingleRepoBlob({
       token: getGithubToken(),
       owner: activeProject.github.owner,
       repo: activeProject.github.repo,
+      blobSha: fileObj.blobSha,
+      path: fileObj.path,
+      isBinary: Boolean(fileObj.isBinary)
+    });
+    const { deleted } = await cacheAndSyncGithubFile({
+      projectId: sourceProjectId,
+      fileObj,
+      remotePayload: blobPayload ?? "",
       blobSha: fileObj.blobSha
     });
-
-    const saved = await cacheSingleGithubFileContent(sourceProjectId, fileObj.path, content, fileObj.blobSha);
-    // Usar lo que efectivamente quedó guardado (si hubo contenido local, se respeta en vez del remoto).
-    fileObj.content = saved?.content ?? content;
-    fileObj.baseContent = saved?.baseContent ?? content;
-    fileObj.contentLoaded = true;
-    if (activeProject.id !== sourceProjectId) {
-      return;
-    }
-    editor.dropFileState(fileObj.id);
-
-    if (filesOnly.length > 0 && filesOnly.every((f) => f.contentLoaded !== false)) {
-      activeProject.offlineCached = true;
-      await markProjectOfflineCached(activeProject.id, true);
-      projects = await listProjects();
-      explorer.renderProjects(projects, activeProject.id);
-    }
-    syncOfflineButtonState();
+    await finalizeLoadedProjectFiles(sourceProjectId, [fileObj], deleted);
   }
 
   async function ensureFilesLoaded(fileList, onProgress) {
@@ -1285,31 +1430,63 @@ async function initApp() {
       token: getGithubToken(),
       owner: activeProject.github.owner,
       repo: activeProject.github.repo,
-      items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha })),
+      items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha, isBinary: Boolean(f.isBinary) })),
       onProgress
     });
 
     const byPath = new Map(loadedItems.map((item) => [item.path, item]));
+    const syncedFiles = [];
+    let hasDeleted = false;
     for (const fileObj of unloaded) {
       const hit = byPath.get(fileObj.path);
       if (!hit) continue;
-      const saved = await cacheSingleGithubFileContent(
-        sourceProjectId,
-        fileObj.path,
-        hit.content,
-        hit.blobSha || fileObj.blobSha
-      );
-      fileObj.content = saved?.content ?? hit.content;
-      fileObj.baseContent = saved?.baseContent ?? hit.content;
-      fileObj.contentLoaded = true;
-      if (activeProject.id === sourceProjectId) {
+      const { deleted } = await cacheAndSyncGithubFile({
+        projectId: sourceProjectId,
+        fileObj,
+        remotePayload: hit,
+        blobSha: hit.blobSha || fileObj.blobSha
+      });
+      if (deleted) {
+        hasDeleted = true;
+      }
+      syncedFiles.push(fileObj);
+    }
+
+    await finalizeLoadedProjectFiles(sourceProjectId, syncedFiles, hasDeleted);
+  }
+
+  async function finalizeLoadedProjectFiles(sourceProjectId, loadedFiles, hasDeleted = false) {
+    if (activeProject.id !== sourceProjectId) {
+      return;
+    }
+
+    if (hasDeleted) {
+      const deletedIds = new Set(loadedFiles.filter((f) => f?.deleted).map((f) => f.id));
+      if (deletedIds.size > 0) {
+        entries = entries.filter((entry) => !deletedIds.has(entry.id));
+        filesOnly = filesOnly.filter((file) => !deletedIds.has(file.id));
+        openTabIds = openTabIds.filter((id) => !deletedIds.has(id));
+        if (activeFileId && deletedIds.has(activeFileId)) {
+          activeFileId = openTabIds[0] || null;
+          await persistTabsState();
+          renderWorkspaceView();
+        } else {
+          renderTabs();
+        }
+        explorer.renderTree(entries, activeFileId);
+        for (const deletedId of deletedIds) {
+          editor.dropFileState(deletedId);
+          splitController?.dropFileState?.(deletedId);
+        }
+      }
+    }
+
+    for (const fileObj of loadedFiles) {
+      if (fileObj && !fileObj.deleted) {
         editor.dropFileState(fileObj.id);
       }
     }
 
-    if (activeProject.id !== sourceProjectId) {
-      return;
-    }
     if (filesOnly.length > 0 && filesOnly.every((f) => f.contentLoaded !== false)) {
       activeProject.offlineCached = true;
       await markProjectOfflineCached(activeProject.id, true);
@@ -1339,6 +1516,9 @@ async function initApp() {
       try {
         await ensureFileContentLoaded(target);
         if (currentSeq !== openRequestSeq || activeProject?.id !== currentProjId) {
+          return;
+        }
+        if (target.deleted || !filesOnly.some((f) => f.id === target.id)) {
           return;
         }
         explorer.setAutosaveStatus("Archivo cargado desde GitHub");
@@ -1374,6 +1554,8 @@ async function initApp() {
     layout.closeLeftOnCompactSelect();
   }
 
+  let activeConfirmCleanup = null;
+
   function showConfirmDialog({
     title,
     message,
@@ -1395,6 +1577,11 @@ async function initApp() {
       return;
     }
 
+    activeConfirmCleanup?.();
+    if (dialog.open) {
+      dialog.close();
+    }
+
     if (titleEl) titleEl.textContent = title;
     if (msgEl) msgEl.textContent = message;
     if (actionBtn) {
@@ -1402,22 +1589,29 @@ async function initApp() {
       actionBtn.className = `btn ${confirmVariant}`;
     }
 
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (activeConfirmCleanup === cleanup) {
+        activeConfirmCleanup = null;
+      }
       keyboardRouter.popModal("confirm-dialog");
       cancelBtn?.removeEventListener("click", onCancel);
       closeBtn?.removeEventListener("click", onCancel);
       actionBtn?.removeEventListener("click", onProceed);
       dialog.removeEventListener("close", onDialogClose);
     };
+    activeConfirmCleanup = cleanup;
 
     const onCancel = () => {
       cleanup();
-      dialog.close();
+      if (dialog.open) dialog.close();
     };
 
     const onProceed = () => {
       cleanup();
-      dialog.close();
+      if (dialog.open) dialog.close();
       onConfirm?.();
     };
 
@@ -1430,16 +1624,16 @@ async function initApp() {
     actionBtn?.addEventListener("click", onProceed);
     dialog.addEventListener("close", onDialogClose);
 
+    dialog.showModal();
     keyboardRouter.pushModal({
       id: "confirm-dialog",
+      blockGlobalShortcuts: true,
       onEscape: () => onCancel(),
       onEnter: () => {
         onProceed();
         return true;
       }
     });
-
-    dialog.showModal();
   }
 
   function requestCloseTab(filePath) {
@@ -1466,13 +1660,19 @@ async function initApp() {
     const idx = openTabIds.indexOf(filePath);
     if (idx === -1) return;
 
-    // Si había un guardado pendiente para este archivo, aplicarlo de inmediato
+    // Si había un guardado pendiente para este archivo, aplicarlo de inmediato antes de limpiar el timer
     const timerKey = `${activeProject.id}::${filePath}`;
     const pending = saveTimers.get(timerKey);
     if (pending) {
-      if (pending.timerId) window.clearTimeout(pending.timerId);
-      saveTimers.delete(timerKey);
+      if (pending.timerId) {
+        window.clearTimeout(pending.timerId);
+        pending.timerId = 0;
+      }
       await updateFileContent(pending.projectId, pending.filePath, pending.content);
+      if (saveTimers.get(timerKey) === pending) {
+        saveTimers.delete(timerKey);
+      }
+      clearProjectEmergencyBackupIfIdle(pending.projectId);
     }
 
     openTabIds.splice(idx, 1);
@@ -1622,6 +1822,9 @@ async function initApp() {
     if (btnWrap) {
       btnWrap.setAttribute("aria-pressed", String(editor.isWordWrapEnabled()));
     }
+    if (btnMinimap) {
+      btnMinimap.setAttribute("aria-pressed", String(editor.isMinimapVisible()));
+    }
     if (zoomReadoutEl) {
       zoomReadoutEl.textContent = `${editor.getFontSize()}px`;
     }
@@ -1743,8 +1946,11 @@ function registerPwaServiceWorker() {
 
   const isLocalDev =
     window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
+  const allowLocalSw =
+    window.__STUDIO_ENABLE_SW__ === true ||
+    new URLSearchParams(window.location.search).get("sw") === "1";
 
-  if (isLocalDev) {
+  if (isLocalDev && !allowLocalSw) {
     // En servidor local de PC desactivamos cualquier Service Worker viejo para ver cambios al instante
     navigator.serviceWorker.getRegistrations().then((regs) => {
       for (const reg of regs) {
@@ -1763,8 +1969,8 @@ function registerPwaServiceWorker() {
     return;
   }
 
-  if (window.location.protocol === "https:") {
-    window.addEventListener("load", () => {
+  if (window.location.protocol === "https:" || (isLocalDev && allowLocalSw)) {
+    const startRegistration = () => {
       navigator.serviceWorker
         .register("./sw.js")
         .then((reg) => {
@@ -1773,7 +1979,12 @@ function registerPwaServiceWorker() {
         .catch(() => {
           // Silencioso en entornos sin soporte de SW
         });
-    });
+    };
+    if (document.readyState === "complete") {
+      startRegistration();
+    } else {
+      window.addEventListener("load", startRegistration);
+    }
   }
 }
 
@@ -1786,4 +1997,81 @@ function escapeHtml(str) {
     .replace(/'/g, "&#39;");
 }
 
-document.addEventListener("DOMContentLoaded", initApp);
+/**
+ * Sincroniza un objeto de archivo en memoria con el registro persistido en IndexedDB tras cachear un blob.
+ */
+export function applyCachedBlobRecordToFile(fileObj, saved, remotePayload) {
+  if (!fileObj || typeof fileObj !== "object") {
+    return { deleted: false };
+  }
+  const isRemoteObj = Boolean(remotePayload && typeof remotePayload === "object");
+  const fallbackIsBinary = isRemoteObj && Boolean(remotePayload.isBinary);
+  const fallbackContent = fallbackIsBinary
+    ? ""
+    : String(isRemoteObj ? (remotePayload.content ?? "") : (remotePayload ?? ""));
+  const fallbackBase64 = fallbackIsBinary ? (remotePayload.base64 ?? null) : null;
+  const fallbackBaseBase64 = fallbackIsBinary
+    ? (remotePayload.baseBase64 ?? remotePayload.base64 ?? null)
+    : null;
+
+  if (saved && typeof saved === "object") {
+    if (saved.deleted) {
+      fileObj.deleted = true;
+      fileObj.content = typeof saved.content === "string" ? saved.content : "";
+      fileObj.baseContent = typeof saved.baseContent === "string" ? saved.baseContent : "";
+      fileObj.isBinary = Boolean(saved.isBinary);
+      fileObj.base64 = saved.base64 ?? null;
+      fileObj.baseBase64 = saved.baseBase64 ?? null;
+      fileObj.contentLoaded = saved.contentLoaded !== false;
+      return { deleted: true };
+    }
+
+    const nextIsBinary = typeof saved.isBinary === "boolean" ? saved.isBinary : fallbackIsBinary;
+    fileObj.deleted = false;
+    fileObj.isBinary = nextIsBinary;
+    fileObj.content = nextIsBinary
+      ? ""
+      : (typeof saved.content === "string" ? saved.content : fallbackContent);
+    fileObj.baseContent = nextIsBinary
+      ? ""
+      : (typeof saved.baseContent === "string" ? saved.baseContent : fileObj.content);
+    fileObj.base64 = nextIsBinary ? (saved.base64 ?? null) : null;
+    fileObj.baseBase64 = nextIsBinary ? (saved.baseBase64 ?? fileObj.base64 ?? null) : null;
+    fileObj.contentLoaded = saved.contentLoaded !== false;
+    if (saved.blobSha) {
+      fileObj.blobSha = saved.blobSha;
+    }
+    return { deleted: false };
+  }
+
+  fileObj.deleted = false;
+  fileObj.isBinary = fallbackIsBinary;
+  fileObj.content = fallbackContent;
+  fileObj.baseContent = fallbackContent;
+  fileObj.base64 = fallbackBase64;
+  fileObj.baseBase64 = fallbackBaseBase64;
+  fileObj.contentLoaded = true;
+  return { deleted: false };
+}
+
+/**
+ * Persiste el payload descargado de GitHub (texto o binario) y reconcilia `fileObj` con el registro guardado.
+ */
+export async function cacheAndSyncGithubFile({
+  projectId,
+  fileObj,
+  remotePayload,
+  blobSha = null,
+  cacheFn = cacheSingleGithubFileContent
+}) {
+  const payload = remotePayload && typeof remotePayload === "object"
+    ? remotePayload
+    : String(remotePayload ?? "");
+  const saved = await cacheFn(projectId, fileObj.path, payload, blobSha ?? fileObj.blobSha ?? null);
+  const status = applyCachedBlobRecordToFile(fileObj, saved, payload);
+  return { saved, ...status };
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("DOMContentLoaded", initApp);
+}

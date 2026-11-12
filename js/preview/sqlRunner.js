@@ -43,11 +43,97 @@ export function convertResultsToCsv(results, maxRows = Infinity) {
 
 function escapeCsvField(val) {
   if (val === null || val === undefined) return "";
-  const str = String(val);
-  if (str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
+  let str = String(val);
+  const needsFormulaNeutralization =
+    typeof val !== "number" &&
+    str.length > 0 &&
+    (/^[=+\t\r@]/.test(str) || (/^-/.test(str) && !/^-\d+(?:\.\d+)?$/.test(str)));
+  if (needsFormulaNeutralization) {
+    str = `'${str}`;
+  }
+  if (needsFormulaNeutralization || str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
+}
+
+/**
+ * Elimina comentarios SQL (-- y /* * /) respetando literales entre comillas simples, dobles o backticks.
+ * @param {string} sql
+ * @returns {string}
+ */
+function stripSqlCommentsSafe(sql) {
+  const src = String(sql || "");
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1] || "";
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const q = ch;
+      out += ch;
+      i += 1;
+      while (i < src.length) {
+        out += src[i];
+        if (src[i] === q) {
+          if (src[i + 1] === q) {
+            out += src[i + 1];
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === "-" && next === "-") {
+      while (i < src.length && src[i] !== "\n") i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? src.length : end + 2;
+      out += " ";
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+function hasMultipleSqlStatements(sql) {
+  const src = stripSqlCommentsSafe(sql);
+  let i = 0;
+  let seenSemicolon = false;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const q = ch;
+      i += 1;
+      while (i < src.length) {
+        if (src[i] === q) {
+          if (src[i + 1] === q) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === ";") {
+      seenSemicolon = true;
+    } else if (seenSemicolon && !/\s/.test(ch)) {
+      return true;
+    }
+    i += 1;
+  }
+  return false;
 }
 
 /**
@@ -73,7 +159,12 @@ export function convertResultsToJson(results, maxRows = Infinity) {
       if (!Array.isArray(row)) continue;
       const obj = {};
       for (let i = 0; i < cols.length; i += 1) {
-        obj[cols[i]] = row[i] !== undefined ? row[i] : null;
+        Object.defineProperty(obj, cols[i], {
+          value: row[i] !== undefined ? row[i] : null,
+          enumerable: true,
+          writable: true,
+          configurable: true
+        });
       }
       out.push(obj);
     }
@@ -89,18 +180,102 @@ export function convertResultsToJson(results, maxRows = Infinity) {
  */
 export function isSelectQuery(sql) {
   if (!sql || typeof sql !== "string") return false;
-  const stripped = sql.replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").trim();
+  if (hasMultipleSqlStatements(sql)) return false;
+  const stripped = stripSqlCommentsSafe(sql).trim();
   return /^(WITH\s+[\s\S]+?SELECT|SELECT\b)/i.test(stripped);
 }
 
 /**
- * Comprueba si la consulta ya contiene una cláusula LIMIT explícita.
+ * Comprueba si la consulta ya contiene una cláusula LIMIT explícita a nivel externo
+ * (ignorando comentarios, cadenas de texto y subconsultas/CTEs).
  * @param {string} sql
+ * @param {(s: string) => string} [stripComments]
  * @returns {boolean}
  */
-export function hasLimitClause(sql) {
+export function hasLimitClause(sql, stripComments = stripSqlCommentsSafe) {
   if (!sql || typeof sql !== "string") return false;
-  return /\bLIMIT\s+\d+/i.test(sql);
+  const src = stripComments(sql);
+  const backtick = String.fromCharCode(96);
+  const NON_CLAUSE_PREV_WORDS = new Set([
+    "SELECT", "AS", "AND", "OR", "NOT", "WHERE", "ON",
+    "WHEN", "THEN", "ELSE", "CASE", "FROM", "JOIN", "SET", "INTO", "VALUES"
+  ]);
+  const NON_CLAUSE_PREV_CHARS = new Set([",", ".", "(", "=", "<", ">", "!", "+", "-", "*", "/", "%", "|"]);
+  let i = 0;
+  let depth = 0;
+  let prevNonWs = "";
+  let prevWord = "";
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "'" || ch === '"' || ch === backtick) {
+      const q = ch;
+      i += 1;
+      while (i < src.length) {
+        if (src[i] === q) {
+          if (src[i + 1] === q) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      prevNonWs = q;
+      prevWord = "";
+      continue;
+    }
+    if (ch === "[") {
+      const closeBracket = src.indexOf("]", i + 1);
+      i = closeBracket === -1 ? src.length : closeBracket + 1;
+      prevNonWs = "]";
+      prevWord = "";
+      continue;
+    }
+    if (ch === "(") {
+      depth += 1;
+      prevNonWs = "(";
+      prevWord = "";
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      if (depth > 0) depth -= 1;
+      prevNonWs = ")";
+      prevWord = "";
+      i += 1;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let end = i + 1;
+      while (end < src.length && /[A-Za-z0-9_$]/.test(src[end])) end += 1;
+      const word = src.slice(i, end);
+      const upper = word.toUpperCase();
+      if (
+        depth === 0 &&
+        upper === "LIMIT" &&
+        !NON_CLAUSE_PREV_CHARS.has(prevNonWs) &&
+        !NON_CLAUSE_PREV_WORDS.has(prevWord)
+      ) {
+        let j = end;
+        while (j < src.length && /\s/.test(src[j])) j += 1;
+        const tail = src.slice(j);
+        if (/^(?:\(|\d|[+-]\s*\d|\?|[:@$][A-Za-z0-9_]*)/.test(tail)) {
+          return true;
+        }
+      }
+      prevNonWs = "id";
+      prevWord = upper;
+      i = end;
+      continue;
+    }
+    if (!/\s/.test(ch)) {
+      prevNonWs = ch;
+      prevWord = "";
+    }
+    i += 1;
+  }
+  return false;
 }
 
 /**
@@ -113,13 +288,14 @@ export function hasLimitClause(sql) {
  */
 export function applySqlPagination(query, limit = 50, offset = 0) {
   if (!query || typeof query !== "string") return "";
-  const trimmed = query.trim().replace(/;+\s*$/, "");
-  if (!isSelectQuery(trimmed) || hasLimitClause(trimmed)) {
-    return trimmed + ";";
+  const cleaned = stripSqlCommentsSafe(query).trim().replace(/;+\s*$/, "");
+  if (!cleaned) return "";
+  if (!isSelectQuery(cleaned) || hasLimitClause(cleaned)) {
+    return cleaned + ";";
   }
   const safeLimit = Math.max(1, parseInt(limit, 10) || 50);
   const safeOffset = Math.max(0, parseInt(offset, 10) || 0);
-  return `${trimmed} LIMIT ${safeLimit} OFFSET ${safeOffset};`;
+  return `${cleaned} LIMIT ${safeLimit} OFFSET ${safeOffset};`;
 }
 
 /**
@@ -129,9 +305,9 @@ export function applySqlPagination(query, limit = 50, offset = 0) {
  */
 export function buildCountQuery(query) {
   if (!query || typeof query !== "string") return "";
-  const trimmed = query.trim().replace(/;+\s*$/, "");
-  if (!isSelectQuery(trimmed)) return "";
-  return `SELECT COUNT(*) AS total_rows FROM (${trimmed});`;
+  const cleaned = stripSqlCommentsSafe(query).trim().replace(/;+\s*$/, "");
+  if (!isSelectQuery(cleaned)) return "";
+  return `SELECT COUNT(*) AS total_rows FROM (${cleaned});`;
 }
 
 function escapeHtml(str) {
@@ -146,10 +322,9 @@ function escapeHtml(str) {
 /**
  * Construye el documento HTML completo del visor SQL interactivo para el iframe.
  * @param {{ path: string, shortName: string, content: string }} sqlFile
- * @param {Array<{ path: string, content: string }>} [sameFolderFiles=[]]
  * @returns {string}
  */
-export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
+export function buildSqlRunnerPreview(sqlFile) {
   const safeTitle = escapeHtml(sqlFile.shortName || "consulta.sql");
   const safeContent = JSON.stringify(sqlFile.content || "").replace(/</g, "\\u003c");
 
@@ -603,13 +778,16 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
             btnPageCsv.title = "Descargar únicamente las filas mostradas en esta página (" + res.values.length + " filas)";
             btnPageCsv.textContent = "CSV (Esta página)";
             btnPageCsv.addEventListener("click", function () {
-              var lines = [res.columns.join(",")];
+              var safeCsvCell = function (v) {
+                if (v === null || v === undefined) return "";
+                var s = String(v);
+                var dangerous = typeof v !== "number" && s.length > 0 && (/^[=+\\t\\r@]/.test(s) || (/^-/.test(s) && !/^-\\d+(?:\\.\\d+)?$/.test(s)));
+                if (dangerous) s = "'" + s;
+                return dangerous || s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
+              };
+              var lines = [res.columns.map(safeCsvCell).join(",")];
               res.values.forEach(function (row) {
-                lines.push(row.map(function (v) {
-                  if (v === null || v === undefined) return "";
-                  var s = String(v);
-                  return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
-                }).join(","));
+                lines.push(row.map(safeCsvCell).join(","));
               });
               downloadBlob("resultados_sql_pagina_" + meta.currentPage + ".csv", lines.join("\\r\\n"), "text/csv;charset=utf-8");
               sendLog("log", "Exportada página " + meta.currentPage + " en CSV (" + res.values.length + " filas)");
@@ -718,13 +896,81 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
         }
       }
 
+      function stripSqlCommentsClient(sql) {
+        var src = String(sql || "");
+        var out = "";
+        var i = 0;
+        while (i < src.length) {
+          var ch = src[i];
+          var nxt = src[i + 1] || "";
+          if (ch === "'" || ch === '"' || ch === "\\u0060") {
+            var q = ch;
+            out += ch;
+            i++;
+            while (i < src.length) {
+              out += src[i];
+              if (src[i] === q) {
+                if (src[i + 1] === q) { out += src[i + 1]; i += 2; continue; }
+                i++;
+                break;
+              }
+              i++;
+            }
+            continue;
+          }
+          if (ch === "-" && nxt === "-") {
+            while (i < src.length && src[i] !== "\\n") i++;
+            continue;
+          }
+          if (ch === "/" && nxt === "*") {
+            var end = src.indexOf("*/", i + 2);
+            i = end === -1 ? src.length : end + 2;
+            out += " ";
+            continue;
+          }
+          out += ch;
+          i++;
+        }
+        return out;
+      }
+
+      function hasMultipleStatementsClient(sql) {
+        var src = stripSqlCommentsClient(sql);
+        var i = 0;
+        var seenSemi = false;
+        while (i < src.length) {
+          var ch = src[i];
+          if (ch === "'" || ch === '"' || ch === "\\u0060") {
+            var q = ch;
+            i++;
+            while (i < src.length) {
+              if (src[i] === q) {
+                if (src[i + 1] === q) { i += 2; continue; }
+                i++;
+                break;
+              }
+              i++;
+            }
+            continue;
+          }
+          if (ch === ";") seenSemi = true;
+          else if (seenSemi && !/\\s/.test(ch)) return true;
+          i++;
+        }
+        return false;
+      }
+
+      var stripSqlCommentsSafe = stripSqlCommentsClient;
+      var hasLimitClauseClient = ${hasLimitClause.toString()};
+
       function runCustomQuery() {
         var query = (queryInput.value || "").trim();
         if (!query || !db) return;
 
-        var clean = query.replace(/--.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "").trim().replace(/;+\s*$/, "");
-        var isSelect = /^(WITH\s+[\s\S]+?SELECT|SELECT\b)/i.test(clean);
-        var hasLimit = /\bLIMIT\s+\d+/i.test(clean);
+        var clean = stripSqlCommentsClient(query).trim().replace(/;+\\s*$/, "");
+        var isSingle = !hasMultipleStatementsClient(query);
+        var isSelect = isSingle && /^(WITH\\s+[\\s\\S]+?SELECT|SELECT\\b)/i.test(clean);
+        var hasLimit = hasLimitClauseClient(clean, stripSqlCommentsClient);
 
         if (isSelect && !hasLimit) {
           lastFullQuery = clean;
@@ -803,7 +1049,9 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        window.setTimeout(function () {
+          try { URL.revokeObjectURL(url); } catch (_) {}
+        }, 1500);
       }
 
       btnRun.addEventListener("click", runCustomQuery);
@@ -825,16 +1073,30 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
         }
       });
 
+      var EXPORT_MAX_ROWS = 10000;
       function getExportDataset() {
         if (isPaginatedQuery && lastFullQuery && db) {
           try {
-            var fullRes = db.exec(lastFullQuery);
+            var baseQuery = stripSqlCommentsClient(lastFullQuery).trim().replace(/;+\\s*$/, "");
+            var boundedSql = baseQuery + " LIMIT " + (EXPORT_MAX_ROWS + 1) + ";";
+            var fullRes = db.exec(boundedSql);
             if (fullRes && fullRes.length > 0) {
-              return { results: fullRes, isFull: true };
+              var truncated = false;
+              var limitedRes = fullRes.map(function (r) {
+                if (r && Array.isArray(r.values) && r.values.length > EXPORT_MAX_ROWS) {
+                  truncated = true;
+                  return { columns: r.columns, values: r.values.slice(0, EXPORT_MAX_ROWS) };
+                }
+                return r;
+              });
+              if (truncated) {
+                sendLog("warn", "Exportación limitada a " + EXPORT_MAX_ROWS + " filas para proteger la memoria del navegador.");
+              }
+              return { results: limitedRes, isFull: !truncated, truncated: truncated };
             }
           } catch (_) {}
         }
-        return { results: lastResults, isFull: !isPaginatedQuery };
+        return { results: lastResults, isFull: !isPaginatedQuery, truncated: false };
       }
 
       btnCsv.addEventListener("click", function () {
@@ -844,17 +1106,20 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
           alert("No hay resultados de consultas SELECT para exportar.");
           return;
         }
+        var safeCsvCell = function (v) {
+          if (v === null || v === undefined) return "";
+          var s = String(v);
+          var dangerous = typeof v !== "number" && s.length > 0 && (/^[=+\\t\\r@]/.test(s) || (/^-/.test(s) && !/^-\\d+(?:\\.\\d+)?$/.test(s)));
+          if (dangerous) s = "'" + s;
+          return dangerous || s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
+        };
         var lines = [];
         var totalRows = 0;
         exportRes.forEach(function (res) {
-          lines.push(res.columns.join(","));
+          lines.push(res.columns.map(safeCsvCell).join(","));
           res.values.forEach(function (row) {
             totalRows++;
-            lines.push(row.map(function (v) {
-              if (v === null || v === undefined) return "";
-              var s = String(v);
-              return s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
-            }).join(","));
+            lines.push(row.map(safeCsvCell).join(","));
           });
         });
         var filename = dataset.isFull ? "resultados_sql_completos.csv" : "resultados_sql.csv";
@@ -874,7 +1139,12 @@ export function buildSqlRunnerPreview(sqlFile, _sameFolderFiles = []) {
           res.values.forEach(function (row) {
             var obj = {};
             res.columns.forEach(function (col, i) {
-              obj[col] = row[i];
+              Object.defineProperty(obj, col, {
+                value: row[i],
+                enumerable: true,
+                writable: true,
+                configurable: true
+              });
             });
             out.push(obj);
           });

@@ -30,6 +30,7 @@ export const KEYBOARD_SHORTCUTS = [
   { combo: "Cmd/Ctrl + P", desc: "Apertura rápida de archivo y salto directo a línea (ej. app.js:145)", category: "Navegación" },
   { combo: "Cmd/Ctrl + Shift + F", desc: "Búsqueda global de texto y expresiones regulares en todo el proyecto", category: "Búsqueda" },
   { combo: "Cmd/Ctrl + S", desc: "Forzar guardado inmediato en almacenamiento local IndexedDB", category: "Archivo" },
+  { combo: "Cmd/Ctrl + \\", desc: "Alternar vista dividida del editor (Split View)", category: "Editor" },
   { combo: "Shift + Alt + F", desc: "Formatear e indentar el archivo activo (100% offline)", category: "Editor" },
   { combo: "Cmd/Ctrl + W / Alt + W", desc: "Cerrar pestaña activa (Alt+W prioritario en iPad Safari PWA)", category: "Editor" },
   { combo: "Cmd/Ctrl + B", desc: "Alternar visibilidad del panel lateral del Explorador", category: "Paneles" },
@@ -95,6 +96,7 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
     }
     keyboardRouter.pushModal({
       id: "settings-dialog",
+      blockGlobalShortcuts: true,
       onEscape: () => close()
     });
   }
@@ -340,7 +342,6 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
     }
 
     refreshTokensMeter();
-    renderActiveModelsList();
   }
 
   async function refreshStorageInfo() {
@@ -387,18 +388,46 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
       .join("");
   }
 
-  // Switch tabs
-  tabButtons?.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const targetTab = btn.dataset.tab;
-      tabButtons.forEach((b) => {
-        const active = b === btn;
-        b.classList.toggle("is-active", active);
-        b.setAttribute("aria-selected", String(active));
-      });
-      tabPanels?.forEach((panel) => {
-        panel.hidden = panel.dataset.tab !== targetTab;
-      });
+  const activateTab = (targetBtn, { moveFocus = false } = {}) => {
+    const targetTab = targetBtn?.dataset?.tab;
+    if (!targetTab) return;
+    tabButtons.forEach((b) => {
+      const active = b === targetBtn;
+      b.classList?.toggle("is-active", active);
+      b.setAttribute?.("aria-selected", String(active));
+      b.setAttribute?.("tabindex", active ? "0" : "-1");
+    });
+    tabPanels?.forEach((panel) => {
+      panel.hidden = panel.dataset?.tab !== targetTab;
+    });
+    if (moveFocus && typeof targetBtn.focus === "function") {
+      targetBtn.focus();
+    }
+  };
+
+  // Switch tabs + roving tabindex / Arrow navigation (WAI-ARIA Tabs)
+  tabButtons?.forEach((btn, idx) => {
+    const isInitiallyActive =
+      btn.classList?.contains?.("is-active") || btn.getAttribute?.("aria-selected") === "true";
+    btn.setAttribute?.("tabindex", isInitiallyActive ? "0" : "-1");
+    btn.addEventListener("click", () => activateTab(btn));
+    btn.addEventListener("keydown", (event) => {
+      const list = Array.from(tabButtons);
+      if (!list.length) return;
+      let nextIdx = -1;
+      if (event.key === "ArrowRight") {
+        nextIdx = (idx + 1) % list.length;
+      } else if (event.key === "ArrowLeft") {
+        nextIdx = (idx - 1 + list.length) % list.length;
+      } else if (event.key === "Home") {
+        nextIdx = 0;
+      } else if (event.key === "End") {
+        nextIdx = list.length - 1;
+      } else {
+        return;
+      }
+      event.preventDefault();
+      activateTab(list[nextIdx], { moveFocus: true });
     });
   });
 

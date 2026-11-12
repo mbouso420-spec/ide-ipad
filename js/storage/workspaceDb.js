@@ -207,7 +207,24 @@ function openDb() {
       }
     };
 
+    let blockTimer = null;
+    const clearBlockTimer = () => {
+      if (blockTimer !== null) {
+        clearTimeout(blockTimer);
+        blockTimer = null;
+      }
+    };
+
+    req.onblocked = () => {
+      if (blockTimer !== null) return;
+      blockTimer = setTimeout(() => {
+        dbPromise = null;
+        reject(new Error("IndexedDB bloqueada por otra pestaña abierta. Cerrá las demás pestañas o recargá la página."));
+      }, 5000);
+    };
+
     req.onsuccess = () => {
+      clearBlockTimer();
       const db = req.result;
       db.onclose = () => {
         dbPromise = null;
@@ -219,6 +236,7 @@ function openDb() {
       resolve(db);
     };
     req.onerror = () => {
+      clearBlockTimer();
       dbPromise = null;
       reject(req.error || new Error("No se pudo abrir IndexedDB."));
     };
@@ -231,11 +249,7 @@ function openDb() {
  * Inicializa la base de datos y crea el proyecto semilla en la primera apertura.
  */
 export async function ensureInitialWorkspace() {
-  const projects = await listProjects();
-  if (projects.length > 0) {
-    return projects;
-  }
-
+  const db = await openDb();
   const now = Date.now();
   const seedProject = {
     id: SEED_PROJECT_ID,
@@ -248,36 +262,54 @@ export async function ensureInitialWorkspace() {
     updatedAt: now
   };
 
-  await putRecord(STORE_PROJECTS, seedProject);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
+    const projectsStore = tx.objectStore(STORE_PROJECTS);
+    const filesStore = tx.objectStore(STORE_FILES);
+    let resultProjects = null;
 
-  const folders = ["src", "web", "scripts", "db"];
-  for (const folderPath of folders) {
-    await putRecord(STORE_FILES, {
-      key: makeFileKey(SEED_PROJECT_ID, folderPath),
-      projectId: SEED_PROJECT_ID,
-      path: folderPath,
-      isFolder: true,
-      content: "",
-      baseContent: "",
-      deleted: false,
-      updatedAt: now
-    });
-  }
+    const listReq = projectsStore.getAll();
+    listReq.onsuccess = () => {
+      const existing = (listReq.result || []).sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+      if (existing.length > 0) {
+        resultProjects = existing;
+        return;
+      }
 
-  for (const item of SEED_ENTRIES) {
-    await putRecord(STORE_FILES, {
-      key: makeFileKey(SEED_PROJECT_ID, item.path),
-      projectId: SEED_PROJECT_ID,
-      path: item.path,
-      isFolder: false,
-      content: item.content,
-      baseContent: item.content,
-      deleted: false,
-      updatedAt: now
-    });
-  }
+      projectsStore.put(seedProject);
+      const folders = ["src", "web", "scripts", "db"];
+      for (const folderPath of folders) {
+        filesStore.put({
+          key: makeFileKey(SEED_PROJECT_ID, folderPath),
+          projectId: SEED_PROJECT_ID,
+          path: folderPath,
+          isFolder: true,
+          content: "",
+          baseContent: "",
+          deleted: false,
+          updatedAt: now
+        });
+      }
 
-  return [seedProject];
+      for (const item of SEED_ENTRIES) {
+        filesStore.put({
+          key: makeFileKey(SEED_PROJECT_ID, item.path),
+          projectId: SEED_PROJECT_ID,
+          path: item.path,
+          isFolder: false,
+          content: item.content,
+          baseContent: item.content,
+          deleted: false,
+          updatedAt: now
+        });
+      }
+      resultProjects = [seedProject];
+    };
+    listReq.onerror = () => reject(listReq.error);
+    tx.oncomplete = () => resolve(resultProjects || [seedProject]);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción inicial de IndexedDB se canceló."));
+  });
 }
 
 export function getSavedActiveProjectId() {
@@ -415,6 +447,13 @@ export async function entryExists(projectId, rawPath) {
   return Boolean(record && !record.deleted);
 }
 
+export async function getEntryRecord(projectId, rawPath) {
+  const cleanPath = normalizePath(rawPath);
+  if (!cleanPath) return null;
+  const record = await getRecord(STORE_FILES, makeFileKey(projectId, cleanPath));
+  return record && !record.deleted ? record : null;
+}
+
 let syncChannel = null;
 function getSyncChannel() {
   if (!syncChannel && typeof BroadcastChannel !== "undefined") {
@@ -460,6 +499,14 @@ export function onWorkspaceBroadcast(listener) {
   };
 }
 
+function resolveEntryBaselineBase64(entry) {
+  if (!entry) return null;
+  if (Object.prototype.hasOwnProperty.call(entry, "baseBase64")) {
+    return entry.baseBase64 ?? null;
+  }
+  return entry.trackedInGithub && entry.isBinary ? (entry.base64 ?? null) : null;
+}
+
 export async function upsertEntry(
   projectId,
   path,
@@ -474,6 +521,8 @@ export async function upsertEntry(
     mode = null,
     isBinary = false,
     base64 = null,
+    baseBase64 = undefined,
+    skipIfDeleted = false,
     silent = false
   } = {}
 ) {
@@ -484,6 +533,9 @@ export async function upsertEntry(
 
   const key = makeFileKey(projectId, cleanPath);
   const existing = await getRecord(STORE_FILES, key);
+  if (skipIfDeleted && existing?.deleted) {
+    return existing;
+  }
   if (!allowOverwrite && existing && !existing.deleted) {
     throw new Error(`Ya existe "${cleanPath}" en este proyecto.`);
   }
@@ -529,67 +581,168 @@ export async function upsertEntry(
     }
   }
 
-  const resolvedBase =
-    baseContent !== null
-      ? baseContent
-      : fromGithub
-        ? content
-        : existing && typeof existing.baseContent === "string"
-          ? existing.baseContent
-          : "";
+  const db = await openDb();
+  let writtenRecord = null;
+  let skippedDeleted = false;
+  let txErr = null;
 
-  const recreatedOverUnloaded = Boolean(
-    !isFolder &&
-      !fromGithub &&
-      existing &&
-      existing.trackedInGithub &&
-      existing.contentLoaded === false
-  );
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const latestExisting = req.result || null;
+      if (skipIfDeleted && latestExisting?.deleted) {
+        writtenRecord = latestExisting;
+        skippedDeleted = true;
+        return;
+      }
+      if (!allowOverwrite && latestExisting && !latestExisting.deleted) {
+        txErr = new Error(`Ya existe "${cleanPath}" en este proyecto.`);
+        tx.abort();
+        return;
+      }
+      if (latestExisting && !latestExisting.deleted && Boolean(latestExisting.isFolder) !== Boolean(isFolder)) {
+        txErr = new Error(
+          latestExisting.isFolder
+            ? `Ya existe una carpeta llamada "${cleanPath}" en este proyecto.`
+            : `Ya existe un archivo llamado "${cleanPath}" en este proyecto.`
+        );
+        tx.abort();
+        return;
+      }
 
-  const resolvedIsBinary = !isFolder && Boolean(isBinary);
-  const resolvedBase64 = resolvedIsBinary
-    ? (base64 ?? (existing && !existing.deleted ? existing.base64 : null) ?? null)
-    : null;
+      const resolvedBase =
+        baseContent !== null
+          ? baseContent
+          : fromGithub
+            ? content
+            : latestExisting && typeof latestExisting.baseContent === "string"
+              ? latestExisting.baseContent
+              : "";
 
-  const record = {
-    key,
-    projectId,
-    path: cleanPath,
-    isFolder,
-    content: isFolder ? "" : content,
-    baseContent: isFolder ? "" : resolvedBase,
-    blobSha: isFolder ? null : blobSha ?? existing?.blobSha ?? null,
-    mode: isFolder ? null : mode ?? existing?.mode ?? null,
-    contentLoaded: isFolder ? true : Boolean(contentLoaded),
-    trackedInGithub: Boolean(fromGithub || existing?.trackedInGithub),
-    forceModified: recreatedOverUnloaded || Boolean(!fromGithub && existing?.forceModified),
-    isBinary: resolvedIsBinary,
-    base64: resolvedBase64,
-    deleted: false,
-    updatedAt: Date.now()
-  };
+      const recreatedOverUnloaded = Boolean(
+        !isFolder &&
+          !fromGithub &&
+          latestExisting &&
+          latestExisting.trackedInGithub &&
+          latestExisting.contentLoaded === false
+      );
 
-  await putRecord(STORE_FILES, record);
-  if (!silent) {
+      const resolvedIsBinary = !isFolder && Boolean(isBinary);
+      const resolvedBase64 = resolvedIsBinary
+        ? (base64 ?? (latestExisting && !latestExisting.deleted ? latestExisting.base64 : null) ?? null)
+        : null;
+      const resolvedBaseBase64 = isFolder
+        ? null
+        : baseBase64 !== undefined
+          ? baseBase64
+          : fromGithub
+            ? (resolvedIsBinary ? resolvedBase64 : null)
+            : resolveEntryBaselineBase64(latestExisting);
+
+      writtenRecord = {
+        key,
+        projectId,
+        path: cleanPath,
+        isFolder,
+        content: isFolder ? "" : content,
+        baseContent: isFolder ? "" : resolvedBase,
+        blobSha: isFolder ? null : blobSha ?? latestExisting?.blobSha ?? null,
+        mode: isFolder ? null : mode ?? latestExisting?.mode ?? null,
+        contentLoaded: isFolder ? true : Boolean(contentLoaded),
+        trackedInGithub: Boolean(fromGithub || latestExisting?.trackedInGithub),
+        forceModified: recreatedOverUnloaded || Boolean(!fromGithub && latestExisting?.forceModified),
+        isBinary: resolvedIsBinary,
+        base64: resolvedBase64,
+        baseBase64: resolvedBaseBase64,
+        deleted: false,
+        updatedAt: Date.now()
+      };
+      store.put(writtenRecord);
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de guardado se canceló."));
+  });
+
+  if (!silent && !skippedDeleted) {
     broadcastWorkspaceChange({ type: "ENTRY_UPSERTED", projectId, path: cleanPath, isFolder });
   }
-  return record;
+  return writtenRecord;
 }
 
 export async function updateFileContent(projectId, path, newContent) {
   const cleanPath = normalizePath(path);
-  const key = makeFileKey(projectId, cleanPath);
-  const existing = await getRecord(STORE_FILES, key);
-  if (!existing) {
-    return upsertEntry(projectId, cleanPath, { isFolder: false, content: newContent });
+  if (!cleanPath) {
+    throw new Error("La ruta no puede estar vacía.");
   }
-  existing.content = newContent;
-  existing.contentLoaded = true;
-  existing.deleted = false;
-  existing.updatedAt = Date.now();
-  await putRecord(STORE_FILES, existing);
-  broadcastWorkspaceChange({ type: "FILE_UPDATED", projectId, path: cleanPath });
-  return existing;
+  const key = makeFileKey(projectId, cleanPath);
+  const db = await openDb();
+  let updatedRecord = null;
+  let needsUpsert = false;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const existing = req.result;
+      if (!existing) {
+        if (!cleanPath.includes("/")) {
+          updatedRecord = {
+            key,
+            projectId,
+            path: cleanPath,
+            isFolder: false,
+            content: newContent,
+            baseContent: "",
+            blobSha: null,
+            mode: null,
+            contentLoaded: true,
+            trackedInGithub: false,
+            forceModified: false,
+            isBinary: false,
+            base64: null,
+            baseBase64: null,
+            deleted: false,
+            updatedAt: Date.now()
+          };
+          store.put(updatedRecord);
+          return;
+        }
+        needsUpsert = true;
+        return;
+      }
+      if (existing.deleted || existing.isFolder) {
+        updatedRecord = existing;
+        return;
+      }
+      existing.content = newContent;
+      existing.contentLoaded = true;
+      existing.deleted = false;
+      existing.updatedAt = Date.now();
+      updatedRecord = existing;
+      store.put(existing);
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de guardado se canceló."));
+  });
+
+  if (needsUpsert) {
+    return upsertEntry(projectId, cleanPath, {
+      isFolder: false,
+      content: newContent,
+      skipIfDeleted: true
+    });
+  }
+  if (updatedRecord && !updatedRecord.deleted && !updatedRecord.isFolder) {
+    broadcastWorkspaceChange({ type: "FILE_UPDATED", projectId, path: cleanPath });
+  }
+  return updatedRecord;
 }
 
 export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) {
@@ -706,6 +859,8 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
 
       if (item.trackedInGithub && !item.isFolder) {
         item.deleted = true;
+        item.content = "";
+        item.base64 = null;
         item.updatedAt = now;
         store.put(item);
       } else {
@@ -723,48 +878,45 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
 
 export async function deleteProjectEntry(projectId, targetPath, isFolder) {
   const cleanPath = normalizePath(targetPath);
-  const all = await getAllRawProjectEntries(projectId);
-  const affected = all.filter(
-    (e) => !e.deleted && (e.path === cleanPath || (isFolder && e.path.startsWith(`${cleanPath}/`)))
-  );
-
-  if (affected.length === 0) return;
+  if (!cleanPath) return;
 
   const db = await openDb();
+  let deletedAny = false;
+
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_FILES, "readwrite");
     const store = tx.objectStore(STORE_FILES);
-    const now = Date.now();
-    for (const item of affected) {
-      if (item.trackedInGithub && !item.isFolder) {
-        item.deleted = true;
-        item.updatedAt = now;
-        store.put(item);
-      } else {
-        store.delete(item.key);
+    const idx = store.index("byProject");
+    const req = idx.getAll(projectId);
+    req.onsuccess = () => {
+      const all = Array.isArray(req.result) ? req.result : [];
+      const affected = all.filter(
+        (e) => !e.deleted && (e.path === cleanPath || (isFolder && e.path.startsWith(`${cleanPath}/`)))
+      );
+      if (affected.length === 0) return;
+
+      deletedAny = true;
+      const now = Date.now();
+      for (const item of affected) {
+        if (!item.isFolder) {
+          item.deleted = true;
+          item.content = "";
+          item.base64 = null;
+          item.updatedAt = now;
+          store.put(item);
+        } else {
+          store.delete(item.key);
+        }
       }
-    }
+    };
+    req.onerror = () => reject(req.error);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error || new Error("La transacción de borrado se canceló."));
   });
 
-  broadcastWorkspaceChange({ type: "ENTRY_DELETED", projectId, path: cleanPath, isFolder });
-}
-
-async function removeOrSoftDeleteRecord(item) {
-  if (item.trackedInGithub && !item.isFolder) {
-    item.deleted = true;
-    item.updatedAt = Date.now();
-    await putRecord(STORE_FILES, item);
-  } else {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_FILES, "readwrite");
-      tx.objectStore(STORE_FILES).delete(item.key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+  if (deletedAny) {
+    broadcastWorkspaceChange({ type: "ENTRY_DELETED", projectId, path: cleanPath, isFolder });
   }
 }
 
@@ -804,20 +956,27 @@ async function replaceAllProjectFilesFromGithub(projectId, files) {
         });
       }
     }
+    const fileIsBinary = Boolean(file.isBinary);
+    const fileLoaded = Boolean(file.contentLoaded);
+    const fileBase64 = fileIsBinary ? (file.base64 ?? null) : null;
+    const fileBaseBase64 = fileIsBinary
+      ? (file.baseBase64 !== undefined ? file.baseBase64 : (fileLoaded ? fileBase64 : null))
+      : null;
     records.set(cleanPath, {
       key: makeFileKey(projectId, cleanPath),
       projectId,
       path: cleanPath,
       isFolder: false,
-      content: file.content,
-      baseContent: file.baseContent,
+      content: fileIsBinary ? "" : file.content,
+      baseContent: fileIsBinary ? "" : file.baseContent,
       blobSha: file.blobSha || null,
       mode: file.mode || null,
-      contentLoaded: Boolean(file.contentLoaded),
+      contentLoaded: fileLoaded,
       trackedInGithub: true,
       forceModified: false,
-      isBinary: Boolean(file.isBinary),
-      base64: file.base64 ?? null,
+      isBinary: fileIsBinary,
+      base64: fileBase64,
+      baseBase64: fileBaseBase64,
       deleted: false,
       updatedAt: now
     });
@@ -859,18 +1018,27 @@ export async function hydrateLazyGithubProject({ owner, repo, branch, commitSha,
   const files = entries.map((item) => {
     const clean = normalizePath(item.path);
     const prev = reusableByPath.get(clean);
-    const canReuse = Boolean(prev && prev.blobSha === item.blobSha && prev.content === prev.baseContent);
+    const prevClean = Boolean(
+      prev &&
+        prev.blobSha === item.blobSha &&
+        prev.content === prev.baseContent &&
+        (prev.isBinary ? (prev.base64 ?? null) : null) === resolveEntryBaselineBase64(prev)
+    );
+    const canReuse = prevClean;
     if (!canReuse) {
       allLoaded = false;
     }
+    const nextIsBinary = Boolean(canReuse ? prev.isBinary : item.isBinary);
+    const nextBase64 = canReuse ? (prev.base64 ?? null) : (item.base64 ?? null);
     return {
       path: clean,
       content: canReuse ? prev.content : "",
       baseContent: canReuse ? prev.baseContent : "",
       blobSha: item.blobSha,
       mode: item.mode || null,
-      isBinary: Boolean(canReuse ? prev.isBinary : item.isBinary),
-      base64: canReuse ? (prev.base64 ?? null) : (item.base64 ?? null),
+      isBinary: nextIsBinary,
+      base64: nextBase64,
+      baseBase64: canReuse ? resolveEntryBaselineBase64(prev) : null,
       contentLoaded: canReuse
     };
   });
@@ -902,34 +1070,80 @@ export async function hydrateLazyGithubProject({ owner, repo, branch, commitSha,
 /**
  * Guarda en IndexedDB el contenido recién descargado de un único archivo bajo demanda (sin marcarlo como editado).
  */
-export async function cacheSingleGithubFileContent(projectId, path, content, blobSha = null) {
+export async function cacheSingleGithubFileContent(projectId, path, contentOrBlob, blobSha = null) {
   const cleanPath = normalizePath(path);
   const key = makeFileKey(projectId, cleanPath);
-  const existing = await getRecord(STORE_FILES, key);
-  if (!existing) {
+  const isBlobObj = Boolean(contentOrBlob && typeof contentOrBlob === "object");
+
+  const db = await openDb();
+  let resultRecord = null;
+  let needsUpsert = false;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const existing = req.result;
+      if (!existing) {
+        needsUpsert = true;
+        return;
+      }
+      if (existing.deleted || existing.contentLoaded !== false) {
+        // Si fue eliminado localmente o ya tiene contenido cargado/editado, nunca pisar el estado local.
+        resultRecord = existing;
+        return;
+      }
+      const nextIsBinary = isBlobObj ? Boolean(contentOrBlob.isBinary) : Boolean(existing.isBinary);
+      const nextBase64 = nextIsBinary
+        ? (isBlobObj
+          ? (contentOrBlob.base64 ?? null)
+          : (typeof contentOrBlob === "string" ? contentOrBlob : null))
+        : null;
+      const nextText = nextIsBinary
+        ? ""
+        : (isBlobObj ? String(contentOrBlob.content ?? "") : String(contentOrBlob ?? ""));
+
+      existing.isBinary = nextIsBinary;
+      existing.content = nextText;
+      existing.baseContent = nextText;
+      existing.base64 = nextBase64;
+      existing.baseBase64 = nextBase64;
+      existing.contentLoaded = true;
+      if (blobSha) {
+        existing.blobSha = blobSha;
+      }
+      existing.updatedAt = Date.now();
+      resultRecord = existing;
+      store.put(existing);
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de caché se canceló."));
+  });
+
+  if (needsUpsert) {
+    const nextIsBinary = isBlobObj && Boolean(contentOrBlob.isBinary);
+    const nextBase64 = nextIsBinary ? (contentOrBlob.base64 ?? null) : null;
+    const nextText = nextIsBinary
+      ? ""
+      : (isBlobObj ? String(contentOrBlob.content ?? "") : String(contentOrBlob ?? ""));
     return upsertEntry(projectId, cleanPath, {
       isFolder: false,
-      content,
-      baseContent: content,
+      content: nextText,
+      baseContent: nextText,
       fromGithub: true,
       blobSha,
-      contentLoaded: true
+      isBinary: nextIsBinary,
+      base64: nextBase64,
+      baseBase64: nextBase64,
+      contentLoaded: true,
+      skipIfDeleted: true
     });
   }
-  if (existing.contentLoaded !== false && !existing.deleted) {
-    // Ya tiene contenido local (descargado antes o recreado/editado mientras esta descarga viajaba):
-    // nunca pisar el trabajo del usuario con la versión remota.
-    return existing;
-  }
-  existing.content = content;
-  existing.baseContent = content;
-  existing.contentLoaded = true;
-  if (blobSha) {
-    existing.blobSha = blobSha;
-  }
-  existing.updatedAt = Date.now();
-  await putRecord(STORE_FILES, existing);
-  return existing;
+
+  return resultRecord;
 }
 
 export async function markProjectOfflineCached(projectId, isCached = true) {
@@ -949,16 +1163,21 @@ export async function hydrateGithubProject({ owner, repo, branch, commitSha, fil
 
   await replaceAllProjectFilesFromGithub(
     projectId,
-    files.map((file) => ({
-      path: file.path,
-      content: file.content,
-      baseContent: file.content,
-      blobSha: file.blobSha || null,
-      mode: file.mode || null,
-      isBinary: Boolean(file.isBinary),
-      base64: file.base64 ?? null,
-      contentLoaded: true
-    }))
+    files.map((file) => {
+      const isBin = Boolean(file.isBinary);
+      const b64 = isBin ? (file.base64 ?? null) : null;
+      return {
+        path: file.path,
+        content: isBin ? "" : file.content,
+        baseContent: isBin ? "" : file.content,
+        blobSha: file.blobSha || null,
+        mode: file.mode || null,
+        isBinary: isBin,
+        base64: b64,
+        baseBase64: b64,
+        contentLoaded: true
+      };
+    })
   );
 
   const firstPaths = files.slice(0, 3).map((f) => normalizePath(f.path));
@@ -1009,18 +1228,22 @@ export async function getPendingGithubChanges(projectId) {
         baseContent: "",
         mode: item.mode || null,
         isBinary: Boolean(item.isBinary),
-        base64: item.base64 || (item.isBinary ? item.content : null)
+        base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
       });
-    } else if (!item.deleted && (item.forceModified || item.content !== item.baseContent)) {
-      changes.push({
-        path: item.path,
-        status: "modified",
-        content: item.content,
-        baseContent: item.baseContent || "",
-        mode: item.mode || null,
-        isBinary: Boolean(item.isBinary),
-        base64: item.base64 || (item.isBinary ? item.content : null)
-      });
+    } else if (!item.deleted) {
+      const curBase64 = item.isBinary ? (item.base64 ?? null) : null;
+      const origBase64 = resolveEntryBaselineBase64(item);
+      if (item.forceModified || item.content !== item.baseContent || curBase64 !== origBase64) {
+        changes.push({
+          path: item.path,
+          status: "modified",
+          content: item.content,
+          baseContent: item.baseContent || "",
+          mode: item.mode || null,
+          isBinary: Boolean(item.isBinary),
+          base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
+        });
+      }
     }
   }
 
@@ -1037,13 +1260,6 @@ export async function getPendingGithubChanges(projectId) {
  * @param {Array<{path: string, status: string, content: string}> | null} [pushedChanges]
  */
 export async function markProjectSynced(projectId, newCommitSha, pushedChanges = null) {
-  const project = await getProject(projectId);
-  if (project && project.github) {
-    project.github.commitSha = newCommitSha;
-    project.updatedAt = Date.now();
-    await putRecord(STORE_PROJECTS, project);
-  }
-
   const all = await getAllRawProjectEntries(projectId);
   const db = await openDb();
   const pushedByPath = Array.isArray(pushedChanges)
@@ -1051,9 +1267,20 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
     : null;
 
   await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_FILES, "readwrite");
+    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
+    const projectsStore = tx.objectStore(STORE_PROJECTS);
     const store = tx.objectStore(STORE_FILES);
     const now = Date.now();
+
+    const projReq = projectsStore.get(projectId);
+    projReq.onsuccess = () => {
+      const project = projReq.result;
+      if (project && project.github) {
+        project.github.commitSha = newCommitSha;
+        project.updatedAt = now;
+        projectsStore.put(project);
+      }
+    };
 
     for (const item of all) {
       if (item.isFolder) continue;
@@ -1063,6 +1290,7 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
           store.delete(item.key);
         } else if (item.contentLoaded !== false) {
           item.baseContent = item.content;
+          item.baseBase64 = item.isBinary ? (item.base64 ?? null) : null;
           item.trackedInGithub = true;
           item.forceModified = false;
           item.contentLoaded = true;
@@ -1073,7 +1301,12 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
       }
 
       const pushed = pushedByPath.get(item.path);
-      if (!pushed) continue;
+      if (!pushed) {
+        if (item.deleted && !item.trackedInGithub) {
+          store.delete(item.key);
+        }
+        continue;
+      }
 
       if (pushed.status === "deleted") {
         if (item.deleted) {
@@ -1082,6 +1315,7 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
           // Se volvió a crear durante el push: en GitHub ya no existe, así que ahora es un archivo nuevo.
           item.trackedInGithub = false;
           item.baseContent = "";
+          item.baseBase64 = null;
           item.blobSha = null;
           item.forceModified = false;
           item.updatedAt = now;
@@ -1091,7 +1325,9 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
       }
 
       // Alta o modificación: la versión remota pasa a ser exactamente la que se envió.
-      item.baseContent = typeof pushed.content === "string" ? pushed.content : "";
+      const pushedIsBinary = Boolean(pushed.isBinary);
+      item.baseContent = pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : "");
+      item.baseBase64 = pushedIsBinary ? (pushed.base64 ?? null) : null;
       item.trackedInGithub = true;
       item.forceModified = false;
       if (!item.deleted) {
@@ -1107,18 +1343,22 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
       const presentPaths = new Set(all.map((e) => e.path));
       for (const [path, pushed] of pushedByPath) {
         if (pushed.status === "deleted" || presentPaths.has(path)) continue;
+        const pushedIsBinary = Boolean(pushed.isBinary);
         store.put({
           key: makeFileKey(projectId, path),
           projectId,
           path,
           isFolder: false,
           content: "",
-          baseContent: typeof pushed.content === "string" ? pushed.content : "",
+          baseContent: pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : ""),
           blobSha: null,
           mode: pushed.mode || null,
           contentLoaded: true,
           trackedInGithub: true,
           forceModified: false,
+          isBinary: pushedIsBinary,
+          base64: null,
+          baseBase64: pushedIsBinary ? (pushed.base64 ?? null) : null,
           deleted: true,
           updatedAt: now
         });
@@ -1127,6 +1367,7 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
 
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de sincronización se canceló."));
   });
 }
 
@@ -1147,139 +1388,178 @@ export async function applyRemotePullPlan(
   projectId,
   { newCommitSha, updates = [], deletions = [], keepLocalRebases = [] }
 ) {
-  const project = await getProject(projectId);
-  if (!project || !project.github) {
-    throw new Error("Proyecto GitHub no encontrado.");
-  }
-
-  const allRaw = await getAllRawProjectEntries(projectId);
-  const rawByPath = new Map(allRaw.map((entry) => [entry.path, entry]));
-  const deletedSet = new Set(deletions.map((p) => normalizePath(p)).filter(Boolean));
-  const now = Date.now();
-  const recordsToPut = new Map();
-  const keysToDelete = new Set();
-
-  function ensureFolderParents(cleanPath) {
-    const parts = cleanPath.split("/");
-    let prefix = "";
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
-      if (!rawByPath.has(prefix) && !recordsToPut.has(prefix)) {
-        recordsToPut.set(prefix, {
-          key: makeFileKey(projectId, prefix),
-          projectId,
-          path: prefix,
-          isFolder: true,
-          content: "",
-          baseContent: "",
-          contentLoaded: true,
-          deleted: false,
-          updatedAt: now
-        });
-      }
-    }
-  }
-
-  for (const delPath of deletedSet) {
-    const existing = rawByPath.get(delPath);
-    keysToDelete.add(existing?.key || makeFileKey(projectId, delPath));
-  }
-
-  for (const upd of updates) {
-    const cleanPath = normalizePath(upd?.path);
-    if (!cleanPath) continue;
-    deletedSet.delete(cleanPath);
-    keysToDelete.delete(makeFileKey(projectId, cleanPath));
-    ensureFolderParents(cleanPath);
-
-    const existing = rawByPath.get(cleanPath);
-    const loaded = upd.contentLoaded !== false;
-    const textContent = loaded ? String(upd.content ?? "") : "";
-    recordsToPut.set(cleanPath, {
-      key: makeFileKey(projectId, cleanPath),
-      projectId,
-      path: cleanPath,
-      isFolder: false,
-      content: textContent,
-      baseContent: textContent,
-      blobSha: upd.blobSha || null,
-      mode: upd.mode || existing?.mode || null,
-      contentLoaded: loaded,
-      trackedInGithub: true,
-      forceModified: false,
-      isBinary: Boolean(upd.isBinary),
-      base64: upd.base64 ?? null,
-      deleted: false,
-      updatedAt: now
-    });
-  }
-
-  for (const rebase of keepLocalRebases) {
-    const cleanPath = normalizePath(rebase?.path);
-    if (!cleanPath) continue;
-    const existing = rawByPath.get(cleanPath);
-    if (!existing || existing.isFolder) continue;
-
-    if (rebase.remoteRemoved) {
-      if (existing.deleted) {
-        keysToDelete.add(existing.key);
-      } else {
-        recordsToPut.set(cleanPath, {
-          ...existing,
-          trackedInGithub: false,
-          baseContent: "",
-          blobSha: null,
-          forceModified: false,
-          updatedAt: now
-        });
-      }
-      continue;
-    }
-
-    const nextBase =
-      typeof rebase.remoteContent === "string"
-        ? rebase.remoteContent
-        : existing.baseContent || "";
-    recordsToPut.set(cleanPath, {
-      ...existing,
-      baseContent: nextBase,
-      blobSha: rebase.remoteBlobSha || existing.blobSha || null,
-      trackedInGithub: true,
-      forceModified: !existing.deleted && existing.content !== nextBase,
-      updatedAt: now
-    });
-  }
-
   const db = await openDb();
+  let updatedProject = null;
+  let deletionsCount = 0;
+  let txErr = null;
+
   await new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_FILES, "readwrite");
-    const store = tx.objectStore(STORE_FILES);
-    for (const key of keysToDelete) {
-      store.delete(key);
-    }
-    for (const rec of recordsToPut.values()) {
-      store.put(rec);
-    }
+    const tx = db.transaction([STORE_FILES, STORE_PROJECTS], "readwrite");
+    const fileStore = tx.objectStore(STORE_FILES);
+    const projectStore = tx.objectStore(STORE_PROJECTS);
+
+    const projReq = projectStore.get(projectId);
+    projReq.onsuccess = () => {
+      const project = projReq.result || null;
+      if (!project || !project.github) {
+        txErr = new Error("Proyecto GitHub no encontrado.");
+        tx.abort();
+        return;
+      }
+
+      const filesReq = fileStore.index("byProject").getAll(projectId);
+      filesReq.onsuccess = () => {
+        const allRaw = Array.isArray(filesReq.result) ? filesReq.result : [];
+        const rawByPath = new Map(allRaw.map((entry) => [entry.path, entry]));
+        const deletedSet = new Set(deletions.map((p) => normalizePath(p)).filter(Boolean));
+        const now = Date.now();
+        const recordsToPut = new Map();
+        const keysToDelete = new Set();
+
+        function ensureFolderParents(cleanPath) {
+          const parts = cleanPath.split("/");
+          let prefix = "";
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+            const prevFolder = rawByPath.get(prefix);
+            if ((!prevFolder || prevFolder.deleted) && !recordsToPut.has(prefix)) {
+              recordsToPut.set(prefix, {
+                key: makeFileKey(projectId, prefix),
+                projectId,
+                path: prefix,
+                isFolder: true,
+                content: "",
+                baseContent: "",
+                contentLoaded: true,
+                deleted: false,
+                updatedAt: now
+              });
+            }
+          }
+        }
+
+        for (const delPath of deletedSet) {
+          const existing = rawByPath.get(delPath);
+          keysToDelete.add(existing?.key || makeFileKey(projectId, delPath));
+        }
+
+        for (const upd of updates) {
+          const cleanPath = normalizePath(upd?.path);
+          if (!cleanPath) continue;
+          deletedSet.delete(cleanPath);
+          keysToDelete.delete(makeFileKey(projectId, cleanPath));
+          ensureFolderParents(cleanPath);
+
+          const existing = rawByPath.get(cleanPath);
+          const loaded = upd.contentLoaded !== false;
+          const updIsBinary = Boolean(upd.isBinary);
+          const textContent = loaded && !updIsBinary ? String(upd.content ?? "") : "";
+          const updBase64 = loaded && updIsBinary ? (upd.base64 ?? null) : null;
+          recordsToPut.set(cleanPath, {
+            key: makeFileKey(projectId, cleanPath),
+            projectId,
+            path: cleanPath,
+            isFolder: false,
+            content: textContent,
+            baseContent: textContent,
+            blobSha: upd.blobSha || null,
+            mode: upd.mode || existing?.mode || null,
+            contentLoaded: loaded,
+            trackedInGithub: true,
+            forceModified: false,
+            isBinary: updIsBinary,
+            base64: updBase64,
+            baseBase64: updBase64,
+            deleted: false,
+            updatedAt: now
+          });
+        }
+
+        for (const rebase of keepLocalRebases) {
+          const cleanPath = normalizePath(rebase?.path);
+          if (!cleanPath) continue;
+          const existing = rawByPath.get(cleanPath);
+          if (!existing || existing.isFolder) continue;
+
+          if (rebase.remoteRemoved) {
+            if (existing.deleted) {
+              keysToDelete.add(existing.key);
+            } else {
+              recordsToPut.set(cleanPath, {
+                ...existing,
+                trackedInGithub: false,
+                baseContent: "",
+                baseBase64: null,
+                blobSha: null,
+                forceModified: false,
+                updatedAt: now
+              });
+            }
+            continue;
+          }
+
+          const remoteIsBinary = Boolean(rebase.remoteIsBinary);
+          let nextBase = existing.baseContent || "";
+          let nextBaseBase64 = resolveEntryBaselineBase64(existing);
+          if (remoteIsBinary) {
+            nextBase = "";
+            nextBaseBase64 = rebase.remoteBase64 ?? null;
+          } else if (typeof rebase.remoteContent === "string") {
+            nextBase = rebase.remoteContent;
+            nextBaseBase64 = null;
+          }
+
+          const curBase64 = existing.isBinary ? (existing.base64 ?? null) : null;
+          recordsToPut.set(cleanPath, {
+            ...existing,
+            baseContent: nextBase,
+            baseBase64: nextBaseBase64,
+            blobSha: rebase.remoteBlobSha || existing.blobSha || null,
+            trackedInGithub: true,
+            forceModified:
+              !existing.deleted && (existing.content !== nextBase || curBase64 !== nextBaseBase64),
+            updatedAt: now
+          });
+        }
+
+        for (const key of keysToDelete) {
+          fileStore.delete(key);
+        }
+        for (const rec of recordsToPut.values()) {
+          fileStore.put(rec);
+        }
+
+        if (newCommitSha) {
+          project.github.commitSha = newCommitSha;
+        }
+        const nextTabs = (project.openTabIds || []).filter((id) => !deletedSet.has(normalizePath(id)));
+        project.openTabIds = nextTabs;
+        if (project.activeFileId && deletedSet.has(normalizePath(project.activeFileId))) {
+          project.activeFileId = nextTabs[0] || null;
+        }
+        project.updatedAt = now;
+        projectStore.put(project);
+        updatedProject = project;
+        deletionsCount = deletedSet.size;
+      };
+      filesReq.onerror = () => {
+        txErr = filesReq.error;
+        tx.abort();
+      };
+    };
+    projReq.onerror = () => {
+      txErr = projReq.error;
+      tx.abort();
+    };
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción de IndexedDB se canceló."));
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de IndexedDB se canceló."));
   });
 
-  if (newCommitSha) {
-    project.github.commitSha = newCommitSha;
-  }
-  const nextTabs = (project.openTabIds || []).filter((id) => !deletedSet.has(normalizePath(id)));
-  project.openTabIds = nextTabs;
-  if (project.activeFileId && deletedSet.has(normalizePath(project.activeFileId))) {
-    project.activeFileId = nextTabs[0] || null;
-  }
-  project.updatedAt = now;
-  await putRecord(STORE_PROJECTS, project);
-
   return {
-    project,
+    project: updatedProject,
     updatesCount: updates.length,
-    deletionsCount: deletedSet.size,
+    deletionsCount,
     keptLocalCount: keepLocalRebases.length
   };
 }
@@ -1479,36 +1759,181 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
  * @param {string} projectId
  * @param {{ owner: string, repo: string, branch: string }} githubMeta
  */
-export async function convertLocalProjectToGithub(projectId, githubMeta) {
-  const project = await getProject(projectId);
-  if (!project) throw new Error("Proyecto no encontrado.");
-  project.kind = "github";
-  project.github = {
-    owner: githubMeta.owner,
-    repo: githubMeta.repo,
-    branch: githubMeta.branch || "main"
-  };
-  project.updatedAt = Date.now();
-  await putRecord(STORE_PROJECTS, project);
+async function migrateProjectWithEntries(sourceProjectId, transformFn) {
+  const db = await openDb();
+  let migratedProject = null;
+  let txErr = null;
 
-  const entries = await getAllRawProjectEntries(projectId);
-  const filesToUpdate = entries.filter((entry) => !entry.isFolder);
-  if (filesToUpdate.length > 0) {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_FILES, "readwrite");
-      const store = tx.objectStore(STORE_FILES);
-      for (const entry of filesToUpdate) {
-        entry.trackedInGithub = true;
-        entry.baseContent = entry.content;
-        entry.deleted = false;
-        store.put(entry);
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
+    const projectStore = tx.objectStore(STORE_PROJECTS);
+    const fileStore = tx.objectStore(STORE_FILES);
+
+    const projReq = projectStore.get(sourceProjectId);
+    projReq.onsuccess = () => {
+      const project = projReq.result || null;
+      if (!project) {
+        txErr = new Error("Proyecto no encontrado.");
+        tx.abort();
+        return;
       }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error || new Error("No se pudieron actualizar las entradas de GitHub."));
-      tx.onabort = () => reject(tx.error || new Error("Transacción abortada al convertir el proyecto a GitHub."));
-    });
+
+      const entriesReq = fileStore.index("byProject").getAll(sourceProjectId);
+      entriesReq.onsuccess = () => {
+        const entries = Array.isArray(entriesReq.result) ? entriesReq.result : [];
+        let transformed;
+        try {
+          transformed = transformFn(project, entries);
+        } catch (err) {
+          txErr = err;
+          tx.abort();
+          return;
+        }
+        const { nextProject, nextEntries } = transformed;
+
+        const applyWrites = () => {
+          if (nextProject.id !== sourceProjectId) {
+            projectStore.delete(sourceProjectId);
+            for (const old of entries) {
+              fileStore.delete(old.key);
+            }
+          }
+          projectStore.put(nextProject);
+          for (const nextEntry of nextEntries) {
+            fileStore.put(nextEntry);
+          }
+          migratedProject = nextProject;
+        };
+
+        if (nextProject.id !== sourceProjectId) {
+          const targetOldReq = fileStore.index("byProject").getAll(nextProject.id);
+          targetOldReq.onsuccess = () => {
+            const targetOld = Array.isArray(targetOldReq.result) ? targetOldReq.result : [];
+            for (const oldTargetEntry of targetOld) {
+              fileStore.delete(oldTargetEntry.key);
+            }
+            applyWrites();
+          };
+          targetOldReq.onerror = () => {
+            txErr = targetOldReq.error;
+            tx.abort();
+          };
+        } else {
+          applyWrites();
+        }
+      };
+      entriesReq.onerror = () => {
+        txErr = entriesReq.error;
+        tx.abort();
+      };
+    };
+    projReq.onerror = () => {
+      txErr = projReq.error;
+      tx.abort();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de migración se canceló."));
+  });
+
+  return migratedProject;
+}
+
+export async function migrateGithubProjectBranch(projectId, branchName, commitSha = null) {
+  const targetBranch = String(branchName || "").trim();
+  if (!targetBranch) {
+    throw new Error("El nombre de la rama no puede estar vacío.");
   }
 
-  return project;
+  return migrateProjectWithEntries(projectId, (project, entries) => {
+    if (project.kind !== "github" || !project.github) {
+      throw new Error("Proyecto GitHub no encontrado.");
+    }
+    const { owner, repo } = project.github;
+    const targetId = makeGithubProjectId(owner, repo, targetBranch);
+    const now = Date.now();
+
+    const nextProject = {
+      ...project,
+      id: targetId,
+      name: `${owner}/${repo} (${targetBranch})`,
+      github: {
+        owner,
+        repo,
+        branch: targetBranch,
+        commitSha: commitSha || project.github.commitSha || null
+      },
+      updatedAt: now
+    };
+
+    const nextEntries = entries.map((entry) => ({
+      ...entry,
+      key: makeFileKey(targetId, entry.path),
+      projectId: targetId
+    }));
+
+    return { nextProject, nextEntries };
+  });
+}
+
+export async function convertLocalProjectToGithub(projectId, githubMeta) {
+  return migrateProjectWithEntries(projectId, (project, entries) => {
+    const targetBranch = githubMeta.branch || "main";
+    const targetId = makeGithubProjectId(githubMeta.owner, githubMeta.repo, targetBranch);
+    const now = Date.now();
+    const activeFiles = entries.filter((entry) => !entry.isFolder && !entry.deleted);
+    const resolvedOfflineCached =
+      githubMeta.offlineCached !== undefined
+        ? Boolean(githubMeta.offlineCached)
+        : activeFiles.every((entry) => entry.contentLoaded !== false);
+
+    const nextProject = {
+      ...project,
+      id: targetId,
+      kind: "github",
+      github: {
+        owner: githubMeta.owner,
+        repo: githubMeta.repo,
+        branch: targetBranch,
+        commitSha: githubMeta.commitSha ?? project.github?.commitSha ?? null
+      },
+      offlineCached: resolvedOfflineCached,
+      updatedAt: now
+    };
+
+    const nextEntries = entries.map((entry) => {
+      const nextKey = makeFileKey(targetId, entry.path);
+      if (entry.deleted) {
+        // Nunca resucitar tombstones locales ni marcarlos como trackedInGithub sobre borrados locales.
+        return {
+          ...entry,
+          key: nextKey,
+          projectId: targetId
+        };
+      }
+      if (entry.isFolder) {
+        return {
+          ...entry,
+          key: nextKey,
+          projectId: targetId,
+          updatedAt: now
+        };
+      }
+      const isBin = Boolean(entry.isBinary);
+      const curBase64 = isBin ? (entry.base64 ?? null) : null;
+      return {
+        ...entry,
+        key: nextKey,
+        projectId: targetId,
+        trackedInGithub: true,
+        baseContent: entry.content,
+        baseBase64: curBase64,
+        forceModified: false,
+        deleted: false,
+        updatedAt: now
+      };
+    });
+
+    return { nextProject, nextEntries };
+  });
 }

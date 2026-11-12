@@ -1,10 +1,8 @@
 import { inferFileMeta } from "../storage/workspaceDb.js";
 import { createMinimapController } from "./minimap.js";
-import { computeSmartReplacement, scoreLineSimilarity } from "./smartReplace.js";
+import { computeSmartReplacement } from "./smartReplace.js";
 import {
-  LANGUAGE_COMPLETIONS,
   extractWordBeforeCursor,
-  scoreCompletionMatch,
   getLanguageCompletions,
   createAutocompleteBarController
 } from "./autocompleteCatalog.js";
@@ -113,7 +111,16 @@ export function wrapTextWithDelimiters(text, selectedText, cursorBack) {
  *   onSelectionChange: (selection: { text: string, lineCount: number }) => void
  * }} config
  */
-export async function createEditorManager({ mountEl, onDocChange, onSelectionChange, enableMinimap = true }) {
+export async function createEditorManager({
+  mountEl,
+  onDocChange,
+  onSelectionChange,
+  enableMinimap = true,
+  isSplitInstance = false,
+  enableGlobalRuler = !isSplitInstance,
+  enableAutocomplete = !isSplitInstance,
+  minimapParent = mountEl
+}) {
   let wordWrap = readStoredBool(PREF_KEYS.wordWrap, true);
   let fontSize = clampFontSize(Number(readStoredValue(PREF_KEYS.fontSize)) || DEFAULT_FONT_SIZE);
   let hardwareKeyboard = readStoredBool(PREF_KEYS.hardwareKeyboard, true);
@@ -137,7 +144,11 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
       initialHardwareKeyboard: hardwareKeyboard,
       onDocChange,
       onSelectionChange,
-      enableMinimap
+      enableMinimap,
+      isSplitInstance,
+      enableGlobalRuler,
+      enableAutocomplete,
+      minimapParent
     });
   }
 
@@ -188,9 +199,14 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
       ? EditorView.contentAttributes.of(buildContentAttributes(hwKb))
       : [];
 
+  const resolvedMinimapParent = minimapParent || mountEl;
+  if (mountEl) {
+    mountEl.innerHTML = "";
+  }
+
   const minimap = enableMinimap
     ? createMinimapController({
-        mountEl: mountEl.parentElement || mountEl,
+        mountEl: resolvedMinimapParent,
         getDocLines: () => {
           if (view?.state?.doc) {
             const doc = view.state.doc;
@@ -266,7 +282,17 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
         })
       : null;
 
-  let activeErrorMarkers = [];
+  const errorMarkersByFile = new Map();
+
+  function getActiveFileMarkers() {
+    const key = activeFileId || "__default__";
+    return errorMarkersByFile.get(key) || [];
+  }
+
+  function syncErrorRuler(totalLines = view?.state?.doc?.lines || 1) {
+    if (!enableGlobalRuler) return;
+    renderErrorRuler(getActiveFileMarkers(), totalLines, goToLine);
+  }
 
   // Tema sintáctico acoplado 100% a nuestros tokens CSS (:root)
   const highlightRules = [
@@ -326,6 +352,8 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
 
   const autocompleteBar = createAutocompleteBarController({
     mountEl,
+    enabled: enableAutocomplete,
+    sharedGlobalBar: enableAutocomplete,
     onAccept(item, wordRange) {
       if (!view) return;
       const docLen = view.state.doc.length;
@@ -549,7 +577,6 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
     }
 
     if (!view) {
-      mountEl.innerHTML = "";
       view = new EditorView({
         state: nextState,
         parent: mountEl
@@ -567,6 +594,7 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
       applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM);
     }
 
+    syncErrorRuler(view?.state?.doc?.lines || 1);
     minimap?.render();
     minimap?.updateSlider();
     emitSelection(view.state);
@@ -595,6 +623,7 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
 
   function dropFileState(fileId) {
     statesByFile.delete(fileId);
+    errorMarkersByFile.delete(fileId);
     if (activeFileId === fileId) {
       activeFileId = null;
       clearErrorMarkers();
@@ -606,6 +635,16 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
   function renameFileStates(oldPath, newPath, isFolder) {
     if (view && activeFileId) {
       statesByFile.set(activeFileId, view.state);
+    }
+
+    for (const [markerKey, markerList] of [...errorMarkersByFile.entries()]) {
+      if (markerKey === oldPath) {
+        errorMarkersByFile.delete(markerKey);
+        errorMarkersByFile.set(newPath, markerList);
+      } else if (isFolder && markerKey.startsWith(`${oldPath}/`)) {
+        errorMarkersByFile.delete(markerKey);
+        errorMarkersByFile.set(`${newPath}${markerKey.slice(oldPath.length)}`, markerList);
+      }
     }
 
     const updates = [];
@@ -761,32 +800,34 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
   function addErrorMarker(lineNum, errorMessage) {
     const num = Math.max(1, parseInt(lineNum, 10) || 1);
     const msg = String(errorMessage || "Error de compilación / sintaxis");
-    activeErrorMarkers.push({ lineNum: num, errorMessage: msg });
+    const key = activeFileId || "__default__";
+    const list = errorMarkersByFile.get(key) || [];
+    list.push({ lineNum: num, errorMessage: msg });
+    errorMarkersByFile.set(key, list);
 
     if (view && addErrorEffect) {
       view.dispatch({
         effects: addErrorEffect.of({ lineNum: num, errorMessage: msg })
       });
-      if (activeErrorMarkers.length === 1) {
+      if (list.length === 1) {
         goToLine(num);
       }
     }
-    const totalLines = view?.state?.doc?.lines || 1;
-    renderErrorRuler(activeErrorMarkers, totalLines, goToLine);
+    syncErrorRuler(view?.state?.doc?.lines || 1);
   }
 
   function clearErrorMarkers() {
-    activeErrorMarkers = [];
+    errorMarkersByFile.delete(activeFileId || "__default__");
     if (view && clearErrorEffect) {
       view.dispatch({
         effects: clearErrorEffect.of(null)
       });
     }
-    renderErrorRuler([], 1, goToLine);
+    syncErrorRuler(1);
   }
 
   function getErrorMarkers() {
-    return [...activeErrorMarkers];
+    return [...getActiveFileMarkers()];
   }
 
   function triggerUndo() {
@@ -910,7 +951,15 @@ export async function createEditorManager({ mountEl, onDocChange, onSelectionCha
     syncDoc,
     focus: () => view?.focus(),
     destroy() {
-      clearErrorMarkers();
+      errorMarkersByFile.clear();
+      if (enableGlobalRuler) {
+        renderErrorRuler([], 1, goToLine);
+      }
+      if (view && clearErrorEffect) {
+        try {
+          view.dispatch({ effects: clearErrorEffect.of(null) });
+        } catch (_) {}
+      }
       autocompleteBar.destroy();
       minimap?.destroy?.();
       if (view) {
@@ -1047,7 +1096,11 @@ function createFallbackEditor({
   initialHardwareKeyboard = true,
   onDocChange,
   onSelectionChange,
-  enableMinimap = true
+  enableMinimap = true,
+  isSplitInstance = false,
+  enableGlobalRuler = !isSplitInstance,
+  enableAutocomplete = !isSplitInstance,
+  minimapParent = mountEl
 }) {
   let wordWrap = initialWrap;
   let fontSize = initialFontSize;
@@ -1068,7 +1121,7 @@ function createFallbackEditor({
 
   const fallbackMinimap = enableMinimap
     ? createMinimapController({
-        mountEl: mountEl.parentElement || mountEl,
+        mountEl: minimapParent || mountEl,
         getDocLines: () => (textarea ? textarea.value.split("\n") : []),
         getViewport: () => {
           if (textarea) {
@@ -1090,6 +1143,8 @@ function createFallbackEditor({
 
   const fallbackAutocompleteBar = createAutocompleteBarController({
     mountEl,
+    enabled: enableAutocomplete,
+    sharedGlobalBar: enableAutocomplete,
     onAccept(item, wordRange) {
       const docLen = textarea.value.length;
       const from = Math.min(Math.max(0, wordRange.from), docLen);
@@ -1199,7 +1254,46 @@ function createFallbackEditor({
     emitSel();
   }
 
-  const fallbackErrorMarkers = [];
+  const fallbackErrorMarkersByFile = new Map();
+
+  function getFallbackActiveMarkers() {
+    return fallbackErrorMarkersByFile.get(activeFileId || "__default__") || [];
+  }
+
+  function syncFallbackErrorRuler() {
+    const markers = getFallbackActiveMarkers();
+    if (markers.length > 0) {
+      const last = markers[markers.length - 1];
+      textarea.classList.add("has-error");
+      textarea.title = `Línea ${last.lineNum}: ${last.errorMessage}`;
+    } else {
+      textarea.classList.remove("has-error");
+      textarea.title = "";
+    }
+    if (!enableGlobalRuler) return;
+    const lineCount = Math.max(1, textarea.value.split("\n").length);
+    renderErrorRuler(markers, lineCount, (l) => goToFallbackLine(l));
+  }
+
+  function goToFallbackLine(lineNo) {
+    const target = Math.max(1, parseInt(lineNo, 10) || 1);
+    const lines = textarea.value.split("\n");
+    const boundedLine = Math.min(target, lines.length);
+    let offset = 0;
+    for (let i = 0; i < boundedLine - 1; i++) {
+      offset += lines[i].length + 1;
+    }
+    textarea.focus();
+    textarea.setSelectionRange(offset, offset);
+    const approxLineHeight = 20;
+    const targetScroll = Math.max(0, (boundedLine - 3) * approxLineHeight);
+    if (typeof textarea.scrollTo === "function") {
+      textarea.scrollTo({ top: targetScroll, behavior: "smooth" });
+    } else {
+      textarea.scrollTop = targetScroll;
+    }
+    emitSel();
+  }
 
   return {
     openFile(file) {
@@ -1209,10 +1303,11 @@ function createFallbackEditor({
       activeFileId = file.id;
       activeLang = file.lang;
       if (!mountEl.contains(textarea)) {
-        mountEl.innerHTML = "";
         mountEl.appendChild(textarea);
       }
       textarea.value = file.content;
+      fallbackAutocompleteBar.hide();
+      syncFallbackErrorRuler();
       fallbackMinimap?.render();
       fallbackMinimap?.updateSlider();
       onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
@@ -1220,10 +1315,12 @@ function createFallbackEditor({
     clearActiveFile() {
       activeFileId = null;
       textarea.value = "";
+      fallbackAutocompleteBar.hide();
       this.clearErrorMarkers();
       onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     },
     dropFileState(fileId) {
+      fallbackErrorMarkersByFile.delete(fileId);
       if (activeFileId === fileId) {
         activeFileId = null;
         textarea.value = "";
@@ -1235,6 +1332,15 @@ function createFallbackEditor({
       textarea.value = "";
     },
     renameFileStates(oldPath, newPath, isFolder) {
+      for (const [markerKey, markerList] of [...fallbackErrorMarkersByFile.entries()]) {
+        if (markerKey === oldPath) {
+          fallbackErrorMarkersByFile.delete(markerKey);
+          fallbackErrorMarkersByFile.set(newPath, markerList);
+        } else if (isFolder && markerKey.startsWith(`${oldPath}/`)) {
+          fallbackErrorMarkersByFile.delete(markerKey);
+          fallbackErrorMarkersByFile.set(`${newPath}${markerKey.slice(oldPath.length)}`, markerList);
+        }
+      }
       if (!activeFileId) return;
       if (activeFileId === oldPath) {
         activeFileId = newPath;
@@ -1303,9 +1409,10 @@ function createFallbackEditor({
     addErrorMarker(lineNum, errorMessage) {
       const num = Math.max(1, parseInt(lineNum, 10) || 1);
       const msg = String(errorMessage || "Error de compilación / sintaxis");
-      fallbackErrorMarkers.push({ lineNum: num, errorMessage: msg });
-      textarea.classList.add("has-error");
-      textarea.title = `Línea ${num}: ${msg}`;
+      const key = activeFileId || "__default__";
+      const list = fallbackErrorMarkersByFile.get(key) || [];
+      list.push({ lineNum: num, errorMessage: msg });
+      fallbackErrorMarkersByFile.set(key, list);
       const lines = textarea.value.split("\n");
       const boundedLine = Math.min(num, lines.length);
       let offset = 0;
@@ -1313,36 +1420,16 @@ function createFallbackEditor({
         offset += lines[i].length + 1;
       }
       textarea.setSelectionRange(offset, offset);
-      renderErrorRuler(fallbackErrorMarkers, lines.length, (l) => this.goToLine(l));
+      syncFallbackErrorRuler();
     },
     clearErrorMarkers() {
-      fallbackErrorMarkers.length = 0;
-      textarea.classList.remove("has-error");
-      textarea.title = "";
-      renderErrorRuler([], 1, () => {});
+      fallbackErrorMarkersByFile.delete(activeFileId || "__default__");
+      syncFallbackErrorRuler();
     },
     getErrorMarkers() {
-      return [...fallbackErrorMarkers];
+      return [...getFallbackActiveMarkers()];
     },
-    goToLine(lineNo) {
-      const target = Math.max(1, parseInt(lineNo, 10) || 1);
-      const lines = textarea.value.split("\n");
-      const boundedLine = Math.min(target, lines.length);
-      let offset = 0;
-      for (let i = 0; i < boundedLine - 1; i++) {
-        offset += lines[i].length + 1;
-      }
-      textarea.focus();
-      textarea.setSelectionRange(offset, offset);
-      const approxLineHeight = 20;
-      const targetScroll = Math.max(0, (boundedLine - 3) * approxLineHeight);
-      if (typeof textarea.scrollTo === "function") {
-        textarea.scrollTo({ top: targetScroll, behavior: "smooth" });
-      } else {
-        textarea.scrollTop = targetScroll;
-      }
-      emitSel();
-    },
+    goToLine: goToFallbackLine,
     triggerUndo() {
       textarea.focus();
       document.execCommand?.("undo");
@@ -1403,6 +1490,10 @@ function createFallbackEditor({
     },
     focus: () => textarea?.focus(),
     destroy() {
+      fallbackErrorMarkersByFile.clear();
+      if (enableGlobalRuler) {
+        renderErrorRuler([], 1, () => {});
+      }
       fallbackAutocompleteBar.destroy();
       fallbackMinimap?.destroy?.();
       textarea.value = "";

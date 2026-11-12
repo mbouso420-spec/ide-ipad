@@ -28,14 +28,14 @@ import {
   renameProjectEntry,
   createProjectFromGistBackup,
   hydrateGithubProject,
-  hydrateLazyGithubProject,
   convertLocalProjectToGithub,
   upsertEntry,
   updateFileContent,
   getProjectEntries,
   closeWorkspaceBroadcast,
   broadcastWorkspaceChange,
-  onWorkspaceBroadcast
+  onWorkspaceBroadcast,
+  validateUserPath
 } from "../js/storage/workspaceDb.js";
 import {
   writeEmergencyBackup,
@@ -44,7 +44,6 @@ import {
   clearEmergencyBackup,
   getEmergencyBackupKey,
   getTabInstanceId,
-  EMERGENCY_BACKUP_KEY,
   EMERGENCY_BACKUP_PREFIX
 } from "../js/storage/emergencyBackup.js";
 import { KeyboardRouter } from "../js/ui/keyboardRouter.js";
@@ -63,15 +62,13 @@ import {
   wrapCssWithConditions,
   bundleHtmlWithFolderAssets,
   buildStandalonePythonPreview,
-  MAX_PREVIEW_ASSET_BYTES,
-  MAX_TOTAL_INLINED_CSS
+  MAX_PREVIEW_ASSET_BYTES
 } from "../js/preview/htmlBundler.js";
 import { LANGUAGE_SYMBOLS } from "../js/ui/symbolBar.js";
 import {
   buildWandboxPayload,
   injectInteractiveInputGuard,
   mountCRunnerView,
-  parseGccErrors,
   WAIT_INPUT_MARKER
 } from "../js/preview/cRunner.js";
 
@@ -945,14 +942,19 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
       await upsertEntry(localProj.id, "app.js", { isFolder: false, content: "console.log(1);" });
       await upsertEntry(localProj.id, "logo.png", { isFolder: false, content: "AQID", isBinary: true, base64: "AQID" });
 
+      let convertedId = null;
       try {
         const ghEntries = await getProjectEntries(ghProj.id);
         const iconEntry = ghEntries.find((e) => e.path === "assets/icon.png");
         assert.equal(iconEntry?.isBinary, true, "hydrateGithubProject debe preservar isBinary");
         assert.equal(iconEntry?.base64, "AQIDBA==", "hydrateGithubProject debe preservar base64");
 
-        await convertLocalProjectToGithub(localProj.id, { owner: "studio", repo: "converted", branch: "main" });
-        const convertedEntries = await getProjectEntries(localProj.id);
+        const converted = await convertLocalProjectToGithub(localProj.id, { owner: "studio", repo: "converted", branch: "main" });
+        convertedId = converted.id;
+        assert.notEqual(converted.id, localProj.id, "convertLocalProjectToGithub debe migrar project.id al ID canónico de GitHub");
+        assert.equal((await getProjectEntries(localProj.id)).length, 0, "No deben quedar entradas bajo el project.id local antiguo");
+
+        const convertedEntries = await getProjectEntries(converted.id);
         const convertedApp = convertedEntries.find((e) => e.path === "app.js");
         const convertedLogo = convertedEntries.find((e) => e.path === "logo.png");
         assert.equal(convertedApp?.trackedInGithub, true);
@@ -961,7 +963,8 @@ describe("Auditoría de Rendimiento, Ciclo de Vida y Resiliencia", () => {
         assert.equal(convertedLogo?.base64, "AQID");
       } finally {
         await deleteProject(ghProj.id);
-        await deleteProject(localProj.id);
+        if (convertedId) await deleteProject(convertedId).catch(() => {});
+        await deleteProject(localProj.id).catch(() => {});
       }
     });
 

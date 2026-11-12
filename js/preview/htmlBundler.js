@@ -27,6 +27,7 @@ import {
 } from "./previewUtils.js";
 import {
   buildExactModuleMap,
+  inspectModuleUsage,
   hasLocalModuleDependencies,
   extractModuleDependencyPaths,
   buildVirtualModuleBundle,
@@ -99,6 +100,9 @@ export function filterFolderScopeFiles(allFiles, baseFolder) {
  */
 export function buildWorkspaceAssetMap(allFiles) {
   const map = new Map();
+  const shortNameEntries = [];
+  const shortNameCounts = new Map();
+
   for (const f of allFiles || []) {
     if (!f || !f.path) continue;
     const clean = normalizePath(f.path);
@@ -113,11 +117,20 @@ export function buildWorkspaceAssetMap(allFiles) {
     if (!isIgnored) {
       map.set(clean, f);
       const baseName = f.shortName || clean.split("/").pop();
-      if (baseName && !map.has(baseName)) {
-        map.set(baseName, f);
+      if (baseName) {
+        shortNameCounts.set(baseName, (shortNameCounts.get(baseName) || 0) + 1);
+        shortNameEntries.push([baseName, f]);
       }
     }
   }
+
+  // Registrar atajos `shortName` solo si no colisionan ni ocultan rutas exactas
+  for (const [baseName, file] of shortNameEntries) {
+    if (!map.has(baseName) && shortNameCounts.get(baseName) === 1) {
+      map.set(baseName, file);
+    }
+  }
+
   return map;
 }
 
@@ -163,6 +176,44 @@ export function extractReferencedAssetPaths(entryPath, rawHtml) {
  * @param {string} rawConditions
  * @returns {{ layerClause: string, supportsCondition: string, mediaQueries: string }}
  */
+function extractBalancedCssFunction(conditions, keyword) {
+  const re = new RegExp(`\\b${keyword}\\(`, "i");
+  const match = re.exec(conditions);
+  if (!match) {
+    return null;
+  }
+  const startIdx = match.index;
+  const openParenIdx = startIdx + match[0].length - 1;
+  let depth = 1;
+  let p = openParenIdx + 1;
+  let quote = null;
+  while (p < conditions.length && depth > 0) {
+    const ch = conditions[p];
+    if (quote) {
+      if (ch === "\\") {
+        p += 2;
+        continue;
+      }
+      if (ch === quote) quote = null;
+    } else {
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === "(") {
+        depth += 1;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          const inner = conditions.slice(openParenIdx + 1, p).trim();
+          const rest = (conditions.slice(0, startIdx) + conditions.slice(p + 1)).trim();
+          return { inner, rest };
+        }
+      }
+    }
+    p += 1;
+  }
+  return null;
+}
+
 export function parseCssImportConditions(rawConditions) {
   let conditions = (rawConditions || "").trim();
   let layerClause = "";
@@ -174,18 +225,23 @@ export function parseCssImportConditions(rawConditions) {
   }
 
   // 1. Extraer layer(...) o layer
-  const layerMatch = conditions.match(/\blayer(?:\(([^)]*)\))?/i);
-  if (layerMatch) {
-    const layerName = layerMatch[1] ? layerMatch[1].trim() : "";
-    layerClause = layerName ? `@layer ${layerName}` : `@layer`;
-    conditions = conditions.replace(layerMatch[0], "").trim();
+  const extractedLayer = extractBalancedCssFunction(conditions, "layer");
+  if (extractedLayer) {
+    layerClause = extractedLayer.inner ? `@layer ${extractedLayer.inner}` : `@layer`;
+    conditions = extractedLayer.rest;
+  } else {
+    const layerBareMatch = conditions.match(/\blayer\b/i);
+    if (layerBareMatch) {
+      layerClause = `@layer`;
+      conditions = conditions.replace(layerBareMatch[0], "").trim();
+    }
   }
 
-  // 2. Extraer supports(...)
-  const supportsMatch = conditions.match(/\bsupports\(([^)]*)\)/i);
-  if (supportsMatch) {
-    supportsCondition = supportsMatch[1].trim();
-    conditions = conditions.replace(supportsMatch[0], "").trim();
+  // 2. Extraer supports(...) soportando paréntesis anidados p. ej. supports((a) and (b))
+  const extractedSupports = extractBalancedCssFunction(conditions, "supports");
+  if (extractedSupports) {
+    supportsCondition = extractedSupports.inner;
+    conditions = extractedSupports.rest;
   }
 
   // 3. El resto de las condiciones corresponden a la lista de media queries
@@ -528,24 +584,52 @@ export function bundleHtmlWithFolderAssets(
 ) {
   const dir = getParentFolder(entryPath);
 
-  const resolveRawEntry = (rawHref) => {
-    if (!rawHref || /^(https?:|data:|blob:|\/\/)/i.test(rawHref)) {
+  const escapesDirectoryScope = (rawRef) => {
+    const unified = String(rawRef || "").trim().replace(/\\/g, "/");
+    if (!unified || unified.startsWith("/")) return false;
+    let depth = 0;
+    for (const seg of unified.split("/")) {
+      const part = seg.trim();
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        depth -= 1;
+        if (depth < 0) return true;
+      } else {
+        depth += 1;
+      }
+    }
+    return false;
+  };
+
+  const resolveEntryFromDir = (rawHref, baseDir) => {
+    if (!rawHref || /^(https?:|data:|blob:|#|\/\/)/i.test(rawHref)) {
       return null;
     }
     const cleanRef = rawHref.split("?")[0].split("#")[0];
-    if (cleanRef.startsWith("../") && !allowParentTraversal) {
+    if (!cleanRef) {
       return null;
     }
-    const resolved = resolveRelativePath(dir, cleanRef);
+    if (escapesDirectoryScope(cleanRef) && !allowParentTraversal) {
+      return null;
+    }
+    const resolved = resolveRelativePath(baseDir, cleanRef);
     let asset = fileMap.get(resolved) || null;
     if (!asset && cleanRef.startsWith("./")) {
-      asset = fileMap.get(resolveRelativePath(dir, cleanRef.slice(2))) || null;
+      asset = fileMap.get(resolveRelativePath(baseDir, cleanRef.slice(2))) || null;
     }
-    if (!asset && !cleanRef.startsWith("/")) {
-      asset = fileMap.get(normalizePath(cleanRef)) || null;
+    if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("./") && !cleanRef.startsWith("../")) {
+      const candidate = fileMap.get(normalizePath(cleanRef)) || null;
+      if (candidate) {
+        const candPath = normalizePath(candidate.path || "");
+        if (!baseDir || allowParentTraversal || candPath.startsWith(`${baseDir}/`)) {
+          asset = candidate;
+        }
+      }
     }
     return asset || null;
   };
+
+  const resolveRawEntry = (rawHref) => resolveEntryFromDir(rawHref, dir);
 
   const resolveAsset = (rawHref) => {
     const asset = resolveRawEntry(rawHref);
@@ -559,6 +643,50 @@ export function bundleHtmlWithFolderAssets(
   let inlinedActiveCss = false;
   const deferredScripts = [];
   let totalInlinedCssBytes = 0;
+
+  function resolveCssAssetMime(filePath) {
+    const ext = getFileExtension(filePath || "");
+    if (ext === "woff2") return "font/woff2";
+    if (ext === "woff") return "font/woff";
+    if (ext === "ttf") return "font/ttf";
+    if (ext === "otf") return "font/otf";
+    if (ext === "eot") return "application/vnd.ms-fontobject";
+    return getImageMimeType(filePath);
+  }
+
+  function inlineCssUrls(cssText, cssDir) {
+    return String(cssText || "").replace(
+      /(\/\*[\s\S]*?\*\/)|url\(\s*(?:(["'])([^"']+)\2|([^)"'\s]+))\s*\)/gi,
+      (fullMatch, commentBlock, _quote, quotedUrl, bareUrl) => {
+        if (commentBlock) {
+          return commentBlock;
+        }
+        const rawUrl = (quotedUrl || bareUrl || "").trim();
+        const entry = resolveEntryFromDir(rawUrl, cssDir);
+        if (!entry) {
+          return fullMatch;
+        }
+        const ext = getFileExtension(entry.path || rawUrl);
+        const b64Payload =
+          typeof entry.base64 === "string" && entry.base64.length > 0
+            ? entry.base64
+            : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
+              ? entry.content
+              : null;
+        if (b64Payload) {
+          const mime = resolveCssAssetMime(entry.path || rawUrl);
+          return `url("data:${mime};base64,${b64Payload}")`;
+        }
+        if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
+          const encodedSvg = encodeURIComponent(entry.content)
+            .replace(/'/g, "%27")
+            .replace(/"/g, "%22");
+          return `url("data:image/svg+xml;charset=utf-8,${encodedSvg}")`;
+        }
+        return fullMatch;
+      }
+    );
+  }
 
   /**
    * Incrusta recursivamente directivas CSS `@import` locales resolviéndolas desde la memoria del bundle,
@@ -577,24 +705,13 @@ export function bundleHtmlWithFolderAssets(
     const cssDir = getParentFolder(cleanPath);
     const importRegex = /@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
 
-    return cssContent.replace(importRegex, (match, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
+    const withImports = cssContent.replace(importRegex, (match, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
       const importUrl = urlGroup1 || urlGroup2 || urlGroup3;
       if (!importUrl || /^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
         return match;
       }
       const cleanRef = importUrl.split("?")[0].split("#")[0];
-      if (cleanRef.startsWith("../") && !allowParentTraversal) {
-        return match;
-      }
-
-      const resolved = resolveRelativePath(cssDir, cleanRef);
-      let importedAsset = fileMap.get(resolved);
-      if (!importedAsset && cleanRef.startsWith("./")) {
-        importedAsset = fileMap.get(resolveRelativePath(cssDir, cleanRef.slice(2)));
-      }
-      if (!importedAsset && !cleanRef.startsWith("/")) {
-        importedAsset = fileMap.get(normalizePath(cleanRef));
-      }
+      const importedAsset = resolveEntryFromDir(importUrl, cssDir);
 
       if (!importedAsset || typeof importedAsset.content !== "string") {
         return match;
@@ -625,9 +742,19 @@ export function bundleHtmlWithFolderAssets(
         commentHeader: headerComment
       });
     });
+
+    return inlineCssUrls(withImports, cssDir);
   }
 
-  let html = rawHtml.replace(/<link\b[^>]*rel=["']stylesheet["'][^>]*>/gi, (tag) => {
+  const escapeCloseStyle = (css) => css.replace(/<\/style(?=[\s>/]|$)/gi, "<\\/style");
+  const escapeCloseScript = (js) => js.replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
+
+  let html = rawHtml.replace(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi, (_fullTag, attrs, cssBody) => {
+    const safeCss = escapeCloseStyle(inlineCssImports(cssBody, entryPath));
+    return `<style${attrs}>${safeCss}</style>`;
+  });
+
+  html = html.replace(/<link\b[^>]*rel=["']stylesheet["'][^>]*>/gi, (tag) => {
     const hrefMatch = tag.match(/href=["']([^"']+)["']/i);
     if (!hrefMatch) return tag;
     const asset = resolveAsset(hrefMatch[1]);
@@ -647,7 +774,7 @@ export function bundleHtmlWithFolderAssets(
     }
 
     totalInlinedCssBytes += asset.content.length;
-    const safeCss = inlineCssImports(asset.content, asset.path).replace(/<\/style>/gi, "<\\/style>");
+    const safeCss = escapeCloseStyle(inlineCssImports(asset.content, asset.path));
     return `<style data-source="${escapeAttr(asset.path)}">\n${safeCss}\n</style>`;
   });
 
@@ -670,7 +797,7 @@ export function bundleHtmlWithFolderAssets(
       }
     } else {
       totalInlinedCssBytes += cssContent.length;
-      const safeExtraCss = inlineCssImports(cssContent, cssPath).replace(/<\/style>/gi, "<\\/style>");
+      const safeExtraCss = escapeCloseStyle(inlineCssImports(cssContent, cssPath));
       const styleTag = `<style data-source="${escapeAttr(cssPath)}">\n${safeExtraCss}\n</style>`;
       if (/<head\b[^>]*>/i.test(html)) {
         html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${styleTag}`);
@@ -695,7 +822,10 @@ export function bundleHtmlWithFolderAssets(
       return `<img${beforeSrc}src=${quote}data:${mime};base64,${b64Payload}${quote}${afterSrc}>`;
     }
     if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
-      return `<img${beforeSrc}src=${quote}data:image/svg+xml;charset=utf-8,${encodeURIComponent(entry.content)}${quote}${afterSrc}>`;
+      const encodedSvg = encodeURIComponent(entry.content)
+        .replace(/'/g, "%27")
+        .replace(/"/g, "%22");
+      return `<img${beforeSrc}src=${quote}data:image/svg+xml;charset=utf-8,${encodedSvg}${quote}${afterSrc}>`;
     }
     return fullTag;
   });
@@ -722,7 +852,7 @@ export function bundleHtmlWithFolderAssets(
       }).code;
     }
     const rendered = typeof transformJs === "function" ? transformJs(executable, isModule) : executable;
-    return rendered.replace(/<\/script>/gi, "<\\/script>");
+    return escapeCloseScript(rendered);
   }
 
   function tryBundleLocalModules(rawCode, sourcePath) {
@@ -757,7 +887,15 @@ export function bundleHtmlWithFolderAssets(
         type === "text/babel";
       if (!isJsOrTs || !inlineCode.trim()) return fullTag;
       const isMod = type === "module";
-      const virtualPath = resolveRelativePath(dir, `__inline_${inlineScriptCounter++}.js`);
+      const virtualExt =
+        type === "text/tsx"
+          ? "tsx"
+          : type === "text/typescript" || type === "application/typescript"
+            ? "ts"
+            : type === "text/jsx" || type === "text/babel"
+              ? "jsx"
+              : "js";
+      const virtualPath = resolveRelativePath(dir, `__inline_${inlineScriptCounter++}.${virtualExt}`);
       const bundledExec = tryBundleLocalModules(inlineCode, virtualPath);
       if (bundledExec) {
         const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
@@ -864,7 +1002,8 @@ export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, o
     exactMap.size > 0 &&
     hasLocalModuleDependencies(jsFile.content, jsFile.path, exactMap, { allowParentTraversal });
 
-  const isModule = !usesLocalModules && /\b(import|export|await)\b/.test(jsFile.content);
+  const moduleUsage = usesLocalModules ? null : inspectModuleUsage(jsFile.content || "");
+  const isModule = Boolean(!usesLocalModules && (moduleUsage.hasModuleSyntax || moduleUsage.hasTopLevelAwait));
   const safeName = escapeHtmlText(jsFile.path);
 
   let scriptSnippet = "";
@@ -906,7 +1045,7 @@ ${statusFooter}
 }
 </script>`;
   } else {
-    const safeJs = transformJs(jsFile.content, isModule).replace(/<\/script>/gi, "<\\/script>");
+    const safeJs = transformJs(jsFile.content, isModule).replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
     scriptSnippet = isModule
       ? `<script type="module">
 ${safeJs}

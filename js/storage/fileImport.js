@@ -15,8 +15,10 @@ export const IMAGE_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "svg"
 ]);
 
+// SVG es texto XML editable (htmlBundler/CodeMirror lo requieren como texto), mientras avif/bmp sí son binarios soportados.
 export const SUPPORTED_BINARY_ASSET_EXTENSIONS = new Set([
-  "png", "jpg", "jpeg", "gif", "webp", "pdf", "ico", "svg"
+  ...[...IMAGE_EXTENSIONS].filter((ext) => ext !== "svg"),
+  "pdf"
 ]);
 
 /**
@@ -94,21 +96,30 @@ export function uint8ArrayToBase64(bytes) {
 export function base64ToUint8Array(base64) {
   if (!base64 || typeof base64 !== "string") return new Uint8Array(0);
   const clean = base64.replace(/\s+/g, "");
+  if (!clean) return new Uint8Array(0);
   const atobFn = typeof atob === "function" ? atob : (globalThis.atob || (typeof window !== "undefined" ? window.atob : null));
   if (!atobFn) {
     const nodeBuf = typeof globalThis !== "undefined" ? globalThis.Buffer : null;
     if (nodeBuf && typeof nodeBuf.from === "function") {
-      return new Uint8Array(nodeBuf.from(clean, "base64"));
+      try {
+        return new Uint8Array(nodeBuf.from(clean, "base64"));
+      } catch {
+        return new Uint8Array(0);
+      }
     }
     return new Uint8Array(0);
   }
-  const binary = atobFn(clean);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+  try {
+    const binary = atobFn(clean);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return new Uint8Array(0);
   }
-  return bytes;
 }
 
 /**
@@ -118,7 +129,20 @@ export function base64ToUint8Array(base64) {
  * @returns {{ ok: true, text?: string, isBinary?: boolean, base64?: string } | { ok: false, reason: string }}
  */
 export function decodeImportedFile(bytes, fileName, options = {}) {
-  if (bytes && bytes.length > MAX_IMPORT_FILE_BYTES) {
+  let view;
+  if (bytes instanceof Uint8Array) {
+    view = bytes;
+  } else if (bytes instanceof ArrayBuffer) {
+    view = new Uint8Array(bytes);
+  } else if (ArrayBuffer.isView(bytes)) {
+    view = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  } else if (Array.isArray(bytes)) {
+    view = new Uint8Array(bytes);
+  } else {
+    return { ok: false, reason: "contenido de archivo inválido" };
+  }
+
+  if (view.length > MAX_IMPORT_FILE_BYTES) {
     return { ok: false, reason: "supera el límite de 5 MB por archivo" };
   }
   const base = String(fileName || "").split("/").pop() || "";
@@ -128,7 +152,7 @@ export function decodeImportedFile(bytes, fileName, options = {}) {
     return {
       ok: true,
       isBinary: true,
-      base64: uint8ArrayToBase64(bytes),
+      base64: uint8ArrayToBase64(view),
       fileName: base
     };
   }
@@ -137,15 +161,15 @@ export function decodeImportedFile(bytes, fileName, options = {}) {
     return { ok: false, reason: "es un archivo binario: imagen, documento o comprimido" };
   }
 
-  const limit = Math.min(bytes.length, SNIFF_BYTES);
+  const limit = Math.min(view.length, SNIFF_BYTES);
   for (let i = 0; i < limit; i += 1) {
-    if (bytes[i] === 0) {
+    if (view[i] === 0) {
       return { ok: false, reason: "parece un archivo binario" };
     }
   }
 
   try {
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(view);
     return { ok: true, text };
   } catch {
     return { ok: false, reason: "no es texto UTF-8" };

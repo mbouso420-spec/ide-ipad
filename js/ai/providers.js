@@ -24,6 +24,7 @@ const CUSTOM_MODEL_PREFIX = "ide.ai.model.";
 const KEY_PREFIX = "ide.ai.key.";
 const GH_TOKEN_STORAGE_KEY = "ide.github.pat";
 const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
+const GH_USER_CACHE_KEY = "ide.github.userLogin";
 
 const liveSyncedByProvider = new Map();
 
@@ -211,7 +212,7 @@ export function setKeyStorageMode(nextMode) {
         window.localStorage.removeItem(k);
       }
     }
-    for (const extraKey of [GH_TOKEN_STORAGE_KEY, GH_REPOS_CACHE_KEY]) {
+    for (const extraKey of [GH_TOKEN_STORAGE_KEY, GH_REPOS_CACHE_KEY, GH_USER_CACHE_KEY]) {
       const val = fromStore.getItem(extraKey);
       if (val) {
         toStore.setItem(extraKey, val);
@@ -493,10 +494,17 @@ export async function validateApiKey(providerId, apiKey, signal) {
   return { status: "unknown", message: `No se pudo verificar la clave de ${label} (respuesta ${res.status}).` };
 }
 
+function isAbortError(error) {
+  return Boolean(error && typeof error === "object" && error.name === "AbortError");
+}
+
 export async function fetchLiveFreeModels(providerId, apiKey, signal, options = {}) {
   try {
     return await fetchLiveFreeModelsRaw(providerId, apiKey, signal, options);
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
     const friendly = toFriendlyNetworkError(error, providerLabel(providerId));
     if (friendly instanceof Error && friendly.message) {
       friendly.message = redactSensitiveTokens(friendly.message, [apiKey]);
@@ -762,7 +770,10 @@ async function streamGeminiWithFallback({
       if (live.length > 0) {
         onModelsSynced?.("gemini", live);
       }
-    } catch {
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        throw isAbortError(err) ? err : new DOMException("Aborted", "AbortError");
+      }
       // Seguimos con los modelos 3.x precargados; el endpoint de generación validará la clave
     }
   }
@@ -869,7 +880,10 @@ async function streamOpenAiWithFallback({
       if (live.length > 0) {
         onModelsSynced?.(provider.id, live);
       }
-    } catch {
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        throw isAbortError(err) ? err : new DOMException("Aborted", "AbortError");
+      }
       // Continuar con lista base
     }
   }
@@ -929,6 +943,7 @@ async function streamOpenAiWithFallback({
       const canFallback =
         status === 404 ||
         status === 429 ||
+        status === 500 ||
         status === 502 ||
         status === 503 ||
         msg.includes("model_not_found") ||
@@ -948,21 +963,66 @@ async function streamOpenAiWithFallback({
 }
 
 function waitAbortable(ms, signal) {
+  if (signal?.aborted) {
+    return Promise.reject(new DOMException("Aborted", "AbortError"));
+  }
   return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
+    let onAbort = null;
+    const timer = window.setTimeout(() => {
+      if (onAbort) {
+        signal?.removeEventListener("abort", onAbort);
+      }
+      resolve();
+    }, ms);
+    if (signal) {
+      onAbort = () => {
         window.clearTimeout(timer);
         reject(new DOMException("Aborted", "AbortError"));
-      },
-      { once: true }
-    );
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
   });
+}
+
+function createFetchConnectSignal(parentSignal, timeoutMs = 45000) {
+  const timerApi = typeof window !== "undefined" ? window : globalThis;
+  const controller = new AbortController();
+  let onParentAbort = null;
+  if (parentSignal?.aborted) {
+    controller.abort(parentSignal.reason || new DOMException("Aborted", "AbortError"));
+    return { signal: controller.signal, clearTimer: () => {}, cleanup: () => {} };
+  }
+  if (parentSignal) {
+    onParentAbort = () => {
+      controller.abort(parentSignal.reason || new DOMException("Aborted", "AbortError"));
+    };
+    parentSignal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  let timer = timerApi.setTimeout(() => {
+    controller.abort(new DOMException("Tiempo de espera agotado al conectar con el servidor de IA.", "TimeoutError"));
+  }, timeoutMs);
+  const clearTimer = () => {
+    if (timer) {
+      timerApi.clearTimeout(timer);
+      timer = 0;
+    }
+  };
+  return {
+    signal: controller.signal,
+    clearTimer,
+    cleanup: () => {
+      clearTimer();
+      if (onParentAbort) {
+        parentSignal?.removeEventListener("abort", onParentAbort);
+        onParentAbort = null;
+      }
+    }
+  };
 }
 
 async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history, onChunk, signal }) {
   const isGemma = cleanModel.toLowerCase().startsWith("gemma-");
+  const supportsThinking = /^gemini-(2\.5|3)/i.test(cleanModel) && !isGemma;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(cleanModel)}:streamGenerateContent?alt=sse`;
 
   const contents = history.map((msg, idx) => {
@@ -976,53 +1036,72 @@ async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history
     };
   });
 
+  const generationConfig = { temperature: getAiTemperature() };
+  if (supportsThinking) {
+    generationConfig.thinkingConfig = { thinkingBudget: getThinkingBudget() };
+  }
+
   const bodyPayload = {
     contents,
-    generationConfig: { temperature: getAiTemperature() }
+    generationConfig
   };
   if (!isGemma) {
     bodyPayload.systemInstruction = { parts: [{ text: systemPrompt }] };
   }
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-    body: JSON.stringify(bodyPayload),
-    signal
-  });
-
-  if (!res.ok) {
-    const errMsg = await extractApiError(res, `Gemini (${cleanModel})`, apiKey);
-    const keyInvalid =
-      res.status === 401 ||
-      res.status === 403 ||
-      (res.status === 400 && /api key|api_key|apikey/i.test(errMsg));
-    if (keyInvalid) {
-      const scope = aiScope("gemini");
-      markTokenRejectedInSession(scope, apiKey);
-      recordAuthFailure(scope);
+  const connect = createFetchConnectSignal(signal);
+  try {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body: JSON.stringify(bodyPayload),
+        signal: connect.signal
+      });
+    } finally {
+      connect.clearTimer();
     }
-    const err = new Error(errMsg);
-    err.httpStatus = res.status;
-    throw err;
-  }
 
-  recordAuthSuccess(aiScope("gemini"));
-
-  await consumeSseStream(res.body, (jsonStr) => {
-    const payload = JSON.parse(jsonStr);
-    const parts = payload?.candidates?.[0]?.content?.parts;
-    if (Array.isArray(parts)) {
-      for (const part of parts) {
-        if (part?.thought) {
-          continue;
-        }
-        if (typeof part.text === "string" && part.text.length > 0) {
-          onChunk(part.text);
-        }
+    if (!res.ok) {
+      const errMsg = await extractApiError(res, `Gemini (${cleanModel})`, apiKey);
+      const keyInvalid =
+        res.status === 401 ||
+        res.status === 403 ||
+        (res.status === 400 && /api key|api_key|apikey/i.test(errMsg));
+      if (keyInvalid) {
+        const scope = aiScope("gemini");
+        markTokenRejectedInSession(scope, apiKey);
+        recordAuthFailure(scope);
       }
+      const err = new Error(errMsg);
+      err.httpStatus = res.status;
+      throw err;
     }
-  });
+
+    recordAuthSuccess(aiScope("gemini"));
+
+    await consumeSseStream(
+      res.body,
+      (jsonStr) => {
+        const payload = JSON.parse(jsonStr);
+        const parts = payload?.candidates?.[0]?.content?.parts;
+        if (Array.isArray(parts)) {
+          for (const part of parts) {
+            if (part?.thought) {
+              continue;
+            }
+            if (typeof part.text === "string" && part.text.length > 0) {
+              onChunk(part.text);
+            }
+          }
+        }
+      },
+      connect.signal
+    );
+  } finally {
+    connect.cleanup();
+  }
 }
 
 async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, systemPrompt, history, onChunk, signal }) {
@@ -1041,42 +1120,127 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
     ...history.map((msg) => ({ role: msg.role, content: msg.content }))
   ];
 
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: true,
-      temperature: getAiTemperature()
-    }),
-    signal
-  });
-
-  if (!res.ok) {
-    const errMsg = await extractApiError(res, `${AI_PROVIDERS[providerId]?.name || providerId} (${model})`, apiKey);
-    if (res.status === 401 || res.status === 403) {
-      const scope = aiScope(providerId);
-      markTokenRejectedInSession(scope, apiKey);
-      recordAuthFailure(scope);
+  const connect = createFetchConnectSignal(signal);
+  try {
+    let res;
+    try {
+      res = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: true,
+          temperature: getAiTemperature()
+        }),
+        signal: connect.signal
+      });
+    } finally {
+      connect.clearTimer();
     }
-    const err = new Error(errMsg);
-    err.httpStatus = res.status;
-    throw err;
+
+    if (!res.ok) {
+      const errMsg = await extractApiError(res, `${AI_PROVIDERS[providerId]?.name || providerId} (${model})`, apiKey);
+      if (res.status === 401 || res.status === 403) {
+        const scope = aiScope(providerId);
+        markTokenRejectedInSession(scope, apiKey);
+        recordAuthFailure(scope);
+      }
+      const err = new Error(errMsg);
+      err.httpStatus = res.status;
+      throw err;
+    }
+
+    recordAuthSuccess(aiScope(providerId));
+
+    await consumeSseStream(
+      res.body,
+      (jsonStr) => {
+        const payload = JSON.parse(jsonStr);
+        const delta = payload?.choices?.[0]?.delta?.content;
+        if (typeof delta === "string" && delta.length > 0) {
+          onChunk(delta);
+        }
+      },
+      connect.signal
+    );
+  } finally {
+    connect.cleanup();
   }
+}
 
-  recordAuthSuccess(aiScope(providerId));
-
-  await consumeSseStream(res.body, (jsonStr) => {
-    const payload = JSON.parse(jsonStr);
-    const delta = payload?.choices?.[0]?.delta?.content;
-    if (typeof delta === "string" && delta.length > 0) {
-      onChunk(delta);
+function findNextSseLineBreak(buf, isFinal) {
+  for (let i = 0; i < buf.length; i += 1) {
+    const ch = buf[i];
+    if (ch === "\n") {
+      return { index: i, length: 1 };
     }
+    if (ch === "\r") {
+      if (i + 1 < buf.length) {
+        return { index: i, length: buf[i + 1] === "\n" ? 2 : 1 };
+      }
+      if (isFinal) {
+        return { index: i, length: 1 };
+      }
+      return null;
+    }
+  }
+  return null;
+}
+
+function readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs) {
+  if (signal?.aborted) {
+    const reason = signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError");
+    return Promise.reject(reason);
+  }
+  const timerApi = typeof window !== "undefined" ? window : globalThis;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timerId = 0;
+    let onAbort = null;
+    const cleanup = () => {
+      if (timerId) {
+        timerApi.clearTimeout(timerId);
+        timerId = 0;
+      }
+      if (onAbort && signal) {
+        signal.removeEventListener("abort", onAbort);
+        onAbort = null;
+      }
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    if (signal) {
+      onAbort = () => {
+        const reason = signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError");
+        fail(reason);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    if (chunkTimeoutMs > 0 && Number.isFinite(chunkTimeoutMs)) {
+      timerId = timerApi.setTimeout(() => {
+        fail(new DOMException("Tiempo de espera agotado esperando datos del flujo de IA.", "TimeoutError"));
+      }, chunkTimeoutMs);
+    }
+    Promise.resolve(reader.read()).then(
+      (chunk) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(chunk);
+      },
+      (err) => {
+        fail(err);
+      }
+    );
   });
 }
 
-async function consumeSseStream(body, onDataPacket) {
+async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutMs = 45000) {
   if (!body) {
     throw new Error("El navegador no recibió un flujo de datos válido.");
   }
@@ -1084,18 +1248,19 @@ async function consumeSseStream(body, onDataPacket) {
   const reader = body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  const eventDataLines = [];
 
-  const processLine = (rawLine) => {
-    if (!rawLine || !rawLine.startsWith("data:")) {
+  const flushEvent = () => {
+    if (eventDataLines.length === 0) {
       return;
     }
-    const dataStr = rawLine.slice(5).trim();
-    if (!dataStr || dataStr === "[DONE]") {
+    const payload = eventDataLines.join("\n").trim();
+    eventDataLines.length = 0;
+    if (!payload || payload === "[DONE]") {
       return;
     }
-
     try {
-      onDataPacket(dataStr);
+      onDataPacket(payload);
     } catch (err) {
       if (err instanceof SyntaxError) {
         return;
@@ -1104,26 +1269,69 @@ async function consumeSseStream(body, onDataPacket) {
     }
   };
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      buffer += decoder.decode();
-      break;
+  const processLine = (rawLine) => {
+    if (rawLine === "") {
+      flushEvent();
+      return;
     }
-    buffer += decoder.decode(value, { stream: true });
+    if (rawLine.startsWith(":")) {
+      return;
+    }
+    if (rawLine === "data") {
+      eventDataLines.push("");
+      return;
+    }
+    if (rawLine.startsWith("data:")) {
+      let val = rawLine.slice(5);
+      if (val.startsWith(" ")) {
+        val = val.slice(1);
+      }
+      eventDataLines.push(val);
+    }
+  };
 
-    let newlineIdx = buffer.indexOf("\n");
-    while (newlineIdx !== -1) {
-      const rawLine = buffer.slice(0, newlineIdx).trim();
-      buffer = buffer.slice(newlineIdx + 1);
-      newlineIdx = buffer.indexOf("\n");
+  try {
+    while (true) {
+      const { value, done } = await readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs);
+      if (done) {
+        buffer += decoder.decode();
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+
+      let br = findNextSseLineBreak(buffer, false);
+      while (br !== null) {
+        const rawLine = buffer.slice(0, br.index);
+        buffer = buffer.slice(br.index + br.length);
+        processLine(rawLine);
+        br = findNextSseLineBreak(buffer, false);
+      }
+    }
+
+    let br = findNextSseLineBreak(buffer, true);
+    while (br !== null) {
+      const rawLine = buffer.slice(0, br.index);
+      buffer = buffer.slice(br.index + br.length);
       processLine(rawLine);
+      br = findNextSseLineBreak(buffer, true);
     }
-  }
-
-  const remainingLines = buffer.split("\n");
-  for (const tail of remainingLines) {
-    processLine(tail.trim());
+    if (buffer.length > 0) {
+      processLine(buffer);
+    }
+    flushEvent();
+  } catch (err) {
+    try {
+      await reader.cancel?.();
+    } catch {
+      // Ignorar errores secundarios al cancelar el lector
+    }
+    throw err;
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch {
+      // El lector ya fue liberado
+    }
   }
 }
 

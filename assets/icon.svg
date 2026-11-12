@@ -1,6 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Studio IDE">
-  <rect width="512" height="512" rx="112" fill="#10131a"/>
-  <rect x="24" y="24" width="464" height="464" rx="92" fill="none" stroke="#283244" stroke-width="6"/>
+  <rect width="512" height="512" fill="#10131a"/>
   <polyline points="204 176 124 256 204 336" fill="none" stroke="#4d89f7" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
   <polyline points="308 176 388 256 308 336" fill="none" stroke="#e9edf5" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
   <line x1="276" y1="156" x2="236" y2="356" stroke="#4d89f7" stroke-width="32" stroke-linecap="round"/>

@@ -6,3 +6,4 @@ Desktop.ini
 .claude/
 .impeccable/
 node_modules/
+scripts/chrome_ud_*/

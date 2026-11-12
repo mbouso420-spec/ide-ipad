@@ -151,55 +151,62 @@ export function writeEmergencyBackup(items, storage = window.localStorage, proje
  * @returns {Array<{ projectId: string, filePath: string, content: string }>}
  */
 export function readEmergencyBackup(storage = window.localStorage, projectId = null, instanceId = null) {
+  const dedupByKey = new Map();
+  const collect = (raw, filterPid = null) => {
+    const payload = parseBackupPayload(raw);
+    for (const item of payload.items) {
+      if (filterPid && item.projectId !== filterPid) continue;
+      const k = `${item.projectId}::${item.filePath}`;
+      const prev = dedupByKey.get(k);
+      if (!prev || payload.savedAt >= prev.savedAt) {
+        dedupByKey.set(k, { savedAt: payload.savedAt, item });
+      }
+    }
+  };
+
   if (projectId && instanceId) {
     const targetKey = getEmergencyBackupKey(projectId, instanceId);
-    const direct = parseBackupItems(storage.getItem(targetKey));
-    if (direct.length > 0) return direct;
-    // Si no está particionado por instancia, buscar en la partición por proyecto
-    const projectOnly = parseBackupItems(storage.getItem(getEmergencyBackupKey(projectId)));
-    if (projectOnly.length > 0) return projectOnly;
-    // Fallback: clave legado
-    const legacy = parseBackupItems(storage.getItem(EMERGENCY_BACKUP_KEY));
-    return legacy.filter((it) => it.projectId === projectId);
+    collect(storage.getItem(targetKey));
+    if (dedupByKey.size === 0) {
+      collect(storage.getItem(getEmergencyBackupKey(projectId)));
+    }
+    if (dedupByKey.size === 0) {
+      collect(storage.getItem(EMERGENCY_BACKUP_KEY), projectId);
+    }
+    return [...dedupByKey.values()].map((v) => v.item);
   }
 
   if (projectId && !instanceId) {
-    const result = [];
-    // Leer clave exacta de proyecto
-    const direct = parseBackupItems(storage.getItem(getEmergencyBackupKey(projectId)));
-    result.push(...direct);
+    collect(storage.getItem(getEmergencyBackupKey(projectId)));
 
-    // Leer todas las particiones de instancias de este proyecto
     const prefix = `${EMERGENCY_BACKUP_PREFIX}${projectId}_`;
     const keys = getAllStorageKeys(storage);
     for (const k of keys) {
       if (k && k.startsWith(prefix)) {
-        const instItems = parseBackupItems(storage.getItem(k));
-        result.push(...instItems);
+        collect(storage.getItem(k));
       }
     }
 
-    if (result.length > 0) return result;
+    if (dedupByKey.size > 0) {
+      return [...dedupByKey.values()].map((v) => v.item);
+    }
 
-    // Fallback: clave legado
-    const legacy = parseBackupItems(storage.getItem(EMERGENCY_BACKUP_KEY));
-    return legacy.filter((it) => it.projectId === projectId);
+    collect(storage.getItem(EMERGENCY_BACKUP_KEY), projectId);
+    return [...dedupByKey.values()].map((v) => v.item);
   }
 
   // Si no se especifica proyecto ni instancia, agregar clave legado y todas las particiones existentes
-  const result = [];
-  const legacyItems = parseBackupItems(storage.getItem(EMERGENCY_BACKUP_KEY));
-  result.push(...legacyItems);
+  // resolviendo colisiones entre pestañas a favor del timestamp más reciente.
+  collect(storage.getItem(EMERGENCY_BACKUP_KEY));
 
   const keys = getAllStorageKeys(storage);
   for (const k of keys) {
     if (k && k.startsWith(EMERGENCY_BACKUP_PREFIX)) {
-      const partItems = parseBackupItems(storage.getItem(k));
-      result.push(...partItems);
+      collect(storage.getItem(k));
     }
   }
 
-  return result;
+  return [...dedupByKey.values()].map((v) => v.item);
 }
 
 /**
@@ -236,33 +243,105 @@ export function clearEmergencyBackup(storage = window.localStorage, projectId = 
   }
 }
 
+async function readInitialDbRecord(db, projectId, filePath, recordCache, projectEntriesCache) {
+  const cacheKey = `${projectId}::${filePath}`;
+  if (recordCache.has(cacheKey)) {
+    return recordCache.get(cacheKey);
+  }
+
+  let record = null;
+  if (typeof db.getEntryRecord === "function") {
+    record = await db.getEntryRecord(projectId, filePath);
+  } else if (typeof db.getFileRecord === "function") {
+    record = await db.getFileRecord(projectId, filePath);
+  } else if (typeof db.getEntry === "function") {
+    record = await db.getEntry(projectId, filePath);
+  } else if (typeof db.getRecord === "function") {
+    record = await db.getRecord(projectId, filePath);
+  } else if (typeof db.getProjectEntries === "function") {
+    let byPath = projectEntriesCache.get(projectId);
+    if (!byPath) {
+      const list = await db.getProjectEntries(projectId);
+      byPath = new Map();
+      if (Array.isArray(list)) {
+        for (const entry of list) {
+          if (entry && typeof entry.path === "string" && !entry.isFolder) {
+            byPath.set(entry.path, entry);
+          }
+        }
+      }
+      projectEntriesCache.set(projectId, byPath);
+    }
+    const cleanPath = String(filePath || "").replace(/^\/+/, "");
+    record = byPath.get(cleanPath) || byPath.get(filePath) || null;
+  }
+
+  recordCache.set(cacheKey, record || null);
+  return record || null;
+}
+
+async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache) {
+  let restored = 0;
+  if (snap.items.length > 0) {
+    for (const item of snap.items) {
+      if (await db.entryExists(item.projectId, item.filePath)) {
+        const record = await readInitialDbRecord(
+          db,
+          item.projectId,
+          item.filePath,
+          recordCache,
+          projectEntriesCache
+        );
+        if (
+          record &&
+          snap.savedAt > 0 &&
+          typeof record.updatedAt === "number" &&
+          snap.savedAt < record.updatedAt
+        ) {
+          continue;
+        }
+        await db.updateFileContent(item.projectId, item.filePath, item.content);
+        restored += 1;
+      }
+    }
+  }
+
+  // Solo eliminar la clave si no fue modificada concurrentemente mientras corrían los await.
+  try {
+    if (storage.getItem(snap.key) === snap.raw) {
+      storage.removeItem(snap.key);
+    }
+  } catch (_) {}
+
+  return restored;
+}
+
 /**
  * Vuelca a IndexedDB el respaldo pendiente (si existe) y lo borra solo cuando todo quedó guardado.
- * Nunca recrea archivos que ya no existen (p. ej. borrados en otra pestaña).
- * @param {{ entryExists: (projectId: string, path: string) => Promise<boolean>, updateFileContent: (projectId: string, path: string, content: string) => Promise<unknown> }} db
+ * Nunca recrea archivos que ya no existen (p. ej. borrados en otra pestaña) ni pisa registros más recientes.
+ * @param {{ entryExists: (projectId: string, path: string) => Promise<boolean>, updateFileContent: (projectId: string, path: string, content: string) => Promise<unknown>, getEntryRecord?: (projectId: string, path: string) => Promise<any>, getProjectEntries?: (projectId: string) => Promise<Array<any>> }} db
  * @param {Storage} [storage]
  * @param {string|null} [projectId]
  * @param {string|null} [instanceId]
  * @returns {Promise<number>} cantidad de archivos recuperados
  */
 export async function restoreEmergencyBackup(db, storage = window.localStorage, projectId = null, instanceId = null) {
+  const recordCache = new Map();
+  const projectEntriesCache = new Map();
+
   // 1. Si se especifica projectId e instanceId puntual, restaurar y limpiar solo esa clave
   if (projectId && instanceId) {
     const key = getEmergencyBackupKey(projectId, instanceId);
-    const items = parseBackupItems(storage.getItem(key));
-    if (items.length === 0) {
-      try { storage.removeItem(key); } catch (_) {}
-      return 0;
-    }
-    let restored = 0;
-    for (const item of items) {
-      if (await db.entryExists(item.projectId, item.filePath)) {
-        await db.updateFileContent(item.projectId, item.filePath, item.content);
-        restored += 1;
-      }
-    }
-    try { storage.removeItem(key); } catch (_) {}
-    return restored;
+    const raw = storage.getItem(key);
+    if (!raw) return 0;
+    const payload = parseBackupPayload(raw);
+    return applySnapshotAndCleanup(
+      db,
+      storage,
+      { key, raw, savedAt: payload.savedAt, items: payload.items },
+      recordCache,
+      projectEntriesCache
+    );
   }
 
   // 2. Si es restauración global o por proyecto:
@@ -292,9 +371,11 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
   }
 
   const snapshots = targetKeys.map((key, index) => {
-    const payload = parseBackupPayload(storage.getItem(key));
+    const raw = storage.getItem(key);
+    const payload = parseBackupPayload(raw);
     return {
       key,
+      raw,
       index,
       savedAt: payload.savedAt,
       items: payload.items
@@ -306,18 +387,7 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
 
   let totalRestored = 0;
   for (const snap of snapshots) {
-    if (snap.items.length > 0) {
-      for (const item of snap.items) {
-        if (await db.entryExists(item.projectId, item.filePath)) {
-          await db.updateFileContent(item.projectId, item.filePath, item.content);
-          totalRestored += 1;
-        }
-      }
-    }
-    // Borrado individual y atómico de la clave procesada en el snapshot
-    try {
-      storage.removeItem(snap.key);
-    } catch (_) {}
+    totalRestored += await applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache);
   }
 
   return totalRestored;

@@ -217,15 +217,18 @@ export const WAIT_INPUT_MARKER = "\x1e__STUDIO_WAIT_INPUT__";
  */
 export function injectInteractiveInputGuard(code, filePath = "main.c", isC = true) {
   const src = String(code || "");
-  const hasScanf = /\bscanf\s*\(/.test(src);
-  const hasGetchar = /\bgetchar\s*\(/.test(src);
-  const hasFgets = /\bfgets\s*\(/.test(src);
+  if (!isC) {
+    return src;
+  }
+  const hasScanf = /(?:^|[^.\w>])\bscanf\s*\(/.test(src);
+  const hasGetchar = /(?:^|[^.\w>])\bgetchar\s*\(/.test(src);
+  const hasFgets = /(?:^|[^.\w>])\bfgets\s*\(/.test(src);
 
   if (!hasScanf && !hasGetchar && !hasFgets) {
     return src;
   }
 
-  const safeFile = String(filePath || (isC ? "main.c" : "main.cpp")).replace(/\\/g, "/").replace(/"/g, "");
+  const safeFile = String(filePath || "main.c").replace(/\\/g, "/").replace(/"/g, "");
   const lines = [
     '#pragma GCC diagnostic push',
     '#pragma GCC diagnostic ignored "-Wunused-function"',
@@ -465,22 +468,104 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
  *   compilerErr: string
  * }>}
  */
-export async function compileAndRunWandbox(payload, fetchFn = (typeof window !== "undefined" ? window.fetch : fetch)) {
-  const res = await fetchFn("https://wandbox.org/api/compile.json", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
+export async function compileAndRunWandbox(
+  payload,
+  fetchFn = (typeof window !== "undefined" ? window.fetch : fetch),
+  timeoutMs = 25000,
+  externalSignal = null
+) {
+  const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+  let timedOut = false;
+  let onExternalAbort = null;
+  if (controller && externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason);
+    } else if (typeof externalSignal.addEventListener === "function") {
+      onExternalAbort = () => controller.abort(externalSignal.reason);
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
+  const timer =
+    controller && timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs)
+      : null;
 
-  if (!res.ok) {
-    throw new Error(`Error en servidor de compilación (HTTP ${res.status}): ${res.statusText}`);
+  let data;
+  try {
+    if (externalSignal?.aborted) {
+      const abortErr = new Error("Compilación cancelada.");
+      abortErr.name = "AbortError";
+      throw abortErr;
+    }
+    const fetchOpts = {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    };
+    if (controller) {
+      fetchOpts.signal = controller.signal;
+    }
+    const res = await fetchFn("https://wandbox.org/api/compile.json", fetchOpts);
+    if (!res.ok) {
+      throw new Error(`Error en servidor de compilación (HTTP ${res.status}): ${res.statusText}`);
+    }
+    const jsonPromise = res.json();
+    if (controller && controller.signal) {
+      let onRaceAbort = null;
+      try {
+        data = await Promise.race([
+          jsonPromise,
+          new Promise((_, reject) => {
+            if (controller.signal.aborted) {
+              const abortErr = new Error("Aborted");
+              abortErr.name = "AbortError";
+              reject(abortErr);
+              return;
+            }
+            onRaceAbort = () => {
+              const abortErr = new Error("Aborted");
+              abortErr.name = "AbortError";
+              reject(abortErr);
+            };
+            controller.signal.addEventListener("abort", onRaceAbort, { once: true });
+          })
+        ]);
+      } finally {
+        if (onRaceAbort && typeof controller.signal.removeEventListener === "function") {
+          controller.signal.removeEventListener("abort", onRaceAbort);
+        }
+      }
+    } else {
+      data = await jsonPromise;
+    }
+  } catch (err) {
+    if (timedOut) {
+      throw new Error("Tiempo de espera agotado al conectar con el compilador remoto (Wandbox).");
+    }
+    if (externalSignal?.aborted) {
+      if (err && err.name === "AbortError") throw err;
+      const abortErr = new Error("Compilación cancelada.");
+      abortErr.name = "AbortError";
+      throw abortErr;
+    }
+    if (controller?.signal?.aborted) {
+      throw new Error("Tiempo de espera agotado al conectar con el compilador remoto (Wandbox).");
+    }
+    throw err;
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    if (externalSignal && onExternalAbort && typeof externalSignal.removeEventListener === "function") {
+      externalSignal.removeEventListener("abort", onExternalAbort);
+    }
   }
 
-  const data = await res.json();
   const rawCompilerErr = String(data.compiler_error || "");
-  const hasRealCompileError = /(?:^|:|\s)(?:fatal error|error(?:\[[^\]]+\])?):/i.test(rawCompilerErr);
+  const hasRealCompileError = /(?:^|:|\s)(?:fatal error|error(?:\s*\[[^\]]+\]|\s+[A-Z]{1,6}\d{1,6})?):/i.test(rawCompilerErr);
   const statusCode = Number(data.status ?? (hasRealCompileError ? 1 : 0));
 
   return {
@@ -494,26 +579,55 @@ export async function compileAndRunWandbox(payload, fetchFn = (typeof window !==
 }
 
 /**
- * Parsea errores y advertencias de compilación devueltos por GCC / Clang en stderr o compiler_output.
+ * Parsea errores y advertencias de compilación devueltos por GCC / Clang / Rust / Go / TypeScript / C#.
  * @param {string} output
  * @returns {Array<{ line: number, column: number, severity: string, message: string, raw: string }>}
  */
 export function parseGccErrors(output) {
   if (!output || typeof output !== "string") return [];
   const errors = [];
-  const regex = /(?:^|\n)(?:[^\s:]+):(\d+)(?::(\d+))?:\s*(?:(fatal error|error|warning):\s*)?([^\r\n]+)/gi;
+  const seen = new Set();
+  const pushIssue = (issue) => {
+    const key = `${issue.line}:${issue.column}:${issue.severity}:${issue.message}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    errors.push(issue);
+  };
+
+  // GCC / Clang / Go / TypeScript pretty (`file:line:col - error TSxxxx: msg`)
+  const regex = /(?:^|\n)(?:[^\s:(]+):(\d+)(?::(\d+))?(?::\s*|\s+-\s+)(?:(fatal error|error|warning)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*)?([^\r\n]+)/gi;
   let match;
   while ((match = regex.exec(output)) !== null) {
     const line = parseInt(match[1], 10);
     const column = match[2] ? parseInt(match[2], 10) : 1;
     const severity = (match[3] || "error").toLowerCase();
-    const rawMessage = match[4].trim()
+    const diagCode = match[4] ? `${match[4]}: ` : "";
+    const rawMessage = `${diagCode}${match[5].trim()}`
       .replace(/__studio_scanf\b/g, "scanf")
       .replace(/__studio_getchar\b/g, "getchar")
       .replace(/__studio_fgets\b/g, "fgets");
     if (rawMessage.includes("__studio_")) continue;
     if (!isNaN(line)) {
-      errors.push({
+      pushIssue({
+        line,
+        column,
+        severity,
+        message: rawMessage,
+        raw: match[0].trim()
+      });
+    }
+  }
+
+  // TypeScript (tsc) & C# (csc / Roslyn / MSBuild): `archivo(linea,columna): error TSxxxx/CSxxxx: mensaje`
+  const parenRegex = /(?:^|\n)[^\r\n(\n]{0,260}\((\d+)(?:,\s*(\d+))?\)\s*:\s*(fatal error|error|warning)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*([^\r\n]+)/gi;
+  while ((match = parenRegex.exec(output)) !== null) {
+    const line = parseInt(match[1], 10);
+    const column = match[2] ? parseInt(match[2], 10) : 1;
+    const severity = (match[3] || "error").toLowerCase();
+    const diagCode = match[4] ? `${match[4]}: ` : "";
+    const rawMessage = `${diagCode}${match[5].trim()}`;
+    if (!isNaN(line)) {
+      pushIssue({
         line,
         column,
         severity,
@@ -531,7 +645,7 @@ export function parseGccErrors(output) {
     const line = parseInt(match[3], 10);
     const column = parseInt(match[4], 10);
     if (!isNaN(line)) {
-      errors.push({
+      pushIssue({
         line,
         column,
         severity,
@@ -739,6 +853,7 @@ export function mountCRunnerView(containerEl, {
   let initialMenuSnapshot = "";
   let isCompiling = false;
   let isDestroyed = false;
+  let activeRequestController = null;
 
   async function executeStep(userInput = null) {
     if (isCompiling) return;
@@ -748,6 +863,7 @@ export function mountCRunnerView(containerEl, {
     }
 
     isCompiling = true;
+    activeRequestController = typeof AbortController !== "undefined" ? new AbortController() : null;
     btnCompile.disabled = true;
     btnSendStdin.disabled = true;
     btnSendStep.disabled = true;
@@ -779,7 +895,7 @@ export function mountCRunnerView(containerEl, {
 
     const t0 = performance.now();
     try {
-      const res = await compileAndRunWandbox(payload, fetchFn);
+      const res = await compileAndRunWandbox(payload, fetchFn, 25000, activeRequestController?.signal || null);
       if (isDestroyed) return;
       const ms = Math.round(performance.now() - t0);
       const rawStdoutWithMarker = String(res.stdout || "");
@@ -803,15 +919,22 @@ export function mountCRunnerView(containerEl, {
         if (compilerErrors.length > 0) {
           const banner = document.createElement("div");
           banner.className = "c-term-err-banner";
-          banner.textContent = `⚠ Se detectaron ${compilerErrors.length} fallo(s) de compilación. Hacé clic en cualquier línea para saltar al editor:`;
+          banner.textContent = `⚠ Se detectaron ${compilerErrors.length} fallo(s) de compilación. Hacé clic en cualquier línea señalada para saltar al editor:`;
           compBlock.appendChild(banner);
 
           const errLines = rawErrText ? rawErrText.split("\n") : [];
           for (const lineText of errLines) {
             const trimmed = lineText.trim();
-            const matched = compilerErrors.find(
-              (e) => trimmed.includes(`:${e.line}:`) && /(error|warning|fatal error):/i.test(trimmed)
-            );
+            const matched = compilerErrors.find((e) => {
+              if (!e || !(e.line > 0)) return false;
+              const hasLoc = trimmed.includes(`:${e.line}:`) || trimmed.includes(`(${e.line},`);
+              if (!hasLoc) return false;
+              return (
+                /(error|warning|fatal error)(?:\s*\[[^\]]+\]|\s+[A-Z]{1,6}\d{1,6})?:/i.test(trimmed) ||
+                /^\s*-->/.test(trimmed) ||
+                /-\s*(error|warning)\s+[A-Z]{1,6}\d{1,6}:/i.test(trimmed)
+              );
+            });
             if (matched) {
               const errLineEl = document.createElement("div");
               errLineEl.className = "c-term-err-line";
@@ -838,11 +961,6 @@ export function mountCRunnerView(containerEl, {
               compBlock.appendChild(normalLine);
             }
           }
-
-          compBlock.title = `Hacé clic para saltar a la línea ${compilerErrors[0].line} en el editor`;
-          compBlock.addEventListener("click", () => {
-            onGoToLine(compilerErrors[0].line);
-          });
         } else {
           compBlock.textContent = rawErrText || "Error de compilación desconocido";
         }
@@ -948,6 +1066,7 @@ export function mountCRunnerView(containerEl, {
       termBody.appendChild(errDiv);
       onCompilerResult({ success: false, errors: [] });
     } finally {
+      activeRequestController = null;
       isCompiling = false;
       btnCompile.disabled = false;
       btnSendStdin.disabled = false;
@@ -956,31 +1075,34 @@ export function mountCRunnerView(containerEl, {
     }
   }
 
-  btnCompile.addEventListener("click", () => {
+  function triggerFreshRun(resetTerminal = false) {
+    if (isCompiling) return false;
     sessionInputs = [];
     lastRawStdout = "";
     initialMenuSnapshot = "";
+    if (resetTerminal) {
+      terminalHistory.clear();
+      termInput.value = "";
+      termBody.innerHTML = '<span class="c-term-hint">Reiniciando consola...</span>';
+    }
     executeStep(null);
+    return true;
+  }
+
+  btnCompile.addEventListener("click", () => {
+    triggerFreshRun(false);
   });
 
   btnSendStdin.addEventListener("click", () => {
-    sessionInputs = [];
-    lastRawStdout = "";
-    initialMenuSnapshot = "";
-    executeStep(null);
+    triggerFreshRun(false);
   });
 
   btnReset.addEventListener("click", () => {
-    sessionInputs = [];
-    lastRawStdout = "";
-    initialMenuSnapshot = "";
-    terminalHistory.clear();
-    termInput.value = "";
-    termBody.innerHTML = '<span class="c-term-hint">Reiniciando consola...</span>';
-    executeStep(null);
+    triggerFreshRun(true);
   });
 
   function handleSendInteractiveInput() {
+    if (isCompiling) return;
     const text = termInput.value.trim();
     if (!text) return;
     terminalHistory.push(text);
@@ -1023,18 +1145,15 @@ export function mountCRunnerView(containerEl, {
   stdinTextarea.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
-      sessionInputs = [];
-      lastRawStdout = "";
-      executeStep(null);
+      e.stopPropagation();
+      triggerFreshRun(false);
     }
   });
 
   function handleKeydown(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
       e.preventDefault();
-      sessionInputs = [];
-      lastRawStdout = "";
-      executeStep(null);
+      triggerFreshRun(false);
     }
   }
   if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
@@ -1047,6 +1166,7 @@ export function mountCRunnerView(containerEl, {
   return {
     destroy() {
       isDestroyed = true;
+      try { activeRequestController?.abort(); } catch (_) {}
       if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
         window.removeEventListener("keydown", handleKeydown);
       }
@@ -1101,7 +1221,6 @@ export function buildCRunnerPreview(activeFile, companionFiles = []) {
   const isCHeader = C_HEADER_EXTENSIONS.has(ext);
   const isHeader = ALL_HEADER_EXTENSIONS.has(ext);
   const isC = isCSource || (isCHeader && !companionFiles.some((f) => CPP_SOURCE_EXTENSIONS.has(getFileExtension(f?.path || ""))));
-  const isCppFamily = !isRust && !isGo && !isJava && !isCSharp && !isTypeScript;
   const langLabel = isRust
     ? "Rust (Wandbox / rustc)"
     : isGo

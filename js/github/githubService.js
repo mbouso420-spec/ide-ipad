@@ -13,7 +13,7 @@ import {
   redactSensitiveTokens,
   validateCredentialFormat
 } from "../security/credentialGuard.js";
-import { BINARY_EXTENSIONS } from "../storage/fileImport.js";
+import { base64ToUint8Array, isBinaryFile, MAX_IMPORT_FILE_BYTES } from "../storage/fileImport.js";
 
 const GH_TOKEN_KEY = "ide.github.pat";
 const GH_SCOPE = "github";
@@ -180,11 +180,8 @@ async function createGithubClient(token, { requireToken = true } = {}) {
           throw authError;
         }
 
-        if ((status === 403 || status === 429) && cleanToken) {
-          const isRateLimit = lowerMsg.includes("rate limit");
-          if (!isRateLimit && status === 403) {
-            markTokenRejectedInSession(GH_SCOPE, cleanToken);
-          }
+        if (status === 403 && cleanToken && isGithubCredentialRejection403(lowerMsg)) {
+          markTokenRejectedInSession(GH_SCOPE, cleanToken);
           const failure = recordAuthFailure(GH_SCOPE);
           if (failure.locked) {
             throw new AuthLockoutError(GH_SCOPE, failure.remainingMs, failure.failedAttempts);
@@ -199,6 +196,42 @@ async function createGithubClient(token, { requireToken = true } = {}) {
       }
     }
   };
+}
+
+function isGithubRateLimitMessage(lowerMsg) {
+  return (
+    lowerMsg.includes("rate limit") ||
+    lowerMsg.includes("secondary rate") ||
+    lowerMsg.includes("abuse detection") ||
+    lowerMsg.includes("too many requests")
+  );
+}
+
+function isGithubCredentialRejection403(lowerMsg) {
+  if (!lowerMsg || isGithubRateLimitMessage(lowerMsg)) return false;
+  if (
+    lowerMsg.includes("resource not accessible") ||
+    lowerMsg.includes("protected branch") ||
+    lowerMsg.includes("branch protection") ||
+    lowerMsg.includes("repository rule") ||
+    lowerMsg.includes("scope") ||
+    lowerMsg.includes("permission") ||
+    lowerMsg.includes("permiso") ||
+    lowerMsg.includes("no tiene permiso")
+  ) {
+    return false;
+  }
+  return (
+    lowerMsg.includes("bad credentials") ||
+    lowerMsg.includes("invalid credentials") ||
+    lowerMsg.includes("token expired") ||
+    lowerMsg.includes("expired token") ||
+    lowerMsg.includes("token revoked") ||
+    lowerMsg.includes("revoked") ||
+    lowerMsg.includes("requires authentication") ||
+    lowerMsg.includes("organization sso") ||
+    lowerMsg.includes("saml")
+  );
 }
 
 async function createRawGithubClient(token) {
@@ -226,7 +259,7 @@ async function createRawGithubClient(token) {
       path = path.replace(/\{([^}]+)\}/g, (_, key) => {
         const val = String(bodyPayload[key] ?? "");
         delete bodyPayload[key];
-        if (key === "ref" || key === "branch") {
+        if (key === "ref" || key === "branch" || key === "path") {
           return val.split("/").map(encodeURIComponent).join("/");
         }
         return encodeURIComponent(val);
@@ -267,8 +300,9 @@ async function createRawGithubClient(token) {
         } catch {
           // Ignorar
         }
-        if (detail.includes("Resource not accessible by personal access token")) {
-          detail = "Tu token de GitHub no tiene permiso para este recurso. Para Gists, activá 'Account permissions -> Gists (Read and write)' en GitHub o usá un Token Classic con la casilla 'gist'.";
+        if (detail.includes("Resource not accessible by personal access token") && rawPath.startsWith("/gists")) {
+          detail =
+            "Resource not accessible by personal access token: Tu token de GitHub no tiene permiso para Gists. Activá 'Account permissions -> Gists (Read and write)' en GitHub o usá un Token Classic con la casilla 'gist'.";
         }
         const safeDetail = redactSensitiveTokens(detail, [token]);
         const err = new Error(`GitHub API: ${safeDetail}`);
@@ -451,14 +485,93 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
     if (st === 404 || st === 409 || msg.includes("not found") || msg.includes("empty")) {
       // Verificar si el repositorio existe pero aún no tiene commits (vacío)
       const repoInfo = await client.request("GET /repos/{owner}/{repo}", { owner, repo });
-      if (repoInfo) {
+      if (!repoInfo) {
+        throw err;
+      }
+      const defaultBranch = repoInfo.default_branch || branch || "main";
+      if (st === 409 || msg.includes("empty")) {
         return {
           commitSha: null,
           isEmptyRepo: true,
-          branch: repoInfo.default_branch || branch || "main",
+          branch: defaultBranch,
           entries: []
         };
       }
+
+      // Ante 404 en /branches/{branch}, validar que realmente sea un repo vacío y no una rama inexistente.
+      let repoHasCommits = typeof repoInfo.size === "number" && repoInfo.size > 0;
+      if (!repoHasCommits && branch && defaultBranch && branch !== defaultBranch) {
+        try {
+          const defBranchInfo = await client.request("GET /repos/{owner}/{repo}/branches/{branch}", {
+            owner,
+            repo,
+            branch: defaultBranch
+          });
+          if (defBranchInfo?.commit?.sha) {
+            repoHasCommits = true;
+          }
+        } catch (defErr) {
+          const defMsg = String(defErr?.message || "").toLowerCase();
+          if (defErr?.status === 409 || defMsg.includes("empty")) {
+            return {
+              commitSha: null,
+              isEmptyRepo: true,
+              branch: defaultBranch,
+              entries: []
+            };
+          }
+        }
+      }
+
+      if (!repoHasCommits) {
+        try {
+          const branchList = await client.request("GET /repos/{owner}/{repo}/branches", {
+            owner,
+            repo,
+            per_page: 1
+          });
+          if (Array.isArray(branchList)) {
+            if (branchList.length > 0) {
+              repoHasCommits = true;
+            } else {
+              return {
+                commitSha: null,
+                isEmptyRepo: true,
+                branch: defaultBranch,
+                entries: []
+              };
+            }
+          }
+        } catch (listErr) {
+          const listMsg = String(listErr?.message || "").toLowerCase();
+          if (listErr?.status === 409 || listMsg.includes("empty")) {
+            return {
+              commitSha: null,
+              isEmptyRepo: true,
+              branch: defaultBranch,
+              entries: []
+            };
+          }
+          if (repoInfo.size === 0 && (!branch || branch === defaultBranch)) {
+            return {
+              commitSha: null,
+              isEmptyRepo: true,
+              branch: defaultBranch,
+              entries: []
+            };
+          }
+        }
+      }
+
+      if (!repoHasCommits && repoInfo.size === 0 && (!branch || branch === defaultBranch)) {
+        return {
+          commitSha: null,
+          isEmptyRepo: true,
+          branch: defaultBranch,
+          entries: []
+        };
+      }
+      throw err;
     }
     throw err;
   }
@@ -490,16 +603,18 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
       if (node.type !== "blob" || !node.path || !node.sha) return false;
       // Los enlaces simbólicos (120000) no son archivos de texto editables: editarlos los convertiría en archivos comunes.
       if (node.mode === "120000") return false;
-      if (typeof node.size === "number" && node.size > MAX_TEXT_FILE_BYTES) return false;
       if (node.path.startsWith("node_modules/") || node.path.startsWith(".git/")) return false;
-      const ext = node.path.includes(".") ? node.path.split(".").pop().toLowerCase() : "";
-      return !BINARY_EXTENSIONS.has(ext);
+      const isBin = isBinaryFile(node.path);
+      const maxSize = isBin ? MAX_IMPORT_FILE_BYTES : MAX_TEXT_FILE_BYTES;
+      if (typeof node.size === "number" && node.size > maxSize) return false;
+      return true;
     })
     .map((node) => ({
       path: node.path,
       blobSha: node.sha,
       size: node.size || 0,
-      mode: node.mode === "100755" ? "100755" : "100644"
+      mode: node.mode === "100755" ? "100755" : "100644",
+      isBinary: isBinaryFile(node.path)
     }));
 
   const isTruncated = Boolean(treeData?.truncated);
@@ -515,15 +630,24 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
 
 /**
  * Descarga el contenido de un único archivo puntual desde GitHub bajo demanda (~120ms).
+ * Devuelve string UTF-8 para archivos de texto, o `{ isBinary: true, base64, content: "" }` para binarios.
  */
-export async function fetchSingleRepoBlob({ token, owner, repo, blobSha }) {
+export async function fetchSingleRepoBlob({ token, owner, repo, blobSha, path = "", isBinary = false }) {
   const client = await createGithubClient(token, { requireToken: false });
   const blob = await client.request("GET /repos/{owner}/{repo}/git/blobs/{file_sha}", {
     owner,
     repo,
     file_sha: blobSha
   });
-  return blob.encoding === "base64" ? decodeBase64Utf8(blob.content || "") : String(blob.content || "");
+  const parsed = parseGithubBlobPayload(blob, { path, isBinary });
+  if (parsed.isBinary) {
+    return {
+      isBinary: true,
+      base64: parsed.base64,
+      content: ""
+    };
+  }
+  return parsed.content;
 }
 
 /**
@@ -548,13 +672,14 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
         });
         completed += 1;
         onProgress?.(completed, total);
-        const content =
-          blob.encoding === "base64" ? decodeBase64Utf8(blob.content || "") : String(blob.content || "");
+        const parsed = parseGithubBlobPayload(blob, { path: item.path, isBinary: item.isBinary });
         return {
           path: item.path,
           blobSha: item.blobSha,
           mode: item.mode || null,
-          content
+          isBinary: parsed.isBinary,
+          base64: parsed.base64,
+          content: parsed.content
         };
       })
     );
@@ -790,16 +915,65 @@ export async function pushAtomicCommit({
   };
 }
 
-function decodeBase64Utf8(base64) {
-  const clean = base64.replace(/\s+/g, "");
-  const atobFn = typeof atob === "function" ? atob : (globalThis.atob || (typeof window !== "undefined" ? window.atob : null));
-  const binary = atobFn(clean);
-  const len = binary.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+function hasBinaryBytes(bytes) {
+  const limit = Math.min(bytes.length, 8000);
+  for (let i = 0; i < limit; i += 1) {
+    if (bytes[i] === 0) return true;
   }
-  return new TextDecoder("utf-8").decode(bytes);
+  return false;
+}
+
+function parseGithubBlobPayload(blob, { path = "", isBinary = false } = {}) {
+  const markedBinary = Boolean(isBinary) || (Boolean(path) && isBinaryFile(path));
+
+  if (blob?.encoding !== "base64") {
+    const raw = String(blob?.content || "");
+    if (markedBinary) {
+      return {
+        isBinary: true,
+        base64: encodeUtf8Base64(raw),
+        content: ""
+      };
+    }
+    return {
+      isBinary: false,
+      base64: null,
+      content: raw
+    };
+  }
+
+  const cleanBase64 = String(blob.content || "").replace(/\s+/g, "");
+  if (markedBinary) {
+    return {
+      isBinary: true,
+      base64: cleanBase64,
+      content: ""
+    };
+  }
+
+  const bytes = base64ToUint8Array(cleanBase64);
+  if (hasBinaryBytes(bytes)) {
+    return {
+      isBinary: true,
+      base64: cleanBase64,
+      content: ""
+    };
+  }
+
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return {
+      isBinary: false,
+      base64: null,
+      content: text
+    };
+  } catch {
+    return {
+      isBinary: true,
+      base64: cleanBase64,
+      content: ""
+    };
+  }
 }
 
 function encodeUtf8Base64(text) {
@@ -996,9 +1170,10 @@ export async function publishProjectAsNewRepository(token, { repoName, isPrivate
   const repo = createdRepo.name;
   const branch = createdRepo.default_branch || "main";
 
+  let commitSha = null;
   const fileEntries = entries.filter((e) => !e.isFolder && !e.deleted && e.path);
   if (fileEntries.length > 0) {
-    await pushAtomicCommit({
+    const pushRes = await pushAtomicCommit({
       token,
       owner,
       repo,
@@ -1013,12 +1188,14 @@ export async function publishProjectAsNewRepository(token, { repoName, isPrivate
         status: "added"
       }))
     });
+    commitSha = pushRes?.commitSha || null;
   }
 
   return {
     owner,
     repo,
     branch,
+    commitSha,
     fullName: createdRepo.full_name,
     url: createdRepo.html_url
   };

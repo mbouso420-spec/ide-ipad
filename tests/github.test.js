@@ -29,13 +29,15 @@ const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
 
 describe("Cliente REST GitHub (fallback sin Octokit)", () => {
   beforeEach(() => resetAuthSecurityState());
-  test("fetchRepoTreeIndex filtra binarios, >350KB, node_modules, .git y nodos no-blob", async () => {
+  test("fetchRepoTreeIndex incluye binarios (marcados con isBinary) y filtra >350KB texto, >MAX_IMPORT_FILE_BYTES binarios, node_modules, .git y nodos no-blob", async () => {
     installFakeGithub({
       "GET /repos/o/r/branches/main": () => [200, { commit: { sha: "C1", commit: { tree: { sha: "T1" } } } }],
       "GET /repos/o/r/git/trees/T1": () => [200, {
         tree: [
           { type: "blob", path: "a.js", sha: "s1", size: 10 },
           { type: "blob", path: "img.PNG", sha: "s2", size: 10 },
+          { type: "blob", path: "huge.png", sha: "s2b", size: 20000000 },
+          { type: "blob", path: ".git/config", sha: "s4b", size: 10 },
           { type: "blob", path: "big.txt", sha: "s3", size: 400000 },
           { type: "blob", path: "node_modules/x.js", sha: "s4", size: 1 },
           { type: "tree", path: "src", sha: "s5" },
@@ -47,7 +49,10 @@ describe("Cliente REST GitHub (fallback sin Octokit)", () => {
     const idx = await gh.fetchRepoTreeIndex({ token: GH_TOK, owner: "o", repo: "r", branch: "main" });
     assert.equal(idx.commitSha, "C1");
     assert.equal(idx.isTruncated, false);
-    assert.deepEqual(idx.entries.map((e) => e.path), ["a.js", "src/ñ.py"]);
+    assert.deepEqual(idx.entries.map((e) => e.path), ["a.js", "img.PNG", "src/ñ.py"]);
+    assert.equal(idx.entries.find((e) => e.path === "a.js")?.isBinary, false);
+    assert.equal(idx.entries.find((e) => e.path === "img.PNG")?.isBinary, true);
+    assert.equal(idx.entries.find((e) => e.path === "src/ñ.py")?.isBinary, false);
   });
 
   test("fetchRepoTreeIndex detecta y propaga indicador isTruncated de la API de GitHub", async () => {
@@ -351,19 +356,26 @@ describe("Respaldo en la Nube con GitHub (Gists y Repositorios)", () => {
     const entries = await getProjectEntries(created.id);
     assert.equal(entries.filter((e) => !e.isFolder).length, 2);
 
-    // Convertir a GitHub
+    // Convertir a GitHub (migra project.id a gh:owner/repo@branch)
     const converted = await convertLocalProjectToGithub(created.id, {
       owner: "mi-usuario",
       repo: "mi-repo",
-      branch: "main"
+      branch: "main",
+      commitSha: "C_INIT"
     });
 
+    assert.notEqual(converted.id, created.id);
     assert.equal(converted.kind, "github");
     assert.equal(converted.github.owner, "mi-usuario");
     assert.equal(converted.github.repo, "mi-repo");
+    assert.equal(converted.github.commitSha, "C_INIT");
 
-    const stored = await getProject(created.id);
+    assert.equal(await getProject(created.id), null, "El project.id local anterior debe haberse migrado");
+    const stored = await getProject(converted.id);
+    assert.ok(stored);
     assert.equal(stored.kind, "github");
+    const migratedEntries = await getProjectEntries(converted.id);
+    assert.equal(migratedEntries.filter((e) => !e.isFolder).length, 2);
   });
 
   test("publishProjectAsNewRepository crea repositorio privado si isPrivate es true", async () => {

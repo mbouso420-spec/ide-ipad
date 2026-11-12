@@ -1,6 +1,9 @@
-const SHELL_CACHE = "studio-ide-shell-v29";
-const RUNTIME_CACHE = "studio-ide-runtime-v1";
+const SHELL_CACHE = "studio-ide-shell-v30";
+const RUNTIME_CACHE = "studio-ide-runtime-v2";
+const CORE_SHELL_URLS = new Set(["./", "./index.html", "./manifest.json", "./js/app.js"]);
 const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";
+// #preview-iframe corre bajo sandbox sin allow-same-origin (origin 'null'): sus peticiones a Pyodide/WASM
+// no pasan por este Service Worker y dependen de la caché HTTP del navegador; se precalienta en best-effort.
 const PYODIDE_ENTRY_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/pyodide.js";
 
 const IMPORTMAP_CDN_URLS = [
@@ -88,6 +91,71 @@ const CACHEABLE_CDN_HOSTS = new Set([
   "fonts.gstatic.com"
 ]);
 
+function isEssentialShellUrl(url) {
+  return CORE_SHELL_URLS.has(url) || url.endsWith(".css") || url.endsWith(".js");
+}
+
+function isCacheableResponse(response) {
+  return Boolean(response && response.ok && response.type !== "opaque");
+}
+
+function safeCachePut(cache, key, response) {
+  if (!isCacheableResponse(response)) {
+    return Promise.resolve();
+  }
+  try {
+    return Promise.resolve(cache.put(key, response.clone())).catch(() => undefined);
+  } catch {
+    return Promise.resolve();
+  }
+}
+
+async function fetchWithTimeout(request, timeoutMs = 12000) {
+  const AbortCtrl =
+    typeof self !== "undefined" && typeof self.AbortController === "function"
+      ? self.AbortController
+      : null;
+  if (!AbortCtrl) {
+    return fetch(request);
+  }
+  const controller = new AbortCtrl();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(request, { signal: controller.signal });
+  } finally {
+    if (typeof clearTimeout === "function") {
+      clearTimeout(timer);
+    }
+  }
+}
+
+async function precacheShellUrl(cache, url) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const res = await fetch(new Request(url, { cache: "reload" }));
+      if (isCacheableResponse(res)) {
+        await safeCachePut(cache, url, res);
+        return;
+      }
+      lastError = new Error(`HTTP ${res ? res.status : "sin respuesta"}`);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  const existing = await cache.match(url, { ignoreSearch: true }).catch(() => undefined);
+  if (existing) {
+    console.warn("PWA prefetch fallback a caché existente:", url, lastError);
+    return;
+  }
+
+  if (isEssentialShellUrl(url)) {
+    throw new Error(`No se pudo precachear recurso crítico: ${url}`, { cause: lastError });
+  }
+  console.warn("PWA prefetch skip:", url, lastError);
+}
+
 async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
   if (!targetUrl || state.visited.has(targetUrl) || state.visited.size >= 80 || depth > 2) {
     return;
@@ -105,27 +173,33 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
 
   let res;
   try {
-    res = await fetch(new Request(targetUrl, { mode: "cors" }));
+    res = await fetchWithTimeout(new Request(targetUrl, { mode: "cors" }), 12000);
   } catch {
     return;
   }
-  if (!res || !res.ok) {
+  if (!isCacheableResponse(res)) {
     return;
   }
 
-  const cloneForTarget = res.clone();
-  const cloneForFinal = res.url && res.url !== targetUrl ? res.clone() : null;
-  const cloneForText = res.clone();
-  await cache.put(targetUrl, cloneForTarget);
+  let cloneForFinal = null;
+  let cloneForText = null;
+  try {
+    cloneForFinal = res.url && res.url !== targetUrl ? res.clone() : null;
+    cloneForText = res.clone();
+  } catch {
+    return;
+  }
+
+  await safeCachePut(cache, targetUrl, res);
   if (cloneForFinal) {
     state.visited.add(res.url);
-    await cache.put(res.url, cloneForFinal);
+    await Promise.resolve(cache.put(res.url, cloneForFinal)).catch(() => undefined);
   }
 
   if (parsed.hostname !== "esm.sh" || depth >= 2) {
     return;
   }
-  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+  const ctype = (res.headers && typeof res.headers.get === "function" ? res.headers.get("content-type") || "" : "").toLowerCase();
   if (!ctype.includes("javascript") && !ctype.includes("ecmascript") && !targetUrl.endsWith(".js") && !targetUrl.endsWith(".mjs")) {
     return;
   }
@@ -157,7 +231,7 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
       }
     }
   }
-  await Promise.all(childTasks);
+  await Promise.all(childTasks.map((p) => p.catch(() => undefined)));
 }
 
 self.addEventListener("install", (event) => {
@@ -165,37 +239,22 @@ self.addEventListener("install", (event) => {
     Promise.all([
       caches
         .open(SHELL_CACHE)
-        .then((cache) =>
-          Promise.all(
-            APP_SHELL_URLS.map((url) =>
-              fetch(new Request(url, { cache: "reload" }))
-                .then((res) => {
-                  if (res && res.ok) {
-                    return cache.put(url, res);
-                  }
-                  return undefined;
-                })
-                .catch((err) => {
-                  console.warn("PWA prefetch skip:", url, err);
-                  return undefined;
-                })
-            )
-          )
-        ),
-      caches.open(RUNTIME_CACHE).then(async (cache) => {
-        const state = { visited: new Set() };
-        const warmAll = Promise.all([
-          warmExternalScriptUrl(cache, ACORN_CDN_URL, state, 0),
-          ...IMPORTMAP_CDN_URLS.map((cdnUrl) => warmExternalScriptUrl(cache, cdnUrl, state, 0)),
-          fetch(new Request(PYODIDE_ENTRY_URL, { mode: "cors" }))
-            .then((res) => (res && res.ok ? cache.put(PYODIDE_ENTRY_URL, res) : undefined))
-            .catch(() => undefined)
-        ]);
-        await Promise.race([
-          warmAll,
-          new Promise((resolve) => setTimeout(resolve, 3500))
-        ]);
-      })
+        .then((cache) => Promise.all(APP_SHELL_URLS.map((url) => precacheShellUrl(cache, url)))),
+      caches
+        .open(RUNTIME_CACHE)
+        .then(async (cache) => {
+          const state = { visited: new Set() };
+          const warmTasks = [
+            warmExternalScriptUrl(cache, ACORN_CDN_URL, state, 0),
+            ...IMPORTMAP_CDN_URLS.map((cdnUrl) => warmExternalScriptUrl(cache, cdnUrl, state, 0)),
+            // Precalentamiento best-effort para el entrypoint de Pyodide (limitado por sandbox 'null' en #preview-iframe)
+            fetchWithTimeout(new Request(PYODIDE_ENTRY_URL, { mode: "cors" }), 12000)
+              .then((res) => (isCacheableResponse(res) ? safeCachePut(cache, PYODIDE_ENTRY_URL, res) : undefined))
+              .catch(() => undefined)
+          ];
+          await Promise.all(warmTasks.map((p) => p.catch(() => undefined)));
+        })
+        .catch(() => undefined)
     ]).then(() => self.skipWaiting())
   );
 });
@@ -225,15 +284,33 @@ self.addEventListener("fetch", (event) => {
       caches.open(RUNTIME_CACHE).then(async (cache) => {
         const cached = await cache.match(request);
         const networkPromise = fetch(request)
-          .then((response) => {
-            if (response && response.ok) {
-              cache.put(request, response.clone());
+          .then(async (response) => {
+            if (isCacheableResponse(response)) {
+              await safeCachePut(cache, request, response);
+              return response;
+            }
+            if (cached && response && response.status >= 500) {
+              return cached;
             }
             return response;
           })
-          .catch(() => cached);
+          .catch(
+            () =>
+              cached ||
+              new Response("Recurso CDN no disponible sin conexión.", {
+                status: 503,
+                statusText: "Service Unavailable",
+                headers: { "Content-Type": "text/plain; charset=utf-8" }
+              })
+          );
 
-        return cached || networkPromise;
+        if (cached) {
+          if (typeof event.waitUntil === "function") {
+            event.waitUntil(networkPromise.catch(() => undefined));
+          }
+          return cached;
+        }
+        return networkPromise;
       })
     );
     return;
@@ -244,18 +321,52 @@ self.addEventListener("fetch", (event) => {
   if (url.origin === self.location.origin) {
     event.respondWith(
       caches.open(SHELL_CACHE).then(async (cache) => {
+        const matchCachedShell = async () =>
+          (await cache.match(request, { ignoreSearch: true })) ||
+          (url.pathname.endsWith("/")
+            ? (await cache.match("./index.html", { ignoreSearch: true })) ||
+              (await cache.match("./", { ignoreSearch: true }))
+            : undefined);
+
+        const matchNavigateFallback = async () =>
+          (await cache.match("./index.html", { ignoreSearch: true })) ||
+          (await cache.match("./", { ignoreSearch: true }));
+
         try {
           const fresh = await fetch(request, { cache: "no-cache" });
-          if (fresh && fresh.ok) {
-            cache.put(request, fresh.clone());
+          if (isCacheableResponse(fresh)) {
+            await safeCachePut(cache, request, fresh);
+            return fresh;
+          }
+          if (fresh && fresh.status >= 500) {
+            const cachedFallback = await matchCachedShell();
+            if (cachedFallback) {
+              return cachedFallback;
+            }
+            if (request.mode === "navigate") {
+              const navFallback = await matchNavigateFallback();
+              if (navFallback) {
+                return navFallback;
+              }
+            }
           }
           return fresh;
         } catch {
-          const cached = await cache.match(request);
+          const cached = await matchCachedShell();
           if (cached) {
             return cached;
           }
-          throw new Error("Sin conexión y recurso no disponible en caché.");
+          if (request.mode === "navigate") {
+            const shellFallback = await matchNavigateFallback();
+            if (shellFallback) {
+              return shellFallback;
+            }
+          }
+          return new Response("Sin conexión y recurso no disponible en caché.", {
+            status: 503,
+            statusText: "Service Unavailable",
+            headers: { "Content-Type": "text/plain; charset=utf-8" }
+          });
         }
       })
     );

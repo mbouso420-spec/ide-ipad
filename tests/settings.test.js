@@ -189,6 +189,7 @@ describe("SettingsModal, Nuevos Lenguajes (Rust y Go) y Preferencias Extendidas"
     modal.open();
     assert.equal(dialog.open, true);
     assert.equal(keyboardRouter.getActiveModal()?.id, "settings-dialog");
+    assert.equal(keyboardRouter.getActiveModal()?.blockGlobalShortcuts, true);
 
     modal.close();
     assert.equal(dialog.open, false);

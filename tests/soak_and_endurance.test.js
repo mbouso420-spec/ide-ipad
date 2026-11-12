@@ -20,16 +20,14 @@ import {
 
 import {
   writeEmergencyBackup,
-  readEmergencyBackup,
   restoreEmergencyBackup,
-  clearEmergencyBackup,
   getEmergencyBackupKey
 } from "../js/storage/emergencyBackup.js";
 
 import { buildZipArchive, computeCrc32 } from "../js/storage/zipExporter.js";
-import { uint8ArrayToBase64, base64ToUint8Array } from "../js/storage/fileImport.js";
+import { uint8ArrayToBase64 } from "../js/storage/fileImport.js";
 import { createEditorManager } from "../js/editor/editorManager.js";
-import { bundleHtmlWithFolderAssets, MAX_TOTAL_INLINED_CSS } from "../js/preview/htmlBundler.js";
+import { bundleHtmlWithFolderAssets } from "../js/preview/htmlBundler.js";
 import { instrumentLoops } from "../js/preview/loopGuard.js";
 import {
   convertResultsToCsv,
@@ -40,7 +38,6 @@ import {
 } from "../js/preview/sqlRunner.js";
 import {
   mountCRunnerView,
-  parseGccErrors,
   WAIT_INPUT_MARKER
 } from "../js/preview/cRunner.js";
 import {

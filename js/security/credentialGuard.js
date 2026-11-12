@@ -52,14 +52,18 @@ export class CredentialFormatError extends Error {
   }
 }
 
+function getBrowserStorageGetters() {
+  if (typeof window === "undefined") return [];
+  return [() => window.localStorage, () => window.sessionStorage];
+}
+
 function readPersistedLockoutRecord(scope) {
   const key = `${LOCKOUT_STORAGE_PREFIX}${scope}`;
-  try {
-    const raw =
-      (typeof window !== "undefined" && window.localStorage?.getItem(key)) ||
-      (typeof window !== "undefined" && window.sessionStorage?.getItem(key)) ||
-      "";
-    if (raw) {
+  for (const getStore of getBrowserStorageGetters()) {
+    try {
+      const store = getStore();
+      const raw = store?.getItem(key) || "";
+      if (!raw) continue;
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object") {
         return {
@@ -68,9 +72,9 @@ function readPersistedLockoutRecord(scope) {
           updatedAt: Math.max(0, Number(parsed.updatedAt) || 0)
         };
       }
+    } catch {
+      // Fall back to next storage backend or in-memory map if JSON or storage fails
     }
-  } catch {
-    // Fallback al mapa en memoria
   }
   return memoryLockoutFallback.get(scope) || { failedAttempts: 0, lockoutUntil: 0, updatedAt: 0 };
 }
@@ -85,28 +89,29 @@ function writePersistedLockoutRecord(scope, record) {
 
   if (clean.failedAttempts === 0 && clean.lockoutUntil === 0) {
     memoryLockoutFallback.delete(scope);
-    try {
-      if (typeof window !== "undefined") {
-        window.localStorage?.removeItem(key);
-        window.sessionStorage?.removeItem(key);
+    for (const getStore of getBrowserStorageGetters()) {
+      try {
+        getStore()?.removeItem(key);
+      } catch {
+        // Ignorar entorno restringido
       }
-    } catch {
-      // Ignorar entorno restringido
     }
     return;
   }
 
   memoryLockoutFallback.set(scope, clean);
+  let serialized = "";
   try {
-    const serialized = JSON.stringify(clean);
-    if (typeof window !== "undefined" && window.localStorage) {
-      window.localStorage.setItem(key, serialized);
-    }
-    if (typeof window !== "undefined" && window.sessionStorage) {
-      window.sessionStorage.setItem(key, serialized);
-    }
+    serialized = JSON.stringify(clean);
   } catch {
-    // Ignorar cuota o entorno restringido: memoryLockoutFallback mantiene la protección en sesión
+    return;
+  }
+  for (const getStore of getBrowserStorageGetters()) {
+    try {
+      getStore()?.setItem(key, serialized);
+    } catch {
+      // Ignorar cuota o entorno restringido: memoryLockoutFallback mantiene la protección en sesión
+    }
   }
 }
 
@@ -225,17 +230,20 @@ export function recordAuthSuccess(scope) {
  * @returns {string}
  */
 export function computeTokenFingerprint(scope, rawToken) {
-  const input = `${String(scope || "")}\x1f${String(rawToken || "")}`;
+  const input = `${String(scope || "")}\x1f${String(rawToken || "")}\x1f${String(rawToken || "").length}`;
   let h1 = 0x811c9dc5 >>> 0;
   let h2 = 0x01000193 >>> 0;
+  let h3 = 0x9e3779b9 >>> 0;
   for (let i = 0; i < input.length; i += 1) {
     const ch = input.charCodeAt(i);
     h1 ^= ch;
     h1 = Math.imul(h1, 0x01000193) >>> 0;
     h2 ^= ch ^ ((i + 1) * 31);
     h2 = Math.imul(h2, 0x85ebca6b) >>> 0;
+    h3 ^= (ch + i * 17) >>> 0;
+    h3 = Math.imul(h3 ^ (h3 >>> 15), 0xc2b2ae35) >>> 0;
   }
-  return `fp_${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}_${rawToken.length}`;
+  return `fp_${h1.toString(16).padStart(8, "0")}${h2.toString(16).padStart(8, "0")}${h3.toString(16).padStart(8, "0")}`;
 }
 
 /**
@@ -467,8 +475,9 @@ export function redactSensitiveTokens(input, extraKnownSecrets = []) {
   out = out
     .replace(/\b(?:github_pat|gh[pousr])_[A-Za-z0-9_]{6,}\b/gi, "[REDACTED_GH_TOKEN]")
     .replace(/\bAIza[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_AI_KEY]")
-    .replace(/\b(?:sk-or-v1-|sk-or-|sk-ant-|sk-|gsk_)[A-Za-z0-9_-]{8,}\b/gi, "[REDACTED_AI_KEY]")
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]{6,}=*/gi, "$1[REDACTED]")
+    .replace(/\b(?:sk-or-v1-|sk-or-|sk-ant-|sk-proj-|sk-|gsk_)[A-Za-z0-9_-]{8,}\b/gi, "[REDACTED_AI_KEY]")
+    .replace(/((?:Bearer|token|Basic)\s+)[A-Za-z0-9._~+/=-]{6,}/gi, "$1[REDACTED]")
+    .replace(/((?:x-goog-api-key|x-api-key)\s*[:=]\s*)[^\s"'<>]+/gi, "$1[REDACTED]")
     .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"'<>]+/gi, "$1[REDACTED]");
 
   if (Array.isArray(extraKnownSecrets)) {
@@ -490,38 +499,41 @@ export function redactSensitiveTokens(input, extraKnownSecrets = []) {
 export function resetAuthSecurityState() {
   memoryLockoutFallback.clear();
   rejectedHashesByScope.clear();
-  try {
-    if (typeof window !== "undefined") {
-      for (const store of [window.localStorage, window.sessionStorage]) {
-        if (!store) continue;
-        const keysToRemove = [];
-        if (typeof store.length === "number" && typeof store.key === "function") {
-          for (let i = 0; i < store.length; i += 1) {
-            const k = store.key(i);
-            if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
-              keysToRemove.push(k);
-            }
-          }
-        } else {
-          for (const k of Object.keys(store)) {
-            if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
-              keysToRemove.push(k);
-            }
-          }
-          if (store.map instanceof Map) {
-            for (const k of store.map.keys()) {
-              if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
-                keysToRemove.push(k);
-              }
-            }
+  for (const getStore of getBrowserStorageGetters()) {
+    try {
+      const store = getStore();
+      if (!store) continue;
+      const keysToRemove = [];
+      if (typeof store.length === "number" && typeof store.key === "function") {
+        for (let i = 0; i < store.length; i += 1) {
+          const k = store.key(i);
+          if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
+            keysToRemove.push(k);
           }
         }
-        for (const k of keysToRemove) {
-          store.removeItem(k);
+      } else {
+        for (const k of Object.keys(store)) {
+          if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
+            keysToRemove.push(k);
+          }
+        }
+        if (store.map instanceof Map) {
+          for (const k of store.map.keys()) {
+            if (k && k.startsWith(LOCKOUT_STORAGE_PREFIX)) {
+              keysToRemove.push(k);
+            }
+          }
         }
       }
+      for (const k of keysToRemove) {
+        try {
+          store.removeItem(k);
+        } catch {
+          // Ignorar fallo individual de borrado
+        }
+      }
+    } catch {
+      // Ignorar entorno restringido por storage independiente
     }
-  } catch {
-    // Ignorar entorno restringido
   }
 }

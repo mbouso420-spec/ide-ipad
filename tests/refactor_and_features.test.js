@@ -9,13 +9,12 @@ import {
   bundleHtmlWithFolderAssets,
   buildStandaloneJsPreview,
   buildStandalonePythonPreview,
-  buildMarkdownPreview,
-  renderMarkdownDocumentHtml
+  buildMarkdownPreview
 } from "../js/preview/htmlBundler.js";
 
-import { KeyboardRouter, keyboardRouter } from "../js/ui/keyboardRouter.js";
+import { KeyboardRouter } from "../js/ui/keyboardRouter.js";
 import { decodeImportedFile, uint8ArrayToBase64, SUPPORTED_BINARY_ASSET_EXTENSIONS } from "../js/storage/fileImport.js";
-import { broadcastWorkspaceChange, onWorkspaceBroadcast } from "../js/storage/workspaceDb.js";
+import { broadcastWorkspaceChange } from "../js/storage/workspaceDb.js";
 import { createGitBlob } from "../js/github/githubService.js";
 
 describe("Nuevas Funcionalidades y Refactorizaciones de Auditoría", () => {

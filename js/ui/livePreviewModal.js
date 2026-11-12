@@ -114,12 +114,13 @@ export function initLivePreviewModal({
 
   let consoleVisible = true;
   let previewRunSeq = 0;
+  let renderSeq = 0;
   let currentPreviewPath = null;
   let activePreviewExt = "";
   /** @type {"auto" | "standalone" | "folder"} */
   let jsRunOverride = "auto";
-  /** @type {"browser" | "compiler"} */
-  let tsRunOverride = "browser";
+  /** @type {"auto" | "browser" | "compiler"} */
+  let tsRunOverride = "auto";
   let activeCRunnerDestroy = null;
   const replHistory = [];
   let replHistoryIdx = -1;
@@ -208,71 +209,97 @@ export function initLivePreviewModal({
     }
   });
 
+  const MAX_TRANSITIVE_DEPS = 250;
+
+  function isFileContentUnloaded(file) {
+    return Boolean(
+      file &&
+      (file.isLoaded === false ||
+        file.contentLoaded === false ||
+        (file.content === "" && Boolean(file.blobSha)))
+    );
+  }
+
+  function buildFilesByNormPathMap(allFiles) {
+    const map = new Map();
+    for (const f of allFiles || []) {
+      if (f && f.path) {
+        map.set(normalizePath(f.path), f);
+      }
+    }
+    return map;
+  }
+
+  function collectDirectDependencies(file, allFiles) {
+    if (!file || typeof file.content !== "string") return [];
+    const ext = getFileExtension(file.path);
+    if (HTML_EXTENSIONS.has(ext)) {
+      return extractReferencedAssetPaths(file.path, file.content);
+    }
+    if (ext === "css") {
+      return extractCssImportPaths(file.path, file.content);
+    }
+    if (JS_EXTENSIONS.has(ext) || TS_EXTENSIONS.has(ext) || ext === "jsx") {
+      return extractModuleDependencyPaths(file.path, file.content, allFiles, {
+        allowParentTraversal: true
+      });
+    }
+    return [];
+  }
+
+  async function loadTransitiveDependencies(seedFiles, allFiles) {
+    const filesByNormPath = buildFilesByNormPathMap(allFiles);
+    const visited = new Set();
+    let wave = [];
+
+    for (const f of seedFiles || []) {
+      if (!f || !f.path) continue;
+      const norm = normalizePath(f.path);
+      if (visited.has(norm)) continue;
+      visited.add(norm);
+      wave.push(f);
+    }
+
+    while (wave.length > 0) {
+      const unloaded = wave.filter(isFileContentUnloaded);
+      if (unloaded.length > 0) {
+        if (typeof ensureFilesLoaded === "function") {
+          await ensureFilesLoaded(unloaded);
+        } else if (typeof ensureFileLoaded === "function") {
+          await Promise.all(unloaded.map((f) => ensureFileLoaded(f)));
+        }
+      }
+
+      const nextWave = [];
+      for (const loadedFile of wave) {
+        if (visited.size >= MAX_TRANSITIVE_DEPS) break;
+        const depPaths = collectDirectDependencies(loadedFile, allFiles);
+        for (const depPath of depPaths) {
+          const norm = normalizePath(depPath);
+          if (visited.has(norm)) continue;
+          const depFile = filesByNormPath.get(norm);
+          if (!depFile) continue;
+          visited.add(norm);
+          nextWave.push(depFile);
+          if (visited.size >= MAX_TRANSITIVE_DEPS) break;
+        }
+      }
+      wave = nextWave;
+    }
+  }
+
   async function prepareHtmlForPreview(targetFile, allFiles) {
     if (!targetFile) return { html: "", assetMap: new Map() };
 
     // 1. Si el HTML está pendiente de descarga bajo demanda (lazy en GitHub), descargarlo primero
-    if (targetFile.contentLoaded === false || (targetFile.content === "" && targetFile.blobSha)) {
-      if (typeof ensureFileLoaded === "function") {
-        await ensureFileLoaded(targetFile);
-      }
+    if (isFileContentUnloaded(targetFile) && typeof ensureFileLoaded === "function") {
+      await ensureFileLoaded(targetFile);
     }
 
-    // 2. Extraer todos los assets locales referenciados por el HTML
-    const referencedPaths = extractReferencedAssetPaths(targetFile.path, targetFile.content || "");
-    const unloadedToFetch = [];
-    const filesByNormPath = new Map();
-    for (const f of allFiles || []) {
-      if (f && f.path) {
-        filesByNormPath.set(normalizePath(f.path), f);
-      }
-    }
+    // 2. Descargar transitivamente todas las dependencias locales (HTML -> CSS -> @import / JS/TS)
+    await loadTransitiveDependencies([targetFile], allFiles);
 
-    const isUnloaded = (f) => Boolean(f && (f.contentLoaded === false || (f.content === "" && f.blobSha)));
-
-    for (const refPath of referencedPaths) {
-      const assetFile = filesByNormPath.get(normalizePath(refPath));
-      if (isUnloaded(assetFile)) {
-        unloadedToFetch.push(assetFile);
-      }
-    }
-
-    // 3. Descargar en lote los assets pendientes desde GitHub
-    if (unloadedToFetch.length > 0 && typeof ensureFilesLoaded === "function") {
-      await ensureFilesLoaded(unloadedToFetch);
-    }
-
-    // 4. Revisar dependencias secundarias (@import en CSS y módulos relativos en JS/TS)
-    const secondaryUnloaded = [];
-    for (const refPath of referencedPaths) {
-      const assetFile = filesByNormPath.get(normalizePath(refPath));
-      if (!assetFile || typeof assetFile.content !== "string") continue;
-      const assetExt = getFileExtension(assetFile.path);
-      if (assetExt === "css") {
-        const cssImports = extractCssImportPaths(assetFile.path, assetFile.content);
-        for (const impPath of cssImports) {
-          const impFile = filesByNormPath.get(normalizePath(impPath));
-          if (isUnloaded(impFile)) {
-            secondaryUnloaded.push(impFile);
-          }
-        }
-      } else if (JS_EXTENSIONS.has(assetExt) || TS_EXTENSIONS.has(assetExt) || assetExt === "jsx") {
-        const modDeps = extractModuleDependencyPaths(assetFile.path, assetFile.content, allFiles, {
-          allowParentTraversal: true
-        });
-        for (const depPath of modDeps) {
-          const depFile = filesByNormPath.get(normalizePath(depPath));
-          if (isUnloaded(depFile)) {
-            secondaryUnloaded.push(depFile);
-          }
-        }
-      }
-    }
-    if (secondaryUnloaded.length > 0 && typeof ensureFilesLoaded === "function") {
-      await ensureFilesLoaded(secondaryUnloaded);
-    }
-
-    // 5. Construir mapa de assets del proyecto completo
+    // 3. Construir mapa de assets del proyecto completo
     const assetMap = buildWorkspaceAssetMap(allFiles);
     return {
       html: targetFile.content || "",
@@ -281,18 +308,15 @@ export function initLivePreviewModal({
   }
 
   async function ensureStandaloneDepsLoaded(activeFile, allFiles) {
-    const depPaths = extractModuleDependencyPaths(activeFile.path, activeFile.content || "", allFiles, {
-      allowParentTraversal: true
-    });
-    const unloaded = depPaths
-      .map((p) => allFiles.find((f) => normalizePath(f.path) === normalizePath(p)))
-      .filter((f) => f && f.isLoaded === false);
-    if (unloaded.length > 0 && typeof ensureFilesLoaded === "function") {
-      await ensureFilesLoaded(unloaded);
+    if (!activeFile) return;
+    if (isFileContentUnloaded(activeFile) && typeof ensureFileLoaded === "function") {
+      await ensureFileLoaded(activeFile);
     }
+    await loadTransitiveDependencies([activeFile], allFiles);
   }
 
   async function navigateToHtml(targetPath, pushHistory = true) {
+    const seq = ++renderSeq;
     const { files, projectId } = getWorkspaceSnapshot();
     const targetFile = files.find((f) => normalizePath(f.path) === normalizePath(targetPath));
     if (!targetFile) return;
@@ -311,6 +335,7 @@ export function initLivePreviewModal({
     syncPageSelect(files, targetFile.path);
 
     const { html, assetMap } = await prepareHtmlForPreview(targetFile, files);
+    if (seq !== renderSeq) return;
     const compiledHtml = bundleHtmlWithFolderAssets(targetFile.path, html, assetMap, null, guardJs, null, true);
 
     showRunnableIframe({
@@ -323,9 +348,14 @@ export function initLivePreviewModal({
 
   const deviceButtons = dialog?.querySelectorAll(".preview-device-btn") || [];
   deviceButtons.forEach((btn) => {
+    btn.setAttribute("aria-checked", String(btn.classList.contains("is-active")));
     btn.addEventListener("click", () => {
       const device = btn.getAttribute("data-device") || "desktop";
-      deviceButtons.forEach((b) => b.classList.toggle("is-active", b === btn));
+      deviceButtons.forEach((b) => {
+        const isSelected = b === btn;
+        b.classList.toggle("is-active", isSelected);
+        b.setAttribute("aria-checked", String(isSelected));
+      });
       if (iframe) {
         iframe.className = `preview-iframe device-${device}`;
       }
@@ -343,21 +373,25 @@ export function initLivePreviewModal({
 
   openBtn?.addEventListener("click", async () => {
     jsRunOverride = "auto";
+    tsRunOverride = "auto";
     await loadAcorn();
     await openPreview();
   });
 
   closeBtn?.addEventListener("click", () => {
+    renderSeq += 1;
     stopIframe();
     dialog?.close();
   });
 
   dialog?.addEventListener("close", () => {
+    renderSeq += 1;
     stopIframe();
   });
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
+      renderSeq += 1;
       stopIframe();
       dialog.close();
     }
@@ -365,7 +399,7 @@ export function initLivePreviewModal({
 
   jsModeBtn?.addEventListener("click", () => {
     if (TS_EXTENSIONS.has(activePreviewExt)) {
-      tsRunOverride = tsRunOverride === "browser" ? "compiler" : "browser";
+      tsRunOverride = tsRunOverride === "compiler" ? "browser" : "compiler";
     } else {
       jsRunOverride = jsRunOverride === "folder" ? "standalone" : "folder";
     }
@@ -492,6 +526,7 @@ export function initLivePreviewModal({
 
   async function openPreview() {
     if (!dialog) return;
+    await loadAcorn();
     if (typeof onBeforePreview === "function") {
       try {
         await onBeforePreview();
@@ -537,6 +572,7 @@ export function initLivePreviewModal({
     hasRepl = true,
     modeLabel = null
   }) {
+    stopIframe();
     clearConsoleOutput();
     if (cRunnerContainer) cRunnerContainer.hidden = true;
     if (iframeWrapper) iframeWrapper.hidden = false;
@@ -661,6 +697,8 @@ export function initLivePreviewModal({
   }
 
   async function renderActiveTabPreview() {
+    const seq = ++renderSeq;
+    const isStale = () => seq !== renderSeq;
     const { files, activeFileId, projectId } = getWorkspaceSnapshot();
     const activeFile = activeFileId
       ? files.find((f) => normalizePath(f.path) === normalizePath(activeFileId)) || null
@@ -694,6 +732,7 @@ export function initLivePreviewModal({
       syncPageSelect(files, activeFile.path);
 
       const { html, assetMap } = await prepareHtmlForPreview(activeFile, files);
+      if (isStale()) return;
       const compiledHtml = bundleHtmlWithFolderAssets(activeFile.path, html, assetMap, null, guardJs, null, true);
       showRunnableIframe({
         headerTitle: "Vista previa de HTML",
@@ -721,6 +760,7 @@ export function initLivePreviewModal({
         syncPageSelect(files, bestHtml.path);
 
         const { html, assetMap } = await prepareHtmlForPreview(bestHtml, files);
+        if (isStale()) return;
         assetMap.set(normalizePath(activeFile.path), activeFile);
 
         const compiledHtml = bundleHtmlWithFolderAssets(
@@ -742,10 +782,8 @@ export function initLivePreviewModal({
       }
 
       hideWebNavigationControls();
-      if (activeFile.isLoaded === false && typeof ensureFileLoaded === "function") {
-        await ensureFileLoaded(activeFile);
-      }
       await ensureStandaloneDepsLoaded(activeFile, files);
+      if (isStale()) return;
       const compiledJsHtml = buildStandaloneJsPreview(activeFile, guardJs, {
         assetMap: buildWorkspaceAssetMap(files)
       });
@@ -770,6 +808,7 @@ export function initLivePreviewModal({
         syncPageSelect(files, bestHtml.path);
 
         const { html, assetMap } = await prepareHtmlForPreview(bestHtml, files);
+        if (isStale()) return;
         assetMap.set(normalizePath(activeFile.path), activeFile);
 
         const compiledHtml = bundleHtmlWithFolderAssets(
@@ -800,16 +839,18 @@ export function initLivePreviewModal({
     }
 
     // Asegurar carga de activeFile y archivos compañeros de la carpeta si provienen de GitHub lazy
-    if (activeFile.isLoaded === false && typeof ensureFileLoaded === "function") {
+    if (isFileContentUnloaded(activeFile) && typeof ensureFileLoaded === "function") {
       await ensureFileLoaded(activeFile);
+      if (isStale()) return;
     }
-    const unloadedFolderCompanions = sameFolderFiles.filter((f) => f && f.isLoaded === false);
+    const unloadedFolderCompanions = sameFolderFiles.filter(isFileContentUnloaded);
     if (unloadedFolderCompanions.length > 0) {
       if (typeof ensureFilesLoaded === "function") {
         await ensureFilesLoaded(unloadedFolderCompanions);
       } else if (typeof ensureFileLoaded === "function") {
         await Promise.all(unloadedFolderCompanions.map((f) => ensureFileLoaded(f)));
       }
+      if (isStale()) return;
     }
 
     // 4. Pestaña Python: ejecuta Python 3 real en el navegador (Pyodide WebAssembly) con entrada inline sin popups
@@ -873,6 +914,7 @@ export function initLivePreviewModal({
         syncPageSelect(files, bestHtml.path);
 
         const { html, assetMap } = await prepareHtmlForPreview(bestHtml, files);
+        if (isStale()) return;
         assetMap.set(normalizePath(activeFile.path), activeFile);
         const compiledHtml = bundleHtmlWithFolderAssets(
           bestHtml.path,
@@ -894,6 +936,7 @@ export function initLivePreviewModal({
       }
       hideWebNavigationControls();
       await ensureStandaloneDepsLoaded(activeFile, files);
+      if (isStale()) return;
       const compiledTsHtml = buildStandaloneTsPreview(activeFile, guardJs, {
         assetMap: buildWorkspaceAssetMap(files)
       });

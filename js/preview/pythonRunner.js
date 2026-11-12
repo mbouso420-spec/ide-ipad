@@ -32,7 +32,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
   }
 
   const pythonBootstrap = [
-    "import builtins, json, random, sys, traceback",
+    "import builtins, json, random, sys, time, traceback",
     "if '.' not in sys.path:",
     "    sys.path.insert(0, '.')",
     "class _StudioPauseForInput(BaseException):",
@@ -62,7 +62,21 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "_result = {'status': 'ok'}",
     "global _studio_repl_ns",
     "_studio_repl_ns = {'__name__': '__main__', '__file__': __studio_entry_name}",
+    "_studio_limit_sec = float(globals().get('__studio_exec_limit_sec', 0) or 0)",
+    "_studio_trace_n = 0",
+    "_studio_start_t = time.monotonic()",
+    "def _studio_trace_guard(frame, event, arg):",
+    "    global _studio_trace_n",
+    "    if event == 'line':",
+    "        _studio_trace_n += 1",
+    "        if _studio_trace_n >= 2000:",
+    "            _studio_trace_n = 0",
+    "            if time.monotonic() - _studio_start_t > _studio_limit_sec:",
+    "                raise TimeoutError(f'Ejecución detenida: se superó el límite de {_studio_limit_sec:.0f} s en hilo principal (posible bucle infinito).')",
+    "    return _studio_trace_guard",
     "try:",
+    "    if _studio_limit_sec > 0:",
+    "        sys.settrace(_studio_trace_guard)",
     "    exec(compile(__studio_entry_code, __studio_entry_name, 'exec'), _studio_repl_ns)",
     "except _StudioPauseForInput as _pause:",
     "    _result = {'status': 'need_input', 'prompt': _pause.prompt_text}",
@@ -78,6 +92,8 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "    _lines.extend([l.rstrip('\\n') for l in traceback.format_exception_only(type(_exc), _exc)])",
     "    print('\\n'.join(_lines), file=sys.stderr)",
     "finally:",
+    "    if _studio_limit_sec > 0:",
+    "        sys.settrace(None)",
     "    sys.stdout.flush()",
     "    sys.stderr.flush()",
     "json.dumps(_result)"
@@ -251,18 +267,26 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     var PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/";
     var pyodide = null;
     var loading = null;
+    var filesWritten = false;
+    var isMainThread = Boolean(self.__studioMainThread);
+    var MAIN_THREAD_LIMIT_SEC = 5;
     function send(msg) { self.postMessage(msg); }
     function ensurePyodide() {
       if (pyodide) return Promise.resolve(pyodide);
       if (!loading) {
         send({ type: "status", text: "loading" });
         loading = (async function () {
-          await __loadScript(PYODIDE_URL + "pyodide.js");
-          var py = await loadPyodide({ indexURL: PYODIDE_URL });
-          py.setStdout({ batched: function (line) { send({ type: "out", level: "log", text: line }); } });
-          py.setStderr({ batched: function (line) { send({ type: "out", level: "error", text: line }); } });
-          pyodide = py;
-          return py;
+          try {
+            await __loadScript(PYODIDE_URL + "pyodide.js");
+            var py = await loadPyodide({ indexURL: PYODIDE_URL });
+            py.setStdout({ batched: function (line) { send({ type: "out", level: "log", text: line }); } });
+            py.setStderr({ batched: function (line) { send({ type: "out", level: "error", text: line }); } });
+            pyodide = py;
+            return py;
+          } catch (err) {
+            loading = null;
+            throw err;
+          }
         })();
       }
       return loading;
@@ -276,17 +300,23 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
     }
     function writeFiles(py, job) {
-      ensureParentDirs(py.FS, job.entryName);
-      try { py.FS.writeFile(job.entryName, job.code, { encoding: "utf8" }); } catch (_) {}
-      if (job.entryPath && job.entryPath !== job.entryName) {
-        ensureParentDirs(py.FS, job.entryPath);
-        try { py.FS.writeFile(job.entryPath, job.code, { encoding: "utf8" }); } catch (_) {}
+      if (typeof job.code === "string") {
+        if (job.entryName) {
+          ensureParentDirs(py.FS, job.entryName);
+          try { py.FS.writeFile(job.entryName, job.code, { encoding: "utf8" }); } catch (_) {}
+        }
+        if (job.entryPath && job.entryPath !== job.entryName) {
+          ensureParentDirs(py.FS, job.entryPath);
+          try { py.FS.writeFile(job.entryPath, job.code, { encoding: "utf8" }); } catch (_) {}
+        }
       }
-      for (var i = 0; i < job.modules.length; i += 1) {
-        var mod = job.modules[i];
+      var mods = Array.isArray(job.modules) ? job.modules : [];
+      for (var i = 0; i < mods.length; i += 1) {
+        var mod = mods[i];
         ensureParentDirs(py.FS, mod.path);
-        py.FS.writeFile(mod.path, mod.content, { encoding: "utf8" });
+        try { py.FS.writeFile(mod.path, mod.content, { encoding: "utf8" }); } catch (_) {}
       }
+      filesWritten = true;
     }
     self.onmessage = async function (event) {
       var job = event.data;
@@ -294,11 +324,36 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       if (job.type === "eval") {
         try {
           var pyEval = await ensurePyodide();
+          if (!filesWritten && Array.isArray(job.modules)) writeFiles(pyEval, job);
+          if (job.entryName) pyEval.globals.set("__studio_entry_name", String(job.entryName));
+          pyEval.globals.set("__studio_exec_limit_sec", isMainThread ? MAIN_THREAD_LIMIT_SEC : 0);
           pyEval.globals.set("__studio_eval_code", String(job.code || ""));
           var evalScript = [
-            "import json, sys, traceback",
+            "import builtins, json, sys, time, traceback",
+            "if '.' not in sys.path:",
+            "    sys.path.insert(0, '.')",
+            "if '_studio_repl_ns' not in globals() or not isinstance(globals().get('_studio_repl_ns'), dict):",
+            "    _studio_repl_ns = {'__name__': '__main__', '__file__': globals().get('__studio_entry_name', '<repl>')}",
+            "if '__studio_input' not in globals():",
+            "    def _studio_repl_no_input(prompt=''):",
+            "        raise EOFError('input() requiere reiniciar el script con Recargar.')",
+            "    builtins.input = _studio_repl_no_input",
             "_er = {'status': 'ok'}",
+            "_repl_limit_sec = float(globals().get('__studio_exec_limit_sec', 0) or 0)",
+            "_repl_trace_n = 0",
+            "_repl_start_t = time.monotonic()",
+            "def _repl_trace_guard(frame, event, arg):",
+            "    global _repl_trace_n",
+            "    if event == 'line':",
+            "        _repl_trace_n += 1",
+            "        if _repl_trace_n >= 2000:",
+            "            _repl_trace_n = 0",
+            "            if time.monotonic() - _repl_start_t > _repl_limit_sec:",
+            "                raise TimeoutError(f'REPL detenido: se superó el límite de {_repl_limit_sec:.0f} s en hilo principal.')",
+            "    return _repl_trace_guard",
             "try:",
+            "    if _repl_limit_sec > 0:",
+            "        sys.settrace(_repl_trace_guard)",
             "    _v = eval(compile(__studio_eval_code, '<repl>', 'eval'), _studio_repl_ns)",
             "    if _v is not None:",
             "        print(repr(_v))",
@@ -311,8 +366,11 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             "except Exception as _ex:",
             "    _er = {'status': 'error'}",
             "    print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
-            "sys.stdout.flush()",
-            "sys.stderr.flush()",
+            "finally:",
+            "    if _repl_limit_sec > 0:",
+            "        sys.settrace(None)",
+            "    sys.stdout.flush()",
+            "    sys.stderr.flush()",
             "json.dumps(_er)"
           ].join("\\n");
           var evalRaw = await pyEval.runPythonAsync(evalScript);
@@ -333,6 +391,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         py.globals.set("__studio_seed", job.seed);
         py.globals.set("__studio_inputs_json", JSON.stringify(job.inputs));
         py.globals.set("__studio_mod_prefixes_json", JSON.stringify(job.modPrefixes));
+        py.globals.set("__studio_exec_limit_sec", isMainThread ? MAIN_THREAD_LIMIT_SEC : 0);
         var raw = await py.runPythonAsync(job.bootstrap);
         send({ type: "result", outcome: JSON.parse(String(raw || '{"status":"ok"}')) });
       } catch (err) {
@@ -360,6 +419,10 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       var runStartedAt = 0;
       var ticker = 0;
       var sawWorkerMessage = false;
+      var stoppedByUser = false;
+      var mainThreadWarned = false;
+      var lastJobMode = "run";
+      var pendingEvalCode = "";
 
       function clearOutputs() {
         if (screenBox) screenBox.innerHTML = "";
@@ -396,12 +459,17 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           ticker = window.setInterval(function () {
             var secs = Math.floor((Date.now() - runStartedAt) / 1000);
             if (secs >= 1) {
-              setStatus(
-                secs >= 5
-                  ? "Ejecutando… " + secs + " s (¿bucle infinito? Tocá Detener)"
-                  : "Ejecutando… " + secs + " s",
-                secs >= 5 ? "var(--warn)" : "var(--accent)"
-              );
+              var canStopNow = Boolean(runner && runner.canStop);
+              if (!canStopNow) {
+                setStatus("Ejecutando en hilo principal… " + secs + " s (límite de seguridad 5 s)", "var(--warn)");
+              } else {
+                setStatus(
+                  secs >= 5
+                    ? "Ejecutando… " + secs + " s (¿bucle infinito? Tocá Detener)"
+                    : "Ejecutando… " + secs + " s",
+                  secs >= 5 ? "var(--warn)" : "var(--accent)"
+                );
+              }
             }
           }, 1000);
         }
@@ -419,15 +487,40 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
 
       function createMainThreadRunner() {
         var fakeSelf = {
+          __studioMainThread: true,
           postMessage: function (msg) { window.setTimeout(function () { handle(msg); }, 0); },
           onmessage: null
         };
         new Function("self", "__loadScript", runnerSrc)(fakeSelf, loadScriptTag);
+        if (!mainThreadWarned) {
+          mainThreadWarned = true;
+          emit("warn", "Web Worker no disponible: Python corre en el hilo principal (sin botón Detener; límite de 5 s para bucles).");
+        }
         return {
           canStop: false,
           post: function (msg) { fakeSelf.onmessage({ data: msg }); },
           stop: function () {}
         };
+      }
+
+      function postEvalJob(code) {
+        lastJobMode = "eval";
+        pendingEvalCode = code;
+        if (!runner) {
+          runner = createRunner();
+          if (stoppedByUser) {
+            stoppedByUser = false;
+            emit("warn", "Se inició una sesión REPL limpia tras detener la ejecución anterior.");
+          }
+        }
+        setRunning(true);
+        runner.post({
+          type: "eval",
+          code: code,
+          entryName: payload.entryName,
+          entryPath: payload.entryPath,
+          modules: payload.modules
+        });
       }
 
       function createRunner() {
@@ -464,7 +557,11 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             if (!sawWorkerMessage && runner === r) {
               r.stop();
               runner = createMainThreadRunner();
-              executePass();
+              if (lastJobMode === "eval" && pendingEvalCode) {
+                postEvalJob(pendingEvalCode);
+              } else {
+                executePass();
+              }
               return;
             }
             handle({ type: "fatal", message: event && event.message ? event.message : "Error en el motor Python." });
@@ -488,12 +585,21 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           return;
         }
         if (msg.type === "fatal") {
+          pendingEvalCode = "";
           setRunning(false);
           setStatus("Error al iniciar Python", "var(--err)");
           emit("error", msg.message);
           return;
         }
         if (msg.type === "eval_done") {
+          pendingEvalCode = "";
+          setRunning(false);
+          var evalOutcome = msg.outcome || { status: "ok" };
+          if (evalOutcome.status === "error") {
+            setStatus("Error en REPL", "var(--err)");
+          } else {
+            setStatus(runner && !runner.canStop ? "Listo (REPL · hilo principal)" : "Listo (REPL)", "var(--ok)");
+          }
           return;
         }
         if (msg.type === "result") {
@@ -512,7 +618,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           if (outcome.status === "error") {
             setStatus("Error en ejecución", "var(--err)");
           } else {
-            setStatus("Ejecutado correctamente", "var(--ok)");
+            setStatus(runner && !runner.canStop ? "Ejecutado correctamente (hilo principal)" : "Ejecutado correctamente", "var(--ok)");
             if (screenBox && screenBox.children.length === 0) {
               var note = document.createElement("div");
               note.className = "py-empty";
@@ -524,6 +630,9 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
 
       function executePass() {
+        lastJobMode = "run";
+        pendingEvalCode = "";
+        stoppedByUser = false;
         if (inputForm) inputForm.hidden = true;
         if (submittedInputs.length > MAX_INPUT_STEPS) {
           emit("error", "Se superó el límite de 200 lecturas input() consecutivas.");
@@ -551,10 +660,12 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           if (!running || !runner || !runner.canStop) return;
           runner.stop();
           runner = null;
+          pendingEvalCode = "";
+          stoppedByUser = true;
           setRunning(false);
           if (inputForm) inputForm.hidden = true;
           setStatus("Ejecución detenida", "var(--err)");
-          emit("error", "Ejecución detenida por el usuario. Tocá Recargar para volver a ejecutar.");
+          emit("error", "Ejecución detenida por el usuario. Tocá Recargar para volver a ejecutar o usá el REPL.");
         });
       }
 
@@ -584,8 +695,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           emit("error", "Esperá a que termine la ejecución actual antes de evaluar en el REPL.");
           return;
         }
-        if (!runner) runner = createRunner();
-        runner.post({ type: "eval", code: code });
+        postEvalJob(code);
       });
 
       executePass();

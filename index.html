@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org https://cdnjs.cloudflare.com; img-src 'self' data: https: blob:; frame-src 'self' blob: data:; object-src 'none'; base-uri 'self';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org https://cdnjs.cloudflare.com; img-src 'self' data: https: blob:; frame-src 'self' blob: data:; worker-src 'self' blob:; form-action 'self'; object-src 'none'; base-uri 'self';">
   <meta name="theme-color" content="#10131a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -15,7 +15,7 @@
   <link rel="apple-touch-icon" href="./assets/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet" crossorigin="anonymous">
   <link rel="stylesheet" href="./css/app.css">
   <script type="importmap">
     {
@@ -263,7 +263,7 @@
 
         <div class="editor-stage" id="editor-stage">
           <div id="editor-mount" class="editor-mount"></div>
-          <div id="editor-split-divider" class="editor-split-divider" hidden aria-hidden="true" title="Arrastrar para redimensionar paneles"></div>
+          <div id="editor-split-divider" class="editor-split-divider" hidden role="separator" aria-orientation="vertical" tabindex="0" aria-label="Divisor de paneles del editor" title="Arrastrar para redimensionar paneles"></div>
           <div id="editor-mount-split" class="editor-mount editor-mount-split" hidden>
             <div class="editor-split-header" id="editor-split-header">
               <span class="editor-split-title" id="editor-split-title">
@@ -314,6 +314,7 @@
               type="button"
               id="btn-open-settings"
               class="btn-status-action"
+              aria-label="Configuración y atajos de teclado"
               aria-haspopup="dialog"
               title="Configuración y atajos de teclado (Cmd/Ctrl + ,)"
             >
@@ -508,6 +509,7 @@
               type="button"
               id="btn-toggle-composer-tools"
               class="chat-tools-toggle-btn"
+              aria-label="Herramientas del asistente IA"
               aria-expanded="false"
               aria-controls="chat-tools-drawer"
               title="Desplegar comandos rápidos y modo de razonamiento"
@@ -525,7 +527,6 @@
               autocapitalize="off"
               autocomplete="off"
               writingsuggestions="false"
-              inputmode="none"
               enterkeyhint="send"
               placeholder="Preguntá sobre tu código o desplegá acciones (✦)…"
             ></textarea>
@@ -549,7 +550,7 @@
   </div>
 
   <!-- Diálogo de Sincronización con GitHub (Octokit + IndexedDB + Commit Atómico) -->
-  <dialog id="github-dialog" class="ide-dialog" aria-labelledby="github-dialog-title">
+  <dialog id="github-dialog" class="ide-dialog" aria-modal="true" aria-labelledby="github-dialog-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -659,7 +660,7 @@
             </button>
           </div>
           <div id="gh-new-branch-box" class="field-row gh-new-branch-box" hidden>
-            <input type="text" id="gh-new-branch-input" class="field-control code-font" placeholder="feature/mi-rama" spellcheck="false" autocomplete="off">
+            <input type="text" id="gh-new-branch-input" class="field-control code-font" aria-label="Nombre de nueva rama" placeholder="feature/mi-rama" spellcheck="false" autocomplete="off">
             <button type="button" id="btn-gh-create-branch" class="btn btn-primary btn-sm">Crear</button>
             <button type="button" id="btn-gh-cancel-branch" class="btn btn-ghost btn-sm">Cancelar</button>
           </div>
@@ -678,7 +679,6 @@
               autocapitalize="off"
               autocomplete="off"
               writingsuggestions="false"
-              inputmode="none"
               placeholder="Ej: Actualizar estilos y lógica desde Studio IDE"
             >
           </div>
@@ -778,7 +778,7 @@
   </dialog>
 
   <!-- Modal de confirmación accesible para acciones destructivas o con cambios pendientes -->
-  <dialog id="confirm-dialog" class="ide-dialog" aria-labelledby="confirm-dialog-title">
+  <dialog id="confirm-dialog" class="ide-dialog" aria-modal="true" aria-labelledby="confirm-dialog-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -800,7 +800,7 @@
   </dialog>
 
   <!-- Visor de Diferencias (Diff línea por línea en verde y rojo) -->
-  <dialog id="diff-dialog" class="ide-dialog ide-dialog-wide" aria-labelledby="diff-dialog-title">
+  <dialog id="diff-dialog" class="ide-dialog ide-dialog-wide" aria-modal="true" aria-labelledby="diff-dialog-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -825,7 +825,7 @@
   </dialog>
 
   <!-- Vista Previa Web en Vivo por pestaña activa (Iframe Sandbox + Consola JS integrada para iPadOS) -->
-  <dialog id="preview-dialog" class="ide-dialog ide-dialog-preview" aria-labelledby="preview-dialog-title">
+  <dialog id="preview-dialog" class="ide-dialog ide-dialog-preview" aria-modal="true" aria-labelledby="preview-dialog-title">
     <div class="dialog-shell preview-dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -836,22 +836,22 @@
 
         <div class="preview-toolbar-controls">
           <div class="preview-nav-controls" role="group" aria-label="Navegación de páginas">
-            <button type="button" id="btn-preview-back" class="btn btn-ghost btn-sm btn-icon" title="Página anterior" disabled>
+            <button type="button" id="btn-preview-back" class="btn btn-ghost btn-sm btn-icon" aria-label="Página anterior" title="Página anterior" disabled>
               <span data-icon="chevronLeft"></span>
             </button>
-            <button type="button" id="btn-preview-forward" class="btn btn-ghost btn-sm btn-icon" title="Página siguiente" disabled>
+            <button type="button" id="btn-preview-forward" class="btn btn-ghost btn-sm btn-icon" aria-label="Página siguiente" title="Página siguiente" disabled>
               <span data-icon="chevronRight"></span>
             </button>
           </div>
           <select id="preview-page-select" class="field-control code-font preview-page-select" aria-label="Página HTML activa" hidden></select>
           <div class="preview-device-switcher" role="radiogroup" aria-label="Tamaño de emulación de pantalla">
-            <button type="button" class="btn btn-ghost btn-sm preview-device-btn" data-device="mobile" title="Móvil (390px)">
+            <button type="button" class="btn btn-ghost btn-sm preview-device-btn" role="radio" aria-checked="false" data-device="mobile" title="Móvil (390px)">
               <span>390px</span>
             </button>
-            <button type="button" class="btn btn-ghost btn-sm preview-device-btn" data-device="tablet" title="Tablet / iPad (820px)">
+            <button type="button" class="btn btn-ghost btn-sm preview-device-btn" role="radio" aria-checked="false" data-device="tablet" title="Tablet / iPad (820px)">
               <span>820px</span>
             </button>
-            <button type="button" class="btn btn-ghost btn-sm preview-device-btn is-active" data-device="desktop" title="Escritorio (100%)">
+            <button type="button" class="btn btn-ghost btn-sm preview-device-btn is-active" role="radio" aria-checked="true" data-device="desktop" title="Escritorio (100%)">
               <span>100%</span>
             </button>
           </div>
@@ -883,7 +883,7 @@
           <iframe
             id="preview-iframe"
             class="preview-iframe device-desktop"
-            sandbox="allow-scripts allow-modals"
+            sandbox="allow-scripts allow-modals allow-downloads allow-popups"
             title="Vista previa web en vivo"
           ></iframe>
         </div>
@@ -902,6 +902,7 @@
               type="text"
               id="preview-repl-input"
               class="preview-repl-input code-font"
+              aria-label="Evaluar expresión en el REPL de vista previa"
               placeholder="Evaluar expresión en vivo…"
               autocomplete="off"
               autocorrect="off"
@@ -916,7 +917,7 @@
   </dialog>
 
   <!-- Búsqueda Global en Archivos del Proyecto (Cmd/Ctrl + Shift + F) -->
-  <dialog id="global-search-dialog" class="ide-dialog ide-dialog-wide" aria-labelledby="global-search-title">
+  <dialog id="global-search-dialog" class="ide-dialog ide-dialog-wide" aria-modal="true" aria-labelledby="global-search-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -935,14 +936,15 @@
               type="search"
               id="global-search-input"
               class="field-control"
+              aria-label="Buscar texto en todos los archivos del proyecto"
               placeholder="Escribí para buscar texto en todos los archivos del proyecto…"
               autocomplete="off"
               spellcheck="false"
             />
             <div class="search-options-group" role="group" aria-label="Opciones de búsqueda">
-              <button type="button" id="btn-search-case" class="btn-toggle-search" title="Coincidir mayúsculas y minúsculas (Case Sensitive)" aria-pressed="false">Aa</button>
-              <button type="button" id="btn-search-word" class="btn-toggle-search" title="Solo palabras completas" aria-pressed="false">\b</button>
-              <button type="button" id="btn-search-regex" class="btn-toggle-search" title="Usar expresión regular" aria-pressed="false">.*</button>
+              <button type="button" id="btn-search-case" class="btn-toggle-search" aria-label="Coincidir mayúsculas y minúsculas" title="Coincidir mayúsculas y minúsculas (Case Sensitive)" aria-pressed="false">Aa</button>
+              <button type="button" id="btn-search-word" class="btn-toggle-search" aria-label="Coincidir solo palabras completas" title="Solo palabras completas" aria-pressed="false">\b</button>
+              <button type="button" id="btn-search-regex" class="btn-toggle-search" aria-label="Usar expresión regular" title="Usar expresión regular" aria-pressed="false">.*</button>
             </div>
           </div>
           <div id="global-search-stats" class="search-stats-bar"></div>
@@ -954,7 +956,7 @@
   </dialog>
 
   <!-- Ventana de Configuración y Atajos de Teclado (Cmd/Ctrl + ,) -->
-  <dialog id="settings-dialog" class="ide-dialog ide-dialog-wide" aria-labelledby="settings-dialog-title">
+  <dialog id="settings-dialog" class="ide-dialog ide-dialog-wide" aria-modal="true" aria-labelledby="settings-dialog-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">
@@ -968,16 +970,16 @@
 
       <div class="dialog-body">
         <div class="settings-tabs-bar" role="tablist" aria-label="Secciones de configuración">
-          <button type="button" class="settings-tab-btn is-active" data-tab="appearance" role="tab" aria-selected="true">Apariencia</button>
-          <button type="button" class="settings-tab-btn" data-tab="editor" role="tab" aria-selected="false">Editor</button>
-          <button type="button" class="settings-tab-btn" data-tab="models" role="tab" aria-selected="false">Modelos</button>
-          <button type="button" class="settings-tab-btn" data-tab="shortcuts" role="tab" aria-selected="false">Atajos de Teclado</button>
-          <button type="button" class="settings-tab-btn" data-tab="storage" role="tab" aria-selected="false">Almacenamiento</button>
+          <button type="button" id="settings-tab-appearance" class="settings-tab-btn is-active" data-tab="appearance" role="tab" aria-selected="true" aria-controls="settings-panel-appearance" tabindex="0">Apariencia</button>
+          <button type="button" id="settings-tab-editor" class="settings-tab-btn" data-tab="editor" role="tab" aria-selected="false" aria-controls="settings-panel-editor" tabindex="-1">Editor</button>
+          <button type="button" id="settings-tab-models" class="settings-tab-btn" data-tab="models" role="tab" aria-selected="false" aria-controls="settings-panel-models" tabindex="-1">Modelos</button>
+          <button type="button" id="settings-tab-shortcuts" class="settings-tab-btn" data-tab="shortcuts" role="tab" aria-selected="false" aria-controls="settings-panel-shortcuts" tabindex="-1">Atajos de Teclado</button>
+          <button type="button" id="settings-tab-storage" class="settings-tab-btn" data-tab="storage" role="tab" aria-selected="false" aria-controls="settings-panel-storage" tabindex="-1">Almacenamiento</button>
         </div>
 
         <div class="settings-content">
           <!-- Pestaña 1: Apariencia -->
-          <div class="settings-tab-panel" data-tab="appearance">
+          <div id="settings-panel-appearance" class="settings-tab-panel" data-tab="appearance" role="tabpanel" aria-labelledby="settings-tab-appearance">
             <div class="setting-field">
               <label for="select-theme" class="setting-label">Tema visual de la interfaz</label>
               <select id="select-theme" class="field-control">
@@ -1007,7 +1009,7 @@
           </div>
 
           <!-- Pestaña 2: Editor y Autoguardado -->
-          <div class="settings-tab-panel" data-tab="editor" hidden>
+          <div id="settings-panel-editor" class="settings-tab-panel" data-tab="editor" role="tabpanel" aria-labelledby="settings-tab-editor" hidden>
             <div class="setting-field">
               <label for="setting-autosave-delay" class="setting-label">Frecuencia de autoguardado en almacenamiento local</label>
               <select id="setting-autosave-delay" class="field-control">
@@ -1019,7 +1021,7 @@
           </div>
 
           <!-- Pestaña 3: Modelos e Inteligencia Artificial -->
-          <div class="settings-tab-panel" data-tab="models" hidden>
+          <div id="settings-panel-models" class="settings-tab-panel" data-tab="models" role="tabpanel" aria-labelledby="settings-tab-models" hidden>
             <!-- Resumen limpio de contexto actual del proyecto y capacidad de proveedores -->
             <div class="models-overview-banner">
               <div class="models-overview-info">
@@ -1050,13 +1052,14 @@
             </div>
           </div>
 
-          <!-- Pestaña 2: Atajos de Teclado -->
-          <div class="settings-tab-panel" data-tab="shortcuts" hidden>
+          <!-- Pestaña 4: Atajos de Teclado -->
+          <div id="settings-panel-shortcuts" class="settings-tab-panel" data-tab="shortcuts" role="tabpanel" aria-labelledby="settings-tab-shortcuts" hidden>
             <div class="settings-shortcuts-header">
               <input
                 type="search"
                 id="setting-shortcuts-filter"
                 class="field-control"
+                aria-label="Filtrar atajos de teclado"
                 placeholder="Filtrar atajos por combinación o comando…"
                 autocomplete="off"
                 spellcheck="false"
@@ -1065,8 +1068,8 @@
             <div id="setting-shortcuts-list" class="settings-shortcuts-viewport"></div>
           </div>
 
-          <!-- Pestaña 3: Almacenamiento -->
-          <div class="settings-tab-panel" data-tab="storage" hidden>
+          <!-- Pestaña 5: Almacenamiento -->
+          <div id="settings-panel-storage" class="settings-tab-panel" data-tab="storage" role="tabpanel" aria-labelledby="settings-tab-storage" hidden>
             <div class="setting-field">
               <label for="setting-key-storage" class="setting-label">Modo de almacenamiento de credenciales (IA y GitHub)</label>
               <select id="setting-key-storage" class="field-control">
@@ -1089,6 +1092,7 @@
                 type="password"
                 id="vault-passphrase-input"
                 class="field-control"
+                aria-label="Contraseña maestra de la bóveda cifrada"
                 placeholder="Contraseña maestra (mínimo 6 caracteres)…"
                 autocomplete="new-password"
                 spellcheck="false"
@@ -1116,7 +1120,7 @@
   </dialog>
 
   <!-- Apertura Rápida de Archivos (Cmd/Ctrl + P) -->
-  <dialog id="quick-open-dialog" class="ide-dialog" aria-labelledby="quick-open-title">
+  <dialog id="quick-open-dialog" class="ide-dialog" aria-modal="true" aria-labelledby="quick-open-title">
     <div class="dialog-shell">
       <div class="dialog-header">
         <div class="panel-title-group">

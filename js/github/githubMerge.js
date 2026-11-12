@@ -1,4 +1,27 @@
+import { isBinaryFile } from "../storage/fileImport.js";
 import { normalizePath } from "../storage/workspaceDb.js";
+
+function normalizeFetchedBlob(fetched) {
+  if (fetched && typeof fetched === "object") {
+    if (fetched.isBinary) {
+      return {
+        isBinary: true,
+        base64: String(fetched.base64 || "").replace(/\s+/g, ""),
+        content: ""
+      };
+    }
+    return {
+      isBinary: Boolean(fetched.isBinary),
+      base64: typeof fetched.base64 === "string" ? fetched.base64.replace(/\s+/g, "") : null,
+      content: typeof fetched.content === "string" ? fetched.content : ""
+    };
+  }
+  return {
+    isBinary: false,
+    base64: null,
+    content: typeof fetched === "string" ? fetched : String(fetched ?? "")
+  };
+}
 
 /**
  * Clasifica los cambios remotos (entre base y HEAD remoto) frente a los cambios
@@ -166,11 +189,13 @@ export async function buildRemotePullPlan({
     );
 
     if (shouldFetchContent) {
-      const content = await fetchBlob(item.blobSha, item.path);
+      const parsed = normalizeFetchedBlob(await fetchBlob(item.blobSha, item.path));
       updates.push({
         path: item.path,
         blobSha: item.blobSha,
-        content,
+        content: parsed.content,
+        isBinary: parsed.isBinary,
+        base64: parsed.base64,
         contentLoaded: true
       });
     } else if (item.blobSha) {
@@ -178,6 +203,8 @@ export async function buildRemotePullPlan({
         path: item.path,
         blobSha: item.blobSha,
         content: "",
+        isBinary: Boolean(existing?.isBinary || isBinaryFile(item.path)),
+        base64: null,
         contentLoaded: false
       });
     }
@@ -189,39 +216,50 @@ export async function buildRemotePullPlan({
       if (conflict.remoteStatus === "removed") {
         deletions.push(conflict.path);
       } else if (conflict.blobSha && typeof fetchBlob === "function") {
-        const remoteContent = await fetchBlob(conflict.blobSha, conflict.path);
+        const parsed = normalizeFetchedBlob(await fetchBlob(conflict.blobSha, conflict.path));
         updates.push({
           path: conflict.path,
           blobSha: conflict.blobSha,
-          content: remoteContent,
+          content: parsed.content,
+          isBinary: parsed.isBinary,
+          base64: parsed.base64,
           contentLoaded: true
         });
       }
       continue;
     }
 
-    // Conservar edición local: reanclar baseContent / estado de tracking al nuevo commit remoto
+    // Conservar edición local: reanclar baseContent/baseBase64 y estado de tracking al nuevo commit remoto
     if (conflict.remoteStatus === "removed") {
       keepLocalRebases.push({
         path: conflict.path,
         remoteRemoved: true,
         remoteBlobSha: null,
-        remoteContent: null
+        remoteContent: null,
+        remoteIsBinary: false,
+        remoteBase64: null
       });
     } else {
       let remoteContent = null;
+      let remoteIsBinary = false;
+      let remoteBase64 = null;
       if (
         conflict.blobSha &&
         conflict.localStatus !== "deleted" &&
         typeof fetchBlob === "function"
       ) {
-        remoteContent = await fetchBlob(conflict.blobSha, conflict.path);
+        const parsed = normalizeFetchedBlob(await fetchBlob(conflict.blobSha, conflict.path));
+        remoteContent = parsed.content;
+        remoteIsBinary = parsed.isBinary;
+        remoteBase64 = parsed.base64;
       }
       keepLocalRebases.push({
         path: conflict.path,
         remoteRemoved: false,
         remoteBlobSha: conflict.blobSha || null,
-        remoteContent
+        remoteContent,
+        remoteIsBinary,
+        remoteBase64
       });
     }
   }

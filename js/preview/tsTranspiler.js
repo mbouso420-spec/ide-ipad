@@ -332,8 +332,52 @@ function prevSigToken(tokens, idx) {
   return j >= 0 ? tokens[j] : null;
 }
 
+const DISALLOW_ARROW_GENERIC_OPS = new Set([
+  "&&",
+  "||",
+  "??",
+  "==",
+  "===",
+  "!=",
+  "!==",
+  "<=",
+  ">=",
+  "+",
+  "-",
+  "*",
+  "/",
+  "%",
+  "!",
+  "+=",
+  "-=",
+  "*=",
+  "/=",
+  "&&=",
+  "||=",
+  "??="
+]);
+
+function angleCloseCount(tok) {
+  if (!tok || tok.type !== "punct") return 0;
+  if (tok.value === ">") return 1;
+  if (tok.value === ">>") return 2;
+  if (tok.value === ">>>") return 3;
+  return 0;
+}
+
+function hasNewlineBeforeToken(tokens, idx) {
+  for (let t = idx - 1; t >= 0 && (tokens[t].type === "ws" || tokens[t].type === "comment"); t -= 1) {
+    if (tokens[t].value.includes("\n")) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isArrowGenericAhead(tokens, ltIdx) {
   let depth = 0;
+  let innerParens = 0;
+  let innerBraces = 0;
   let k = ltIdx;
   while (k < tokens.length) {
     const t = tokens[k];
@@ -341,16 +385,49 @@ function isArrowGenericAhead(tokens, ltIdx) {
       k += 1;
       continue;
     }
-    if (t.type === "punct" && t.value === "<") {
-      depth += 1;
-    } else if (t.type === "punct" && t.value === ">") {
-      depth -= 1;
-      if (depth === 0) {
-        const after = nextSigIndex(tokens, k + 1);
-        return after < tokens.length && tokens[after].type === "punct" && tokens[after].value === "(";
+    if (t.type === "punct") {
+      if (t.value === "<") {
+        depth += 1;
+      } else {
+        const closeAngles = angleCloseCount(t);
+        if (closeAngles > 0) {
+          depth -= closeAngles;
+          if (depth === 0 && innerParens === 0 && innerBraces === 0) {
+            const afterOpen = nextSigIndex(tokens, k + 1);
+            if (afterOpen >= tokens.length || tokens[afterOpen].type !== "punct" || tokens[afterOpen].value !== "(") {
+              return false;
+            }
+            const afterClose = skipBalancedPair(tokens, afterOpen, "(", ")");
+            const retStart = nextSigIndex(tokens, afterClose);
+            if (retStart >= tokens.length) return false;
+            if (tokens[retStart].value === "=>") return true;
+            if (tokens[retStart].value === ":") {
+              const retEnd = skipTypeAnnotation(tokens, retStart + 1, new Set(["=>", ";", "{", ")", "}"]));
+              return retEnd < tokens.length && tokens[retEnd].value === "=>";
+            }
+            return false;
+          }
+          if (depth <= 0) {
+            return false;
+          }
+        } else if (t.value === "(" || t.value === "[") {
+          innerParens += 1;
+        } else if (t.value === ")" || t.value === "]") {
+          if (innerParens === 0) return false;
+          innerParens -= 1;
+        } else if (t.value === "{") {
+          innerBraces += 1;
+        } else if (t.value === "}") {
+          if (innerBraces === 0) return false;
+          innerBraces -= 1;
+        } else if (t.value === ";") {
+          if (innerParens === 0 && innerBraces === 0) {
+            return false;
+          }
+        } else if (depth === 1 && innerParens === 0 && innerBraces === 0 && DISALLOW_ARROW_GENERIC_OPS.has(t.value)) {
+          return false;
+        }
       }
-    } else if (t.type === "punct" && (t.value === ";" || t.value === "{" || t.value === "}")) {
-      return false;
     }
     k += 1;
   }
@@ -385,23 +462,222 @@ function expandJsxInSource(source, fileName) {
   let usedJsx = false;
 
   function findBalancedCurly(src, openIdx) {
-    const subTokens = tokenize(src.slice(openIdx));
-    let depth = 0;
-    let offset = openIdx;
-    for (const t of subTokens) {
-      if (t.type === "punct" && t.value === "{") depth += 1;
-      else if (t.type === "punct" && t.value === "}") {
+    let p = openIdx + 1;
+    let depth = 1;
+    let lastSig = null;
+
+    const skipQuoted = (idx, quote) => {
+      let j = idx + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === quote) {
+          return j + 1;
+        }
+        j += 1;
+      }
+      return src.length;
+    };
+
+    const skipTemplate = (idx) => {
+      let j = idx + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === "`") {
+          return j + 1;
+        }
+        if (src[j] === "$" && src[j + 1] === "{") {
+          const nested = findBalancedCurly(src, j + 1);
+          j = nested.endIdx;
+          continue;
+        }
+        j += 1;
+      }
+      return src.length;
+    };
+
+    while (p < src.length) {
+      const ch = src[p];
+
+      if (/\s/.test(ch)) {
+        p += 1;
+        continue;
+      }
+
+      if (ch === "/" && src[p + 1] === "/") {
+        const nl = src.indexOf("\n", p + 2);
+        p = nl === -1 ? src.length : nl + 1;
+        continue;
+      }
+      if (ch === "/" && src[p + 1] === "*") {
+        const endC = src.indexOf("*/", p + 2);
+        p = endC === -1 ? src.length : endC + 2;
+        continue;
+      }
+
+      if (ch === "'" || ch === '"') {
+        p = skipQuoted(p, ch);
+        lastSig = { type: "string", value: ch };
+        continue;
+      }
+
+      if (ch === "`") {
+        p = skipTemplate(p);
+        lastSig = { type: "template_full", value: "`" };
+        continue;
+      }
+
+      if (ch === "/" && canStartRegex(lastSig)) {
+        let j = p + 1;
+        let inClass = false;
+        while (j < src.length) {
+          const rc = src[j];
+          if (rc === "\\") {
+            j += 2;
+            continue;
+          }
+          if (rc === "[") inClass = true;
+          else if (rc === "]") inClass = false;
+          else if (rc === "/" && !inClass) {
+            j += 1;
+            break;
+          } else if (rc === "\n") {
+            break;
+          }
+          j += 1;
+        }
+        while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
+        p = j;
+        lastSig = { type: "regex", value: "/" };
+        continue;
+      }
+
+      if (ch === "<") {
+        const prevAllowsJsx =
+          !lastSig ||
+          (lastSig.type === "ident" && EXPR_START_KEYWORDS.has(lastSig.value)) ||
+          (lastSig.type === "punct" &&
+            lastSig.value !== ")" &&
+            lastSig.value !== "]" &&
+            lastSig.value !== "}" &&
+            lastSig.value !== "++" &&
+            lastSig.value !== "--");
+        if (prevAllowsJsx) {
+          let afterLt = p + 1;
+          while (afterLt < src.length && /\s/.test(src[afterLt])) afterLt += 1;
+          if (src[afterLt] === ">" || /[A-Za-z_$]/.test(src[afterLt] || "")) {
+            let isArrowGen = false;
+            if (src[afterLt] !== ">") {
+              const probeTokens = tokenize(src.slice(p, Math.min(src.length, p + 512)));
+              isArrowGen = isArrowGenericAhead(probeTokens, 0);
+            }
+            if (!isArrowGen) {
+              const parsed = parseJsxElement(src, p);
+              if (parsed) {
+                p = parsed.endIdx;
+                lastSig = { type: "punct", value: ")" };
+                continue;
+              }
+            }
+          }
+        }
+      }
+
+      if (ch === "{") {
+        depth += 1;
+        lastSig = { type: "punct", value: "{" };
+        p += 1;
+        continue;
+      }
+      if (ch === "}") {
         depth -= 1;
         if (depth === 0) {
           return {
-            inner: src.slice(openIdx + 1, offset),
-            endIdx: offset + t.value.length
+            inner: src.slice(openIdx + 1, p),
+            endIdx: p + 1
           };
         }
+        lastSig = { type: "punct", value: "}" };
+        p += 1;
+        continue;
       }
-      offset += t.value.length;
+
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = p + 1;
+        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
+        lastSig = { type: "ident", value: src.slice(p, j) };
+        p = j;
+        continue;
+      }
+
+      if (/[0-9]/.test(ch)) {
+        let j = p + 1;
+        while (j < src.length && /[0-9A-Za-z_.]/.test(src[j])) j += 1;
+        lastSig = { type: "number", value: src.slice(p, j) };
+        p = j;
+        continue;
+      }
+
+      const tri = src.slice(p, p + 3);
+      const duo = src.slice(p, p + 2);
+      const op = THREE_CHAR_OPS.has(tri) ? tri : TWO_CHAR_OPS.has(duo) ? duo : ch;
+      lastSig = { type: "punct", value: op };
+      p += op.length;
     }
     throw new Error(`Llave JSX sin cerrar en ${fileName}`);
+  }
+
+  function skipGenericArgsInJsxTag(src, startIdx) {
+    let p = startIdx;
+    let gDepth = 0;
+    while (p < src.length) {
+      const ch = src[p];
+      if (ch === "=" && src[p + 1] === ">") {
+        p += 2;
+        continue;
+      }
+      if (ch === "/" && src[p + 1] === "/") {
+        const nl = src.indexOf("\n", p + 2);
+        p = nl === -1 ? src.length : nl + 1;
+        continue;
+      }
+      if (ch === "/" && src[p + 1] === "*") {
+        const endC = src.indexOf("*/", p + 2);
+        p = endC === -1 ? src.length : endC + 2;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") {
+        const q = ch;
+        p += 1;
+        while (p < src.length) {
+          if (src[p] === "\\") {
+            p += 2;
+            continue;
+          }
+          if (src[p] === q) {
+            p += 1;
+            break;
+          }
+          p += 1;
+        }
+        continue;
+      }
+      if (ch === "<") {
+        gDepth += 1;
+      } else if (ch === ">") {
+        gDepth -= 1;
+        if (gDepth === 0) {
+          return p + 1;
+        }
+      }
+      p += 1;
+    }
+    return p;
   }
 
   function parseJsxElement(src, ltIdx) {
@@ -422,18 +698,7 @@ function expandJsxInSource(source, fileName) {
       // Omitir argumentos genéricos opcionales en JSX <Comp<Foo> />
       while (p < src.length && /\s/.test(src[p])) p += 1;
       if (src[p] === "<") {
-        let gDepth = 0;
-        while (p < src.length) {
-          if (src[p] === "<") gDepth += 1;
-          else if (src[p] === ">") {
-            gDepth -= 1;
-            if (gDepth === 0) {
-              p += 1;
-              break;
-            }
-          }
-          p += 1;
-        }
+        p = skipGenericArgsInJsxTag(src, p);
       }
     }
 
@@ -500,6 +765,7 @@ function expandJsxInSource(source, fileName) {
     const childArgs = [];
     if (!selfClosing) {
       let textBuf = "";
+      let closedTag = false;
       function flushText() {
         if (!textBuf) return;
         const hasNewline = textBuf.includes("\n");
@@ -524,6 +790,7 @@ function expandJsxInSource(source, fileName) {
             throw new Error(`Etiqueta JSX </${closeTag}> no coincide con <${tagName}>`);
           }
           p = gt + 1;
+          closedTag = true;
           break;
         }
         if (src[p] === "<") {
@@ -550,6 +817,7 @@ function expandJsxInSource(source, fileName) {
         textBuf += src[p];
         p += 1;
       }
+      if (!closedTag) return null;
       flushText();
     }
 
@@ -600,10 +868,17 @@ function expandJsxInSource(source, fileName) {
 function skipBalancedPair(tokens, startIdx, openChar, closeChar) {
   let depth = 0;
   let k = startIdx;
+  const isAngle = openChar === "<" && closeChar === ">";
   while (k < tokens.length) {
     const t = tokens[k];
     if (t.type === "punct" && t.value === openChar) {
       depth += 1;
+    } else if (isAngle) {
+      const closeCount = angleCloseCount(t);
+      if (closeCount > 0) {
+        depth -= closeCount;
+        if (depth <= 0) return k + 1;
+      }
     } else if (t.type === "punct" && t.value === closeChar) {
       depth -= 1;
       if (depth === 0) return k + 1;
@@ -612,6 +887,18 @@ function skipBalancedPair(tokens, startIdx, openChar, closeChar) {
   }
   return k;
 }
+
+const TYPE_CONT_PREV_KEYWORDS = new Set([
+  "keyof",
+  "typeof",
+  "readonly",
+  "infer",
+  "is",
+  "extends",
+  "implements",
+  "asserts",
+  "new"
+]);
 
 function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
   let k = startIdx;
@@ -623,6 +910,40 @@ function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
   while (k < tokens.length) {
     const t = tokens[k];
     if (t.type === "ws" || t.type === "comment") {
+      if (
+        angle === 0 &&
+        paren === 0 &&
+        brace === 0 &&
+        bracket === 0 &&
+        t.value.includes("\n")
+      ) {
+        const prev = prevSigToken(tokens, k);
+        const nxtIdx = nextSigIndex(tokens, k + 1);
+        const nxt = nxtIdx < tokens.length ? tokens[nxtIdx] : null;
+        const prevContinues =
+          prev &&
+          ((prev.type === "punct" &&
+            (prev.value === "|" ||
+              prev.value === "&" ||
+              prev.value === "<" ||
+              prev.value === "," ||
+              prev.value === "=>" ||
+              prev.value === "?" ||
+              prev.value === ":" ||
+              prev.value === ".")) ||
+            (prev.type === "ident" && TYPE_CONT_PREV_KEYWORDS.has(prev.value)));
+        const nextContinues =
+          nxt &&
+          ((nxt.type === "punct" &&
+            (nxt.value === "|" ||
+              nxt.value === "&" ||
+              nxt.value === "." ||
+              nxt.value === "=>")) ||
+            (nxt.type === "ident" && (nxt.value === "extends" || nxt.value === "is")));
+        if (!prevContinues && !nextContinues) {
+          return k;
+        }
+      }
       k += 1;
       continue;
     }
@@ -736,16 +1057,33 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
       const valStart = nextSigIndex(tokens, nextIdx + 1);
       let valEnd = valStart;
       let valStr = "";
-      while (valEnd < endIdx - 1 && tokens[valEnd].value !== ",") {
-        valStr += tokens[valEnd].value;
+      let pDepth = 0;
+      let bDepth = 0;
+      let cDepth = 0;
+      while (valEnd < endIdx - 1) {
+        const vt = tokens[valEnd];
+        if (pDepth === 0 && bDepth === 0 && cDepth === 0 && vt.type === "punct" && vt.value === ",") {
+          break;
+        }
+        if (vt.type === "punct") {
+          if (vt.value === "(") pDepth += 1;
+          else if (vt.value === ")") pDepth = Math.max(0, pDepth - 1);
+          else if (vt.value === "[") bDepth += 1;
+          else if (vt.value === "]") bDepth = Math.max(0, bDepth - 1);
+          else if (vt.value === "{") cDepth += 1;
+          else if (vt.value === "}") cDepth = Math.max(0, cDepth - 1);
+        }
+        if (vt.type !== "comment") {
+          valStr += vt.type === "ws" ? " " : vt.value;
+        }
         valEnd += 1;
       }
-      const trimmedVal = valStr.trim();
+      const trimmedVal = valStr.replace(/\s+/g, " ").trim();
       const numVal = Number(trimmedVal);
-      if (Number.isInteger(numVal)) {
+      if (trimmedVal !== "" && Number.isInteger(numVal)) {
         autoNum = numVal + 1;
       }
-      props.push(`${keyName}: ${trimmedVal}`);
+      props.push(`${keyName}: ${trimmedVal || "undefined"}`);
       k = valEnd + 1;
     } else {
       props.push(`${keyName}: ${autoNum}`);
@@ -760,43 +1098,94 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
   };
 }
 
-function isParamParen(tokens, openParenIdx, stack) {
+function isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack) {
+  const prev = prevSigToken(tokens, openParenIdx);
+  if (!prev) return false;
+  if (prev.type === "ident" && (prev.value === "function" || prev.value === "constructor")) {
+    return true;
+  }
+  let nameTok = prev;
+  if (angleCloseCount(prev) > 0) {
+    let j = tokens.indexOf(prev);
+    let angle = angleCloseCount(prev);
+    j -= 1;
+    while (j >= 0 && angle > 0) {
+      const tj = tokens[j];
+      if (tj.type === "punct" && tj.value === "<") {
+        angle -= 1;
+      } else {
+        angle += angleCloseCount(tj);
+      }
+      if (angle === 0) break;
+      j -= 1;
+    }
+    nameTok = prevSigToken(tokens, j);
+    if (!nameTok) return false;
+  }
+  if (nameTok.type !== "ident" || EXPR_START_KEYWORDS.has(nameTok.value)) {
+    return false;
+  }
+  const beforeName = prevSigToken(tokens, tokens.indexOf(nameTok));
+  if (beforeName && (beforeName.value === "function" || beforeName.value === "*")) {
+    return true;
+  }
+  const topBrace = [...stack].reverse().find((s) => s.kind === "brace");
+  if (topBrace?.inClass) {
+    return !beforeName || beforeName.value !== "=";
+  }
+  if (topBrace?.isObject) {
+    if (nameTok.value === "async" && beforeName?.value === ":") {
+      return false;
+    }
+    return beforeName?.value === "{" || beforeName?.value === "," || beforeName?.value === "async";
+  }
+  return false;
+}
+
+function classifyParamParen(tokens, openParenIdx, stack) {
   const prev = prevSigToken(tokens, openParenIdx);
   if (prev) {
-    if (prev.type === "ident" && (prev.value === "function" || prev.value === "catch" || prev.value === "constructor")) {
-      return prev.value !== "catch";
+    if (prev.type === "ident" && prev.value === "catch") {
+      return { isParams: false, isMethodOrFunc: false };
     }
-    if (prev.type === "punct" && prev.value === ">") {
+    if (prev.type === "ident" && (prev.value === "function" || prev.value === "constructor")) {
+      return { isParams: true, isMethodOrFunc: true };
+    }
+    if (angleCloseCount(prev) > 0) {
       // `function foo<T>(` o `<T>(`
-      return true;
+      return { isParams: true, isMethodOrFunc: isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack) };
     }
   }
   const closeIdx = skipBalancedPair(tokens, openParenIdx, "(", ")");
   const afterClose = nextSigIndex(tokens, closeIdx);
+  const isMethodOrFunc = isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack);
   if (afterClose < tokens.length) {
     const t = tokens[afterClose];
-    if (t.type === "punct" && t.value === "=>") return true;
+    if (t.type === "punct" && t.value === "=>") {
+      return { isParams: true, isMethodOrFunc: false };
+    }
     if (t.type === "punct" && t.value === ":") {
-      const retEnd = skipTypeAnnotation(
-        tokens,
-        afterClose + 1,
-        new Set(["{", "=>", ";", ",", ")"])
-      );
+      const stopSet = isMethodOrFunc
+        ? new Set(["{", ";", ",", ")"])
+        : new Set(["{", "=>", ";", ",", ")"]);
+      const retEnd = skipTypeAnnotation(tokens, afterClose + 1, stopSet);
       if (retEnd < tokens.length && (tokens[retEnd].value === "=>" || tokens[retEnd].value === "{")) {
-        return true;
+        return { isParams: true, isMethodOrFunc };
       }
     }
   }
-  // Verificar método de clase o función nombrada: `ident (` seguido de `) {` o `) :`
+  // Verificar método de clase o función nombrada: `ident (` seguido de `) {`
   if (prev && prev.type === "ident" && !EXPR_START_KEYWORDS.has(prev.value)) {
     const beforeName = prevSigToken(tokens, tokens.indexOf(prev));
-    if (beforeName && beforeName.value === "function") return true;
+    if (beforeName && beforeName.value === "function") {
+      return { isParams: true, isMethodOrFunc: true };
+    }
     const topBrace = [...stack].reverse().find((s) => s.kind === "brace");
-    if (topBrace?.inClass && afterClose < tokens.length && tokens[afterClose].value === "{") {
-      return true;
+    if ((topBrace?.inClass || topBrace?.isObject) && afterClose < tokens.length && tokens[afterClose].value === "{") {
+      return { isParams: true, isMethodOrFunc: true };
     }
   }
-  return false;
+  return { isParams: false, isMethodOrFunc: false };
 }
 
 function looksLikeCallGeneric(tokens, ltIdx) {
@@ -810,23 +1199,29 @@ function looksLikeCallGeneric(tokens, ltIdx) {
     const t = tokens[k];
     if (t.type === "punct" && t.value === "<") {
       depth += 1;
-    } else if (t.type === "punct" && t.value === ">") {
-      depth -= 1;
-      if (depth === 0) {
-        const after = nextSigIndex(tokens, k + 1);
-        return (
-          after < tokens.length &&
-          tokens[after].type === "punct" &&
-          (tokens[after].value === "(" || tokens[after].value === "=>")
-        );
+    } else {
+      const closeCount = angleCloseCount(t);
+      if (closeCount > 0) {
+        depth -= closeCount;
+        if (depth === 0) {
+          const after = nextSigIndex(tokens, k + 1);
+          return (
+            after < tokens.length &&
+            tokens[after].type === "punct" &&
+            (tokens[after].value === "(" || tokens[after].value === "=>")
+          );
+        }
+        if (depth < 0) {
+          return false;
+        }
+      } else if (
+        t.type === "punct" &&
+        (t.value === ";" || t.value === "&&" || t.value === "||")
+      ) {
+        return false;
+      } else if (t.type === "ws" && t.value.includes("\n")) {
+        return false;
       }
-    } else if (
-      t.type === "punct" &&
-      (t.value === ";" || t.value === "&&" || t.value === "||")
-    ) {
-      return false;
-    } else if (t.type === "ws" && t.value.includes("\n")) {
-      return false;
     }
     k += 1;
   }
@@ -845,11 +1240,133 @@ function stripTypeScriptFromTokens(tokens) {
   let pendingConstructorParams = null;
   let injectConstructorThis = null;
   let waitingForSuperEnd = false;
+  let superBodyDepth = -1;
+  let superCallClosed = false;
+  let lastClosedParen = null;
   const stack = [];
 
+  const OBJ_BEFORE_PUNCT = new Set([
+    "=",
+    "(",
+    "[",
+    ",",
+    ":",
+    ";",
+    "?",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "<",
+    ">",
+    "!",
+    "&&",
+    "||",
+    "??",
+    "...",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&&=",
+    "||=",
+    "??="
+  ]);
   const TOP_TYPE_STOP = new Set(["=", ";", ",", "in", "of", ")", "}"]);
   const PARAM_TYPE_STOP = new Set([",", ")", "="]);
   const RET_TYPE_STOP = new Set(["{", "=>", ";", ",", ")"]);
+  const METHOD_RET_TYPE_STOP = new Set(["{", ";", ",", ")"]);
+  const DECLARE_FOLLOWERS = new Set([
+    "const",
+    "let",
+    "var",
+    "function",
+    "class",
+    "abstract",
+    "enum",
+    "interface",
+    "type",
+    "namespace",
+    "module",
+    "async",
+    "global"
+  ]);
+  const VAR_INIT_CONT_PREV = new Set([
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&&=",
+    "||=",
+    "??=",
+    "?",
+    ":",
+    ",",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "&&",
+    "||",
+    "??",
+    "==",
+    "===",
+    "!=",
+    "!==",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "<<",
+    ">>",
+    ">>>",
+    "&",
+    "|",
+    "^",
+    ".",
+    "?.",
+    "=>",
+    "typeof",
+    "await",
+    "yield",
+    "new",
+    "return",
+    "delete",
+    "void",
+    "in",
+    "of",
+    "instanceof"
+  ]);
+  const VAR_INIT_CONT_NEXT = new Set([
+    ".",
+    "?.",
+    "?",
+    ":",
+    ",",
+    "&&",
+    "||",
+    "??",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "==",
+    "===",
+    "!=",
+    "!==",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "as",
+    "satisfies"
+  ]);
 
   function currentBrace() {
     for (let s = stack.length - 1; s >= 0; s -= 1) {
@@ -870,8 +1387,74 @@ function stripTypeScriptFromTokens(tokens) {
     const prev = prevSigToken(tokens, i);
 
     if (tok.type === "ws" || tok.type === "comment") {
-      if (tok.type === "ws" && tok.value.includes("\n") && inImportExportClause && prev?.type === "string") {
-        inImportExportClause = false;
+      if (tok.value.includes("\n")) {
+        if (inImportExportClause && prev?.type === "string") {
+          inImportExportClause = false;
+        }
+        if (
+          waitingForSuperEnd &&
+          injectConstructorThis &&
+          superCallClosed &&
+          stack.length === superBodyDepth
+        ) {
+          const nxtIdx = nextSigIndex(tokens, i + 1);
+          const nxt = nxtIdx < tokens.length ? tokens[nxtIdx] : null;
+          if (
+            !nxt ||
+            (nxt.value !== "." &&
+              nxt.value !== "?." &&
+              nxt.value !== "(" &&
+              nxt.value !== "[" &&
+              nxt.value !== ";")
+          ) {
+            waitingForSuperEnd = false;
+            superCallClosed = false;
+            superBodyDepth = -1;
+            const assignments = injectConstructorThis.map((p) => `this.${p} = ${p};`).join(" ");
+            injectConstructorThis = null;
+            out += `; ${assignments}`;
+          }
+        }
+        if (inVarDecl) {
+          const top = stack[stack.length - 1];
+          const inStmtScope = !top || (top.kind === "brace" && !top.isObject && !top.isPattern);
+          if (inStmtScope) {
+            const nxtIdx = nextSigIndex(tokens, i + 1);
+            const nxt = nxtIdx < tokens.length ? tokens[nxtIdx] : null;
+            let continues = false;
+            if (!inVarInit) {
+              continues =
+                Boolean(
+                  prev &&
+                    (prev.value === ":" ||
+                      prev.value === "," ||
+                      prev.value === "|" ||
+                      prev.value === "&" ||
+                      prev.value === "<" ||
+                      prev.value === "const" ||
+                      prev.value === "let" ||
+                      prev.value === "var")
+                ) ||
+                Boolean(
+                  nxt &&
+                    (nxt.value === "=" ||
+                      nxt.value === ":" ||
+                      nxt.value === "|" ||
+                      nxt.value === "&" ||
+                      nxt.value === "in" ||
+                      nxt.value === "of")
+                );
+            } else {
+              continues =
+                Boolean(prev && VAR_INIT_CONT_PREV.has(prev.value)) ||
+                Boolean(nxt && VAR_INIT_CONT_NEXT.has(nxt.value));
+            }
+            if (!continues) {
+              inVarDecl = false;
+              inVarInit = false;
+            }
+          }
+        }
       }
       out += tok.value;
       i += 1;
@@ -889,7 +1472,7 @@ function stripTypeScriptFromTokens(tokens) {
             continue;
           }
         }
-        if (tok.value === "export" && tokens[n1].value === "interface") {
+        if (tok.value === "export" && (tokens[n1].value === "interface" || tokens[n1].value === "declare")) {
           i = skipStatement(tokens, i);
           continue;
         }
@@ -927,40 +1510,61 @@ function stripTypeScriptFromTokens(tokens) {
       }
     }
 
-    // Inline `type` en import { a, type B }
+    // Inline `type` en import { a, type B, type C as D }
     if (inImportExportClause && tok.type === "ident" && tok.value === "type") {
       const n1 = nextSigIndex(tokens, i + 1);
-      if (n1 < tokens.length && tokens[n1].type === "ident") {
+      if (n1 < tokens.length && tokens[n1].type === "ident" && tokens[n1].value !== "as") {
+        let endSpec = n1;
         const afterName = nextSigIndex(tokens, n1 + 1);
-        i = afterName < tokens.length && tokens[afterName].value === "," ? afterName + 1 : n1 + 1;
+        if (afterName < tokens.length && tokens[afterName].type === "ident" && tokens[afterName].value === "as") {
+          const aliasIdx = nextSigIndex(tokens, afterName + 1);
+          if (aliasIdx < tokens.length && tokens[aliasIdx].type === "ident") {
+            endSpec = aliasIdx;
+          }
+        }
+        const afterSpec = nextSigIndex(tokens, endSpec + 1);
+        i = afterSpec < tokens.length && tokens[afterSpec].value === "," ? afterSpec + 1 : endSpec + 1;
         continue;
       }
     }
 
-    // Declaraciones puras de TS a nivel de bloque o módulo
-    if (
-      tok.type === "ident" &&
-      (tok.value === "interface" || tok.value === "declare") &&
-      (!prev || prev.value === ";" || prev.value === "{" || prev.value === "}" || prev.value === "export")
-    ) {
-      i = skipStatement(tokens, i);
-      continue;
-    }
+    // Declaraciones puras de TS a nivel de bloque o módulo (incluyendo ASI tras salto de línea)
+    const startsTsStmt =
+      !prev ||
+      (prev.value !== "." &&
+        prev.value !== "?." &&
+        (prev.value === ";" ||
+          prev.value === "{" ||
+          prev.value === "}" ||
+          prev.value === "export" ||
+          hasNewlineBeforeToken(tokens, i)));
 
-    if (
-      tok.type === "ident" &&
-      tok.value === "type" &&
-      (!prev || prev.value === ";" || prev.value === "{" || prev.value === "}" || prev.value === "export")
-    ) {
-      const n1 = nextSigIndex(tokens, i + 1);
-      const n2 = n1 < tokens.length ? nextSigIndex(tokens, n1 + 1) : tokens.length;
-      if (
-        n1 < tokens.length &&
-        tokens[n1].type === "ident" &&
-        (tokens[n2]?.value === "=" || tokens[n2]?.value === "<")
-      ) {
-        i = skipStatement(tokens, i);
-        continue;
+    if (tok.type === "ident" && startsTsStmt) {
+      if (tok.value === "interface") {
+        const n1 = nextSigIndex(tokens, i + 1);
+        if (n1 < tokens.length && tokens[n1].type === "ident") {
+          i = skipStatement(tokens, i);
+          continue;
+        }
+      }
+      if (tok.value === "declare") {
+        const n1 = nextSigIndex(tokens, i + 1);
+        if (n1 < tokens.length && tokens[n1].type === "ident" && DECLARE_FOLLOWERS.has(tokens[n1].value)) {
+          i = skipStatement(tokens, i);
+          continue;
+        }
+      }
+      if (tok.value === "type") {
+        const n1 = nextSigIndex(tokens, i + 1);
+        const n2 = n1 < tokens.length ? nextSigIndex(tokens, n1 + 1) : tokens.length;
+        if (
+          n1 < tokens.length &&
+          tokens[n1].type === "ident" &&
+          (tokens[n2]?.value === "=" || tokens[n2]?.value === "<")
+        ) {
+          i = skipStatement(tokens, i);
+          continue;
+        }
       }
     }
 
@@ -1017,7 +1621,12 @@ function stripTypeScriptFromTokens(tokens) {
           nextTok &&
           (nextTok.type === "ident" || nextTok.value === "[" || nextTok.value === "#"))
       ) {
-        if (paren?.isParams && pendingConstructorParams !== null && nextTok.type === "ident") {
+        if (
+          paren?.isParams &&
+          pendingConstructorParams !== null &&
+          nextTok.type === "ident" &&
+          !MODIFIER_KEYWORDS.has(nextTok.value)
+        ) {
           pendingConstructorParams.push(nextTok.value);
         }
         i += 1;
@@ -1029,19 +1638,35 @@ function stripTypeScriptFromTokens(tokens) {
       pendingConstructorParams = [];
     }
 
-    // as Type / satisfies Type (fuera de import/export)
+    // as Type / satisfies Type (fuera de import/export y accesos a propiedad `obj.as`)
     if (
       tok.type === "ident" &&
       (tok.value === "as" || tok.value === "satisfies") &&
-      !inImportExportClause
+      !inImportExportClause &&
+      prev &&
+      prev.value !== "." &&
+      prev.value !== "?." &&
+      !(prev.type === "ident" && (prev.value === "const" || prev.value === "let" || prev.value === "var" || prev.value === "function"))
     ) {
-      const afterType = skipTypeAnnotation(
-        tokens,
-        i + 1,
-        new Set([";", ",", ")", "]", "}", ":", "?", "&&", "||", "??", "=", "==", "===", "!=", "!==", "+", "-", "*", "/"])
-      );
-      i = afterType;
-      continue;
+      const n1 = nextSigIndex(tokens, i + 1);
+      const nTok = n1 < tokens.length ? tokens[n1] : null;
+      const startsType =
+        nTok &&
+        (nTok.type === "ident" ||
+          nTok.type === "string" ||
+          nTok.type === "number" ||
+          nTok.value === "{" ||
+          nTok.value === "[" ||
+          nTok.value === "(");
+      if (startsType) {
+        const afterType = skipTypeAnnotation(
+          tokens,
+          i + 1,
+          new Set([";", ",", ")", "]", "}", ":", "?", "&&", "||", "??", "=", "==", "===", "!=", "!==", "+", "-", "*", "/"])
+        );
+        i = afterType;
+        continue;
+      }
     }
 
     // Genéricos de llamada, flecha o cabecera de clase <T>
@@ -1055,12 +1680,15 @@ function stripTypeScriptFromTokens(tokens) {
       }
     }
 
-    // Postfix `!` no-nulo: `ident!` o `)!` o `]!` o `!:` en asignación
+    // Postfix `!` no-nulo: `ident!` o `)!` o `]!` sin salto de línea previo (ASI) ni operador prefijo tras keyword
     if (tok.type === "punct" && tok.value === "!") {
       const n1 = nextSigIndex(tokens, i + 1);
+      const hasNewlineBefore = hasNewlineBeforeToken(tokens, i);
       if (
+        !hasNewlineBefore &&
         prev &&
         (prev.type === "ident" || prev.value === ")" || prev.value === "]") &&
+        !(prev.type === "ident" && EXPR_BEFORE_REGEX_KEYWORDS.has(prev.value)) &&
         (!tokens[n1] || tokens[n1].value !== "=")
       ) {
         i += 1;
@@ -1096,16 +1724,11 @@ function stripTypeScriptFromTokens(tokens) {
         continue;
       }
 
+      const top = stack[stack.length - 1];
       const brace = currentBrace();
       const paren = currentParen();
 
-      if (brace && brace.isObject) {
-        out += tok.value;
-        i += 1;
-        continue;
-      }
-
-      if (paren && paren.isParams) {
+      if (top?.kind === "paren" && top.isParams) {
         const stopIdx = skipTypeAnnotation(tokens, i + 1, PARAM_TYPE_STOP);
         const stopTok = tokens[stopIdx];
         if (stopTok && stopTok.value === "=" && out.length > 0 && !/\s$/.test(out)) {
@@ -1115,18 +1738,31 @@ function stripTypeScriptFromTokens(tokens) {
         continue;
       }
 
-      if (prev && (prev.value === ")" || prev.value === "]") && !brace?.isObject) {
-        const stopIdx = skipTypeAnnotation(tokens, i + 1, RET_TYPE_STOP);
+      if (prev && (prev.value === ")" || prev.value === "]")) {
+        const useMethodStop =
+          prev.value === ")" &&
+          lastClosedParen?.token === prev &&
+          lastClosedParen.isMethodOrFunc;
+        const stopIdx = skipTypeAnnotation(tokens, i + 1, useMethodStop ? METHOD_RET_TYPE_STOP : RET_TYPE_STOP);
         const stopTok = tokens[stopIdx];
-        if (stopTok && (stopTok.value === "{" || stopTok.value === "=>") && out.length > 0 && !/\s$/.test(out)) {
-          out += " ";
+        const canStripInObj = prev.value === ")" && (stopTok?.value === "{" || stopTok?.value === "=>");
+        if (!brace?.isObject || canStripInObj) {
+          if (stopTok && (stopTok.value === "{" || stopTok.value === "=>") && out.length > 0 && !/\s$/.test(out)) {
+            out += " ";
+          }
+          i = stopIdx;
+          continue;
         }
-        i = stopIdx;
+      }
+
+      if (brace && brace.isObject) {
+        out += tok.value;
+        i += 1;
         continue;
       }
 
       if (
-        ((!brace || (!brace.isObject && !brace.isPattern)) && !paren && inVarDecl && !inVarInit) ||
+        ((!brace || (!brace.isObject && !brace.isPattern)) && !paren?.isParams && inVarDecl && !inVarInit) ||
         (brace?.inClass && !paren)
       ) {
         const stopIdx = skipTypeAnnotation(tokens, i + 1, TOP_TYPE_STOP);
@@ -1143,9 +1779,43 @@ function stripTypeScriptFromTokens(tokens) {
       continue;
     }
 
+    if (tok.type === "punct" && (tok.value === "." || tok.value === "?.")) {
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        superCallClosed = false;
+      }
+      out += tok.value;
+      i += 1;
+      continue;
+    }
+
+    if (tok.type === "punct" && tok.value === "[") {
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        superCallClosed = false;
+      }
+      stack.push({ kind: "bracket" });
+      out += tok.value;
+      i += 1;
+      continue;
+    }
+
+    if (tok.type === "punct" && tok.value === "]") {
+      if (stack.length > 0 && stack[stack.length - 1].kind === "bracket") {
+        stack.pop();
+      }
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        superCallClosed = true;
+      }
+      out += tok.value;
+      i += 1;
+      continue;
+    }
+
     if (tok.type === "punct" && tok.value === "(") {
-      const isParams = isParamParen(tokens, i, stack);
-      stack.push({ kind: "paren", isParams });
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        superCallClosed = false;
+      }
+      const parenMeta = classifyParamParen(tokens, i, stack);
+      stack.push({ kind: "paren", isParams: parenMeta.isParams, isMethodOrFunc: parenMeta.isMethodOrFunc });
       out += tok.value;
       i += 1;
       continue;
@@ -1154,10 +1824,14 @@ function stripTypeScriptFromTokens(tokens) {
     if (tok.type === "punct" && tok.value === ")") {
       if (stack.length > 0 && stack[stack.length - 1].kind === "paren") {
         const closed = stack.pop();
+        lastClosedParen = { token: tok, isMethodOrFunc: closed.isMethodOrFunc };
         if (closed.isParams && pendingConstructorParams && pendingConstructorParams.length > 0) {
           injectConstructorThis = pendingConstructorParams;
           pendingConstructorParams = null;
         }
+      }
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        superCallClosed = true;
       }
       out += tok.value;
       i += 1;
@@ -1185,7 +1859,7 @@ function stripTypeScriptFromTokens(tokens) {
         (!inVarDecl || inVarInit) &&
         prev &&
         prev.type === "punct" &&
-        "=([,:;?+-*/%<>!".includes(prev.value);
+        OBJ_BEFORE_PUNCT.has(prev.value);
       const isObjFromKeyword =
         !isPattern && prev && prev.type === "ident" && EXPR_START_KEYWORDS.has(prev.value);
       const braceIsObject = Boolean(isObj || isObjFromKeyword);
@@ -1195,6 +1869,8 @@ function stripTypeScriptFromTokens(tokens) {
         const nextTokIdx = nextSigIndex(tokens, i + 1);
         if (tokens[nextTokIdx]?.value === "super") {
           waitingForSuperEnd = true;
+          superBodyDepth = stack.length;
+          superCallClosed = false;
         } else {
           const assignments = injectConstructorThis.map((p) => `this.${p} = ${p};`).join(" ");
           injectConstructorThis = null;
@@ -1206,6 +1882,16 @@ function stripTypeScriptFromTokens(tokens) {
     }
 
     if (tok.type === "punct" && tok.value === "}") {
+      if (waitingForSuperEnd && stack.length === superBodyDepth) {
+        waitingForSuperEnd = false;
+        superCallClosed = false;
+        superBodyDepth = -1;
+        if (injectConstructorThis) {
+          const assignments = injectConstructorThis.map((p) => `this.${p} = ${p};`).join(" ");
+          injectConstructorThis = null;
+          out += `${out.trimEnd().endsWith(";") ? " " : "; "}${assignments} `;
+        }
+      }
       if (stack.length > 0 && stack[stack.length - 1].kind === "brace") {
         stack.pop();
       }
@@ -1231,8 +1917,10 @@ function stripTypeScriptFromTokens(tokens) {
       inVarInit = false;
       inImportExportClause = false;
       out += tok.value;
-      if (waitingForSuperEnd && injectConstructorThis) {
+      if (waitingForSuperEnd && injectConstructorThis && stack.length === superBodyDepth) {
         waitingForSuperEnd = false;
+        superCallClosed = false;
+        superBodyDepth = -1;
         const assignments = injectConstructorThis.map((p) => `this.${p} = ${p};`).join(" ");
         injectConstructorThis = null;
         out += ` ${assignments}`;

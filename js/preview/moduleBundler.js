@@ -86,10 +86,21 @@ export function resolveLocalModuleEntry(specifier, fromPath, exactMap, options =
   const { allowParentTraversal = true, allowUnloaded = false } = options;
   if (!exactMap || !isRelativeModuleSpecifier(specifier)) return null;
 
-  const cleanRef = String(specifier).trim().split("?")[0].split("#")[0];
+  const cleanRef = String(specifier).trim().split("?")[0].split("#")[0].replace(/\\/g, "/");
   if (!cleanRef) return null;
-  if (cleanRef.startsWith("../") && !allowParentTraversal) {
-    return null;
+  if (!allowParentTraversal) {
+    let depth = 0;
+    for (const seg of cleanRef.split("/")) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") {
+        depth -= 1;
+        if (depth < 0) {
+          return null;
+        }
+      } else {
+        depth += 1;
+      }
+    }
   }
 
   const fromDir = getParentFolder(fromPath);
@@ -99,7 +110,7 @@ export function resolveLocalModuleEntry(specifier, fromPath, exactMap, options =
   if (!base) return null;
 
   const isUsable = (entry) =>
-    Boolean(entry) && (allowUnloaded || typeof entry.content === "string");
+    Boolean(entry) && (allowUnloaded || (typeof entry.content === "string" && entry.contentLoaded !== false));
 
   const direct = exactMap.get(base);
   if (isUsable(direct)) return direct;
@@ -536,12 +547,54 @@ export function inspectModuleUsage(jsCode) {
 
   // Rastreo liviano de si estamos en ámbito superior (fuera de function/arrow/class) para detectar top-level await
   const fnBraceDepthStack = [];
+  const conciseArrowStack = [];
+  const STMT_POP_KEYWORDS = new Set([
+    "const",
+    "let",
+    "var",
+    "function",
+    "class",
+    "if",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "try",
+    "export",
+    "import",
+    "return",
+    "throw"
+  ]);
 
   for (let i = 0; i < tokens.length; i += 1) {
     const t = tokens[i];
     if (t.type === "ws" || t.type === "comment") continue;
 
+    while (conciseArrowStack.length > 0) {
+      const top = conciseArrowStack[conciseArrowStack.length - 1];
+      const sameDepth = brace === top.brace && paren === top.paren && bracket === top.bracket;
+      if (
+        brace < top.brace ||
+        paren < top.paren ||
+        bracket < top.bracket ||
+        (sameDepth && t.type === "punct" && (t.value === "," || t.value === ";")) ||
+        (sameDepth && t.type === "ident" && STMT_POP_KEYWORDS.has(t.value))
+      ) {
+        conciseArrowStack.pop();
+      } else {
+        break;
+      }
+    }
+
     if (t.type === "punct") {
+      if (t.value === "=>") {
+        const afterArrow = skipTrivia(tokens, i + 1);
+        if (afterArrow >= tokens.length || tokens[afterArrow].value !== "{") {
+          conciseArrowStack.push({ brace, paren, bracket });
+        }
+        prevSig = i;
+        continue;
+      }
       if (t.value === "{") {
         brace += 1;
         if (prevSig >= 0) {
@@ -593,6 +646,7 @@ export function inspectModuleUsage(jsCode) {
       t.type === "ident" &&
       t.value === "await" &&
       fnBraceDepthStack.length === 0 &&
+      conciseArrowStack.length === 0 &&
       (prevSig < 0 || tokens[prevSig].value !== ".")
     ) {
       const n1 = skipTrivia(tokens, i + 1);
@@ -601,9 +655,15 @@ export function inspectModuleUsage(jsCode) {
       }
     }
 
-    // Dynamic `import("...")` a cualquier profundidad
+    // Dynamic `import("...")` a cualquier profundidad: solo precargar módulos locales relativos
     if (t.type === "ident" && t.value === "import" && (prevSig < 0 || tokens[prevSig].value !== ".")) {
       const n1 = skipTrivia(tokens, i + 1);
+      if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === ".") {
+        const n2 = skipTrivia(tokens, n1 + 1);
+        if (n2 < tokens.length && tokens[n2].type === "ident" && tokens[n2].value === "meta") {
+          hasModuleSyntax = true;
+        }
+      }
       if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === "(") {
         const argIdx = skipTrivia(tokens, n1 + 1);
         const closeP = skipTrivia(tokens, argIdx + 1);
@@ -615,7 +675,7 @@ export function inspectModuleUsage(jsCode) {
           tokens[closeP].value === ")"
         ) {
           const spec = unquoteStringToken(tokens[argIdx]);
-          if (spec) dynamicLocalImports.push(spec);
+          if (spec && isRelativeModuleSpecifier(spec)) dynamicLocalImports.push(spec);
         }
       }
     }
@@ -688,8 +748,983 @@ export function inspectModuleUsage(jsCode) {
  * @param {{ useAsyncRequire?: boolean }} [options]
  * @returns {{ code: string, hasTopLevelAwait: boolean }}
  */
+const LIVE_NON_DECL_PREV = new Set([
+  "=",
+  "(",
+  "[",
+  ",",
+  ":",
+  "?",
+  "&&",
+  "||",
+  "??",
+  "!",
+  "+",
+  "-",
+  "*",
+  "/",
+  "%",
+  "=>",
+  "return",
+  "throw",
+  "yield",
+  "await",
+  "typeof",
+  "void",
+  "delete",
+  "new"
+]);
+
+const LIVE_OBJ_BEFORE_PUNCT = new Set([
+  "=",
+  "(",
+  "[",
+  ",",
+  ":",
+  ";",
+  "?",
+  "+",
+  "-",
+  "*",
+  "/",
+  "%",
+  "<",
+  ">",
+  "!",
+  "&&",
+  "||",
+  "??",
+  "...",
+  "+=",
+  "-=",
+  "*=",
+  "/=",
+  "%=",
+  "&&=",
+  "||=",
+  "??="
+]);
+
+const LIVE_OBJ_BEFORE_KEYWORD = new Set([
+  "return",
+  "throw",
+  "yield",
+  "await",
+  "typeof",
+  "void",
+  "delete"
+]);
+
+/**
+ * Recolecta identificadores ligados y tokens de clave/patrón que no son referencias de lectura en LHS.
+ */
+function collectPatternInfo(tokens, startIdx, namesOut, nonRefOut) {
+  let i = skipTrivia(tokens, startIdx);
+  if (i >= tokens.length) return i;
+  const t = tokens[i];
+  if (t.type === "ident") {
+    namesOut.push(t.value);
+    nonRefOut.add(i);
+    return i + 1;
+  }
+  if (t.type === "punct" && t.value === "{") {
+    const closeIdx = findMatchingBrace(tokens, i);
+    let cur = i + 1;
+    while (cur < closeIdx) {
+      cur = skipTrivia(tokens, cur);
+      if (cur >= closeIdx) break;
+      const ct = tokens[cur];
+      if (ct.type === "punct" && ct.value === ",") {
+        cur += 1;
+        continue;
+      }
+      if (ct.type === "punct" && ct.value === "...") {
+        cur = skipTrivia(tokens, cur + 1);
+        if (cur < closeIdx && tokens[cur].type === "ident") {
+          namesOut.push(tokens[cur].value);
+          nonRefOut.add(cur);
+          cur += 1;
+        }
+        continue;
+      }
+      if (ct.type === "punct" && ct.value === "[") {
+        cur = findMatchingBrace(tokens, cur, "[", "]") + 1;
+        cur = skipTrivia(tokens, cur);
+        if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === ":") {
+          cur = collectPatternInfo(tokens, cur + 1, namesOut, nonRefOut);
+        }
+      } else if (ct.type === "ident" || ct.type === "string" || ct.type === "number") {
+        const keyIdx = cur;
+        const n1 = skipTrivia(tokens, cur + 1);
+        if (n1 < closeIdx && tokens[n1].type === "punct" && tokens[n1].value === ":") {
+          nonRefOut.add(keyIdx);
+          cur = collectPatternInfo(tokens, n1 + 1, namesOut, nonRefOut);
+        } else {
+          if (ct.type === "ident") {
+            namesOut.push(ct.value);
+            nonRefOut.add(keyIdx);
+          }
+          cur = n1;
+        }
+      } else {
+        cur += 1;
+        continue;
+      }
+      cur = skipTrivia(tokens, cur);
+      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
+        cur += 1;
+        let b = 0;
+        let p = 0;
+        let br = 0;
+        while (cur < closeIdx) {
+          const dt = tokens[cur];
+          if (dt.type === "punct") {
+            if (dt.value === "{") b += 1;
+            else if (dt.value === "}") b = Math.max(0, b - 1);
+            else if (dt.value === "(") p += 1;
+            else if (dt.value === ")") p = Math.max(0, p - 1);
+            else if (dt.value === "[") br += 1;
+            else if (dt.value === "]") br = Math.max(0, br - 1);
+            else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
+          }
+          cur += 1;
+        }
+      }
+    }
+    return closeIdx + 1;
+  }
+  if (t.type === "punct" && t.value === "[") {
+    const closeIdx = findMatchingBrace(tokens, i, "[", "]");
+    let cur = i + 1;
+    while (cur < closeIdx) {
+      cur = skipTrivia(tokens, cur);
+      if (cur >= closeIdx) break;
+      const ct = tokens[cur];
+      if (ct.type === "punct" && ct.value === ",") {
+        cur += 1;
+        continue;
+      }
+      if (ct.type === "punct" && ct.value === "...") {
+        cur = collectPatternInfo(tokens, cur + 1, namesOut, nonRefOut);
+        continue;
+      }
+      cur = collectPatternInfo(tokens, cur, namesOut, nonRefOut);
+      cur = skipTrivia(tokens, cur);
+      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
+        cur += 1;
+        let b = 0;
+        let p = 0;
+        let br = 0;
+        while (cur < closeIdx) {
+          const dt = tokens[cur];
+          if (dt.type === "punct") {
+            if (dt.value === "{") b += 1;
+            else if (dt.value === "}") b = Math.max(0, b - 1);
+            else if (dt.value === "(") p += 1;
+            else if (dt.value === ")") p = Math.max(0, p - 1);
+            else if (dt.value === "[") br += 1;
+            else if (dt.value === "]") br = Math.max(0, br - 1);
+            else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
+          }
+          cur += 1;
+        }
+      }
+    }
+    return closeIdx + 1;
+  }
+  return i + 1;
+}
+
+function collectParamNamesAndNonRefs(tokens, openParenIdx, closeParenIdx, nonRefOut) {
+  const names = [];
+  let cur = openParenIdx + 1;
+  while (cur < closeParenIdx) {
+    cur = skipTrivia(tokens, cur);
+    if (cur >= closeParenIdx) break;
+    if (tokens[cur].type === "punct" && tokens[cur].value === ",") {
+      cur += 1;
+      continue;
+    }
+    if (tokens[cur].type === "punct" && tokens[cur].value === "...") {
+      cur = skipTrivia(tokens, cur + 1);
+    }
+    cur = collectPatternInfo(tokens, cur, names, nonRefOut);
+    cur = skipTrivia(tokens, cur);
+    if (cur < closeParenIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
+      cur += 1;
+      let b = 0;
+      let p = 0;
+      let br = 0;
+      while (cur < closeParenIdx) {
+        const dt = tokens[cur];
+        if (dt.type === "punct") {
+          if (dt.value === "{") b += 1;
+          else if (dt.value === "}") b = Math.max(0, b - 1);
+          else if (dt.value === "(") p += 1;
+          else if (dt.value === ")") p = Math.max(0, p - 1);
+          else if (dt.value === "[") br += 1;
+          else if (dt.value === "]") br = Math.max(0, br - 1);
+          else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
+        }
+        cur += 1;
+      }
+    }
+  }
+  return names;
+}
+
+function collectVarDeclaratorsInfo(tokens, startIdx, namesOut, nonRefOut) {
+  let cur = startIdx;
+  let prevSig = startIdx > 0 ? prevNonTriviaIndex(tokens, startIdx) : -1;
+  while (cur < tokens.length) {
+    cur = skipTrivia(tokens, cur);
+    if (cur >= tokens.length) break;
+    cur = collectPatternInfo(tokens, cur, namesOut, nonRefOut);
+    cur = skipTrivia(tokens, cur);
+    if (cur >= tokens.length) break;
+    const ct = tokens[cur];
+    if (ct.type === "punct" && ct.value === "=") {
+      cur += 1;
+      let b = 0;
+      let p = 0;
+      let br = 0;
+      prevSig = cur - 1;
+      while (cur < tokens.length) {
+        const it = tokens[cur];
+        if (it.type === "ws" || it.type === "comment") {
+          cur += 1;
+          continue;
+        }
+        if (b === 0 && p === 0 && br === 0) {
+          if (it.type === "punct" && (it.value === "," || it.value === ";" || it.value === ")")) {
+            break;
+          }
+          if (it.type === "ident" && (it.value === "in" || it.value === "of")) {
+            break;
+          }
+          if (isAsiBoundary(tokens, prevSig, cur)) {
+            return;
+          }
+        }
+        if (it.type === "punct") {
+          if (it.value === "{") b += 1;
+          else if (it.value === "}") {
+            if (b === 0) return;
+            b -= 1;
+          } else if (it.value === "(") p += 1;
+          else if (it.value === ")") {
+            if (p === 0) return;
+            p -= 1;
+          } else if (it.value === "[") br += 1;
+          else if (it.value === "]") br = Math.max(0, br - 1);
+        }
+        prevSig = cur;
+        cur += 1;
+      }
+    }
+    cur = skipTrivia(tokens, cur);
+    if (cur >= tokens.length) break;
+    const sep = tokens[cur];
+    if (sep.type === "punct" && sep.value === ",") {
+      cur += 1;
+      continue;
+    }
+    break;
+  }
+}
+
+function collectFunctionHoists(tokens, openBraceIdx, closeBraceIdx) {
+  const hoists = [];
+  const dummyNonRef = new Set();
+  let brace = 0;
+  let paren = 0;
+  let bracket = 0;
+  let prevSig = -1;
+  let k = openBraceIdx + 1;
+  while (k < closeBraceIdx) {
+    const t = tokens[k];
+    if (t.type === "ws" || t.type === "comment") {
+      k += 1;
+      continue;
+    }
+    if (t.type === "punct") {
+      if (t.value === "{") brace += 1;
+      else if (t.value === "}") brace = Math.max(0, brace - 1);
+      else if (t.value === "(") paren += 1;
+      else if (t.value === ")") paren = Math.max(0, paren - 1);
+      else if (t.value === "[") bracket += 1;
+      else if (t.value === "]") bracket = Math.max(0, bracket - 1);
+      prevSig = k;
+      k += 1;
+      continue;
+    }
+    const prev = prevSig >= 0 ? tokens[prevSig] : null;
+    const isProp = prev && (prev.value === "." || prev.value === "?.");
+    if (!isProp && t.type === "ident" && t.value === "function") {
+      let nameIdx = skipTrivia(tokens, k + 1);
+      if (nameIdx < closeBraceIdx && tokens[nameIdx].value === "*") {
+        nameIdx = skipTrivia(tokens, nameIdx + 1);
+      }
+      if (brace === 0 && nameIdx < closeBraceIdx && tokens[nameIdx].type === "ident") {
+        hoists.push(tokens[nameIdx].value);
+      }
+      // Saltar cuerpo completo de funciones anidadas para no filtrar sus `var` internos
+      let pScan = nameIdx;
+      while (pScan < closeBraceIdx && tokens[pScan].value !== "{") pScan += 1;
+      if (pScan < closeBraceIdx && tokens[pScan].value === "{") {
+        k = findMatchingBrace(tokens, pScan) + 1;
+        continue;
+      }
+    } else if (!isProp && t.type === "ident" && t.value === "var" && paren === 0 && bracket === 0) {
+      const next = tokens[skipTrivia(tokens, k + 1)];
+      if (!next || next.value !== ":") {
+        collectVarDeclaratorsInfo(tokens, k + 1, hoists, dummyNonRef);
+      }
+    } else if (t.type === "punct" && t.value === "=>") {
+      const after = skipTrivia(tokens, k + 1);
+      if (after < closeBraceIdx && tokens[after].value === "{") {
+        k = findMatchingBrace(tokens, after) + 1;
+        continue;
+      }
+    }
+    prevSig = k;
+    k += 1;
+  }
+  return hoists;
+}
+
+const LIVE_ASSIGN_OPS = new Set([
+  "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "^=", "|=", "&&=", "||=", "??="
+]);
+
+const ASSIGN_INCOMPLETE_PREV_OPS = new Set([
+  "=", "+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "^=", "|=", "&&=", "||=", "??=",
+  "+", "-", "*", "/", "%", "**", "&&", "||", "??", "?", ":", ".", "?.", "=>", ",", "(", "[", "{"
+]);
+
+const ASSIGN_INCOMPLETE_PREV_KW = new Set([
+  "return", "throw", "yield", "await", "typeof", "void", "delete", "new", "in", "instanceof"
+]);
+
+const ASSIGN_CONTINUATION_OPS = new Set([
+  ".", "?.", "[", "(", "+", "-", "*", "/", "%", "**", "&&", "||", "??", "?", ":",
+  "===", "!==", "==", "!=", "<", ">", "<=", ">=", "<<", ">>", ">>>", "&", "|", "^", "in", "instanceof"
+]);
+
+function findAssignRhsEndOffset(tokens, startIdx, sourceLen) {
+  let b = 0;
+  let p = 0;
+  let br = 0;
+  let ternary = 0;
+  let prevRhsSig = -1;
+  for (let k = startIdx; k < tokens.length; k += 1) {
+    const t = tokens[k];
+    if (t.type === "ws" || t.type === "comment") continue;
+    if (b === 0 && p === 0 && br === 0) {
+      if (t.type === "punct") {
+        if (t.value === "?") {
+          ternary += 1;
+          prevRhsSig = k;
+          continue;
+        }
+        if (t.value === ":") {
+          if (ternary > 0) {
+            ternary -= 1;
+            prevRhsSig = k;
+            continue;
+          }
+          break;
+        }
+        if (t.value === "," || t.value === ";" || t.value === ")" || t.value === "]" || t.value === "}") {
+          break;
+        }
+      }
+      if (prevRhsSig >= 0 && isAsiBoundary(tokens, prevRhsSig, k)) {
+        const pt = tokens[prevRhsSig];
+        const prevIncomplete =
+          (pt.type === "punct" && ASSIGN_INCOMPLETE_PREV_OPS.has(pt.value)) ||
+          (pt.type === "ident" && ASSIGN_INCOMPLETE_PREV_KW.has(pt.value));
+        const curContinues =
+          (t.type === "punct" || t.type === "ident") && ASSIGN_CONTINUATION_OPS.has(t.value);
+        if (!prevIncomplete && !curContinues) {
+          break;
+        }
+      }
+    }
+    if (t.type === "punct") {
+      if (t.value === "{") b += 1;
+      else if (t.value === "}") b = Math.max(0, b - 1);
+      else if (t.value === "(") p += 1;
+      else if (t.value === ")") p = Math.max(0, p - 1);
+      else if (t.value === "[") br += 1;
+      else if (t.value === "]") br = Math.max(0, br - 1);
+    }
+    prevRhsSig = k;
+  }
+  if (prevRhsSig >= startIdx) return tokens[prevRhsSig].end;
+  return startIdx < tokens.length ? tokens[startIdx].end : sourceLen;
+}
+
+/**
+ * Envuelve escrituras/mutaciones sobre variables locales exportadas (`export let count = 0`)
+ * para propagar sus cambios en vivo hacia los bindings importados (`__studioBind`).
+ */
+function rewriteLiveExportWritesInCode(code, liveExportNames) {
+  if (!liveExportNames || liveExportNames.size === 0) {
+    return code;
+  }
+
+  const tokens = tokenizeJsWithOffsets(code);
+  const splices = [];
+  const nonRefTokens = new Set();
+  const attachScopeAtBrace = new Map();
+  const attachScopeAtParen = new Map();
+  const attachConciseArrowAt = new Map();
+
+  const scopes = [{ kind: "module", shadows: new Set() }];
+  let brace = 0;
+  let paren = 0;
+  let bracket = 0;
+  let prevSig = -1;
+  let ternaryDepth = 0;
+  let inCaseExpr = false;
+
+  const isShadowed = (name) => {
+    for (let s = scopes.length - 1; s >= 1; s -= 1) {
+      if (scopes[s].shadows && scopes[s].shadows.has(name)) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  const addShadowToCurrent = (name, isVar) => {
+    if (scopes.length <= 1) return;
+    if (isVar) {
+      for (let s = scopes.length - 1; s >= 1; s -= 1) {
+        if (scopes[s].kind === "fn") {
+          scopes[s].shadows.add(name);
+          return;
+        }
+      }
+      return;
+    }
+    for (let s = scopes.length - 1; s >= 1; s -= 1) {
+      if (scopes[s].shadows) {
+        scopes[s].shadows.add(name);
+        return;
+      }
+    }
+  };
+
+  const activeBraceFrame = () => {
+    for (let s = scopes.length - 1; s >= 0; s -= 1) {
+      const k = scopes[s].kind;
+      if (k === "obj" || k === "class" || k === "block" || k === "fn" || k === "module") {
+        return scopes[s];
+      }
+    }
+    return scopes[0];
+  };
+
+  const popConciseArrowsIfNeeded = (tok, nextBrace, nextParen, nextBracket) => {
+    while (scopes.length > 1) {
+      const top = scopes[scopes.length - 1];
+      if (top.kind !== "concise") break;
+      const exitedDelim =
+        nextBrace < top.braceDepth || nextParen < top.parenDepth || nextBracket < top.bracketDepth;
+      const sameDepthSep =
+        nextBrace === top.braceDepth &&
+        nextParen === top.parenDepth &&
+        nextBracket === top.bracketDepth &&
+        tok &&
+        tok.type === "punct" &&
+        (tok.value === "," || tok.value === ";");
+      if (exitedDelim || sameDepthSep) {
+        scopes.pop();
+      } else {
+        break;
+      }
+    }
+  };
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (t.type === "ws" || t.type === "comment") {
+      continue;
+    }
+
+    const prev = prevSig >= 0 ? tokens[prevSig] : null;
+    const isAfterDot = Boolean(prev && (prev.value === "." || prev.value === "?."));
+    const curFrame = activeBraceFrame();
+
+    // Fin de concise arrow por ASI en salto de línea
+    if (prevSig >= 0 && scopes[scopes.length - 1]?.kind === "concise") {
+      const topC = scopes[scopes.length - 1];
+      if (
+        brace === topC.braceDepth &&
+        paren === topC.parenDepth &&
+        bracket === topC.bracketDepth &&
+        isAsiBoundary(tokens, prevSig, i)
+      ) {
+        scopes.pop();
+      }
+    }
+
+    // Fin de expresión `case expr:`
+    if (inCaseExpr && t.type === "punct" && t.value === ":") {
+      inCaseExpr = false;
+      prevSig = i;
+      continue;
+    }
+
+    if (t.type === "punct") {
+      if (t.value === "?") {
+        ternaryDepth += 1;
+        prevSig = i;
+        continue;
+      }
+      if (t.value === ":") {
+        if (ternaryDepth > 0) ternaryDepth -= 1;
+        if (curFrame.kind === "obj" && curFrame.braceDepth === brace) {
+          curFrame.objKeyExpected = false;
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "(") {
+        paren += 1;
+        const closeP = findMatchingBrace(tokens, i, "(", ")");
+        const afterP = skipTrivia(tokens, closeP + 1);
+        const paramAttach = attachScopeAtParen.get(i);
+        if (paramAttach) {
+          attachScopeAtParen.delete(i);
+          scopes.push({ kind: "paren", parenDepth: paren, shadows: paramAttach });
+        } else if (afterP < tokens.length && tokens[afterP].type === "punct" && tokens[afterP].value === "=>") {
+          const pNames = collectParamNamesAndNonRefs(tokens, i, closeP, nonRefTokens);
+          const afterArrow = skipTrivia(tokens, afterP + 1);
+          scopes.push({ kind: "paren", parenDepth: paren, shadows: new Set(pNames) });
+          if (afterArrow < tokens.length && tokens[afterArrow].value === "{") {
+            const closeB = findMatchingBrace(tokens, afterArrow);
+            const hoists = collectFunctionHoists(tokens, afterArrow, closeB);
+            attachScopeAtBrace.set(afterArrow, {
+              kind: "fn",
+              shadows: new Set([...pNames, ...hoists])
+            });
+          } else {
+            attachConciseArrowAt.set(afterP, new Set(pNames));
+          }
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === ")") {
+        const nextP = Math.max(0, paren - 1);
+        popConciseArrowsIfNeeded(t, brace, nextP, bracket);
+        paren = nextP;
+        if (scopes[scopes.length - 1]?.kind === "paren" && scopes[scopes.length - 1].parenDepth === paren + 1) {
+          scopes.pop();
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "[") {
+        if (curFrame.kind === "obj" && curFrame.braceDepth === brace) {
+          curFrame.objKeyExpected = false;
+        }
+        bracket += 1;
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "]") {
+        const nextBr = Math.max(0, bracket - 1);
+        popConciseArrowsIfNeeded(t, brace, paren, nextBr);
+        bracket = nextBr;
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "=>") {
+        const conciseShadows = attachConciseArrowAt.get(i);
+        if (conciseShadows) {
+          attachConciseArrowAt.delete(i);
+          scopes.push({
+            kind: "concise",
+            braceDepth: brace,
+            parenDepth: paren,
+            bracketDepth: bracket,
+            shadows: conciseShadows
+          });
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "{") {
+        brace += 1;
+        const attached = attachScopeAtBrace.get(i);
+        if (attached) {
+          attachScopeAtBrace.delete(i);
+          scopes.push({
+            kind: attached.kind,
+            braceDepth: brace,
+            shadows: attached.shadows,
+            memberExpected: attached.kind === "class"
+          });
+        } else {
+          const isObj =
+            !inCaseExpr &&
+            prev &&
+            ((prev.type === "punct" && LIVE_OBJ_BEFORE_PUNCT.has(prev.value)) ||
+              (prev.type === "ident" && LIVE_OBJ_BEFORE_KEYWORD.has(prev.value)));
+          if (isObj) {
+            scopes.push({
+              kind: "obj",
+              braceDepth: brace,
+              shadows: null,
+              objKeyExpected: true
+            });
+          } else {
+            scopes.push({
+              kind: "block",
+              braceDepth: brace,
+              shadows: new Set()
+            });
+          }
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "}") {
+        const nextB = Math.max(0, brace - 1);
+        popConciseArrowsIfNeeded(t, nextB, paren, bracket);
+        brace = nextB;
+        while (scopes.length > 1) {
+          const top = scopes[scopes.length - 1];
+          if (top.braceDepth === brace + 1) {
+            scopes.pop();
+            if (top.kind === "forSingle") continue;
+            break;
+          }
+          break;
+        }
+        const outerFrame = activeBraceFrame();
+        if (outerFrame.kind === "class" && outerFrame.braceDepth === brace) {
+          outerFrame.memberExpected = true;
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "," || t.value === ";") {
+        popConciseArrowsIfNeeded(t, brace, paren, bracket);
+        if (t.value === "," && curFrame.kind === "obj" && curFrame.braceDepth === brace) {
+          curFrame.objKeyExpected = true;
+        }
+        if (t.value === ";" && curFrame.kind === "class" && curFrame.braceDepth === brace) {
+          curFrame.memberExpected = true;
+        }
+        if (t.value === ";" && scopes[scopes.length - 1]?.kind === "for" && scopes[scopes.length - 1].inBody) {
+          scopes.pop();
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "..." && curFrame.kind === "obj" && curFrame.braceDepth === brace) {
+        curFrame.objKeyExpected = false;
+      }
+
+      prevSig = i;
+      continue;
+    }
+
+    // Clase / Objeto llaves & miembros
+    if (!isAfterDot && t.type === "ident") {
+      if (curFrame.kind === "obj" && curFrame.braceDepth === brace && curFrame.objKeyExpected) {
+        const n1 = skipTrivia(tokens, i + 1);
+        const nt = n1 < tokens.length ? tokens[n1] : null;
+        if (
+          (t.value === "get" || t.value === "set" || t.value === "async") &&
+          nt &&
+          nt.type === "ident"
+        ) {
+          nonRefTokens.add(i);
+          prevSig = i;
+          continue;
+        }
+        if (nt && nt.type === "punct" && (nt.value === ":" || nt.value === "(")) {
+          nonRefTokens.add(i);
+          curFrame.objKeyExpected = false;
+          if (nt.value === "(") {
+            const closeP = findMatchingBrace(tokens, n1, "(", ")");
+            const openB = skipTrivia(tokens, closeP + 1);
+            const pNames = collectParamNamesAndNonRefs(tokens, n1, closeP, nonRefTokens);
+            attachScopeAtParen.set(n1, new Set(pNames));
+            if (openB < tokens.length && tokens[openB].value === "{") {
+              const closeB = findMatchingBrace(tokens, openB);
+              const hoists = collectFunctionHoists(tokens, openB, closeB);
+              attachScopeAtBrace.set(openB, { kind: "fn", shadows: new Set([...pNames, ...hoists]) });
+            }
+          }
+          prevSig = i;
+          continue;
+        }
+        if (nt && nt.type === "punct" && (nt.value === "," || nt.value === "}" || nt.value === "=")) {
+          curFrame.objKeyExpected = false;
+        }
+      }
+
+      if (curFrame.kind === "class" && curFrame.braceDepth === brace) {
+        if (!curFrame.memberExpected && prevSig >= 0 && isAsiBoundary(tokens, prevSig, i)) {
+          curFrame.memberExpected = true;
+        }
+        if (curFrame.memberExpected) {
+          const n1 = skipTrivia(tokens, i + 1);
+          const nt = n1 < tokens.length ? tokens[n1] : null;
+          if (
+            (t.value === "static" || t.value === "get" || t.value === "set" || t.value === "async") &&
+            nt &&
+            (nt.type === "ident" || nt.value === "#" || nt.value === "[" || nt.value === "*")
+          ) {
+            nonRefTokens.add(i);
+            prevSig = i;
+            continue;
+          }
+          if (t.value === "static" && nt && nt.value === "{") {
+            curFrame.memberExpected = false;
+            prevSig = i;
+            continue;
+          }
+          if (
+            !nt ||
+            nt.value === "=" ||
+            nt.value === ";" ||
+            nt.value === "(" ||
+            isAsiBoundary(tokens, i, n1)
+          ) {
+            nonRefTokens.add(i);
+            curFrame.memberExpected = false;
+            if (nt && nt.value === "(") {
+              const closeP = findMatchingBrace(tokens, n1, "(", ")");
+              const openB = skipTrivia(tokens, closeP + 1);
+              const pNames = collectParamNamesAndNonRefs(tokens, n1, closeP, nonRefTokens);
+              attachScopeAtParen.set(n1, new Set(pNames));
+              if (openB < tokens.length && tokens[openB].value === "{") {
+                const closeB = findMatchingBrace(tokens, openB);
+                const hoists = collectFunctionHoists(tokens, openB, closeB);
+                attachScopeAtBrace.set(openB, { kind: "fn", shadows: new Set([...pNames, ...hoists]) });
+              }
+            }
+            prevSig = i;
+            continue;
+          }
+        }
+      }
+
+      if (t.value === "case" || (t.value === "default" && tokens[skipTrivia(tokens, i + 1)]?.value === ":")) {
+        inCaseExpr = true;
+      }
+
+      if (t.value === "function") {
+        let nameIdx = skipTrivia(tokens, i + 1);
+        if (nameIdx < tokens.length && tokens[nameIdx].value === "*") {
+          nameIdx = skipTrivia(tokens, nameIdx + 1);
+        }
+        let fnName = null;
+        if (nameIdx < tokens.length && tokens[nameIdx].type === "ident") {
+          fnName = tokens[nameIdx].value;
+          nonRefTokens.add(nameIdx);
+          const isExpr = prev && LIVE_NON_DECL_PREV.has(prev.value);
+          if (!isExpr) {
+            addShadowToCurrent(fnName, true);
+          }
+        }
+        let pScan = nameIdx;
+        while (pScan < tokens.length && tokens[pScan].value !== "(") pScan += 1;
+        if (pScan < tokens.length) {
+          const closeP = findMatchingBrace(tokens, pScan, "(", ")");
+          const pNames = collectParamNamesAndNonRefs(tokens, pScan, closeP, nonRefTokens);
+          const openB = skipTrivia(tokens, closeP + 1);
+          const paramSet = new Set(pNames);
+          if (fnName) paramSet.add(fnName);
+          attachScopeAtParen.set(pScan, paramSet);
+          if (openB < tokens.length && tokens[openB].value === "{") {
+            const closeB = findMatchingBrace(tokens, openB);
+            const hoists = collectFunctionHoists(tokens, openB, closeB);
+            const bodySet = new Set([...paramSet, ...hoists]);
+            attachScopeAtBrace.set(openB, { kind: "fn", shadows: bodySet });
+          }
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "class") {
+        const nameIdx = skipTrivia(tokens, i + 1);
+        let clsName = null;
+        if (nameIdx < tokens.length && tokens[nameIdx].type === "ident" && tokens[nameIdx].value !== "extends") {
+          clsName = tokens[nameIdx].value;
+          nonRefTokens.add(nameIdx);
+          const isExpr = prev && LIVE_NON_DECL_PREV.has(prev.value);
+          if (!isExpr) {
+            addShadowToCurrent(clsName, false);
+          }
+        }
+        let scan = i + 1;
+        let pD = 0;
+        let bD = 0;
+        while (scan < tokens.length) {
+          if (tokens[scan].value === "(") pD += 1;
+          else if (tokens[scan].value === ")") pD = Math.max(0, pD - 1);
+          else if (tokens[scan].value === "[") bD += 1;
+          else if (tokens[scan].value === "]") bD = Math.max(0, bD - 1);
+          else if (pD === 0 && bD === 0 && tokens[scan].value === "{") {
+            const clsSet = new Set();
+            if (clsName) clsSet.add(clsName);
+            attachScopeAtBrace.set(scan, { kind: "class", shadows: clsSet });
+            break;
+          }
+          scan += 1;
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "catch") {
+        const n1 = skipTrivia(tokens, i + 1);
+        if (n1 < tokens.length && tokens[n1].value === "(") {
+          const closeP = findMatchingBrace(tokens, n1, "(", ")");
+          const cNames = collectParamNamesAndNonRefs(tokens, n1, closeP, nonRefTokens);
+          const openB = skipTrivia(tokens, closeP + 1);
+          attachScopeAtParen.set(n1, new Set(cNames));
+          if (openB < tokens.length && tokens[openB].value === "{") {
+            attachScopeAtBrace.set(openB, { kind: "block", shadows: new Set(cNames) });
+          }
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "for") {
+        let n1 = skipTrivia(tokens, i + 1);
+        if (n1 < tokens.length && tokens[n1].type === "ident" && tokens[n1].value === "await") {
+          n1 = skipTrivia(tokens, n1 + 1);
+        }
+        if (n1 < tokens.length && tokens[n1].value === "(") {
+          const closeP = findMatchingBrace(tokens, n1, "(", ")");
+          const fNames = [];
+          let scan = skipTrivia(tokens, n1 + 1);
+          if (
+            scan < closeP &&
+            tokens[scan].type === "ident" &&
+            (tokens[scan].value === "let" || tokens[scan].value === "const")
+          ) {
+            collectVarDeclaratorsInfo(tokens, scan + 1, fNames, nonRefTokens);
+          }
+          if (fNames.length > 0) {
+            attachScopeAtParen.set(n1, new Set(fNames));
+            const afterP = skipTrivia(tokens, closeP + 1);
+            if (afterP < tokens.length && tokens[afterP].value === "{") {
+              attachScopeAtBrace.set(afterP, { kind: "block", shadows: new Set(fNames) });
+            }
+          }
+        }
+        prevSig = i;
+        continue;
+      }
+
+      if (t.value === "const" || t.value === "let" || t.value === "var") {
+        const dNames = [];
+        collectVarDeclaratorsInfo(tokens, i + 1, dNames, nonRefTokens);
+        for (const name of dNames) {
+          addShadowToCurrent(name, t.value === "var");
+        }
+        prevSig = i;
+        continue;
+      }
+
+      // Arrow de parámetro único `x => ...`
+      const n1Idx = skipTrivia(tokens, i + 1);
+      if (n1Idx < tokens.length && tokens[n1Idx].type === "punct" && tokens[n1Idx].value === "=>") {
+        nonRefTokens.add(i);
+        const afterArrow = skipTrivia(tokens, n1Idx + 1);
+        if (afterArrow < tokens.length && tokens[afterArrow].value === "{") {
+          const closeB = findMatchingBrace(tokens, afterArrow);
+          const hoists = collectFunctionHoists(tokens, afterArrow, closeB);
+          attachScopeAtBrace.set(afterArrow, { kind: "fn", shadows: new Set([t.value, ...hoists]) });
+        } else {
+          attachConciseArrowAt.set(n1Idx, new Set([t.value]));
+        }
+        prevSig = i;
+        continue;
+      }
+    }
+
+    // Envolver escrituras sobre variables exportadas para notificar bindings vivos
+    if (
+      t.type === "ident" &&
+      !isAfterDot &&
+      !nonRefTokens.has(i) &&
+      liveExportNames.has(t.value) &&
+      !isShadowed(t.value)
+    ) {
+      const prevIsBreakCont = prev && (prev.value === "break" || prev.value === "continue");
+      const n1Idx = skipTrivia(tokens, i + 1);
+      const nextTok = n1Idx < tokens.length ? tokens[n1Idx] : null;
+      const isLabel =
+        nextTok &&
+        nextTok.type === "punct" &&
+        nextTok.value === ":" &&
+        ternaryDepth === 0 &&
+        !inCaseExpr &&
+        curFrame.kind !== "obj";
+
+      if (!prevIsBreakCont && !isLabel) {
+        if (prev && (prev.value === "++" || prev.value === "--") && !isAsiBoundary(tokens, prevSig, i)) {
+          splices.push({ pos: prev.start, text: "(__studioSync(", isStart: true });
+          splices.push({ pos: t.end, text: "))", isStart: false });
+        } else if (nextTok && (nextTok.value === "++" || nextTok.value === "--") && !isAsiBoundary(tokens, i, n1Idx)) {
+          splices.push({ pos: t.start, text: "(__studioSync(", isStart: true });
+          splices.push({ pos: nextTok.end, text: "))", isStart: false });
+        } else if (nextTok && LIVE_ASSIGN_OPS.has(nextTok.value)) {
+          const rhsEnd = findAssignRhsEndOffset(tokens, n1Idx + 1, code.length);
+          splices.push({ pos: t.start, text: "(__studioSync(", isStart: true });
+          splices.push({ pos: rhsEnd, text: "))", isStart: false });
+        }
+      }
+    }
+
+    prevSig = i;
+  }
+
+  if (splices.length === 0) {
+    return code;
+  }
+  splices.sort((a, b) => b.pos - a.pos || (a.isStart === b.isStart ? 0 : a.isStart ? 1 : -1));
+  let out = code;
+  for (const sp of splices) {
+    out = out.slice(0, sp.pos) + sp.text + out.slice(sp.pos);
+  }
+  return `const __studioSync = function(__v) { __studioNotify(exports); return __v; };\n${out}`;
+}
+
+/**
+ * Reescribe declaraciones ES Module (`import`, `export`, `import("./x")`, `import.meta`) a llamadas compatibles
+ * con `__studioRequire` / `__studioExport`, preservando literales de string, regex, comentarios y live bindings.
+ *
+ * @param {string} jsCode
+ * @param {(specifier: string) => { kind: "local"|"external", id?: string, extVar?: string }} resolveDep
+ * @param {{ useAsyncRequire?: boolean, moduleId?: string, moduleUrl?: string }} [options]
+ * @returns {{ code: string, hasTopLevelAwait: boolean }}
+ */
 export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
-  const { useAsyncRequire = false } = options;
+  const { useAsyncRequire = false, moduleId = "module.js", moduleUrl = "" } = options;
   const reqCall = (idLiteral) =>
     useAsyncRequire ? `(await __studioRequireAsync(${idLiteral}))` : `__studioRequire(${idLiteral})`;
 
@@ -698,6 +1733,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
   const edits = [];
   const hoistedExports = [];
   const deferredExports = [];
+  const liveExportNames = new Set();
   let tempCounter = 0;
 
   let brace = 0;
@@ -776,9 +1812,20 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
       }
     }
 
-    // Dynamic `import("./local")` -> `Promise.resolve(__studioRequire("..."))`
+    // Dynamic `import("./local")` y `import.meta` a cualquier profundidad
     if (t.type === "ident" && t.value === "import" && (prevSig < 0 || tokens[prevSig].value !== ".")) {
       const n1 = skipTrivia(tokens, i + 1);
+      if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === ".") {
+        const n2 = skipTrivia(tokens, n1 + 1);
+        if (n2 < tokens.length && tokens[n2].type === "ident" && tokens[n2].value === "meta") {
+          const cleanId = String(moduleId || "module.js").replace(/^\/+/, "");
+          const safeUrl = moduleUrl || `https://studio.local/${encodeURI(cleanId)}`;
+          edits.push({ start: t.start, end: tokens[n2].end, text: `({ url: ${JSON.stringify(safeUrl)} })` });
+          i = n2;
+          prevSig = n2;
+          continue;
+        }
+      }
       if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === "(") {
         const argIdx = skipTrivia(tokens, n1 + 1);
         const closeP = skipTrivia(tokens, argIdx + 1);
@@ -851,11 +1898,15 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
                   lines.push(`const ${namespaceIdent} = ${tmp};`);
                 }
                 if (defaultIdent) {
-                  lines.push(`const ${defaultIdent} = __studioInteropDefault(${tmp});`);
+                  lines.push(
+                    `let ${defaultIdent}; __studioBind(${tmp}, "__default_interop__", function(__v) { ${defaultIdent} = __v; });`
+                  );
                 }
-                if (namedSpecs.length > 0) {
-                  const pairs = namedSpecs.map((s) => `${s.imported}: ${s.local}`).join(", ");
-                  lines.push(`const { ${pairs} } = ${tmp};`);
+                for (const s of namedSpecs) {
+                  const propKey = s.imported.startsWith('"') ? JSON.parse(s.imported) : s.imported;
+                  lines.push(
+                    `let ${s.local}; __studioBind(${tmp}, ${JSON.stringify(propKey)}, function(__v) { ${s.local} = __v; });`
+                  );
                 }
               }
               edits.push({ start: t.start, end: endInfo.endOffset, text: lines.join(" ") });
@@ -912,10 +1963,11 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
               if (hasName) {
                 const fnName = tokens[nameTokIdx].value;
                 hoistedExports.push({ local: fnName, exported: "default" });
+                liveExportNames.add(fnName);
                 edits.push({ start: t.start, end: tokens[n2].start, text: "" });
               } else {
                 edits.push({ start: t.start, end: tokens[n2].start, text: "exports.default = (" });
-                edits.push({ start: tokens[closeBody].end, end: tokens[closeBody].end, text: ");" });
+                edits.push({ start: tokens[closeBody].end, end: tokens[closeBody].end, text: "); __studioNotify(exports);" });
               }
               prevSig = i;
               continue;
@@ -945,15 +1997,12 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
               const closeBody = findMatchingBrace(tokens, openBody);
               if (hasName) {
                 const clsName = tokens[nameTokIdx].value;
+                hoistedExports.push({ local: clsName, exported: "default" });
+                liveExportNames.add(clsName);
                 edits.push({ start: t.start, end: tokens[n2].start, text: "" });
-                edits.push({
-                  start: tokens[closeBody].end,
-                  end: tokens[closeBody].end,
-                  text: ` __studioExport(exports, "default", function() { return ${clsName}; });`
-                });
               } else {
                 edits.push({ start: t.start, end: tokens[n2].start, text: "exports.default = (" });
-                edits.push({ start: tokens[closeBody].end, end: tokens[closeBody].end, text: ");" });
+                edits.push({ start: tokens[closeBody].end, end: tokens[closeBody].end, text: "); __studioNotify(exports);" });
               }
               prevSig = i;
               continue;
@@ -964,7 +2013,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
           const stmtEnd = findStatementEndOffset(tokens, n2, source.length);
           const exprEnd = stmtEnd.endsWithSemi ? stmtEnd.endOffset - 1 : stmtEnd.endOffset;
           edits.push({ start: t.start, end: tokens[n2].start, text: "exports.default = (" });
-          edits.push({ start: exprEnd, end: stmtEnd.endOffset, text: ");" });
+          edits.push({ start: exprEnd, end: stmtEnd.endOffset, text: "); __studioNotify(exports);" });
           i = Math.max(i, stmtEnd.nextTokenIdx - 1);
           prevSig = i;
           continue;
@@ -1026,7 +2075,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
               edits.push({
                 start: t.start,
                 end: endInfo.endOffset,
-                text: `const ${tmp} = ${depExpr(spec)}; ${binds}`
+                text: `const ${tmp} = ${depExpr(spec)}; ${binds} __studioBindReexport(exports, ${tmp});`
               });
               i = Math.max(i, endInfo.nextTokenIdx - 1);
               prevSig = i;
@@ -1041,10 +2090,12 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
             nextIdx = afterBrace + 1;
           }
           for (const p of specPairs) {
-            deferredExports.push({
-              local: p.imported.startsWith('"') ? JSON.parse(p.imported) : p.imported,
+            const localName = p.imported.startsWith('"') ? JSON.parse(p.imported) : p.imported;
+            hoistedExports.push({
+              local: localName,
               exported: p.local
             });
+            liveExportNames.add(localName);
           }
           edits.push({ start: t.start, end: endPos, text: "" });
           i = Math.max(i, nextIdx - 1);
@@ -1066,6 +2117,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
           if (nameIdx < tokens.length && tokens[nameIdx].type === "ident") {
             const fnName = tokens[nameIdx].value;
             hoistedExports.push({ local: fnName, exported: fnName });
+            liveExportNames.add(fnName);
           }
           edits.push({ start: t.start, end: kw1.start, text: "" });
           prevSig = i;
@@ -1077,31 +2129,10 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
           const nameIdx = skipTrivia(tokens, n1 + 1);
           if (nameIdx < tokens.length && tokens[nameIdx].type === "ident") {
             const clsName = tokens[nameIdx].value;
-            let scan = n1 + 1;
-            let pD = 0;
-            let bD = 0;
-            let openBody = tokens.length - 1;
-            while (scan < tokens.length) {
-              if (tokens[scan].value === "(") pD += 1;
-              else if (tokens[scan].value === ")") pD = Math.max(0, pD - 1);
-              else if (tokens[scan].value === "[") bD += 1;
-              else if (tokens[scan].value === "]") bD = Math.max(0, bD - 1);
-              else if (pD === 0 && bD === 0 && tokens[scan].value === "{") {
-                openBody = scan;
-                break;
-              }
-              scan += 1;
-            }
-            const closeBody = findMatchingBrace(tokens, openBody);
-            edits.push({ start: t.start, end: kw1.start, text: "" });
-            edits.push({
-              start: tokens[closeBody].end,
-              end: tokens[closeBody].end,
-              text: ` __studioExport(exports, ${JSON.stringify(clsName)}, function() { return ${clsName}; });`
-            });
-          } else {
-            edits.push({ start: t.start, end: kw1.start, text: "" });
+            hoistedExports.push({ local: clsName, exported: clsName });
+            liveExportNames.add(clsName);
           }
+          edits.push({ start: t.start, end: kw1.start, text: "" });
           prevSig = i;
           continue;
         }
@@ -1110,11 +2141,10 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
         if (kw1.type === "ident" && (kw1.value === "const" || kw1.value === "let" || kw1.value === "var")) {
           const decl = parseVarDeclBindingsAndEnd(tokens, n1, source.length);
           edits.push({ start: t.start, end: kw1.start, text: "" });
-          if (decl.names.length > 0) {
-            const bindCalls = decl.names
-              .map((n) => `__studioExport(exports, ${JSON.stringify(n)}, function() { return ${n}; });`)
-              .join(" ");
-            edits.push({ start: decl.endOffset, end: decl.endOffset, text: ` ${bindCalls}` });
+          edits.push({ start: decl.endOffset, end: decl.endOffset, text: "; __studioNotify(exports);" });
+          for (const name of decl.names) {
+            hoistedExports.push({ local: name, exported: name });
+            liveExportNames.add(name);
           }
           i = Math.max(i, decl.nextTokenIdx - 1);
           prevSig = i;
@@ -1132,6 +2162,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
   for (const edit of edits) {
     body = body.slice(0, edit.start) + edit.text + body.slice(edit.end);
   }
+  const rewrittenBody = rewriteLiveExportWritesInCode(body, liveExportNames);
 
   const head = hoistedExports
     .map((e) => `__studioExport(exports, ${JSON.stringify(e.exported)}, function() { return ${e.local}; });`)
@@ -1142,7 +2173,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
 
   const parts = [];
   if (head) parts.push(head);
-  parts.push(body);
+  parts.push(rewrittenBody);
   if (tail) parts.push(tail);
   return {
     code: parts.join("\n"),
@@ -1220,7 +2251,7 @@ export function extractModuleDependencyPaths(entryPath, rawCode, allFiles, optio
       if (target && target.path) {
         const targetNorm = normalizePath(target.path);
         discovered.add(targetNorm);
-        if (!visited.has(targetNorm) && typeof target.content === "string") {
+        if (!visited.has(targetNorm) && target.contentLoaded !== false && typeof target.content === "string") {
           queue.push({ path: targetNorm, content: target.content });
         }
       }
@@ -1240,19 +2271,65 @@ export function buildVirtualModuleRuntimeScript() {
   window.__studioRuntimeInit = true;
   window.__studioModules = window.__studioModules || Object.create(null);
   window.__studioCache = window.__studioCache || Object.create(null);
+  window.__studioPending = window.__studioPending || Object.create(null);
   window.__studioExt = window.__studioExt || Object.create(null);
+  var liveWatchers = typeof WeakMap === "function" ? new WeakMap() : null;
+  function notifyModule(exports) {
+    if (!exports || !liveWatchers) return;
+    var list = liveWatchers.get(exports);
+    if (!list) return;
+    for (var i = 0; i < list.length; i += 1) {
+      try { list[i](); } catch (_) {}
+    }
+  }
+  function subscribeModule(mod, fn) {
+    if (!mod || typeof mod !== "object" || !liveWatchers) return;
+    var list = liveWatchers.get(mod);
+    if (!list) {
+      list = [];
+      liveWatchers.set(mod, list);
+    }
+    list.push(fn);
+  }
+  window.__studioNotify = notifyModule;
+  window.__studioBind = function (mod, key, setter) {
+    var push = function () {
+      if (!mod || (typeof mod !== "object" && typeof mod !== "function")) return;
+      var val;
+      try {
+        val = key === "__default_interop__" ? window.__studioInteropDefault(mod) : mod[key];
+      } catch (_) {
+        return;
+      }
+      try { setter(val); } catch (_) {}
+    };
+    push();
+    subscribeModule(mod, push);
+  };
+  window.__studioBindReexport = function (exports, srcMod) {
+    subscribeModule(srcMod, function () { notifyModule(exports); });
+  };
   window.__studioExport = function (exports, name, getter) {
     Object.defineProperty(exports, name, { enumerable: true, configurable: true, get: getter });
   };
   window.__studioExportStar = function (exports, mod) {
     if (!mod || typeof mod !== "object") return;
-    Object.keys(mod).forEach(function (k) {
-      if (k === "default" || k === "__esModule") return;
-      Object.defineProperty(exports, k, {
-        enumerable: true,
-        configurable: true,
-        get: function () { return mod[k]; }
+    function syncKeys() {
+      Object.keys(mod).forEach(function (k) {
+        if (k === "default" || k === "__esModule") return;
+        if (!Object.prototype.hasOwnProperty.call(exports, k)) {
+          Object.defineProperty(exports, k, {
+            enumerable: true,
+            configurable: true,
+            get: function () { return mod[k]; }
+          });
+        }
       });
+    }
+    syncKeys();
+    subscribeModule(mod, function () {
+      syncKeys();
+      notifyModule(exports);
     });
   };
   window.__studioInteropDefault = function (mod) {
@@ -1278,9 +2355,17 @@ export function buildVirtualModuleRuntimeScript() {
     module.exports.__esModule = true;
     window.__studioCache[id] = module;
     factory(window.__studioRequire, module, module.exports);
+    notifyModule(module.exports);
     return module.exports;
   };
-  window.__studioRequireAsync = async function (id) {
+  window.__studioRequireAsync = async function (id, ancestors) {
+    var chain = ancestors || Object.create(null);
+    if (Object.prototype.hasOwnProperty.call(window.__studioPending, id)) {
+      if (chain[id] && Object.prototype.hasOwnProperty.call(window.__studioCache, id)) {
+        return window.__studioCache[id].exports;
+      }
+      return await window.__studioPending[id];
+    }
     if (Object.prototype.hasOwnProperty.call(window.__studioCache, id)) {
       return window.__studioCache[id].exports;
     }
@@ -1291,8 +2376,26 @@ export function buildVirtualModuleRuntimeScript() {
     var module = { exports: Object.create(null) };
     module.exports.__esModule = true;
     window.__studioCache[id] = module;
-    await factory(window.__studioRequireAsync, module, module.exports);
-    return module.exports;
+    var nextChain = Object.create(null);
+    Object.keys(chain).forEach(function (k) { nextChain[k] = true; });
+    nextChain[id] = true;
+    var scopedRequire = function (depId) {
+      return window.__studioRequireAsync(depId, nextChain);
+    };
+    var initPromise = (async function () {
+      try {
+        await factory(scopedRequire, module, module.exports, scopedRequire);
+        notifyModule(module.exports);
+        return module.exports;
+      } catch (err) {
+        delete window.__studioCache[id];
+        throw err;
+      } finally {
+        delete window.__studioPending[id];
+      }
+    })();
+    window.__studioPending[id] = initPromise;
+    return await initPromise;
   };
 })();`;
 }
@@ -1365,7 +2468,7 @@ export function buildVirtualModuleBundle({
       anyTopLevelAwait = true;
     }
 
-    for (const spec of [...usage.staticImports, ...usage.dynamicLocalImports]) {
+    for (const spec of usage.staticImports) {
       if (isRelativeModuleSpecifier(spec)) {
         const target = resolveLocalModuleEntry(spec, node.id, exactMap, { allowParentTraversal });
         if (target) {
@@ -1374,8 +2477,19 @@ export function buildVirtualModuleBundle({
             queue.push({ id: targetId, content: target.content, ext: getFileExtension(targetId) });
           }
         }
-      } else if (/^https?:\/\//i.test(spec)) {
+      } else if (/^(?:https?:|data:|blob:)/i.test(spec)) {
         externalSet.add(spec);
+      }
+    }
+    for (const spec of usage.dynamicLocalImports) {
+      if (isRelativeModuleSpecifier(spec)) {
+        const target = resolveLocalModuleEntry(spec, node.id, exactMap, { allowParentTraversal });
+        if (target) {
+          const targetId = normalizePath(target.path);
+          if (!visited.has(targetId)) {
+            queue.push({ id: targetId, content: target.content, ext: getFileExtension(targetId) });
+          }
+        }
       }
     }
 
@@ -1433,11 +2547,12 @@ export function buildVirtualModuleBundle({
     };
 
     const rewritten = rewriteEsModuleToRegistry(node.jsCode, resolveDep, {
-      useAsyncRequire: anyTopLevelAwait
+      useAsyncRequire: anyTopLevelAwait,
+      moduleId: node.id
     });
-    const safeBody = safeTransformJs(rewritten.code, false).replace(/<\/script>/gi, "<\\/script>");
+    const safeBody = safeTransformJs(rewritten.code, false).replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
     const fnHeader = anyTopLevelAwait
-      ? `async function (__studioRequire, module, exports)`
+      ? `async function (__studioRequire, module, exports, __studioRequireAsync)`
       : `function (__studioRequire, module, exports)`;
     compiledModules.push(`__studioDefine(${idLit}, ${fnHeader} {\n${safeBody}\n});`);
   }
@@ -1478,8 +2593,8 @@ export function formatVirtualModuleExecution(bundle) {
     : `__studioRequire(${JSON.stringify(bundle.entryId)});`;
   parts.push(execCall);
 
-  const extImportPreamble = extParts.join("\n").replace(/<\/script>/gi, "<\\/script>");
-  const bodyCode = parts.join("\n").replace(/<\/script>/gi, "<\\/script>");
+  const extImportPreamble = extParts.join("\n").replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
+  const bodyCode = parts.join("\n").replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
 
   return {
     isModuleTag: needsModuleTag,

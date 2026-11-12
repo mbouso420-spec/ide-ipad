@@ -923,7 +923,7 @@
 /* Menú contextual flotante para pulsación prolongada y click secundario */
 .tree-context-menu {
   position: fixed;
-  z-index: var(--z-dropdown);
+  z-index: calc(var(--z-modal) + 10);
   min-width: 170px;
   background: var(--color-paper-2);
   border: var(--rule-hair) solid var(--color-rule-strong);
@@ -1086,11 +1086,16 @@
 .c-stdin-summary {
   cursor: pointer;
   user-select: none;
-  outline: none;
   display: flex;
   align-items: center;
   gap: var(--space-2xs);
   padding: 4px 0;
+  border-radius: var(--radius-control);
+}
+
+.c-stdin-summary:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
 
 .c-stdin-card {
@@ -1118,7 +1123,7 @@
 }
 
 .c-stdin-help {
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
   color: var(--color-muted);
 }
 
@@ -1171,10 +1176,10 @@
 }
 
 .c-terminal-prompt-sym {
-  font-family: var(--font-code);
+  font-family: var(--font-outlier);
   font-size: var(--text-sm);
   font-weight: 700;
-  color: var(--color-brand);
+  color: var(--color-accent-text);
   user-select: none;
 }
 
@@ -1191,8 +1196,18 @@
 }
 
 .c-terminal-input:focus-visible {
-  border-color: var(--color-brand);
-  box-shadow: 0 0 0 2px var(--color-brand-glow);
+  border-color: var(--color-focus);
+  box-shadow: 0 0 0 2px var(--color-accent-soft);
+}
+
+@media (pointer: coarse) {
+  .inline-edit-input,
+  .explorer-project-select,
+  .preview-repl-input,
+  .c-stdin-textarea,
+  .c-terminal-input {
+    font-size: var(--text-touch-input);
+  }
 }
 
 .c-term-user-line {

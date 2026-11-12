@@ -76,18 +76,18 @@
 
   /* Bordes y divisores de 1px */
   --color-rule: oklch(33% 0.016 255 / 0.65);
-  --color-rule-strong: oklch(43% 0.018 255 / 0.85);
+  --color-rule-strong: oklch(55% 0.018 255 / 0.85);
 
   /* Acento Azul Cobalto y estados semánticos */
-  --color-accent: oklch(52% 0.165 252);
-  --color-accent-hover: oklch(57% 0.165 252);
+  --color-accent: oklch(50% 0.135 252);
+  --color-accent-hover: oklch(54% 0.135 252);
   --color-accent-soft: oklch(62% 0.155 252 / 0.18);
   --color-accent-text: oklch(74% 0.13 252);
   --color-accent-ink: oklch(98% 0.005 252);
   --color-focus: oklch(72% 0.145 252);
 
-  --color-error: oklch(62% 0.18 25);
-  --color-error-soft: oklch(62% 0.18 25 / 0.15);
+  --color-error: oklch(73% 0.145 25);
+  --color-error-soft: oklch(56% 0.15 25 / 0.13);
   --color-success: oklch(66% 0.14 152);
   --color-success-soft: oklch(66% 0.14 152 / 0.15);
   --color-warning: oklch(74% 0.14 75);
@@ -171,13 +171,13 @@
   --syn-comment: oklch(60% 0.03 285);
 
   --color-rule: oklch(34% 0.025 285 / 0.65);
-  --color-rule-strong: oklch(44% 0.03 285 / 0.85);
+  --color-rule-strong: oklch(57% 0.028 285 / 0.85);
 
   --color-accent: oklch(70% 0.17 325);
   --color-accent-hover: oklch(75% 0.17 325);
   --color-accent-soft: oklch(70% 0.17 325 / 0.18);
   --color-accent-text: oklch(80% 0.14 325);
-  --color-accent-ink: oklch(98% 0.01 325);
+  --color-accent-ink: oklch(15% 0.02 285);
   --color-focus: oklch(74% 0.16 325);
 }
 
@@ -197,7 +197,7 @@
   --color-ink: oklch(94% 0.01 245);
   --color-ink-2: oklch(82% 0.015 245);
   --color-muted: oklch(66% 0.02 245);
-  --color-gutter-ink: oklch(58% 0.02 245);
+  --color-gutter-ink: oklch(62% 0.02 245);
 
   --syn-keyword: oklch(70% 0.12 235);
   --syn-type: oklch(75% 0.11 210);
@@ -207,10 +207,10 @@
   --syn-operator: oklch(70% 0.12 235);
   --syn-tag: oklch(70% 0.12 235);
   --syn-attr: oklch(76% 0.12 220);
-  --syn-comment: oklch(56% 0.025 245);
+  --syn-comment: oklch(61% 0.022 245);
 
   --color-rule: oklch(33% 0.02 245 / 0.65);
-  --color-rule-strong: oklch(42% 0.025 245 / 0.85);
+  --color-rule-strong: oklch(58% 0.022 245 / 0.85);
 
   --color-accent: oklch(72% 0.11 220);
   --color-accent-hover: oklch(76% 0.11 220);
@@ -236,7 +236,7 @@
   --color-ink: oklch(95% 0.008 80);
   --color-ink-2: oklch(80% 0.01 80);
   --color-muted: oklch(65% 0.012 80);
-  --color-gutter-ink: oklch(58% 0.012 80);
+  --color-gutter-ink: oklch(61% 0.012 80);
 
   --syn-keyword: oklch(68% 0.22 15);
   --syn-type: oklch(76% 0.15 200);
@@ -246,10 +246,10 @@
   --syn-operator: oklch(68% 0.22 15);
   --syn-tag: oklch(68% 0.22 15);
   --syn-attr: oklch(80% 0.18 135);
-  --syn-comment: oklch(55% 0.015 80);
+  --syn-comment: oklch(60% 0.014 80);
 
   --color-rule: oklch(32% 0.012 60 / 0.65);
-  --color-rule-strong: oklch(42% 0.015 60 / 0.85);
+  --color-rule-strong: oklch(57% 0.014 60 / 0.85);
 
   --color-accent: oklch(80% 0.16 95);
   --color-accent-hover: oklch(85% 0.16 95);

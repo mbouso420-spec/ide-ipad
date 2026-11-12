@@ -45,92 +45,347 @@ export function escapeRegExp(str) {
  *   error: string | null
  * }}
  */
+const MAX_LINE_SNIPPET_LENGTH = 300;
+const SNIPPET_MATCH_LEADING_CONTEXT = 60;
+const WILDCARD_EQUIV_CLASSES = new Set(["[\\s\\S]", "[\\S\\s]", "[\\w\\W]", "[\\W\\w]", "[\\d\\D]", "[\\D\\d]"]);
+const SAMPLE_OVERLAP_CHARS = (() => {
+  const chars = ["\t", "\n"];
+  for (let code = 32; code <= 126; code += 1) {
+    chars.push(String.fromCharCode(code));
+  }
+  return chars;
+})();
+
+function classifyEscapeAtom(escaped) {
+  if ("wWdDsS".includes(escaped)) {
+    return { type: "atom", kind: "shorthand", value: escaped };
+  }
+  return { type: "atom", kind: "lit", value: escaped };
+}
+
+function skipGroupHeader(src, lparenIndex) {
+  const afterParen = lparenIndex + 1;
+  if (src[afterParen] !== "?") {
+    return afterParen;
+  }
+  const mod = src[afterParen + 1];
+  if (mod === ":" || mod === "=" || mod === "!") {
+    return afterParen + 2;
+  }
+  if (mod === "<") {
+    const afterLt = src[afterParen + 2];
+    if (afterLt === "=" || afterLt === "!") {
+      return afterParen + 3;
+    }
+    const closeGt = src.indexOf(">", afterParen + 2);
+    if (closeGt !== -1 && !/[()]/.test(src.slice(afterParen + 2, closeGt))) {
+      return closeGt + 1;
+    }
+  }
+  if (mod === "P" && src[afterParen + 2] === "<") {
+    const closeGt = src.indexOf(">", afterParen + 3);
+    if (closeGt !== -1 && !/[()]/.test(src.slice(afterParen + 3, closeGt))) {
+      return closeGt + 1;
+    }
+  }
+  const flagMatch = /^[a-z-]+:/i.exec(src.slice(afterParen + 1));
+  if (flagMatch) {
+    return afterParen + 1 + flagMatch[0].length;
+  }
+  return afterParen + 1;
+}
+
+function tokenizeRegexPattern(src) {
+  const tokens = [];
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (ch === "\\") {
+      const next = src[i + 1] ?? "";
+      i += 1;
+      if (next === "b" || next === "B") {
+        tokens.push({ type: "anchor" });
+      } else {
+        tokens.push(classifyEscapeAtom(next));
+      }
+      continue;
+    }
+    if (ch === "[") {
+      let end = i + 1;
+      if (src[end] === "^") end += 1;
+      if (src[end] === "]") end += 1;
+      while (end < src.length) {
+        if (src[end] === "\\") {
+          end += 2;
+          continue;
+        }
+        if (src[end] === "]") break;
+        end += 1;
+      }
+      const rawClass = src.slice(i, end < src.length ? end + 1 : src.length);
+      i = end < src.length ? end : src.length - 1;
+      if (WILDCARD_EQUIV_CLASSES.has(rawClass)) {
+        tokens.push({ type: "atom", kind: "wildcard", value: "." });
+      } else {
+        tokens.push({ type: "atom", kind: "class", value: rawClass });
+      }
+      continue;
+    }
+    if (ch === "(") {
+      tokens.push({ type: "lparen" });
+      i = skipGroupHeader(src, i) - 1;
+      continue;
+    }
+    if (ch === ")") {
+      tokens.push({ type: "rparen" });
+      continue;
+    }
+    if (ch === "|") {
+      tokens.push({ type: "alt" });
+      continue;
+    }
+    if (ch === "^" || ch === "$") {
+      tokens.push({ type: "anchor" });
+      continue;
+    }
+    if (ch === "+" || ch === "*") {
+      if (src[i + 1] === "?") i += 1;
+      tokens.push({ type: "quant" });
+      continue;
+    }
+    if (ch === "?") {
+      tokens.push({ type: "optional" });
+      continue;
+    }
+    if (ch === "{") {
+      const braceMatch = /^\{(\d+)(?:,(\d*))?\}/.exec(src.slice(i));
+      if (braceMatch) {
+        i += braceMatch[0].length - 1;
+        if (src[i + 1] === "?") i += 1;
+        const min = Number(braceMatch[1]);
+        const maxStr = braceMatch[2];
+        const isVariableOrMulti = maxStr !== undefined || min > 1;
+        if (maxStr === "1" && min === 0) {
+          tokens.push({ type: "optional" });
+        } else if (isVariableOrMulti && !(maxStr === undefined && min === 1)) {
+          tokens.push({ type: "quant" });
+        }
+        continue;
+      }
+    }
+    if (ch === ".") {
+      tokens.push({ type: "atom", kind: "wildcard", value: "." });
+    } else {
+      tokens.push({ type: "atom", kind: "lit", value: ch });
+    }
+  }
+  return tokens;
+}
+
+function atomMatchesChar(atom, ch) {
+  if (atom.kind === "wildcard") return ch !== "\n";
+  if (atom.kind === "lit") return atom.value === ch;
+  if (atom.kind === "shorthand") {
+    switch (atom.value) {
+      case "d": return /\d/.test(ch);
+      case "D": return /\D/.test(ch);
+      case "w": return /\w/.test(ch);
+      case "W": return /\W/.test(ch);
+      case "s": return /\s/.test(ch);
+      case "S": return /\S/.test(ch);
+      default: return true;
+    }
+  }
+  if (atom.kind === "class") {
+    try {
+      return new RegExp(`^${atom.value}$`).test(ch);
+    } catch {
+      return true;
+    }
+  }
+  return true;
+}
+
+function atomsCanOverlap(a, b) {
+  if (!a || !b) return false;
+  if (a.type === "alt-group") {
+    return a.atoms.some((inner) => atomsCanOverlap(inner, b));
+  }
+  if (b.type === "alt-group") {
+    return b.atoms.some((inner) => atomsCanOverlap(a, inner));
+  }
+  if (a.kind === "wildcard" || b.kind === "wildcard") return true;
+  if (a.kind === "lit") return atomMatchesChar(b, a.value);
+  if (b.kind === "lit") return atomMatchesChar(a, b.value);
+  if (a.kind === b.kind && a.value === b.value) return true;
+  return SAMPLE_OVERLAP_CHARS.some((ch) => atomMatchesChar(a, ch) && atomMatchesChar(b, ch));
+}
+
+function anyAtomOverlaps(listA, listB) {
+  if (!listA?.length || !listB?.length) return false;
+  return listA.some((a) => listB.some((b) => atomsCanOverlap(a, b)));
+}
+
+function branchesTokensOverlap(branchA, branchB) {
+  if (branchA.length === 0 || branchB.length === 0) return false;
+  const minLen = Math.min(branchA.length, branchB.length);
+  for (let idx = 0; idx < minLen; idx += 1) {
+    if (!atomsCanOverlap(branchA[idx], branchB[idx])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function groupHasOverlappingBranches(branches) {
+  if (branches.length < 2) return false;
+  for (let a = 0; a < branches.length; a += 1) {
+    for (let b = a + 1; b < branches.length; b += 1) {
+      if (branchesTokensOverlap(branches[a], branches[b])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function createFrame(isRoot = false) {
+  return {
+    isRoot,
+    hasQuantifier: false,
+    hasAlternationOverlap: false,
+    branches: [[]],
+    prevQuantified: null,
+    startsWithQuantified: false,
+    leadingQuantified: null,
+    sawFirstToken: false
+  };
+}
+
 /**
  * Detecta patrones de expresiones regulares susceptibles a Catastrophic Backtracking (ReDoS):
  * 1. Cuantificadores anidados a cualquier nivel de paréntesis: (a+)+, ((a)+)+, (a{1,5})+, ([a-z]+)*
- * 2. Alternancias solapadas o duplicadas dentro de grupos cuantificados: (a|a)+, (a|ab)+, (ab|a)*
+ * 2. Cuantificadores adyacentes solapados en raíz u otro nivel: .*.*!$, a+a+!$
+ * 3. Alternancias solapadas o con comodines dentro de grupos cuantificados: (a|a)+, (a|ab)+, (b|.)+, (?<g>a|ab)+
  * @param {string} rawPattern
  * @returns {boolean}
  */
 export function hasUnsafeReDoSPattern(rawPattern) {
   const src = String(rawPattern || "");
-  // Reemplazar escapes y clases de caracteres [...] por un token neutro 'a'
-  let normalized = "";
-  let inCharClass = false;
-  for (let i = 0; i < src.length; i += 1) {
-    const ch = src[i];
-    if (ch === "\\") {
-      normalized += "a";
-      i += 1;
-      continue;
-    }
-    if (inCharClass) {
-      if (ch === "]") {
-        inCharClass = false;
-        normalized += "a";
-      }
-      continue;
-    }
-    if (ch === "[") {
-      inCharClass = true;
-      continue;
-    }
-    normalized += ch;
-  }
+  const tokens = tokenizeRegexPattern(src);
+  const frames = [createFrame(true)];
 
-  const isRepetitionAt = (str, idx) => {
-    const c = str[idx];
-    return c === "+" || c === "*" || c === "{";
-  };
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    const current = frames[frames.length - 1];
 
-  // Analizar grupos con pila para detectar cuantificadores anidados y alternancias solapadas
-  const stack = [];
-  for (let i = 0; i < normalized.length; i += 1) {
-    const ch = normalized[i];
-    if (ch === "(") {
-      // Ignorar prefijos de grupo como ?:, ?=, ?!
-      let startIdx = i + 1;
-      if (normalized[startIdx] === "?") {
-        startIdx += 2;
+    if (tok.type === "anchor" || tok.type === "quant" || tok.type === "optional") {
+      continue;
+    }
+
+    if (tok.type === "alt") {
+      current.branches.push([]);
+      current.prevQuantified = null;
+      current.sawFirstToken = false;
+      continue;
+    }
+
+    if (tok.type === "lparen") {
+      frames.push(createFrame(false));
+      continue;
+    }
+
+    if (tok.type === "rparen") {
+      if (frames.length <= 1) continue;
+      const group = frames.pop();
+      const parent = frames[frames.length - 1];
+      const nextTok = tokens[i + 1];
+      const groupQuantified = nextTok?.type === "quant";
+      const groupOptional = nextTok?.type === "optional";
+      if (groupQuantified || groupOptional) {
+        i += 1;
       }
-      stack.push({ hasQuantifier: false, startIdx });
-    } else if (ch === ")") {
-      const group = stack.pop();
-      if (!group) continue;
-      const groupBody = normalized.slice(group.startIdx, i);
-      const groupQuantified = isRepetitionAt(normalized, i + 1);
+
+      const branchOverlap = groupHasOverlappingBranches(group.branches);
+      const hasNestedOverlap = group.hasAlternationOverlap || branchOverlap;
 
       if (groupQuantified) {
-        if (group.hasQuantifier) {
+        if (group.hasQuantifier || hasNestedOverlap) {
           return true;
         }
-        // Verificar alternancias solapadas en grupo cuantificado: ej. (a|a)+ o (a|ab)+
-        if (groupBody.includes("|")) {
-          const branches = groupBody
-            .split("|")
-            .map((b) => b.replace(/[()?:^$]/g, "").trim())
-            .filter(Boolean);
-          for (let a = 0; a < branches.length; a += 1) {
-            for (let b = a + 1; b < branches.length; b += 1) {
-              if (
-                branches[a] === branches[b] ||
-                branches[a].startsWith(branches[b]) ||
-                branches[b].startsWith(branches[a])
-              ) {
-                return true;
-              }
-            }
+        parent.hasQuantifier = true;
+        const groupAtoms = group.branches.flat();
+        if (groupAtoms.length > 0) {
+          if (anyAtomOverlaps(parent.prevQuantified, groupAtoms)) {
+            return true;
+          }
+          parent.prevQuantified = groupAtoms;
+          if (!parent.sawFirstToken) {
+            parent.startsWithQuantified = true;
+            parent.leadingQuantified = groupAtoms;
           }
         }
+        parent.sawFirstToken = true;
+        const branch = parent.branches[parent.branches.length - 1];
+        if (group.branches.length === 1) {
+          branch.push(...group.branches[0]);
+        } else if (groupAtoms.length > 0) {
+          branch.push({ type: "alt-group", atoms: groupAtoms });
+        }
+        continue;
       }
 
-      if (stack.length > 0 && (group.hasQuantifier || groupQuantified)) {
-        stack[stack.length - 1].hasQuantifier = true;
+      if (group.hasQuantifier) parent.hasQuantifier = true;
+      if (hasNestedOverlap) parent.hasAlternationOverlap = true;
+
+      if (group.startsWithQuantified && anyAtomOverlaps(parent.prevQuantified, group.leadingQuantified)) {
+        return true;
       }
-    } else if (isRepetitionAt(normalized, i)) {
-      if (stack.length > 0) {
-        stack[stack.length - 1].hasQuantifier = true;
+      if (!groupOptional) {
+        if (!parent.sawFirstToken && group.startsWithQuantified) {
+          parent.startsWithQuantified = true;
+          parent.leadingQuantified = group.leadingQuantified;
+        }
+        parent.prevQuantified = group.prevQuantified;
       }
+      parent.sawFirstToken = true;
+
+      const branch = parent.branches[parent.branches.length - 1];
+      if (group.branches.length === 1) {
+        branch.push(...group.branches[0]);
+      } else {
+        const flatAtoms = group.branches.flat();
+        if (flatAtoms.length > 0) {
+          branch.push({ type: "alt-group", atoms: flatAtoms });
+        }
+      }
+      continue;
+    }
+
+    if (tok.type === "atom") {
+      const nextTok = tokens[i + 1];
+      const isQuantified = nextTok?.type === "quant";
+      const isOptional = nextTok?.type === "optional";
+      if (isQuantified || isOptional) {
+        i += 1;
+      }
+
+      const branch = current.branches[current.branches.length - 1];
+      branch.push(tok);
+
+      if (isQuantified) {
+        current.hasQuantifier = true;
+        if (anyAtomOverlaps(current.prevQuantified, [tok])) {
+          return true;
+        }
+        current.prevQuantified = [tok];
+        if (!current.sawFirstToken) {
+          current.startsWithQuantified = true;
+          current.leadingQuantified = [tok];
+        }
+      } else if (!isOptional) {
+        current.prevQuantified = null;
+      }
+      current.sawFirstToken = true;
     }
   }
 
@@ -169,7 +424,7 @@ export function searchInFiles(files, query, options = {}) {
     }
 
     if (matchWholeWord) {
-      pattern = `\\b${pattern}\\b`;
+      pattern = `\\b(?:${pattern})\\b`;
     }
 
     const flags = caseSensitive ? "g" : "gi";
@@ -216,13 +471,36 @@ export function searchInFiles(files, query, options = {}) {
           continue;
         }
 
+        const matchStart = match.index;
+        const matchEnd = matchStart + matchText.length;
+        let snippet = lineText;
+        let start = matchStart;
+        let end = matchEnd;
+
+        if (lineText.length > MAX_LINE_SNIPPET_LENGTH) {
+          const fitsFromStart = matchEnd <= MAX_LINE_SNIPPET_LENGTH;
+          const windowStart = fitsFromStart
+            ? 0
+            : Math.max(0, Math.min(matchStart - SNIPPET_MATCH_LEADING_CONTEXT, lineText.length - MAX_LINE_SNIPPET_LENGTH));
+          const prefix = windowStart > 0 ? "…" : "";
+          const maxBodyLength = MAX_LINE_SNIPPET_LENGTH - prefix.length;
+          const windowEnd = Math.min(lineText.length, windowStart + maxBodyLength);
+          const suffix = windowEnd < lineText.length ? "…" : "";
+          snippet = `${prefix}${lineText.slice(windowStart, windowEnd)}${suffix}`;
+
+          const minSnippetIdx = prefix.length;
+          const maxSnippetIdx = prefix.length + (windowEnd - windowStart);
+          start = Math.max(minSnippetIdx, Math.min(maxSnippetIdx, prefix.length + (matchStart - windowStart)));
+          end = Math.max(start, Math.min(maxSnippetIdx, prefix.length + (matchEnd - windowStart)));
+        }
+
         fileMatches.push({
           line: lineIdx + 1,
           column: match.index + 1,
-          lineText: lineText.length > 300 ? `${lineText.slice(0, 300)}…` : lineText,
+          lineText: snippet,
           matchText,
-          start: match.index,
-          end: match.index + matchText.length
+          start,
+          end
         });
 
         totalMatchesCount++;

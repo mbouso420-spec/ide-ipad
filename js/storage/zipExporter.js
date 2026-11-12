@@ -55,17 +55,34 @@ export function buildZipArchive(files, options = {}) {
   const encoder = new TextEncoder();
   const { dosDate, dosTime } = getDosDateTime(options.date || new Date());
 
-  // Preparar metadatos y convertir contenidos a Uint8Array
-  const entries = [];
-  let totalLocalSize = 0;
-  let totalCentralDirSize = 0;
+  // Preparar metadatos y convertir contenidos a Uint8Array evitando rutas duplicadas
+  const MAX_ZIP_UINT16 = 0xffff;
+  const MAX_ZIP_UINT32 = 0xffffffff;
+  const entriesByPath = new Map();
 
   for (const file of files) {
     if (!file || !file.path) continue;
-    const cleanPath = String(file.path).replace(/^\/+/, "").replace(/\\/g, "/").trim();
+    const rawPath = String(file.path).trim().replace(/\\/g, "/");
+    if (/[\x00-\x1f\x7f]/.test(rawPath)) {
+      throw new Error(`Ruta ZIP inválida (caracteres de control no permitidos): ${file.path}`);
+    }
+    const cleanSegments = [];
+    for (const seg of rawPath.replace(/^\/+/, "").split("/")) {
+      const part = seg.trim();
+      if (!part || part === ".") continue;
+      if (part === "..") {
+        throw new Error(`Ruta ZIP inválida (traversal '..' no permitido): ${file.path}`);
+      }
+      cleanSegments.push(part);
+    }
+    const cleanPath = cleanSegments.join("/");
     if (!cleanPath) continue;
 
     const nameBytes = encoder.encode(cleanPath);
+    if (nameBytes.length > MAX_ZIP_UINT16) {
+      throw new Error(`Ruta ZIP demasiado larga (> 65535 bytes): ${cleanPath}`);
+    }
+
     let dataBytes;
     if (file.content instanceof Uint8Array) {
       dataBytes = file.content;
@@ -74,15 +91,15 @@ export function buildZipArchive(files, options = {}) {
     } else {
       dataBytes = new Uint8Array(0);
     }
+    if (dataBytes.length > MAX_ZIP_UINT32) {
+      throw new Error(`Archivo demasiado grande para PKZIP (> 4 GB): ${cleanPath}`);
+    }
 
     const crc = computeCrc32(dataBytes);
     const localSize = 30 + nameBytes.length + dataBytes.length;
     const centralSize = 46 + nameBytes.length;
 
-    totalLocalSize += localSize;
-    totalCentralDirSize += centralSize;
-
-    entries.push({
+    entriesByPath.set(cleanPath, {
       nameBytes,
       dataBytes,
       crc,
@@ -91,8 +108,28 @@ export function buildZipArchive(files, options = {}) {
     });
   }
 
+  const entries = Array.from(entriesByPath.values());
+  if (entries.length > MAX_ZIP_UINT16) {
+    throw new Error("El archivo ZIP supera el límite máximo de 65535 entradas.");
+  }
+
+  let totalLocalSize = 0;
+  let totalCentralDirSize = 0;
+  for (const entry of entries) {
+    totalLocalSize += entry.localSize;
+    totalCentralDirSize += entry.centralSize;
+  }
+
   const eocdSize = 22;
   const totalBufferSize = totalLocalSize + totalCentralDirSize + eocdSize;
+  if (
+    totalLocalSize > MAX_ZIP_UINT32 ||
+    totalCentralDirSize > MAX_ZIP_UINT32 ||
+    totalBufferSize > MAX_ZIP_UINT32
+  ) {
+    throw new Error("El archivo ZIP supera el límite máximo de 4 GB para formato PKZIP 2.0.");
+  }
+
   const buffer = new Uint8Array(totalBufferSize);
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
@@ -142,8 +179,8 @@ export function buildZipArchive(files, options = {}) {
 
     // Firma Central Directory Header: 0x02014b50
     view.setUint32(currentCentralOffset + 0, 0x02014b50, true);
-    // Versión creada por: 20 (DOS/FAT, ZIP 2.0)
-    view.setUint16(currentCentralOffset + 4, 20, true);
+    // Versión creada por: 0x0314 (UNIX = 3, PKZIP 2.0 = 20) alineada con atributos externos POSIX
+    view.setUint16(currentCentralOffset + 4, 0x0314, true);
     // Versión necesaria para extraer: 20
     view.setUint16(currentCentralOffset + 6, 20, true);
     // Flags: 0x0800 (UTF-8)
@@ -215,5 +252,5 @@ export function downloadZip(zipBytes, filename = "proyecto.zip") {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

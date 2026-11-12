@@ -146,15 +146,15 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
       "En arranque frío no debe descargarse ningún runtime pesado (Pyodide/SQLite/tsc)"
     );
 
-    // Verificar sw.js accesible, versión v29 y API de Cache Storage activa en localhost
+    // Verificar sw.js accesible, versión v30 y API de Cache Storage activa en localhost
     const swAssetOk = await page.evaluate(async () => {
       if (!("serviceWorker" in navigator) || !("caches" in window)) return false;
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v29");
+      return text.includes("studio-ide-shell-v30");
     });
-    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v29");
+    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v30");
 
     // 2. Crear archivos E2E vía IndexedDB, recargar, abrir desde árbol, formatear y comprobar persistencia
     await page.evaluate(async () => {

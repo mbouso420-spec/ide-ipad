@@ -55,6 +55,10 @@ La aplicación organiza el espacio de trabajo en **3 islas ergonómicas**:
 | `Clic central` (trackpad o mouse) | Cierra la pestaña sobre la que se hace clic (`auxclick`) |
 | `Cmd + P` / `Ctrl + P` | Abre la paleta de apertura rápida de archivos |
 | `Cmd + P` seguido de `:número` | Salto directo al número de línea (ej. `app.js:140` o `:45` en el archivo activo) |
+| `Cmd + Shift + F` / `Ctrl + Shift + F` | Búsqueda global de texto y expresiones regulares en todo el proyecto |
+| `Shift + Alt + F` | Formatea e indenta automáticamente el archivo activo (100% offline) |
+| `Cmd/Ctrl + \` | Alterna la vista dividida del editor en dos paneles simultáneos (*Split View*) |
+| `Cmd + ,` / `Ctrl + ,` | Abre el diálogo de Configuración y Atajos de Teclado |
 | `Ctrl + S` / `Cmd + S` | Fuerza el guardado inmediato en `IndexedDB` |
 | `Ctrl + B` / `Cmd + B` | Muestra u oculta el panel lateral del Explorador |
 | `Ctrl + J` / `Cmd + J` | Muestra u oculta el panel lateral del Asistente IA |
@@ -106,7 +110,7 @@ La aplicación organiza el espacio de trabajo en **3 islas ergonómicas**:
 - Por estabilidad y rendimiento en el iPad, las importaciones cuentan con un límite de seguridad de **5 MB por archivo** y detección automática de codificación UTF-8.
 
 ### Monitor de almacenamiento local
-- En la parte inferior del Explorador verás el estado en vivo de tu almacenamiento (`~1.2 MB / 1.5 GB`).
+- En la barra superior del Explorador verás el estado en vivo de tu almacenamiento (`~1.2 MB / 1.5 GB`).
 - Esta cifra se actualiza automáticamente consultando `navigator.storage.estimate()` para que sepas en todo momento cuánto espacio tenés disponible en tu dispositivo.
 
 ---
@@ -182,10 +186,15 @@ En el panel **Asistente**, tocá el icono del **engranaje** para configurar tu p
 3. **OpenRouter (Modelos gratuitos `:free`):** clave en `https://openrouter.ai/keys`.
 4. **Mistral (Gratis — La Plateforme):** clave en `https://console.mistral.ai/api-keys`.
 
-### Migración de claves en un toque (PC a iPad)
-1. En tu PC, abrí el engranaje del chat y tocá **Copiar pack de claves**.
-2. Enviate ese texto a tu iPad (por AirDrop, Notas de iCloud o mensaje).
-3. En el iPad, abrí el engranaje, tocá **Importar pack**, pegá el contenido y tocá **Guardar**. Se configurarán tus APIs de IA y tu token de GitHub automáticamente.
+### Bóveda cifrada AES-GCM 256 y migración de claves (PC a iPad)
+Podés trasladar tus API keys de IA y tu token de GitHub entre dispositivos de forma segura mediante dos opciones:
+
+1. **Bóveda cifrada AES-GCM 256 (Recomendada para archivos y respaldos):**
+   - Abrí **Configuración** (`Cmd/Ctrl + ,`) -> pestaña **Almacenamiento** -> sección **Portabilidad cifrada de credenciales (AES-GCM 256)**.
+   - Ingresá una **contraseña maestra** (mínimo 6 caracteres) y tocá **Exportar bóveda cifrada** para descargar el archivo cifrado `studio-ide-claves.vault.json` (derivación de clave `PBKDF2-SHA256` + cifrado autenticado `AES-GCM 256`).
+   - En tu otro dispositivo (PC o iPad), abrí **Configuración** -> **Almacenamiento**, ingresá la misma contraseña maestra y tocá **Importar bóveda** seleccionando el archivo `.vault.json`. El IDE limpia automáticamente el campo de contraseña tras completar la operación.
+2. **Pack rápido por portapapeles:**
+   - En tu PC, abrí el engranaje del chat y tocá **Copiar pack de claves**; luego envialo a tu iPad (por AirDrop o Notas) y pegalo con **Importar pack**.
 
 ---
 
@@ -242,6 +251,6 @@ Podés usar cualquiera de los dos tipos de token de GitHub:
 
 ### Respaldo en la Nube para Proyectos Locales (Gists Privados y Publicación)
 Si estás trabajando en un proyecto local (guardado en el almacenamiento del iPad) y no querés correr ningún riesgo de perderlo ante limpiezas de caché de Safari:
-* **Respaldo en un toque desde el Explorador:** Tocá el botón con la flecha hacia arriba y la nube (`Respaldar en Gist Privado`) en la barra inferior del explorador. El sistema creará o actualizará automáticamente un **Gist Secreto** en tu cuenta de GitHub con todos los archivos de tu proyecto.
+* **Respaldo en un toque desde el Explorador:** Tocá el botón con la flecha hacia arriba y la nube (`Respaldar en Gist Privado`) en la barra superior del Explorador. El sistema creará o actualizará automáticamente un **Gist Secreto** en tu cuenta de GitHub con todos los archivos de tu proyecto.
 * **Publicar como nuevo Repositorio Privado:** Al abrir la ventana **Repositorio** estando parado en un proyecto local, contás con el botón **Publicar como Repositorio**. Le asignás un nombre y el IDE creará el repositorio privado en tu cuenta de GitHub, subirá todos los archivos en un commit inicial y lo dejará listo para sincronizar con Git.
 * **Restaurar proyectos en cualquier dispositivo:** Si abrís el IDE desde tu PC o desde otro iPad, en la ventana **Repositorio** podés desplegar la lista de tus **Gists respaldados** y tocar **Restaurar** para tener tu proyecto abierto y listo para seguir programando al instante.

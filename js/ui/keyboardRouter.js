@@ -37,12 +37,15 @@ export class KeyboardRouter {
         dialog.__kr_hooked = true;
         dialog.showModal = (...args) => {
           const res = originalShowModal.apply(dialog, args);
+          const modalId = dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`;
+          const existing = this.modalStack.find((m) => m.id === modalId);
           this.pushModal({
-            id: dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`,
             blockGlobalShortcuts: true,
             onEscape: () => {
               if (dialog.open) dialog.close();
-            }
+            },
+            ...existing,
+            id: modalId
           });
           return res;
         };
@@ -87,6 +90,29 @@ export class KeyboardRouter {
    */
   getActiveModal() {
     return this.modalStack[this.modalStack.length - 1] || null;
+  }
+
+  /**
+   * Indica si hay algún modal o <dialog> abierto bloqueando atajos globales.
+   * @param {string | null} [allowedModalId]
+   * @returns {boolean}
+   */
+  shouldBlockGlobalShortcuts(allowedModalId = null) {
+    const activeModal = this.getActiveModal();
+    if (activeModal && activeModal.blockGlobalShortcuts !== false) {
+      if (!allowedModalId || activeModal.id !== allowedModalId) {
+        return true;
+      }
+    }
+    if (typeof document !== "undefined" && typeof document.querySelectorAll === "function") {
+      const openDialogs = document.querySelectorAll("dialog[open]");
+      for (const dlg of openDialogs) {
+        if (!allowedModalId || dlg.id !== allowedModalId) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**

@@ -249,6 +249,7 @@ src/utils.cpp:12:3: warning: unused variable 'unused_x' [-Wunused-variable]
 
       minimap.toggle(true);
       assert.equal(minimap.isVisible(), true);
+      assert.equal(scrolledRatio, null);
 
       minimap.destroy();
     });

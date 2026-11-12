@@ -101,6 +101,12 @@ export function isEncryptedKeyVault(rawText) {
   }
 }
 
+function buildVaultAad(iterations, kdf = "PBKDF2-SHA256", cipher = "AES-GCM-256") {
+  return new TextEncoder().encode(
+    `${VAULT_FORMAT}|${VAULT_VERSION}|${kdf}|${Math.floor(iterations)}|${cipher}`
+  );
+}
+
 /**
  * Cifra una carga JSON de credenciales usando PBKDF2-SHA256 + AES-GCM-256.
  * @param {string} plainJson
@@ -115,6 +121,9 @@ export async function encryptKeysPayload(plainJson, passphrase, options = {}) {
   validatePassphrase(passphrase);
 
   const requestedIterations = Number(options.iterations ?? DEFAULT_PBKDF2_ITERATIONS);
+  if (!Number.isFinite(requestedIterations)) {
+    throw new Error("Parámetros criptográficos inválidos: iteraciones PBKDF2 inválidas.");
+  }
   const iterations = Math.min(
     MAX_PBKDF2_ITERATIONS,
     Math.max(MIN_PBKDF2_ITERATIONS, Math.floor(requestedIterations))
@@ -124,12 +133,16 @@ export async function encryptKeysPayload(plainJson, passphrase, options = {}) {
   const salt = cryptoApi.getRandomValues(new Uint8Array(SALT_BYTES));
   const iv = cryptoApi.getRandomValues(new Uint8Array(IV_BYTES));
 
+  const kdf = "PBKDF2-SHA256";
+  const cipher = "AES-GCM-256";
+  const additionalData = buildVaultAad(iterations, kdf, cipher);
   const aesKey = await deriveAesGcmKey(cryptoApi, passphrase, salt, iterations, ["encrypt"]);
   const plainBytes = new TextEncoder().encode(plainJson);
   const cipherBuffer = await cryptoApi.subtle.encrypt(
     {
       name: "AES-GCM",
-      iv
+      iv,
+      additionalData
     },
     aesKey,
     plainBytes
@@ -139,9 +152,10 @@ export async function encryptKeysPayload(plainJson, passphrase, options = {}) {
     {
       format: VAULT_FORMAT,
       version: VAULT_VERSION,
-      kdf: "PBKDF2-SHA256",
+      kdf,
       iterations,
-      cipher: "AES-GCM-256",
+      cipher,
+      aad: "metadata-v1",
       salt: bytesToBase64(salt),
       iv: bytesToBase64(iv),
       ciphertext: bytesToBase64(new Uint8Array(cipherBuffer)),
@@ -189,6 +203,14 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
     throw new Error("Parámetros criptográficos fuera de rango seguro.");
   }
 
+  if (
+    (parsed.kdf !== undefined && parsed.kdf !== "PBKDF2-SHA256") ||
+    (parsed.cipher !== undefined && parsed.cipher !== "AES-GCM-256") ||
+    (parsed.aad !== undefined && parsed.aad !== "metadata-v1")
+  ) {
+    throw new Error("Parámetros criptográficos de bóveda no compatibles o alterados.");
+  }
+
   let salt;
   let iv;
   let ciphertext;
@@ -205,14 +227,16 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
   }
 
   const cryptoApi = getWebCrypto();
-  const aesKey = await deriveAesGcmKey(cryptoApi, passphrase, salt, Math.floor(iterations), ["decrypt"]);
+  const safeIterations = Math.floor(iterations);
+  const aesKey = await deriveAesGcmKey(cryptoApi, passphrase, salt, safeIterations, ["decrypt"]);
+  const decryptParams = { name: "AES-GCM", iv };
+  if (parsed.aad === "metadata-v1") {
+    decryptParams.additionalData = buildVaultAad(safeIterations, "PBKDF2-SHA256", "AES-GCM-256");
+  }
 
   try {
     const plainBuffer = await cryptoApi.subtle.decrypt(
-      {
-        name: "AES-GCM",
-        iv
-      },
+      decryptParams,
       aesKey,
       ciphertext
     );

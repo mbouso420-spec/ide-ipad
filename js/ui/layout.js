@@ -1,3 +1,5 @@
+import { keyboardRouter } from "./keyboardRouter.js";
+
 const STORAGE_KEYS = {
   leftOpen: "ide.layout.leftOpen",
   rightOpen: "ide.layout.rightOpen",
@@ -37,9 +39,17 @@ export function initLayoutController() {
   applyState();
 
   function applyState() {
+    const compact = isCompact();
     document.body.dataset.leftOpen = String(leftOpen);
     document.body.dataset.rightOpen = String(rightOpen);
-    document.body.dataset.drawerBackdrop = String(isCompact() && (leftOpen || rightOpen));
+    document.body.dataset.drawerBackdrop = String(compact && (leftOpen || rightOpen));
+
+    if (panelLeft) {
+      panelLeft.inert = compact && !leftOpen;
+    }
+    if (panelRight) {
+      panelRight.inert = compact && !rightOpen;
+    }
 
     if (btnLeft) {
       btnLeft.setAttribute("aria-expanded", String(leftOpen));
@@ -118,6 +128,11 @@ export function initLayoutController() {
 
   // Atajos de teclado (Cmd/Ctrl + B para Explorador, Cmd/Ctrl + J para Asistente, Escape para cerrar drawers)
   window.addEventListener("keydown", (event) => {
+    const activeModal = keyboardRouter.getActiveModal();
+    if (activeModal && activeModal.blockGlobalShortcuts !== false) {
+      return;
+    }
+
     const mod = event.metaKey || event.ctrlKey;
     const key = event.key.toLowerCase();
 
@@ -134,6 +149,19 @@ export function initLayoutController() {
     }
 
     if (event.key === "Escape" && isCompact() && (leftOpen || rightOpen)) {
+      if (event.defaultPrevented) {
+        return;
+      }
+      const hasOpenDialog = Boolean(document.querySelector("dialog[open]"));
+      const ctxMenu = document.getElementById("tree-context-menu");
+      const hasOpenContextMenu = Boolean(
+        (ctxMenu && !ctxMenu.hidden) ||
+          document.querySelector(".tree-context-menu:not([hidden])")
+      );
+      const hasActiveRename = Boolean(document.querySelector(".inline-edit-input"));
+      if (hasOpenDialog || hasOpenContextMenu || hasActiveRename) {
+        return;
+      }
       setLeftOpen(false);
       setRightOpen(false);
     }
@@ -167,6 +195,12 @@ export function initLayoutController() {
   bindVisualViewport();
 
   return {
+    isLeftPanelOpen: () => leftOpen,
+    isRightPanelOpen: () => rightOpen,
+    toggleLeftPanel: () => setLeftOpen(!leftOpen),
+    toggleRightPanel: () => setRightOpen(!rightOpen),
+    setLeftOpen,
+    setRightOpen,
     closeLeftOnCompactSelect() {
       if (isCompact() && leftOpen) {
         setLeftOpen(false);
@@ -182,33 +216,48 @@ export function initLayoutController() {
 
 function bindSplitter(handle, side, callbacks = {}) {
   let activePointerId = null;
+  const isLeft = side === "left";
+  const minW = isLeft ? 220 : 260;
+  const storageKey = isLeft ? STORAGE_KEYS.leftWidth : STORAGE_KEYS.rightWidth;
+  const defaultW = isLeft ? 250 : 340;
+  const getMaxW = (viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1200) =>
+    Math.max(
+      minW,
+      isLeft ? Math.min(420, Math.floor(viewportWidth * 0.36)) : Math.min(540, Math.floor(viewportWidth * 0.44))
+    );
+
+  const savedInitialW = Number(safeGetStorage(storageKey));
+  const initialW = clamp(Number.isFinite(savedInitialW) && savedInitialW > 0 ? savedInitialW : defaultW, minW, getMaxW());
 
   handle.setAttribute("role", "separator");
   handle.setAttribute("tabindex", "0");
   handle.setAttribute("aria-orientation", "vertical");
+  handle.setAttribute("aria-valuemin", String(minW));
+  handle.setAttribute("aria-valuemax", String(getMaxW()));
+  handle.setAttribute("aria-valuenow", String(initialW));
   handle.setAttribute(
     "aria-label",
-    side === "left" ? "Divisor de ancho del explorador de archivos" : "Divisor de ancho del panel de asistente"
+    isLeft ? "Divisor de ancho del explorador de archivos" : "Divisor de ancho del panel de asistente"
   );
 
   const applyWidth = (nextWidth) => {
-    if (side === "left") {
+    if (isLeft) {
       document.documentElement.style.setProperty("--left-panel-w", `${nextWidth}px`);
       safeSetStorage(STORAGE_KEYS.leftWidth, String(nextWidth));
     } else {
       document.documentElement.style.setProperty("--right-panel-w", `${nextWidth}px`);
       safeSetStorage(STORAGE_KEYS.rightWidth, String(nextWidth));
     }
+    handle.setAttribute("aria-valuemax", String(getMaxW()));
     handle.setAttribute("aria-valuenow", String(nextWidth));
   };
 
   handle.addEventListener("keydown", (event) => {
     const step = 16;
     const viewportWidth = window.innerWidth;
-    const isLeft = side === "left";
-    const currentW = isLeft
-      ? Number(safeGetStorage(STORAGE_KEYS.leftWidth)) || 256
-      : Number(safeGetStorage(STORAGE_KEYS.rightWidth)) || 360;
+    const maxW = getMaxW(viewportWidth);
+    const savedW = Number(safeGetStorage(storageKey));
+    const currentW = Number.isFinite(savedW) && savedW > 0 ? savedW : defaultW;
 
     let targetW = currentW;
     if (event.key === "ArrowLeft") {
@@ -216,20 +265,15 @@ function bindSplitter(handle, side, callbacks = {}) {
     } else if (event.key === "ArrowRight") {
       targetW = isLeft ? currentW + step : currentW - step;
     } else if (event.key === "Home") {
-      targetW = isLeft ? 190 : 260;
+      targetW = minW;
     } else if (event.key === "End") {
-      targetW = isLeft
-        ? Math.min(420, Math.floor(viewportWidth * 0.36))
-        : Math.min(540, Math.floor(viewportWidth * 0.44));
+      targetW = maxW;
     } else {
       return;
     }
 
     event.preventDefault();
-    const clampedW = isLeft
-      ? clamp(targetW, 190, Math.min(420, Math.floor(viewportWidth * 0.36)))
-      : clamp(targetW, 260, Math.min(540, Math.floor(viewportWidth * 0.44)));
-    applyWidth(clampedW);
+    applyWidth(clamp(targetW, minW, maxW));
   });
 
   handle.addEventListener("pointerdown", (event) => {
@@ -245,7 +289,8 @@ function bindSplitter(handle, side, callbacks = {}) {
     }
 
     const viewportWidth = window.innerWidth;
-    if (side === "left") {
+    const maxW = getMaxW(viewportWidth);
+    if (isLeft) {
       const rawWidth = Math.round(event.clientX - 8);
       if (rawWidth < 140) {
         callbacks.onCollapse?.();
@@ -254,8 +299,7 @@ function bindSplitter(handle, side, callbacks = {}) {
       if (callbacks.isOpen && !callbacks.isOpen()) {
         callbacks.onExpand?.();
       }
-      const nextWidth = clamp(rawWidth, 220, Math.min(420, Math.floor(viewportWidth * 0.36)));
-      applyWidth(nextWidth);
+      applyWidth(clamp(rawWidth, minW, maxW));
     } else {
       const rawWidth = Math.round(viewportWidth - event.clientX - 8);
       if (rawWidth < 160) {
@@ -265,8 +309,7 @@ function bindSplitter(handle, side, callbacks = {}) {
       if (callbacks.isOpen && !callbacks.isOpen()) {
         callbacks.onExpand?.();
       }
-      const nextWidth = clamp(rawWidth, 260, Math.min(540, Math.floor(viewportWidth * 0.44)));
-      applyWidth(nextWidth);
+      applyWidth(clamp(rawWidth, minW, maxW));
     }
   });
 
@@ -295,8 +338,11 @@ function bindSwipeToClose(panel, direction, onClose) {
         return;
       }
       const target = event.target;
-      // No interceptar el scroll horizontal dentro de bloques <pre> de código
-      if (target instanceof Element && target.closest("pre, code, input, textarea")) {
+      // No interceptar gestos sobre campos editables, scroll del editor, pestañas o tablas
+      if (
+        target instanceof Element &&
+        target.closest("pre, code, input, textarea, .cm-scroller, .cm-editor, .tabs-strip, table")
+      ) {
         tracking = false;
         return;
       }
@@ -374,13 +420,13 @@ function restorePanelWidths() {
   const maxRight = Math.min(540, Math.floor(viewportWidth * 0.44));
 
   if (Number.isFinite(leftW) && leftW >= 220) {
-    const clampedL = clamp(leftW, 220, maxLeft);
+    const clampedL = clamp(leftW, 220, Math.max(220, maxLeft));
     document.documentElement.style.setProperty("--left-panel-w", `${clampedL}px`);
   } else {
-    document.documentElement.style.setProperty("--left-panel-w", "256px");
+    document.documentElement.style.setProperty("--left-panel-w", "250px");
   }
   if (Number.isFinite(rightW) && rightW >= 260) {
-    const clampedR = clamp(rightW, 260, maxRight);
+    const clampedR = clamp(rightW, 260, Math.max(260, maxRight));
     document.documentElement.style.setProperty("--right-panel-w", `${clampedR}px`);
   }
 }

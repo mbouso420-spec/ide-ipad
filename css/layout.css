@@ -39,7 +39,7 @@ body[data-keyboard-open="true"] .ide-workspace {
   container-type: inline-size;
   container-name: panel-left;
   width: var(--left-panel-w);
-  min-width: 190px;
+  min-width: 220px;
   flex-shrink: 0;
 }
 
@@ -219,12 +219,10 @@ body[data-keyboard-open="true"] .ide-workspace {
   overflow-wrap: normal !important;
 }
 
-body[data-left-open="false"] .panel-title,
 body[data-left-open="false"] #panel-explorer .panel-title {
   display: none !important;
 }
 
-body[data-right-open="false"] .panel-title,
 body[data-right-open="false"] #panel-assistant .panel-title {
   display: none !important;
 }
@@ -498,19 +496,26 @@ body[data-symbols-visible="false"] .symbol-bar {
 }
 
 .btn-status-action {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   padding: 0;
   background: transparent;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-control);
   color: var(--color-muted);
   cursor: pointer;
   line-height: 1;
   transition: color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.btn-status-action::after {
+  content: "";
+  position: absolute;
+  inset: -6px -4px;
 }
 
 .btn-status-action:hover {
@@ -599,10 +604,15 @@ body[data-symbols-visible="false"] .symbol-bar {
   input,
   select,
   textarea,
+  input.code-font,
+  textarea.code-font,
+  select.code-font,
   .field-control,
   .chat-input,
   .inline-edit-input,
   .explorer-project-select,
+  .preview-repl-input,
+  .editor-split-select,
   .editor-mount .cm-textfield {
     font-size: var(--text-touch-input);
   }
