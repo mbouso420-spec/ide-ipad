@@ -196,10 +196,11 @@ export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
   }
 
   if (includeMedia) {
-    // 3. <img src="...">, <source src="...">, <input src="...">
-    const mediaSrcRegex = /<(?:img|source|input)\b[^>]*src=["']([^"']+)["'][^>]*>/gi;
+    // 3. <img src="...">, <source src="...">, <input src="...">, <video src="...">, <audio src="...">
+    const mediaSrcRegex = /<(?:img|source|input|video|audio)\b[^>]*?(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\1|([^\s"'=<>`]+))[^>]*>/gi;
     while ((match = mediaSrcRegex.exec(rawHtml)) !== null) {
-      if (match[1]) addCandidateRef(match[1]);
+      const ref = match[2] || match[3];
+      if (ref) addCandidateRef(ref);
     }
 
     // 4. srcset="..." en <img> y <source>
@@ -1218,12 +1219,43 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
+  function getMediaMimeType(filePath) {
+    const ext = getFileExtension(filePath || "");
+    switch (ext) {
+      case "mp4":
+      case "m4v":
+        return "video/mp4";
+      case "webm":
+        return "video/webm";
+      case "mov":
+        return "video/quicktime";
+      case "avi":
+        return "video/x-msvideo";
+      case "mkv":
+        return "video/x-matroska";
+      case "ogv":
+        return "video/ogg";
+      case "mp3":
+        return "audio/mpeg";
+      case "wav":
+        return "audio/wav";
+      case "ogg":
+        return "audio/ogg";
+      case "m4a":
+        return "audio/mp4";
+      case "flac":
+        return "audio/flac";
+      default:
+        return getImageMimeType(filePath);
+    }
+  }
+
   function resolveEntryToDataUrl(rawUrl, baseDir = dir) {
     if (!rawUrl || typeof rawUrl !== "string") return null;
     const cleanUrl = rawUrl.trim();
     if (!cleanUrl || /^(https?:|data:|blob:|#|\/\/)/i.test(cleanUrl)) return null;
     const entry = resolveEntryFromDir(cleanUrl, baseDir);
-    return buildEntryDataUrl(entry, cleanUrl, getImageMimeType);
+    return buildEntryDataUrl(entry, cleanUrl, getMediaMimeType);
   }
 
   function inlineSrcsetString(rawSrcset, baseDir = dir) {
@@ -1238,7 +1270,7 @@ export function bundleHtmlWithFolderAssets(
   }
 
   // Incrustar imágenes locales (<img src="..."> o sin comillas) almacenadas en Base64 o SVG dentro del proyecto
-  html = html.replace(/<img\b([^>]*?)\bsrc\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
+  html = html.replace(/<img\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
     const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
     if (dataUrl) {
@@ -1254,11 +1286,13 @@ export function bundleHtmlWithFolderAssets(
     return `srcset=${quote}${inlined}${quote}`;
   });
 
-  // Incrustar fuentes alternativas <source src="...">
-  html = html.replace(/<source\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
+  // Incrustar fuentes alternativas <source src="...">, <video src="..."> y <audio src="...">
+  html = html.replace(/<(source|video|audio)\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\3|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, tagName, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
+    const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
     if (dataUrl) {
-      return `<source${beforeSrc}src=${quote}${dataUrl}${quote}${afterSrc}>`;
+      const outQuote = quote || '"';
+      return `<${tagName}${beforeSrc}src=${outQuote}${dataUrl}${outQuote}${afterSrc}>`;
     }
     return fullTag;
   });

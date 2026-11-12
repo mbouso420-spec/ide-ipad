@@ -476,4 +476,31 @@ describe("Auditoría Comité Multi-Agente — AppSec, Higiene, Ciclo de Vida y S
     });
     assert.equal(cssDeps.includes("sitio/img/mi foto.png"), true);
   });
+
+  test("htmlBundler y CSP soportan video/audio (data:video/mp4) y no confunden data-src con src", () => {
+    const indexHtml = readFileSync(resolve(ROOT, "index.html"), "utf8");
+    assert.equal(/media-src\s+'self'\s+data:\s+https:\s+blob:/i.test(indexHtml), true);
+
+    const files = [
+      { path: "media/clip.mp4", shortName: "clip.mp4", isBinary: true, base64: "AAAAIGZ0eXBpc29t" },
+      { path: "media/clip.webm", shortName: "clip.webm", isBinary: true, base64: "GkXfo59ChoEBQveBAULygQ==" },
+      { path: "img/real.png", shortName: "real.png", isBinary: true, base64: "iVBORw0KGgo=" }
+    ];
+    const map = buildWorkspaceAssetMap(files);
+    const html = [
+      '<video controls src="media/clip.mp4"></video>',
+      '<video controls><source src="media/clip.webm" type="video/webm"></video>',
+      '<img data-src="placeholder.png" src="img/real.png">'
+    ].join("\n");
+
+    const refs = extractReferencedAssetPaths("index.html", html, { includeMedia: true });
+    assert.equal(refs.includes("media/clip.mp4"), true);
+    assert.equal(refs.includes("media/clip.webm"), true);
+    assert.equal(refs.includes("img/real.png"), true);
+
+    const bundled = bundleHtmlWithFolderAssets("index.html", html, map, null, (c) => c, null, true);
+    assert.equal(bundled.includes('src="data:video/mp4;base64,AAAAIGZ0eXBpc29t"'), true);
+    assert.equal(bundled.includes('src="data:video/webm;base64,GkXfo59ChoEBQveBAULygQ=="'), true);
+    assert.equal(bundled.includes('data-src="placeholder.png" src="data:image/png;base64,iVBORw0KGgo="'), true);
+  });
 });

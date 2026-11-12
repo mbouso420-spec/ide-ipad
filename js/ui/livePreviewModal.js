@@ -233,13 +233,38 @@ export function initLivePreviewModal({
   }
 
   function buildFilesByNormPathMap(allFiles) {
-    const map = new Map();
+    const exactMap = new Map();
+    const lowerMap = new Map();
+    const shortNameEntries = [];
+    const shortNameCounts = new Map();
     for (const f of allFiles || []) {
       if (f && f.path) {
-        map.set(normalizePath(f.path), f);
+        const norm = normalizePath(f.path);
+        exactMap.set(norm, f);
+        const lower = norm.toLowerCase();
+        if (!lowerMap.has(lower)) {
+          lowerMap.set(lower, f);
+        }
+        const baseName = f.shortName || norm.split("/").pop();
+        if (baseName) {
+          const baseLower = baseName.toLowerCase();
+          shortNameCounts.set(baseLower, (shortNameCounts.get(baseLower) || 0) + 1);
+          shortNameEntries.push([baseName, baseLower, f]);
+        }
       }
     }
-    return map;
+    for (const [baseName, baseLower, f] of shortNameEntries) {
+      if (shortNameCounts.get(baseLower) === 1) {
+        if (!exactMap.has(baseName)) exactMap.set(baseName, f);
+        if (!lowerMap.has(baseLower)) lowerMap.set(baseLower, f);
+      }
+    }
+    return {
+      get(normPath) {
+        if (!normPath) return null;
+        return exactMap.get(normPath) || lowerMap.get(String(normPath).toLowerCase()) || null;
+      }
+    };
   }
 
   function collectDirectDependencies(file, allFiles) {
