@@ -54,6 +54,7 @@ La aplicación organiza el espacio de trabajo en **3 islas ergonómicas**:
 | `Alt + W` / `Cmd + W` / `Ctrl + W` | Cierra la pestaña activa (con confirmación si tiene cambios pendientes) |
 | `Clic central` (trackpad o mouse) | Cierra la pestaña sobre la que se hace clic (`auxclick`) |
 | `Cmd + P` / `Ctrl + P` | Abre la paleta de apertura rápida de archivos |
+| `Cmd + K` / `Ctrl + K` | Abre la Paleta de Comandos global (escribí `>` para listar y ejecutar acciones del editor) |
 | `Cmd + P` seguido de `:número` | Salto directo al número de línea (ej. `app.js:140` o `:45` en el archivo activo) |
 | `Cmd + Shift + F` / `Ctrl + Shift + F` | Búsqueda global de texto y expresiones regulares en todo el proyecto |
 | `Shift + Alt + F` | Formatea e indenta automáticamente el archivo activo (100% offline) |

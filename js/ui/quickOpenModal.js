@@ -29,7 +29,12 @@ export function parseQuickOpenQuery(rawQuery) {
  * Paleta de apertura rápida de archivos (Cmd/Ctrl + P y botón de búsqueda en el Explorador),
  * ideal para saltar en un toque a cualquier archivo de un repositorio grande en el iPad o PC.
  */
-export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
+export function initQuickOpenModal({
+  getFiles,
+  getActiveFile,
+  onSelectFile,
+  getCommands
+}) {
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = controller ? { signal: controller.signal } : undefined;
   const openBtn = document.getElementById("btn-quick-open");
@@ -42,14 +47,14 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
   let activeIndex = 0;
   let currentTargetLine = null;
 
-  function open() {
+  function open(initialPrefix = "") {
     if (!dialog) return;
     if (input) {
-      input.value = "";
+      input.value = initialPrefix;
     }
     activeIndex = 0;
     currentTargetLine = null;
-    renderResults("");
+    renderResults(initialPrefix);
     if (!dialog.open) {
       dialog.showModal();
     }
@@ -59,7 +64,7 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
       onEscape: () => close(),
       onKey: (event) => {
         const key = typeof event?.key === "string" ? event.key.toLowerCase() : "";
-        if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && key === "p") {
+        if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && (key === "p" || key === "k")) {
           event.preventDefault();
           close();
           return true;
@@ -67,8 +72,14 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
         return false;
       }
     });
-    window.requestAnimationFrame(() => {
+    const scheduleFocus = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
+      ? (cb) => window.requestAnimationFrame(cb)
+      : (cb) => setTimeout(cb, 0);
+    scheduleFocus(() => {
       input?.focus();
+      if (initialPrefix && typeof input?.setSelectionRange === "function") {
+        input.setSelectionRange(initialPrefix.length, initialPrefix.length);
+      }
     });
   }
 
@@ -77,7 +88,7 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
     dialog?.close();
   }
 
-  openBtn?.addEventListener("click", () => open(), listenOpts);
+  openBtn?.addEventListener("click", () => open(""), listenOpts);
   closeBtn?.addEventListener("click", () => close(), listenOpts);
 
   dialog?.addEventListener("click", (event) => {
@@ -112,20 +123,31 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
       event.preventDefault();
       const chosen = filtered[activeIndex];
       if (chosen) {
-        pickFile(chosen.path, currentTargetLine);
+        if (chosen.kind === "command") {
+          close();
+          try {
+            chosen.cmd.run?.();
+          } catch (err) {
+            console.error("[CommandPalette] Error al ejecutar comando:", err);
+          }
+        } else {
+          pickFile(chosen.file.path, currentTargetLine);
+        }
       }
     }
   }, listenOpts);
 
-  const handleShortcutToggle = () => {
+  const handleShortcutToggle = (prefix = "") => {
     if (dialog?.open) {
       close();
     } else {
-      open();
+      open(prefix);
     }
   };
-  keyboardRouter.registerGlobalShortcut("ctrl+p", handleShortcutToggle);
-  keyboardRouter.registerGlobalShortcut("meta+p", handleShortcutToggle);
+  keyboardRouter.registerGlobalShortcut("ctrl+p", () => handleShortcutToggle(""));
+  keyboardRouter.registerGlobalShortcut("meta+p", () => handleShortcutToggle(""));
+  keyboardRouter.registerGlobalShortcut("ctrl+k", () => handleShortcutToggle(">"));
+  keyboardRouter.registerGlobalShortcut("meta+k", () => handleShortcutToggle(">"));
 
   function pickFile(path, targetLine = currentTargetLine) {
     close();
@@ -134,70 +156,142 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
 
   function renderResults(rawQuery) {
     if (!listEl) return;
-    const allFiles = getFiles() || [];
-    const parsed = parseQuickOpenQuery(rawQuery);
-    currentTargetLine = parsed.targetLine;
-    const query = parsed.fileQuery.toLowerCase();
-    const activeFile = getActiveFile ? getActiveFile() : null;
+    const titleEl = document.getElementById("quick-open-title");
+    const isCommandMode = rawQuery.trim().startsWith(">");
 
-    if (!query) {
-      if (currentTargetLine && activeFile) {
-        const rest = allFiles.filter((f) => f.id !== activeFile.id);
-        filtered = [activeFile, ...rest].slice(0, 50);
+    if (titleEl) {
+      titleEl.textContent = isCommandMode ? "Paleta de comandos" : "Ir al archivo";
+    }
+    if (input) {
+      input.placeholder = isCommandMode
+        ? "Escribí una acción o comando del editor…"
+        : "Escribí el nombre del archivo o '>' para comandos…";
+    }
+
+    if (isCommandMode) {
+      const cmdQuery = rawQuery.trim().slice(1).trim().toLowerCase();
+      const allCommands = typeof getCommands === "function" ? getCommands() || [] : [];
+      let matches = [];
+      if (!cmdQuery) {
+        matches = allCommands;
       } else {
-        filtered = allFiles.slice(0, 50);
+        matches = allCommands.filter((cmd) => {
+          const t = cmd.title.toLowerCase();
+          const c = (cmd.category || "").toLowerCase();
+          const s = (cmd.shortcut || "").toLowerCase();
+          return t.includes(cmdQuery) || c.includes(cmdQuery) || s.includes(cmdQuery);
+        });
       }
+      filtered = matches.map((cmd) => ({
+        kind: "command",
+        cmd,
+        shortName: cmd.title,
+        path: cmd.category || "Comando",
+        icon: cmd.icon || "sparkles",
+        badge: cmd.shortcut || ""
+      }));
     } else {
-      const scored = [];
-      for (const file of allFiles) {
-        const lowerPath = file.path.toLowerCase();
-        const lowerName = file.shortName.toLowerCase();
-        if (lowerName === query) {
-          scored.push({ file, score: 0 });
-        } else if (lowerName.startsWith(query)) {
-          scored.push({ file, score: 1 });
-        } else if (lowerName.includes(query)) {
-          scored.push({ file, score: 2 });
-        } else if (lowerPath.includes(query)) {
-          scored.push({ file, score: 3 });
+      const allFiles = getFiles() || [];
+      const parsed = parseQuickOpenQuery(rawQuery);
+      currentTargetLine = parsed.targetLine;
+      const query = parsed.fileQuery.toLowerCase();
+      const activeFile = getActiveFile ? getActiveFile() : null;
+
+      let fileList = [];
+      if (!query) {
+        if (currentTargetLine && activeFile) {
+          const rest = allFiles.filter((f) => f.id !== activeFile.id);
+          fileList = [activeFile, ...rest].slice(0, 50);
+        } else {
+          fileList = allFiles.slice(0, 50);
         }
+      } else {
+        const scored = [];
+        for (const file of allFiles) {
+          const lowerPath = file.path.toLowerCase();
+          const lowerName = file.shortName.toLowerCase();
+          if (lowerName === query) {
+            scored.push({ file, score: 0 });
+          } else if (lowerName.startsWith(query)) {
+            scored.push({ file, score: 1 });
+          } else if (lowerName.includes(query)) {
+            scored.push({ file, score: 2 });
+          } else if (lowerPath.includes(query)) {
+            scored.push({ file, score: 3 });
+          }
+        }
+        scored.sort((a, b) => a.score - b.score || a.file.path.localeCompare(b.file.path));
+        fileList = scored.slice(0, 50).map((s) => s.file);
       }
-      scored.sort((a, b) => a.score - b.score || a.file.path.localeCompare(b.file.path));
-      filtered = scored.slice(0, 50).map((s) => s.file);
+
+      filtered = fileList.map((file) => ({
+        kind: "file",
+        file,
+        shortName: file.shortName,
+        path: file.path,
+        icon: file.icon,
+        badge: file.badge
+      }));
     }
 
     listEl.innerHTML = "";
     if (filtered.length === 0) {
       const emptyLi = document.createElement("li");
       emptyLi.className = "quick-open-empty";
-      emptyLi.textContent = allFiles.length === 0
-        ? "Este proyecto aún no tiene archivos."
-        : "No se encontraron archivos con ese nombre.";
+      emptyLi.textContent = isCommandMode
+        ? "No se encontraron comandos coincidentes."
+        : (getFiles() || []).length === 0
+          ? "Este proyecto aún no tiene archivos."
+          : "No se encontraron archivos con ese nombre.";
       listEl.appendChild(emptyLi);
       return;
     }
 
-    filtered.forEach((file, idx) => {
+    filtered.forEach((item, idx) => {
       const li = document.createElement("li");
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = idx === activeIndex ? "quick-open-item is-active" : "quick-open-item";
-      const dir = file.path.includes("/") ? file.path.slice(0, file.path.lastIndexOf("/")) : "raíz";
-      const lineBadge = currentTargetLine
+
+      const isCmd = item.kind === "command";
+      const dir = isCmd
+        ? item.path
+        : item.path.includes("/")
+          ? item.path.slice(0, item.path.lastIndexOf("/"))
+          : "raíz";
+
+      const lineBadge = !isCmd && currentTargetLine
         ? `<span class="quick-open-line-badge code-font">:l ${currentTargetLine}</span>`
         : "";
+
+      const metaBadge = isCmd
+        ? (item.badge ? `<span class="quick-open-kbd-badge code-font">${escapeHtml(item.badge)}</span>` : "")
+        : `<span class="file-tree-lang">${escapeHtml(item.badge || "")}</span>`;
+
       btn.innerHTML = `
         <span class="quick-open-main">
-          ${icon(file.icon)}
-          <span class="quick-open-name">${escapeHtml(file.shortName)}</span>
+          ${icon(item.icon)}
+          <span class="quick-open-name">${escapeHtml(item.shortName)}</span>
           <span class="quick-open-dir code-font">${escapeHtml(dir)}</span>
         </span>
         <span class="quick-open-meta">
           ${lineBadge}
-          <span class="file-tree-lang">${escapeHtml(file.badge)}</span>
+          ${metaBadge}
         </span>
       `;
-      btn.addEventListener("click", () => pickFile(file.path, currentTargetLine));
+
+      btn.addEventListener("click", () => {
+        if (item.kind === "command") {
+          close();
+          try {
+            item.cmd.run?.();
+          } catch (err) {
+            console.error("[CommandPalette] Error al ejecutar comando:", err);
+          }
+        } else {
+          pickFile(item.file.path, currentTargetLine);
+        }
+      });
       li.appendChild(btn);
       listEl.appendChild(li);
     });
@@ -221,6 +315,8 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
       controller?.abort();
       keyboardRouter.unregisterGlobalShortcut("ctrl+p");
       keyboardRouter.unregisterGlobalShortcut("meta+p");
+      keyboardRouter.unregisterGlobalShortcut("ctrl+k");
+      keyboardRouter.unregisterGlobalShortcut("meta+k");
     }
   };
 }

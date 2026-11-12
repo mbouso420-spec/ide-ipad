@@ -927,6 +927,18 @@
   border-radius: var(--radius-control);
 }
 
+.quick-open-kbd-badge {
+  font-size: var(--text-xs);
+  color: var(--color-ink-2);
+  background: var(--color-paper-2);
+  border: var(--rule-hair) solid var(--color-rule);
+  padding-inline: var(--space-xs);
+  padding-block: 1px;
+  border-radius: var(--radius-control);
+  font-family: var(--font-outlier);
+  user-select: none;
+}
+
 .quick-open-empty {
   padding: var(--space-md);
   text-align: center;

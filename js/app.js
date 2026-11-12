@@ -273,6 +273,182 @@ async function initApp() {
       if (typeof targetLine === "number" && targetLine > 0) {
         editor.goToLine(targetLine);
       }
+    },
+    getCommands() {
+      return [
+        {
+          id: "format-code",
+          title: "Formatear documento",
+          category: "Editor",
+          icon: "alignLeft",
+          shortcut: "Shift+Alt+F",
+          run: () => formatActiveDocument()
+        },
+        {
+          id: "toggle-zen",
+          title: layout.isZenMode() ? "Salir del Modo Zen" : "Modo Zen / Enfoque total",
+          category: "Vista",
+          icon: layout.isZenMode() ? "minimize" : "maximize",
+          shortcut: "Cmd+Alt+Z",
+          run: () => layout.toggleZenMode()
+        },
+        {
+          id: "toggle-explorer",
+          title: layout.isLeftPanelOpen() ? "Ocultar panel del Explorador" : "Mostrar panel del Explorador",
+          category: "Vista",
+          icon: "panelLeft",
+          shortcut: "Cmd+B",
+          run: () => layout.toggleLeftPanel()
+        },
+        {
+          id: "toggle-assistant",
+          title: layout.isRightPanelOpen() ? "Ocultar panel del Asistente IA" : "Mostrar panel del Asistente IA",
+          category: "Vista",
+          icon: "panelRight",
+          shortcut: "Cmd+J",
+          run: () => layout.toggleRightPanel()
+        },
+        {
+          id: "live-preview",
+          title: "Ejecutar vista previa web en vivo",
+          category: "Ejecución",
+          icon: "play",
+          shortcut: "",
+          run: () => document.getElementById("btn-live-preview")?.click()
+        },
+        {
+          id: "split-editor",
+          title: "Dividir editor en dos paneles (Split View)",
+          category: "Editor",
+          icon: "columns",
+          shortcut: "Cmd+\\",
+          run: () => document.getElementById("btn-editor-split")?.click()
+        },
+        {
+          id: "toggle-word-wrap",
+          title: "Alternar ajuste de línea (Word Wrap)",
+          category: "Editor",
+          icon: "wrapText",
+          shortcut: "",
+          run: () => document.getElementById("btn-editor-wrap")?.click()
+        },
+        {
+          id: "toggle-minimap",
+          title: "Alternar minimapa",
+          category: "Editor",
+          icon: "layout",
+          shortcut: "",
+          run: () => document.getElementById("btn-editor-minimap")?.click()
+        },
+        {
+          id: "toggle-symbols",
+          title: "Alternar teclado táctil y barra de símbolos",
+          category: "Editor",
+          icon: "keyboard",
+          shortcut: "",
+          run: () => document.getElementById("btn-toggle-symbols")?.click()
+        },
+        {
+          id: "global-search",
+          title: "Buscar en todo el proyecto",
+          category: "Buscar",
+          icon: "fileSearch",
+          shortcut: "Cmd+Shift+F",
+          run: () => globalSearchModal?.open()
+        },
+        {
+          id: "settings",
+          title: "Configuración y atajos de teclado",
+          category: "Ajustes",
+          icon: "settings",
+          shortcut: "Cmd+,",
+          run: () => settingsModal?.open()
+        },
+        {
+          id: "github-sync",
+          title: "Sincronización con GitHub (Repositorio / Commit)",
+          category: "Git",
+          icon: "gitBranch",
+          shortcut: "",
+          run: () => document.getElementById("btn-open-github")?.click()
+        },
+        {
+          id: "export-zip",
+          title: "Descargar proyecto completo como archivo ZIP",
+          category: "Proyecto",
+          icon: "layers",
+          shortcut: "",
+          run: () => document.getElementById("btn-export-zip")?.click()
+        },
+        {
+          id: "new-file",
+          title: "Nuevo archivo en proyecto",
+          category: "Proyecto",
+          icon: "plus",
+          shortcut: "",
+          run: () => document.getElementById("btn-new-file")?.click()
+        },
+        {
+          id: "new-folder",
+          title: "Nueva carpeta en proyecto",
+          category: "Proyecto",
+          icon: "folderPlus",
+          shortcut: "",
+          run: () => document.getElementById("btn-new-folder")?.click()
+        },
+        {
+          id: "theme-default",
+          title: "Tema: Grafito neutro (Por defecto)",
+          category: "Tema",
+          icon: "sparkles",
+          shortcut: "",
+          run: () => {
+            delete document.documentElement.dataset.theme;
+            localStorage.removeItem("studio_theme");
+          }
+        },
+        {
+          id: "theme-dracula",
+          title: "Tema: Dracula Dark",
+          category: "Tema",
+          icon: "sparkles",
+          shortcut: "",
+          run: () => {
+            document.documentElement.dataset.theme = "dracula";
+            localStorage.setItem("studio_theme", "dracula");
+          }
+        },
+        {
+          id: "theme-nord",
+          title: "Tema: Nord Frost",
+          category: "Tema",
+          icon: "sparkles",
+          shortcut: "",
+          run: () => {
+            document.documentElement.dataset.theme = "nord";
+            localStorage.setItem("studio_theme", "nord");
+          }
+        },
+        {
+          id: "theme-monokai",
+          title: "Tema: Monokai Pro",
+          category: "Tema",
+          icon: "sparkles",
+          shortcut: "",
+          run: () => {
+            document.documentElement.dataset.theme = "monokai";
+            localStorage.setItem("studio_theme", "monokai");
+          }
+        },
+        {
+          id: "clear-chat",
+          title: "Asistente IA: Limpiar conversación",
+          category: "Asistente",
+          icon: "trash",
+          shortcut: "",
+          run: () => document.getElementById("btn-ai-clear-chat")?.click()
+        }
+      ];
     }
   });
 

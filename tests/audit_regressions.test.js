@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { KeyboardRouter } from "../js/ui/keyboardRouter.js";
 import { initLayoutController } from "../js/ui/layout.js";
+import { initQuickOpenModal } from "../js/ui/quickOpenModal.js";
 import { createMinimapController } from "../js/editor/minimap.js";
 import { formatInlineMarkdown } from "../js/ai/chatController.js";
 import { formatMdInline } from "../js/preview/markdownPreview.js";
@@ -149,6 +150,67 @@ describe("Regresiones de Auditoría Integral", () => {
       } finally {
         document.getElementById = origGetById;
         window.matchMedia = origMatchMedia;
+      }
+    });
+
+    test("initQuickOpenModal soporta apertura rápida de archivos y modo paleta de comandos '>'", () => {
+      const dialog = makeMockNode("dialog", "quick-open-dialog");
+      dialog.showModal = () => { dialog.open = true; };
+      dialog.close = () => { dialog.open = false; };
+      const input = makeMockNode("input", "quick-open-input");
+      const listEl = makeMockNode("ul", "quick-open-list");
+      const titleEl = makeMockNode("h2", "quick-open-title");
+      const btnOpen = makeMockNode("button", "btn-quick-open");
+      const btnClose = makeMockNode("button", "btn-close-quick-open");
+
+      const ids = {
+        "quick-open-dialog": dialog,
+        "quick-open-input": input,
+        "quick-open-list": listEl,
+        "quick-open-title": titleEl,
+        "btn-quick-open": btnOpen,
+        "btn-close-quick-open": btnClose
+      };
+
+      const origGetById = document.getElementById;
+      document.getElementById = (id) => ids[id] || null;
+
+      let executedCommand = null;
+
+      try {
+        const modal = initQuickOpenModal({
+          getFiles: () => [
+            { id: "1", path: "src/main.js", shortName: "main.js", icon: "fileCode", badge: "JS" },
+            { id: "2", path: "src/style.css", shortName: "style.css", icon: "fileCode", badge: "CSS" }
+          ],
+          getActiveFile: () => null,
+          onSelectFile: () => {},
+          getCommands: () => [
+            { id: "format", title: "Formatear documento", category: "Editor", icon: "alignLeft", shortcut: "Shift+Alt+F", run: () => { executedCommand = "format"; } },
+            { id: "zen", title: "Modo Zen", category: "Vista", icon: "maximize", shortcut: "Cmd+Alt+Z", run: () => { executedCommand = "zen"; } }
+          ]
+        });
+
+        // 1. Apertura normal en modo archivos
+        modal.open("");
+        assert.equal(dialog.open, true);
+        assert.equal(titleEl.textContent, "Ir al archivo");
+        assert.equal(listEl.children.length, 2);
+
+        // 2. Modo Paleta de comandos con '>'
+        modal.open(">");
+        assert.equal(titleEl.textContent, "Paleta de comandos");
+        assert.equal(listEl.children.length, 2);
+
+        // 3. Ejecutar comando vía click
+        const firstCmdBtn = listEl.children[0].firstElementChild;
+        firstCmdBtn.click();
+        assert.equal(executedCommand, "format");
+        assert.equal(dialog.open, false);
+
+        modal.destroy();
+      } finally {
+        document.getElementById = origGetById;
       }
     });
 
