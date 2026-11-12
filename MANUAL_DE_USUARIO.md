@@ -1,5 +1,7 @@
 # Manual de Usuario — Studio IDE
 
+> **Versión:** `1.2.0`
+
 Esta guía reúne todo lo que necesitás para instalar **Studio IDE** en tu iPad o PC, dominar todos los atajos de teclado y gestos táctiles, gestionar ramas en GitHub, previsualizar sitios web multi-página de forma responsiva y programar asistido por inteligencia artificial gratuita.
 
 ---

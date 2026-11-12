@@ -6,9 +6,10 @@
 
 **Studio IDE** es un entorno de desarrollo web ligero, modular y 100% offline-first sin servidores intermedios, diseñado específicamente para programar con fluidez desde un **iPad** (instalado como PWA a pantalla completa en Safari y adaptable a ventanas de **Stage Manager**) así como desde una **PC de escritorio**.
 
+- **Versión actual:** `1.2.0`
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 523 pruebas automatizadas en 120 suites + suites E2E reales en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) pasando al 100% (tests unitarios, bundler de módulos ES offline, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y navegadores reales, 0 fallos).
+- **Suite de pruebas automáticas:** 525 pruebas automatizadas en 120 suites + suites E2E reales en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) pasando al 100% (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v29, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y navegadores reales, 0 fallos).
 
 ---
 
@@ -184,7 +185,7 @@
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas, REPL y medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 523 pruebas en 120 suites + E2E Chromium y WebKit
+└── tests/                      # Suite automatizada con 525 pruebas en 120 suites + E2E Chromium y WebKit
 ```
 
 ---
@@ -202,7 +203,7 @@ npm --prefix tests run test:e2e:webkit
 
 Resultado actual:
 - **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js` y `sw.js`.
-- **523 pruebas automatizadas en Node** distribuidas en **120 suites** (unitarias, bundler ES Modules multi-archivo offline, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX).
+- **525 pruebas automatizadas en Node** distribuidas en **120 suites** (unitarias, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v29, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX).
 - **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v29, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless.
 - **Suite E2E Cross-Engine en WebKit (`tests/webkit.e2e.mjs`):** render táctil iPadOS portrait/landscape sin desbordes, IndexedDB, formateador, ES Modules multi-archivo en CSP y WebCrypto verificados en motor WebKit (Playwright).
 - **0 fallos, 0 pruebas canceladas.**

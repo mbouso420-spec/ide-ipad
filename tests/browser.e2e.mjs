@@ -124,7 +124,10 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
   test("Arranque sin errores, IndexedDB, Service Worker, Formateo + Recarga, TS/JSX Offline + REPL y Bóveda AES-GCM", async () => {
     const page = await browser.newPage();
     const pageErrors = [];
+    const coldBootRequests = [];
     page.on("pageerror", (err) => pageErrors.push(err.message));
+    const onColdRequest = (req) => coldBootRequests.push(req.url());
+    page.on("request", onColdRequest);
 
     await page.setViewport({ width: 1280, height: 820 });
     await page.goto(`${baseUrl}/index.html`, { waitUntil: "domcontentloaded", timeout: 15000 });
@@ -132,6 +135,16 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
     // 1. Verificar arranque completo y semilla inicial en Explorador + Editor
     await page.waitForSelector(".editor-tab-item", { timeout: 20000 });
     await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+    page.off("request", onColdRequest);
+
+    const eagerHeavyDownloads = coldBootRequests.filter((url) =>
+      /pyodide|sql\.js|sql-wasm|wandbox|typescript/i.test(url)
+    );
+    assert.deepEqual(
+      eagerHeavyDownloads,
+      [],
+      "En arranque frío no debe descargarse ningún runtime pesado (Pyodide/SQLite/tsc)"
+    );
 
     // Verificar sw.js accesible, versión v29 y API de Cache Storage activa en localhost
     const swAssetOk = await page.evaluate(async () => {

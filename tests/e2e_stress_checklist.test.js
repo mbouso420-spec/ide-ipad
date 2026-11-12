@@ -361,6 +361,29 @@ describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
       assert.ok(swContent.includes(`"${cdnUrl}"`), `Falta precalentar URL del importmap en sw.js: ${cdnUrl}`);
     }
 
+    const shellArrayMatch = swContent.match(/const APP_SHELL_URLS = (\[[\s\S]*?\]);/);
+    assert.ok(shellArrayMatch, "sw.js debe declarar const APP_SHELL_URLS = [...]");
+    const appShellList = JSON.parse(shellArrayMatch[1]);
+    const uniqueShellSet = new Set(appShellList);
+    assert.equal(uniqueShellSet.size, appShellList.length, "APP_SHELL_URLS no debe contener rutas duplicadas");
+
+    const requiredRecentModules = [
+      "./js/editor/codeFormatter.js",
+      "./js/editor/minimap.js",
+      "./js/editor/smartReplace.js",
+      "./js/editor/splitEditorController.js",
+      "./js/github/githubMerge.js",
+      "./js/preview/markdownPreview.js",
+      "./js/preview/moduleBundler.js",
+      "./js/preview/pythonRunner.js",
+      "./js/preview/tsTranspiler.js",
+      "./js/security/keyVaultCrypto.js",
+      "./js/storage/storageQuota.js"
+    ];
+    for (const modPath of requiredRecentModules) {
+      assert.ok(uniqueShellSet.has(modPath), `Falta módulo reciente en APP_SHELL_URLS: ${modPath}`);
+    }
+
     async function listRelative(dirName) {
       const out = [];
       async function walk(rel) {
@@ -381,8 +404,12 @@ describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
       ...(await listRelative("assets"))
     ];
     for (const relPath of expectedAssets) {
-      assert.ok(swContent.includes(`"${relPath}"`), `Falta precachear ${relPath} en sw.js`);
+      assert.ok(uniqueShellSet.has(relPath), `Falta precachear ${relPath} en APP_SHELL_URLS de sw.js`);
     }
+
+    const expectedRootAndAssets = new Set(["./", "./index.html", "./manifest.json", ...expectedAssets]);
+    const staleShellEntries = appShellList.filter((entry) => !expectedRootAndAssets.has(entry));
+    assert.deepEqual(staleShellEntries, [], "APP_SHELL_URLS no debe referenciar archivos inexistentes u obsoletos");
   });
 
   test("6.2 Rotación iPadOS y Stage Manager: event listeners de orientación presentes en layout.js", async () => {
@@ -391,5 +418,87 @@ describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
     assert.ok(layoutContent.includes("orientationchange"));
     assert.ok(layoutContent.includes("screen.orientation"));
     assert.ok(layoutContent.includes("restorePanelWidths"));
+  });
+
+  test("6.3 Lazy loading de runtimes pesados (pythonRunner.js, tsTranspiler.js, sqlRunner.js) sin descargas en arranque en frío", async () => {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+    const appSource = await fs.readFile(path.join(rootDir, "js/app.js"), "utf-8");
+    assert.equal(/pyodide|sql-wasm|sql\.js|wandbox/i.test(appSource), false, "js/app.js no debe cargar runtimes WASM/remotos en arranque");
+
+    const tsSource = await fs.readFile(path.join(rootDir, "js/preview/tsTranspiler.js"), "utf-8");
+    assert.equal(/fetch\(|new Worker|cdn\.|esm\.sh|WebAssembly/i.test(tsSource), false, "tsTranspiler.js debe ser 100% local offline sin compilador externo");
+
+    const origFetch = globalThis.fetch;
+    const origWorker = globalThis.Worker;
+    const fetchCalls = [];
+    let workerCreations = 0;
+
+    globalThis.fetch = async (url, ...rest) => {
+      fetchCalls.push(String(url));
+      return origFetch(url, ...rest);
+    };
+    globalThis.Worker = class MockLazyCheckWorker {
+      constructor() {
+        workerCreations += 1;
+      }
+    };
+
+    let pyMod;
+    let tsMod;
+    let sqlMod;
+    try {
+      const nonce = Date.now();
+      pyMod = await import(`../js/preview/pythonRunner.js?lazycheck=${nonce}`);
+      tsMod = await import(`../js/preview/tsTranspiler.js?lazycheck=${nonce}`);
+      sqlMod = await import(`../js/preview/sqlRunner.js?lazycheck=${nonce}`);
+    } finally {
+      globalThis.fetch = origFetch;
+      globalThis.Worker = origWorker;
+    }
+
+    assert.deepEqual(fetchCalls, [], "Importar pythonRunner, tsTranspiler y sqlRunner no debe disparar descargas en frío");
+    assert.equal(workerCreations, 0, "Importar los runners no debe instanciar Web Workers al inicio");
+
+    const tsOut = tsMod.transpileTypeScriptAndJsx("const n: number = 42;");
+    assert.ok(tsOut.code.includes("const n = 42;"), "tsTranspiler debe transpilar TypeScript 100% offline");
+
+    const pyHtml = pyMod.buildStandalonePythonPreview(
+      { path: "main.py", shortName: "main.py", content: "print('hola')" },
+      [],
+      ""
+    );
+    assert.ok(pyHtml.includes("pyodide.js") && pyHtml.includes("new Worker"), "Pyodide solo debe instanciarse bajo demanda dentro del preview");
+
+    const sqlHtml = sqlMod.buildSqlRunnerPreview({ path: "db.sql", shortName: "db.sql", content: "SELECT 1;" }, []);
+    assert.ok(sqlHtml.includes("sql-wasm.js"), "SQLite WASM solo debe cargarse bajo demanda dentro del preview SQL");
+  });
+
+  test("6.4 Aislamiento estricto de scripts QA (tests/package.json y ci.yml)", async () => {
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+    const pkg = JSON.parse(await fs.readFile(path.join(rootDir, "tests/package.json"), "utf-8"));
+    assert.equal(pkg.version, "1.2.0");
+    assert.ok(pkg.scripts?.test.includes("node --test"), "npm --prefix tests test debe invocar node --test");
+    assert.ok(pkg.scripts?.test.includes(".test.js"), "npm --prefix tests test debe restringirse a *.test.js");
+    for (const forbidden of ["browser.e2e.mjs", "webkit.e2e.mjs", "take_real_screenshots", "playwright", "puppeteer"]) {
+      assert.equal(pkg.scripts.test.includes(forbidden), false, `npm test no debe invocar ${forbidden}`);
+    }
+    assert.ok(pkg.scripts?.["test:e2e"]?.includes("browser.e2e.mjs"));
+    assert.ok(pkg.scripts?.["test:e2e:webkit"]?.includes("webkit.e2e.mjs"));
+
+    const testFiles = await fs.readdir(path.join(rootDir, "tests"));
+    assert.equal(testFiles.some((f) => /\.e2e\.test\.js$/i.test(f)), false, "No debe haber suites E2E bajo el patrón *.test.js");
+
+    const ciYml = await fs.readFile(path.join(rootDir, ".github/workflows/ci.yml"), "utf-8");
+    assert.ok(ciYml.includes("lint-and-unit-tests:"));
+    assert.ok(ciYml.includes("e2e-browser:"));
+    assert.ok(ciYml.includes("e2e-webkit:"));
   });
 });

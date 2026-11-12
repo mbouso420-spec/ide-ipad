@@ -74,11 +74,24 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
   test("Render iPadOS táctil, IndexedDB, SW v29, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
     const page = await context.newPage();
     const pageErrors = [];
+    const coldBootRequests = [];
     page.on("pageerror", (err) => pageErrors.push(err.message));
+    const onColdRequest = (req) => coldBootRequests.push(req.url());
+    page.on("request", onColdRequest);
 
     await page.goto(`${baseUrl}/index.html`, { waitUntil: "domcontentloaded", timeout: 20000 });
     await page.waitForSelector(".editor-tab-item", { timeout: 20000 });
     await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+    page.off("request", onColdRequest);
+
+    const eagerHeavyDownloads = coldBootRequests.filter((url) =>
+      /pyodide|sql\.js|sql-wasm|wandbox|typescript/i.test(url)
+    );
+    assert.deepEqual(
+      eagerHeavyDownloads,
+      [],
+      "WebKit no debe descargar runtimes pesados (Pyodide/SQLite/tsc) durante el arranque en frío"
+    );
 
     // 1. Verificar Service Worker v29 accesible y sin desborde horizontal en iPad vertical (820x1180)
     const swAssetOk = await page.evaluate(async () => {
