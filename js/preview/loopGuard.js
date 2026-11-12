@@ -87,13 +87,21 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
     }
   }
 
-  // Aplicar de atrás hacia adelante para no desplazar posiciones pendientes
-  edits.sort((a, b) => b.pos - a.pos);
-  let out = source;
+  // Aplicar en orden ascendente mediante join lineal O(N + E log E)
+  edits.sort((a, b) => a.pos - b.pos);
+  const chunks = [];
+  let cursor = 0;
   for (const edit of edits) {
-    out = out.slice(0, edit.pos) + edit.text + out.slice(edit.pos);
+    if (edit.pos > cursor) {
+      chunks.push(source.slice(cursor, edit.pos));
+    }
+    chunks.push(edit.text);
+    cursor = edit.pos;
   }
-  return { code: out, loops: loopsList.length, instrumented: true };
+  if (cursor < source.length) {
+    chunks.push(source.slice(cursor));
+  }
+  return { code: chunks.join(""), loops: loopsList.length, instrumented: true };
 }
 
 /**

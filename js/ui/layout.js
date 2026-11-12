@@ -1,4 +1,5 @@
 import { keyboardRouter } from "./keyboardRouter.js";
+import { readStoredBool, readStoredValue, saveStoredValue } from "../utils/storage.js";
 
 const STORAGE_KEYS = {
   leftOpen: "ide.layout.leftOpen",
@@ -14,6 +15,11 @@ const COMPACT_MEDIA = "(max-width: 74rem)";
  * divisores táctiles, atajos de teclado, gestos swipe de cierre y ajuste al teclado virtual de iPadOS.
  */
 export function initLayoutController() {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const signal = controller?.signal;
+  const listenOpts = signal ? { signal } : undefined;
+  const passiveOpts = signal ? { passive: true, signal } : { passive: true };
+
   const mqCompact = window.matchMedia(COMPACT_MEDIA);
   const btnLeft = document.getElementById("btn-toggle-left");
   const btnRight = document.getElementById("btn-toggle-right");
@@ -64,13 +70,13 @@ export function initLayoutController() {
     if (isCompact() && leftOpen && rightOpen) {
       rightOpen = false;
     }
-    persistBool(STORAGE_KEYS.leftOpen, leftOpen);
-    persistBool(STORAGE_KEYS.rightOpen, rightOpen);
+    saveStoredValue(STORAGE_KEYS.leftOpen, leftOpen);
+    saveStoredValue(STORAGE_KEYS.rightOpen, rightOpen);
     if (leftOpen) {
-      const storedW = Number(safeGetStorage(STORAGE_KEYS.leftWidth));
+      const storedW = Number(readStoredValue(STORAGE_KEYS.leftWidth));
       if (!Number.isFinite(storedW) || storedW < 220) {
         document.documentElement.style.setProperty("--left-panel-w", "256px");
-        safeSetStorage(STORAGE_KEYS.leftWidth, "256");
+        saveStoredValue(STORAGE_KEYS.leftWidth, "256");
       }
     }
     applyState();
@@ -81,26 +87,26 @@ export function initLayoutController() {
     if (isCompact() && rightOpen && leftOpen) {
       leftOpen = false;
     }
-    persistBool(STORAGE_KEYS.leftOpen, leftOpen);
-    persistBool(STORAGE_KEYS.rightOpen, rightOpen);
+    saveStoredValue(STORAGE_KEYS.leftOpen, leftOpen);
+    saveStoredValue(STORAGE_KEYS.rightOpen, rightOpen);
     if (rightOpen) {
-      const storedW = Number(safeGetStorage(STORAGE_KEYS.rightWidth));
+      const storedW = Number(readStoredValue(STORAGE_KEYS.rightWidth));
       if (!Number.isFinite(storedW) || storedW < 260) {
         document.documentElement.style.setProperty("--right-panel-w", "340px");
-        safeSetStorage(STORAGE_KEYS.rightWidth, "340");
+        saveStoredValue(STORAGE_KEYS.rightWidth, "340");
       }
     }
     applyState();
   }
 
-  btnLeft?.addEventListener("click", () => setLeftOpen(!leftOpen));
-  btnRight?.addEventListener("click", () => setRightOpen(!rightOpen));
-  btnCloseLeft?.addEventListener("click", () => setLeftOpen(false));
-  btnCloseRight?.addEventListener("click", () => setRightOpen(false));
+  btnLeft?.addEventListener("click", () => setLeftOpen(!leftOpen), listenOpts);
+  btnRight?.addEventListener("click", () => setRightOpen(!rightOpen), listenOpts);
+  btnCloseLeft?.addEventListener("click", () => setLeftOpen(false), listenOpts);
+  btnCloseRight?.addEventListener("click", () => setRightOpen(false), listenOpts);
   backdrop?.addEventListener("click", () => {
     setLeftOpen(false);
     setRightOpen(false);
-  });
+  }, listenOpts);
 
   mqCompact.addEventListener("change", (event) => {
     if (event.matches && leftOpen && rightOpen) {
@@ -108,7 +114,7 @@ export function initLayoutController() {
     }
     applyState();
     restorePanelWidths();
-  });
+  }, listenOpts);
 
   let restoreRaf = 0;
   const scheduleRestoreWidths = () => {
@@ -119,35 +125,26 @@ export function initLayoutController() {
     });
   };
 
-  window.addEventListener("resize", scheduleRestoreWidths, { passive: true });
-  window.addEventListener("orientationchange", scheduleRestoreWidths, { passive: true });
+  window.addEventListener("resize", scheduleRestoreWidths, passiveOpts);
+  window.addEventListener("orientationchange", scheduleRestoreWidths, passiveOpts);
 
   if (typeof screen !== "undefined" && screen.orientation && typeof screen.orientation.addEventListener === "function") {
-    screen.orientation.addEventListener("change", scheduleRestoreWidths);
+    screen.orientation.addEventListener("change", scheduleRestoreWidths, listenOpts);
   }
 
-  // Atajos de teclado (Cmd/Ctrl + B para Explorador, Cmd/Ctrl + J para Asistente, Escape para cerrar drawers)
+  // Atajos globales enrutados por KeyboardRouter (Cmd/Ctrl + B Explorador, Cmd/Ctrl + J Asistente)
+  const toggleLeftShortcut = () => setLeftOpen(!leftOpen);
+  const toggleRightShortcut = () => setRightOpen(!rightOpen);
+  keyboardRouter.registerGlobalShortcut("ctrl+b", toggleLeftShortcut);
+  keyboardRouter.registerGlobalShortcut("meta+b", toggleLeftShortcut);
+  keyboardRouter.registerGlobalShortcut("ctrl+j", toggleRightShortcut);
+  keyboardRouter.registerGlobalShortcut("meta+j", toggleRightShortcut);
+
+  // Escape para cerrar drawers en modo compacto cuando no hay modales ni edición en línea
   window.addEventListener("keydown", (event) => {
-    const activeModal = keyboardRouter.getActiveModal();
-    if (activeModal && activeModal.blockGlobalShortcuts !== false) {
+    if (keyboardRouter.shouldBlockGlobalShortcuts()) {
       return;
     }
-
-    const mod = event.metaKey || event.ctrlKey;
-    const key = event.key.toLowerCase();
-
-    if (mod && !event.shiftKey && !event.altKey && key === "b") {
-      event.preventDefault();
-      setLeftOpen(!leftOpen);
-      return;
-    }
-
-    if (mod && !event.shiftKey && !event.altKey && key === "j") {
-      event.preventDefault();
-      setRightOpen(!rightOpen);
-      return;
-    }
-
     if (event.key === "Escape" && isCompact() && (leftOpen || rightOpen)) {
       if (event.defaultPrevented) {
         return;
@@ -165,11 +162,12 @@ export function initLayoutController() {
       setLeftOpen(false);
       setRightOpen(false);
     }
-  });
+  }, listenOpts);
 
   // Divisores arrastrables con soporte táctil y mouse (Pointer Events)
   if (resizerLeft) {
     bindSplitter(resizerLeft, "left", {
+      signal,
       onCollapse: () => setLeftOpen(false),
       onExpand: () => setLeftOpen(true),
       isOpen: () => leftOpen
@@ -177,6 +175,7 @@ export function initLayoutController() {
   }
   if (resizerRight) {
     bindSplitter(resizerRight, "right", {
+      signal,
       onCollapse: () => setRightOpen(false),
       onExpand: () => setRightOpen(true),
       isOpen: () => rightOpen
@@ -185,14 +184,14 @@ export function initLayoutController() {
 
   // Gestos swipe cortos sobre cada panel abierto para cerrarlo sin interferir con bordes de Safari/Stage Manager
   if (panelLeft) {
-    bindSwipeToClose(panelLeft, "left", () => setLeftOpen(false));
+    bindSwipeToClose(panelLeft, "left", () => setLeftOpen(false), signal);
   }
   if (panelRight) {
-    bindSwipeToClose(panelRight, "right", () => setRightOpen(false));
+    bindSwipeToClose(panelRight, "right", () => setRightOpen(false), signal);
   }
 
   // Sincronización con visualViewport para elevar la barra de símbolos sobre el teclado virtual de iPadOS
-  bindVisualViewport();
+  bindVisualViewport(signal);
 
   return {
     isLeftPanelOpen: () => leftOpen,
@@ -210,12 +209,25 @@ export function initLayoutController() {
       if (isCompact() && rightOpen) {
         setRightOpen(false);
       }
+    },
+    destroy() {
+      if (restoreRaf && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(restoreRaf);
+      }
+      restoreRaf = 0;
+      controller?.abort();
+      keyboardRouter.unregisterGlobalShortcut("ctrl+b");
+      keyboardRouter.unregisterGlobalShortcut("meta+b");
+      keyboardRouter.unregisterGlobalShortcut("ctrl+j");
+      keyboardRouter.unregisterGlobalShortcut("meta+j");
     }
   };
 }
 
 function bindSplitter(handle, side, callbacks = {}) {
   let activePointerId = null;
+  const { signal } = callbacks;
+  const listenOpts = signal ? { signal } : undefined;
   const isLeft = side === "left";
   const minW = isLeft ? 220 : 260;
   const storageKey = isLeft ? STORAGE_KEYS.leftWidth : STORAGE_KEYS.rightWidth;
@@ -226,7 +238,7 @@ function bindSplitter(handle, side, callbacks = {}) {
       isLeft ? Math.min(420, Math.floor(viewportWidth * 0.36)) : Math.min(540, Math.floor(viewportWidth * 0.44))
     );
 
-  const savedInitialW = Number(safeGetStorage(storageKey));
+  const savedInitialW = Number(readStoredValue(storageKey));
   const initialW = clamp(Number.isFinite(savedInitialW) && savedInitialW > 0 ? savedInitialW : defaultW, minW, getMaxW());
 
   handle.setAttribute("role", "separator");
@@ -243,10 +255,10 @@ function bindSplitter(handle, side, callbacks = {}) {
   const applyWidth = (nextWidth) => {
     if (isLeft) {
       document.documentElement.style.setProperty("--left-panel-w", `${nextWidth}px`);
-      safeSetStorage(STORAGE_KEYS.leftWidth, String(nextWidth));
+      saveStoredValue(STORAGE_KEYS.leftWidth, String(nextWidth));
     } else {
       document.documentElement.style.setProperty("--right-panel-w", `${nextWidth}px`);
-      safeSetStorage(STORAGE_KEYS.rightWidth, String(nextWidth));
+      saveStoredValue(STORAGE_KEYS.rightWidth, String(nextWidth));
     }
     handle.setAttribute("aria-valuemax", String(getMaxW()));
     handle.setAttribute("aria-valuenow", String(nextWidth));
@@ -256,7 +268,7 @@ function bindSplitter(handle, side, callbacks = {}) {
     const step = 16;
     const viewportWidth = window.innerWidth;
     const maxW = getMaxW(viewportWidth);
-    const savedW = Number(safeGetStorage(storageKey));
+    const savedW = Number(readStoredValue(storageKey));
     const currentW = Number.isFinite(savedW) && savedW > 0 ? savedW : defaultW;
 
     let targetW = currentW;
@@ -274,14 +286,14 @@ function bindSplitter(handle, side, callbacks = {}) {
 
     event.preventDefault();
     applyWidth(clamp(targetW, minW, maxW));
-  });
+  }, listenOpts);
 
   handle.addEventListener("pointerdown", (event) => {
     activePointerId = event.pointerId;
     handle.setPointerCapture(event.pointerId);
     handle.classList.add("is-dragging");
     event.preventDefault();
-  });
+  }, listenOpts);
 
   handle.addEventListener("pointermove", (event) => {
     if (event.pointerId !== activePointerId) {
@@ -311,7 +323,7 @@ function bindSplitter(handle, side, callbacks = {}) {
       }
       applyWidth(clamp(rawWidth, minW, maxW));
     }
-  });
+  }, listenOpts);
 
   const endDrag = (event) => {
     if (event.pointerId !== activePointerId) {
@@ -321,14 +333,15 @@ function bindSplitter(handle, side, callbacks = {}) {
     handle.classList.remove("is-dragging");
   };
 
-  handle.addEventListener("pointerup", endDrag);
-  handle.addEventListener("pointercancel", endDrag);
+  handle.addEventListener("pointerup", endDrag, listenOpts);
+  handle.addEventListener("pointercancel", endDrag, listenOpts);
 }
 
-function bindSwipeToClose(panel, direction, onClose) {
+function bindSwipeToClose(panel, direction, onClose, signal) {
   let startX = 0;
   let startY = 0;
   let tracking = false;
+  const passiveOpts = signal ? { passive: true, signal } : { passive: true };
 
   panel.addEventListener(
     "touchstart",
@@ -350,7 +363,7 @@ function bindSwipeToClose(panel, direction, onClose) {
       startY = event.touches[0].clientY;
       tracking = true;
     },
-    { passive: true }
+    passiveOpts
   );
 
   panel.addEventListener(
@@ -373,15 +386,16 @@ function bindSwipeToClose(panel, direction, onClose) {
         onClose();
       }
     },
-    { passive: true }
+    passiveOpts
   );
 }
 
-function bindVisualViewport() {
+function bindVisualViewport(signal) {
   const vv = window.visualViewport;
   if (!vv) {
     return;
   }
+  const listenOpts = signal ? { signal } : undefined;
 
   const syncViewport = () => {
     const vHeight = Math.round(vv.height);
@@ -408,14 +422,14 @@ function bindVisualViewport() {
   };
 
   syncViewport();
-  vv.addEventListener("resize", syncViewport);
-  vv.addEventListener("scroll", syncViewport);
+  vv.addEventListener("resize", syncViewport, listenOpts);
+  vv.addEventListener("scroll", syncViewport, listenOpts);
 }
 
 function restorePanelWidths() {
   const viewportWidth = typeof window !== "undefined" ? window.innerWidth : 1200;
-  const leftW = Number(safeGetStorage(STORAGE_KEYS.leftWidth));
-  const rightW = Number(safeGetStorage(STORAGE_KEYS.rightWidth));
+  const leftW = Number(readStoredValue(STORAGE_KEYS.leftWidth));
+  const rightW = Number(readStoredValue(STORAGE_KEYS.rightWidth));
   const maxLeft = Math.min(420, Math.floor(viewportWidth * 0.36));
   const maxRight = Math.min(540, Math.floor(viewportWidth * 0.44));
 
@@ -433,31 +447,4 @@ function restorePanelWidths() {
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
-}
-
-function readStoredBool(key, fallback) {
-  const raw = safeGetStorage(key);
-  if (raw === "true") return true;
-  if (raw === "false") return false;
-  return fallback;
-}
-
-function persistBool(key, value) {
-  safeSetStorage(key, String(value));
-}
-
-function safeGetStorage(key) {
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function safeSetStorage(key, value) {
-  try {
-    window.localStorage.setItem(key, value);
-  } catch {
-    // Ignorar en navegación privada estricta
-  }
 }

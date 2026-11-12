@@ -1,4 +1,4 @@
-import { hydrateIcons, icon } from "./ui/icons.js";
+import { hydrateIcons } from "./ui/icons.js";
 import { initLayoutController } from "./ui/layout.js";
 import { initSymbolBar } from "./ui/symbolBar.js";
 import { generateDuplicatePath, initExplorerController } from "./ui/explorerController.js";
@@ -8,7 +8,13 @@ import { initLivePreviewModal } from "./ui/livePreviewModal.js";
 import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
-import { computeSmartReplacement, createEditorManager } from "./editor/editorManager.js";
+import { showConfirmDialog } from "./ui/confirmDialog.js";
+import { createStatusBarController } from "./ui/statusBarController.js";
+import {
+  applyDocumentEdit,
+  computeSmartReplacement,
+  createEditorManager
+} from "./editor/editorManager.js";
 import { createSplitEditorController } from "./editor/splitEditorController.js";
 import { createBinaryPreview } from "./ui/binaryPreview.js";
 import { formatCode } from "./editor/codeFormatter.js";
@@ -25,7 +31,8 @@ import {
   exportKeysBundle,
   getKeyStorageMode,
   hasStoredCredentials,
-  importKeysBundle
+  importKeysBundle,
+  setKeyStorageMode
 } from "./ai/providers.js";
 import {
   cacheSingleGithubFileContent,
@@ -56,16 +63,16 @@ import {
   validateUserPath
 } from "./storage/workspaceDb.js";
 import { keyboardRouter } from "./ui/keyboardRouter.js";
-import {
-  clearEmergencyBackup,
-  restoreEmergencyBackup,
-  writeEmergencyBackup,
-  getTabInstanceId
-} from "./storage/emergencyBackup.js";
-import {
-  base64ToUint8Array,
-  isBinaryFile
-} from "./storage/fileImport.js";
+import { restoreEmergencyBackup } from "./storage/emergencyBackup.js";
+import { base64ToUint8Array, isBinaryFile } from "./storage/fileImport.js";
+import { downloadBlob } from "./utils/dom.js";
+import { readStoredValue } from "./utils/storage.js";
+import { createAutosaveManager } from "./workspace/autosaveManager.js";
+import { createTabManager } from "./workspace/tabManager.js";
+import { createGithubLazySync } from "./workspace/githubLazySync.js";
+import { initBroadcastSync } from "./workspace/broadcastSync.js";
+
+const THEME_STORAGE_KEY = "studio_theme";
 
 async function initApp() {
   hydrateIcons(document);
@@ -73,19 +80,17 @@ async function initApp() {
   void requestPersistentStorage();
   keyboardRouter.attach();
 
-  // Inicializar Tema visual (persistido en localStorage)
-  const THEME_STORAGE_KEY = "studio_theme";
+  const appListeners = typeof AbortController === "function" ? new AbortController() : null;
+  const appListenOpts = appListeners ? { signal: appListeners.signal } : undefined;
+
+  // Inicializar tema visual (persistido en localStorage)
   const selectThemeEl = document.getElementById("select-theme");
-  try {
-    const savedTheme = localStorage.getItem(THEME_STORAGE_KEY) || "default";
-    if (savedTheme && savedTheme !== "default") {
-      document.documentElement.dataset.theme = savedTheme;
-    }
-    if (selectThemeEl) {
-      selectThemeEl.value = savedTheme;
-    }
-  } catch {
-    // Entorno restringido o sin localStorage
+  const savedTheme = readStoredValue(THEME_STORAGE_KEY, "default") || "default";
+  if (savedTheme !== "default") {
+    document.documentElement.dataset.theme = savedTheme;
+  }
+  if (selectThemeEl) {
+    selectThemeEl.value = savedTheme;
   }
 
   // Restaurar credenciales (claves IA y token GitHub) desde IndexedDB si Safari/iPadOS vació localStorage
@@ -111,8 +116,6 @@ async function initApp() {
   const editorMountEl = document.getElementById("editor-mount");
   const emptyStateEl = document.getElementById("editor-empty-state");
   const emptyQuickListEl = document.getElementById("editor-empty-quicklist");
-  const contextStatusEl = document.getElementById("chat-context-status");
-  const contextFileEl = document.getElementById("chat-context-filename");
 
   const btnUndo = document.getElementById("btn-editor-undo");
   const btnRedo = document.getElementById("btn-editor-redo");
@@ -123,8 +126,7 @@ async function initApp() {
   const btnEditorSplit = document.getElementById("btn-editor-split");
   const btnFontDown = document.getElementById("btn-font-down");
   const btnFontUp = document.getElementById("btn-font-up");
-  const btnExportFile = document.getElementById("btn-export-file");
-  const zoomReadoutEl = document.getElementById("editor-zoom-readout");
+  const btnToggleSymbols = document.getElementById("btn-toggle-symbols");
 
   const editorStageEl = document.getElementById("editor-stage");
   const splitDividerEl = document.getElementById("editor-split-divider");
@@ -133,6 +135,7 @@ async function initApp() {
   const splitTitleTextEl = document.getElementById("editor-split-title-text");
   const splitFileSelectEl = document.getElementById("editor-split-file-select");
   const btnCloseSplit = document.getElementById("btn-close-split");
+
   const binaryPreview = createBinaryPreview({
     binaryPreviewEl: document.getElementById("editor-binary-preview"),
     onDownloadFile: downloadCurrentActiveFile
@@ -140,14 +143,14 @@ async function initApp() {
 
   /** @type {ReturnType<typeof createSplitEditorController> | null} */
   let splitController = null;
-
-  const statusFilePathEl = document.getElementById("status-file-path");
-  const statusFileLangEl = document.getElementById("status-file-lang");
-  const statusCursorPosEl = document.getElementById("status-cursor-pos");
-  const statusNetworkEl = document.getElementById("status-network-state");
+  let chat = null;
+  let explorer = null;
+  let github = null;
+  let settingsModal = null;
+  let statusBar = null;
+  let tabManager = null;
 
   let projects = await ensureInitialWorkspace();
-  // Recuperar lo escrito justo antes de un cierre/recarga abrupta (ver emergencyBackup.js)
   let restoredFromBackup = 0;
   try {
     restoredFromBackup = await restoreEmergencyBackup({
@@ -159,49 +162,110 @@ async function initApp() {
   } catch {
     // Si falla, el respaldo queda en localStorage y se reintenta en la próxima apertura
   }
+
   let activeProject =
     projects.find((p) => p.id === getSavedActiveProjectId()) || projects[0];
   setSavedActiveProjectId(activeProject.id);
 
-  /** @type {Array<any>} */
-  let entries = [];
+  /** @type {Array<{ path: string, isFolder: boolean }>} */
+  let treeEntries = [];
   /** @type {Array<any>} */
   let filesOnly = [];
   let openTabIds = [];
   let activeFileId = null;
   let activeSelection = { text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 };
-  let chat = null;
 
-  /** @type {Map<string, number>} */
-  const saveTimers = new Map();
+  const autosaveManager = createAutosaveManager({
+    getActiveProjectId: () => activeProject?.id || null,
+    updateFileContent,
+    setAutosaveStatus: (msg) => explorer?.setAutosaveStatus(msg),
+    refreshStorageIndicator: () => explorer?.refreshStorageIndicator?.(),
+    refreshTopbarBadge: () => github?.refreshTopbarBadge()
+  });
 
   const editor = await createEditorManager({
     mountEl: editorMountEl,
     onDocChange(filePath, newContent) {
-      const target = filesOnly.find((f) => f.id === filePath);
-      if (!target) {
-        return;
-      }
-      const wasDirty = isFileDirtyForProject(target);
-      target.content = newContent;
-      const nowDirty = isFileDirtyForProject(target);
-
-      if (wasDirty !== nowDirty) {
-        renderTabs();
-      }
-
-      scheduleAutosave(activeProject.id, filePath, newContent);
-      splitController?.syncDoc(filePath, newContent);
+      applyDocumentEdit({
+        filePath,
+        newContent,
+        getFilesOnly: () => filesOnly,
+        isFileDirtyForProject,
+        onDirtyChange: (target, nowDirty) => tabManager?.updateTabDirtyBadge(target.id, nowDirty),
+        getActiveProject: () => activeProject,
+        scheduleAutosave: (pid, path, content) => autosaveManager.scheduleAutosave(pid, path, content),
+        onAfterEdit: (path, content) => splitController?.syncDoc(path, content)
+      });
     },
     onSelectionChange(selection) {
       activeSelection = selection;
-      updateAssistantContextLabel();
-      updateStatusBar();
+      statusBar?.updateAssistantContextLabel();
+      statusBar?.updateStatusBar();
       chat?.notifySelectionChanged();
     }
   });
 
-  initQuickOpenModal({
+  statusBar = createStatusBarController({
+    editor,
+    getActiveFile: () => (activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null),
+    getActiveSelection: () => activeSelection
+  });
+
+  tabManager = createTabManager({
+    tabStripEl,
+    emptyQuickListEl,
+    getFilesOnly: () => filesOnly,
+    getOpenTabIds: () => openTabIds,
+    getActiveFileId: () => activeFileId,
+    getActiveProject: () => activeProject,
+    saveProjectState,
+    isFileDirtyForProject,
+    onOpenFile: (path) => openOrFocusFile(path),
+    onRequestCloseTab: (path) => requestCloseTab(path),
+    onAfterRenderTabs: () => splitController?.refreshIfOpen()
+  });
+
+  const githubLazySync = createGithubLazySync({
+    getActiveProject: () => activeProject,
+    setProjects: (next) => {
+      projects = next;
+    },
+    getTreeEntries: () => treeEntries,
+    setTreeEntries: (next) => {
+      treeEntries = next;
+    },
+    getFilesOnly: () => filesOnly,
+    setFilesOnly: (next) => {
+      filesOnly = next;
+    },
+    getOpenTabIds: () => openTabIds,
+    setOpenTabIds: (next) => {
+      openTabIds = next;
+    },
+    getActiveFileId: () => activeFileId,
+    setActiveFileId: (next) => {
+      activeFileId = next;
+    },
+    persistTabsState: () => tabManager.persistTabsState(),
+    renderWorkspaceView,
+    renderTabs: (opts) => tabManager.renderTabs(opts),
+    explorer: {
+      setOfflineRepoState: (state) => explorer.setOfflineRepoState(state),
+      setAutosaveStatus: (msg) => explorer.setAutosaveStatus(msg),
+      renderTree: (entriesArg, activeIdArg) => explorer.renderTree(entriesArg, activeIdArg),
+      renderProjects: (projs, activeIdArg) => explorer.renderProjects(projs, activeIdArg)
+    },
+    editor,
+    getSplitController: () => splitController,
+    cacheAndSyncGithubFileFn: cacheAndSyncGithubFile,
+    getGithubToken,
+    fetchSingleRepoBlob,
+    downloadBatchBlobs,
+    markProjectOfflineCached,
+    listProjects
+  });
+
+  const quickOpenModal = initQuickOpenModal({
     getFiles: () => filesOnly,
     getActiveFile: () => (activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null),
     async onSelectFile(path, targetLine) {
@@ -249,11 +313,20 @@ async function initApp() {
     }
   });
 
-  const settingsModal = initSettingsModal({
+  settingsModal = initSettingsModal({
     editor,
     getContextSnapshot,
     onHardwareKeyboardChange(hardwareMode) {
       splitController?.setHardwareKeyboardMode(hardwareMode);
+    },
+    onWordWrapChange(enabled) {
+      statusBar.syncWordWrapPressed(enabled);
+    },
+    onMinimapChange(visible) {
+      statusBar.syncMinimapPressed(visible);
+    },
+    onThinkingSpeedChange(speed) {
+      chat?.syncThinkingSpeed?.(speed);
     },
     onSelectProvider(providerId) {
       if (!layout.isRightPanelOpen()) {
@@ -270,7 +343,7 @@ async function initApp() {
     const target = filesOnly.find((f) => f.id === filePath);
     if (!target) return;
     try {
-      await ensureFileContentLoaded(target);
+      await githubLazySync.ensureFileContentLoaded(target);
     } catch (error) {
       explorer.setAutosaveStatus(
         error instanceof Error ? error.message : "No se pudo descargar el archivo desde GitHub"
@@ -285,16 +358,7 @@ async function initApp() {
     } else {
       blob = new Blob([target.content ?? ""], { type: "text/plain;charset=utf-8" });
     }
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    window.setTimeout(() => {
-      URL.revokeObjectURL(url);
-    }, 1000);
+    downloadBlob(blob, filename, { revokeDelayMs: 1000 });
   }
 
   async function downloadCurrentActiveFile() {
@@ -303,12 +367,12 @@ async function initApp() {
     await downloadSingleFile(current.id);
   }
 
-  const explorer = initExplorerController({
+  explorer = initExplorerController({
     onSelectFile(path) {
       openOrFocusFile(path);
     },
     async onCreateEntry(path, isFolder) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       await upsertEntry(activeProject.id, path, {
         isFolder,
         content: isFolder ? "" : defaultStarterTemplate(path),
@@ -323,7 +387,7 @@ async function initApp() {
       await github.refreshTopbarBadge();
     },
     async onRenameEntry(oldPath, newPath, isFolder) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       const affectedUnloaded = filesOnly.filter(
         (f) =>
           f.contentLoaded === false &&
@@ -331,16 +395,14 @@ async function initApp() {
       );
       const sourceProjectId = activeProject.id;
       if (affectedUnloaded.length > 0) {
-        await ensureFilesLoaded(affectedUnloaded);
+        await githubLazySync.ensureFilesLoaded(affectedUnloaded);
       }
       if (activeProject.id !== sourceProjectId) {
-        // El usuario cambió de proyecto mientras se descargaban los archivos: no renombrar en el proyecto equivocado.
         return;
       }
 
       await renameProjectEntry(activeProject.id, oldPath, newPath, isFolder);
 
-      // Actualizar pestañas abiertas afectadas por el renombrado
       openTabIds = openTabIds.map((id) => {
         if (id === oldPath) return newPath;
         if (isFolder && id.startsWith(`${oldPath}/`)) {
@@ -356,13 +418,13 @@ async function initApp() {
       splitController?.handleEntryRenamed(oldPath, newPath, isFolder);
       editor.renameFileStates(oldPath, newPath, isFolder);
 
-      await persistTabsState();
+      await tabManager.persistTabsState();
       await reloadProjectEntries();
       renderWorkspaceView();
       await github.refreshTopbarBadge();
     },
     async onDeleteEntry(path, isFolder) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       await deleteProjectEntry(activeProject.id, path, isFolder);
 
       const removedTabs = openTabIds.filter(
@@ -380,13 +442,13 @@ async function initApp() {
         activeFileId = openTabIds[0] || null;
       }
 
-      await persistTabsState();
+      await tabManager.persistTabsState();
       await reloadProjectEntries();
       renderWorkspaceView();
       await github.refreshTopbarBadge();
     },
     async onSwitchProject(selectedValue) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       if (selectedValue.startsWith("ghlive::")) {
         const parts = selectedValue.split("::");
         const fullName = parts[1] || "";
@@ -410,7 +472,7 @@ async function initApp() {
             entries: index.entries
           });
           projects = await listProjects();
-          await switchProject(createdProj.id, true);
+          await switchProject(createdProj.id);
           if (index.isTruncated) {
             explorer.setAutosaveStatus(
               `Atención: Árbol de ${repo} incompleto (truncado por GitHub en ${index.entries.length} archivos)`
@@ -432,21 +494,21 @@ async function initApp() {
       await switchProject(selectedValue);
     },
     async onCreateProject(name) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       const created = await createLocalProject(name);
       projects = await listProjects();
       await switchProject(created.id);
     },
     async onDeleteCurrentProject() {
       if (projects.length <= 1) return;
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       const removedId = activeProject.id;
       await deleteProject(removedId);
       projects = await listProjects();
       await switchProject(projects[0].id);
     },
     async onImportFiles(importedList) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       let lastPath = null;
       let importedCount = 0;
       try {
@@ -480,12 +542,12 @@ async function initApp() {
       await github.refreshTopbarBadge();
     },
     async onDuplicateEntry(sourcePath) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       const source = filesOnly.find((f) => f.id === sourcePath);
       if (!source) return;
 
       try {
-        await ensureFileContentLoaded(source);
+        await githubLazySync.ensureFileContentLoaded(source);
       } catch (error) {
         explorer.setAutosaveStatus(
           error instanceof Error ? error.message : "No se pudo leer el archivo a duplicar"
@@ -511,7 +573,7 @@ async function initApp() {
     onDownloadFile: downloadSingleFile,
     onDownloadActiveFile: downloadCurrentActiveFile,
     async onExportProjectZip() {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       if (!filesOnly || filesOnly.length === 0) {
         explorer.setAutosaveStatus("No hay archivos para exportar");
         return;
@@ -521,7 +583,7 @@ async function initApp() {
       const unloaded = filesOnly.filter((f) => f.contentLoaded === false && f.blobSha);
       if (unloaded.length > 0) {
         try {
-          await ensureFilesLoaded(unloaded, (done, total) => {
+          await githubLazySync.ensureFilesLoaded(unloaded, (done, total) => {
             explorer.setAutosaveStatus(`Descargando archivos para el ZIP (${done}/${total})…`);
           });
         } catch {
@@ -554,7 +616,7 @@ async function initApp() {
     },
     async onSaveRepoOffline() {
       if (activeProject.kind !== "github" || !activeProject.github) return;
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
 
       const pending = filesOnly.filter((f) => f.contentLoaded === false && f.blobSha);
       if (pending.length === 0) {
@@ -562,7 +624,7 @@ async function initApp() {
         activeProject.offlineCached = true;
         projects = await listProjects();
         explorer.renderProjects(projects, activeProject.id);
-        syncOfflineButtonState();
+        githubLazySync.syncOfflineButtonState();
         explorer.setAutosaveStatus("Copia offline completa en el iPad");
         return;
       }
@@ -577,21 +639,20 @@ async function initApp() {
 
       const sourceProjectId = activeProject.id;
       try {
-        await ensureFilesLoaded(pending, (done, total) => {
+        await githubLazySync.ensureFilesLoaded(pending, (done, total) => {
           explorer.setAutosaveStatus(`Guardando copia offline (${done}/${total})…`);
         });
         if (activeProject.id !== sourceProjectId) {
-          // ensureFilesLoaded ya guardó cada archivo en su repositorio de origen; no marcar otro proyecto.
           return;
         }
         await markProjectOfflineCached(activeProject.id, true);
         activeProject.offlineCached = true;
         projects = await listProjects();
         explorer.renderProjects(projects, activeProject.id);
-        syncOfflineButtonState();
+        githubLazySync.syncOfflineButtonState();
         explorer.setAutosaveStatus("Copia offline guardada en el iPad");
       } catch (error) {
-        syncOfflineButtonState();
+        githubLazySync.syncOfflineButtonState();
         explorer.setAutosaveStatus(
           error instanceof Error ? error.message : "No se pudo completar la copia offline"
         );
@@ -600,16 +661,20 @@ async function initApp() {
     async onCloudBackupProject() {
       const token = getGithubToken();
       if (!token) {
-        document.getElementById("btn-open-github")?.click();
+        if (typeof github.openModal === "function") {
+          github.openModal();
+        } else {
+          document.getElementById("btn-open-github")?.click();
+        }
         return;
       }
       try {
         explorer.setAutosaveStatus("Respaldando en Gist privado…");
-        await flushPendingSaves();
-        const entries = await getProjectEntries(activeProject.id);
+        await autosaveManager.flushPendingSaves();
+        const projectEntries = await getProjectEntries(activeProject.id);
         const res = await saveProjectToGist(token, {
           projectName: activeProject.name,
-          entries,
+          entries: projectEntries,
           existingGistId: activeProject.gistId || null
         });
         activeProject.gistId = res.id;
@@ -617,7 +682,11 @@ async function initApp() {
         explorer.setAutosaveStatus(`¡Respaldado en Gist! (${res.id.slice(0, 6)})`);
       } catch (err) {
         const msg = err?.message || "al respaldar en Gist";
-        if (msg.includes("Resource not accessible") || msg.includes("permiso para Gists") || msg.includes("token no tiene permiso")) {
+        if (
+          msg.includes("Resource not accessible") ||
+          msg.includes("permiso para Gists") ||
+          msg.includes("token no tiene permiso")
+        ) {
           explorer.setAutosaveStatus("Error: el token necesita permiso 'Gists: Read and write'");
         } else {
           explorer.setAutosaveStatus(`Error: ${msg}`);
@@ -626,24 +695,7 @@ async function initApp() {
     }
   });
 
-  const PREVIEWABLE_LANGS = new Set([
-    "html",
-    "js",
-    "ts",
-    "tsx",
-    "css",
-    "python",
-    "markdown",
-    "c",
-    "cpp",
-    "java",
-    "csharp",
-    "sql",
-    "rust",
-    "go"
-  ]);
-
-  initLivePreviewModal({
+  const livePreviewModal = initLivePreviewModal({
     getWorkspaceSnapshot() {
       return {
         files: filesOnly,
@@ -656,98 +708,34 @@ async function initApp() {
         ? filesOnly.find((f) => normalizePath(f.path) === normalizePath(fileOrPath))
         : fileOrPath;
       if (target) {
-        await ensureFileContentLoaded(target);
+        await githubLazySync.ensureFileContentLoaded(target);
       }
       return target;
     },
     async ensureFilesLoaded(fileList) {
       if (!Array.isArray(fileList) || fileList.length === 0) return;
-      const targets = fileList.map((f) => {
-        return typeof f === "string"
-          ? filesOnly.find((item) => normalizePath(item.path) === normalizePath(f))
-          : f;
-      }).filter(Boolean);
-      await ensureFilesLoaded(targets);
+      const targets = fileList
+        .map((f) =>
+          typeof f === "string"
+            ? filesOnly.find((item) => normalizePath(item.path) === normalizePath(f))
+            : f
+        )
+        .filter(Boolean);
+      await githubLazySync.ensureFilesLoaded(targets);
     },
     onErrorMarker(lineNum, errorMessage) {
-      if (editor && typeof editor.addErrorMarker === "function") {
-        editor.addErrorMarker(lineNum, errorMessage);
-      }
+      editor?.addErrorMarker?.(lineNum, errorMessage);
     },
     onClearErrorMarkers() {
-      if (editor && typeof editor.clearErrorMarkers === "function") {
-        editor.clearErrorMarkers();
-      }
+      editor?.clearErrorMarkers?.();
     },
     onGoToLine(lineNum) {
-      if (editor && typeof editor.goToLine === "function") {
-        editor.goToLine(lineNum);
-      }
+      editor?.goToLine?.(lineNum);
     },
     async onBeforePreview() {
-      await flushPendingSaves();
-      if (activeProject.kind !== "github" || !activeFileId) return;
-      const activeFile = filesOnly.find((f) => f.id === activeFileId);
-      if (!activeFile || !PREVIEWABLE_LANGS.has(activeFile.lang)) return;
-
-      if (activeFile.lang === "markdown") {
-        if (activeFile.contentLoaded === false && activeFile.blobSha) {
-          try {
-            await ensureFileContentLoaded(activeFile);
-          } catch {
-            // Se muestra con el estado actual en memoria
-          }
-        }
-        return;
-      }
-
-      const lastSlash = activeFile.path.lastIndexOf("/");
-      const folderPrefix = lastSlash === -1 ? "" : `${activeFile.path.slice(0, lastSlash + 1)}`;
-      const isWeb =
-        activeFile.lang === "html" ||
-        activeFile.lang === "js" ||
-        activeFile.lang === "ts" ||
-        activeFile.lang === "tsx" ||
-        activeFile.lang === "css";
-
-      const needed = filesOnly.filter((f) => {
-        if (f.contentLoaded !== false || !f.blobSha) return false;
-        if (!isWeb && folderPrefix && !f.path.startsWith(folderPrefix)) return false;
-        if (activeFile.lang === "python") {
-          return f.lang === "python";
-        }
-        if (
-          activeFile.lang === "c" ||
-          activeFile.lang === "cpp" ||
-          activeFile.lang === "rust" ||
-          activeFile.lang === "go" ||
-          activeFile.lang === "java" ||
-          activeFile.lang === "csharp"
-        ) {
-          return f.lang === activeFile.lang || f.path.endsWith(".h") || f.path.endsWith(".hpp");
-        }
-        if (activeFile.lang === "sql") {
-          return f.lang === "sql";
-        }
-        return (
-          f.lang === "html" ||
-          f.lang === "js" ||
-          f.lang === "ts" ||
-          f.lang === "tsx" ||
-          f.lang === "css" ||
-          f.path.endsWith(".json")
-        );
-      });
-
-      if (needed.length > 0) {
-        explorer.setAutosaveStatus(`Cargando ${needed.length} archivo(s) para la vista previa…`);
-        try {
-          await ensureFilesLoaded(needed);
-          explorer.setAutosaveStatus("Vista previa lista");
-        } catch {
-          // Si falla la red, abre con los archivos ya disponibles en memoria
-        }
-      }
+      await autosaveManager.flushPendingSaves();
+      const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
+      await githubLazySync.preloadForPreview(activeFile);
     }
   });
 
@@ -790,7 +778,6 @@ async function initApp() {
   async function ensureAnOpenFile(preferredLang = "") {
     if (activeFileId) return;
     if (filesOnly.length > 0) {
-      // Preferir un archivo ya disponible en el iPad para no depender de la red
       const candidate = filesOnly.find((f) => f.contentLoaded !== false) || filesOnly[0];
       await openOrFocusFile(candidate.id);
       return;
@@ -870,8 +857,8 @@ async function initApp() {
         await openOrFocusFile(targetFile.id);
         editor.replaceEntireDocument(code);
         targetFile.content = code;
-        scheduleAutosave(activeProject.id, targetFile.id, code);
-        renderTabs();
+        autosaveManager.scheduleAutosave(activeProject.id, targetFile.id, code);
+        tabManager.renderTabs();
       }
       return true;
     },
@@ -912,11 +899,10 @@ async function initApp() {
       if (firstTarget) {
         await openOrFocusFile(firstTarget.id);
       }
-      renderTabs();
+      tabManager.renderTabs();
       return true;
     },
     onConversationChange(history, projectId) {
-      // La respuesta puede terminar después de cambiar de proyecto: se guarda donde se hizo la pregunta.
       const targetId = projectId || activeProject.id;
       if (targetId === activeProject.id) {
         activeProject.chatHistory = history;
@@ -928,9 +914,9 @@ async function initApp() {
     }
   });
 
-  const github = initGithubController({
+  github = initGithubController({
     getActiveProject: () => activeProject,
-    onFlushPendingSaves: flushPendingSaves,
+    onFlushPendingSaves: () => autosaveManager.flushPendingSaves(),
     onOpenDiff({ title, oldCode, newCode }) {
       diffModal.openReadOnlyDiff({ title, oldCode, newCode });
     },
@@ -938,212 +924,82 @@ async function initApp() {
       explorer.renderProjects(projects, activeProject.id, remoteRepos);
     },
     async onProjectClonedOrSynced(projectId) {
-      await flushPendingSaves();
+      await autosaveManager.flushPendingSaves();
       projects = await listProjects();
-      await switchProject(projectId, true);
+      await switchProject(projectId);
     }
   });
 
-  // Atajo universal Cmd+S / Ctrl+S para forzar volcado inmediato a IndexedDB sin diálogo del navegador
-  window.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === "s") {
-      if (keyboardRouter.shouldBlockGlobalShortcuts()) {
-        return;
-      }
-      event.preventDefault();
-      void (async () => {
-        await flushPendingSaves();
-        explorer.setAutosaveStatus("Guardado en IndexedDB");
-      })();
-    }
-  });
+  // Atajo universal Cmd+S / Ctrl+S y Cmd+W / Ctrl+W / Alt+W enrutados vía keyboardRouter
+  const triggerManualSave = () => {
+    void (async () => {
+      await autosaveManager.flushPendingSaves();
+      explorer.setAutosaveStatus("Guardado en IndexedDB");
+    })();
+  };
+  keyboardRouter.registerGlobalShortcut("ctrl+s", triggerManualSave);
+  keyboardRouter.registerGlobalShortcut("meta+s", triggerManualSave);
 
-  // Atajo universal Cmd+W / Ctrl+W / Alt+W para cerrar la pestaña activa (Alt+W prioritario en Safari PWA)
-  window.addEventListener("keydown", (event) => {
-    if (
-      (event.ctrlKey || event.metaKey || event.altKey) &&
-      !event.shiftKey &&
-      (event.key === "w" || event.key === "W")
-    ) {
-      if (keyboardRouter.getActiveModal() || document.querySelector("dialog[open]")) {
-        return;
-      }
-      if (activeFileId) {
-        event.preventDefault();
-        requestCloseTab(activeFileId);
-      }
+  const triggerCloseActiveTab = () => {
+    if (activeFileId) {
+      requestCloseTab(activeFileId);
     }
-  });
+  };
+  keyboardRouter.registerGlobalShortcut("ctrl+w", triggerCloseActiveTab);
+  keyboardRouter.registerGlobalShortcut("meta+w", triggerCloseActiveTab);
+  keyboardRouter.registerGlobalShortcut("alt+w", triggerCloseActiveTab);
 
   // Sincronización multi-pestaña en vivo vía BroadcastChannel
-  onWorkspaceBroadcast(async (event) => {
-    if (!event || !activeProject || event.projectId !== activeProject.id) return;
-
-    // Actualización de contenido de archivo emitida por otra pestaña (contrato FILE_UPDATED)
-    if (event.type === "FILE_UPDATED" && event.path) {
-      const timerKey = `${activeProject.id}::${event.path}`;
-      // Si esta pestaña tiene escrituras locales en vuelo para este archivo, no pisarlas
-      if (saveTimers.has(timerKey)) {
-        return;
-      }
-
-      await reloadProjectEntries();
-      // Re-verificar tras la lectura asíncrona por si el usuario tecleó mientras se cargaban las entradas
-      if (!activeProject || event.projectId !== activeProject.id || saveTimers.has(timerKey)) {
-        return;
-      }
-
-      const updated = filesOnly.find((f) => f.id === event.path);
-      if (!updated) return;
-
-      if (event.path === activeFileId) {
-        // Invalida el estado cacheado en statesByFile y reabre limpiamente desde IndexedDB sin recargar toda la UI
-        editor.dropFileState(event.path);
-        if (isBinaryFile(updated)) {
-          if (editorMountEl) editorMountEl.hidden = true;
-          binaryPreview.render(updated);
-          symbolBar.setLanguage(updated.lang);
-          setEditorToolbarDisabled(false, true);
-        } else {
-          binaryPreview.hide();
-          if (editorMountEl) editorMountEl.hidden = false;
-          editor.openFile(updated);
-          symbolBar.setLanguage(updated.lang);
-          setEditorToolbarDisabled(false, false);
-        }
-        renderTabs();
-        updateStatusBar();
-      } else {
-        // Invalida el estado en segundo plano para que al hacer clic se lea el contenido fresco
-        editor.dropFileState(event.path);
-        renderTabs();
-      }
-
-      splitController?.handleRemoteFileUpdated(event.path, updated);
-      await github.refreshTopbarBadge();
-      return;
-    }
-
-    let tabsChanged = false;
-
-    // Para cambios estructurales (creación, renombrado, borrado): descartar timers y actualizar estado local
-    if (event.type === "ENTRY_DELETED" && event.path && activeProject) {
-      const deletedPrefix = `${event.path}/`;
-      const isDeletedTarget = (p) =>
-        p === event.path || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(deletedPrefix));
-
-      for (const [key, item] of [...saveTimers.entries()]) {
-        if (item.projectId === activeProject.id && isDeletedTarget(item.filePath)) {
-          if (item.timerId) {
-            window.clearTimeout(item.timerId);
-          }
-          saveTimers.delete(key);
-        }
-      }
-
-      const nextTabs = [];
-      for (const tabId of openTabIds) {
-        if (isDeletedTarget(tabId)) {
-          editor.dropFileState(tabId);
-          tabsChanged = true;
-        } else {
-          nextTabs.push(tabId);
-        }
-      }
-      if (tabsChanged) {
-        openTabIds = nextTabs;
-      }
-      splitController?.dropFileState(event.path, Boolean(event.isFolder));
-      if (isDeletedTarget(activeFileId)) {
-        activeFileId = openTabIds[0] || null;
-        tabsChanged = true;
-      }
-    } else if (event.type === "ENTRY_RENAMED" && event.oldPath && activeProject) {
-      const oldPrefix = `${event.oldPath}/`;
-      const matchesOld = (p) =>
-        p === event.oldPath || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(oldPrefix));
-
-      for (const [key, item] of [...saveTimers.entries()]) {
-        if (item.projectId === activeProject.id && matchesOld(item.filePath)) {
-          if (item.timerId) {
-            window.clearTimeout(item.timerId);
-          }
-          saveTimers.delete(key);
-        }
-      }
-
-      if (event.newPath) {
-        const remapPath = (p) => {
-          if (!p) return p;
-          if (p === event.oldPath) return event.newPath;
-          if (event.isFolder && p.startsWith(oldPrefix)) {
-            return `${event.newPath}${p.slice(event.oldPath.length)}`;
-          }
-          return p;
-        };
-
-        const remappedTabs = [];
-        for (const tabId of openTabIds) {
-          const nextId = remapPath(tabId);
-          if (nextId !== tabId) tabsChanged = true;
-          if (!remappedTabs.includes(nextId)) {
-            remappedTabs.push(nextId);
-          }
-        }
-        openTabIds = remappedTabs;
-
-        if (activeFileId) {
-          const nextActive = remapPath(activeFileId);
-          if (nextActive !== activeFileId) {
-            activeFileId = nextActive;
-            tabsChanged = true;
-          }
-        }
-
-        editor.renameFileStates(event.oldPath, event.newPath, Boolean(event.isFolder));
-        splitController?.handleEntryRenamed(event.oldPath, event.newPath, Boolean(event.isFolder));
-      }
-    }
-
-    // Volcar ediciones pendientes locales restantes antes de recargar
-    await flushPendingSaves();
-    await reloadProjectEntries();
-    if (tabsChanged) {
-      const validIds = new Set(filesOnly.map((f) => f.id));
-      openTabIds = openTabIds.filter((id) => validIds.has(id));
-      if (activeFileId && !validIds.has(activeFileId)) {
-        activeFileId = openTabIds[0] || null;
-      }
-      await persistTabsState();
-    }
-    renderWorkspaceView();
-    await github.refreshTopbarBadge();
-  });
-
-  // Autoguardado inmediato si Safari en iPad suspende la app o cambia en Stage Manager.
-  // Primero se escribe un respaldo SÍNCRONO particionado por proyecto e instancia de pestaña en localStorage.
-  const tabInstanceId = getTabInstanceId();
-  const backupAndFlush = () => {
-    if (saveTimers.size === 0) return;
-    const currentPid = activeProject?.id || null;
-    writeEmergencyBackup([...saveTimers.values()], window.localStorage, currentPid, tabInstanceId);
-    void flushPendingSaves().then(() => {
-      if (saveTimers.size === 0) {
-        clearEmergencyBackup(window.localStorage, currentPid, tabInstanceId);
-      }
-    });
-  };
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") {
-      backupAndFlush();
+  const broadcastSync = initBroadcastSync({
+    onWorkspaceBroadcast,
+    getActiveProject: () => activeProject,
+    autosaveManager,
+    reloadProjectEntries,
+    getFilesOnly: () => filesOnly,
+    getOpenTabIds: () => openTabIds,
+    setOpenTabIds: (next) => {
+      openTabIds = next;
+    },
+    getActiveFileId: () => activeFileId,
+    setActiveFileId: (next) => {
+      activeFileId = next;
+    },
+    persistTabsState: () => tabManager.persistTabsState(),
+    editor,
+    editorMountEl,
+    binaryPreview,
+    symbolBar,
+    statusBar,
+    tabManager,
+    renderWorkspaceView,
+    getSplitController: () => splitController,
+    github,
+    onKeyStorageModeBroadcast: (mode) => {
+      setKeyStorageMode(mode);
+      settingsModal?.syncControls?.();
+      void github.refreshTopbarBadge();
+      explorer?.setAutosaveStatus(
+        mode === "session"
+          ? "Claves solo en esta sesión (sincronizado)"
+          : "Claves persistentes en este dispositivo"
+      );
     }
   });
-  window.addEventListener("pagehide", backupAndFlush);
-  window.addEventListener("beforeunload", backupAndFlush);
 
-  const btnToggleSymbols = document.getElementById("btn-toggle-symbols");
-  syncToolbarState();
-  preventFocusSteal([btnUndo, btnRedo, btnFontDown, btnFontUp, btnMinimap, btnEditorSplit, btnCloseSplit, btnToggleSymbols]);
+  statusBar.syncToolbarState();
+  preventFocusSteal(
+    [
+      btnUndo,
+      btnRedo,
+      btnFontDown,
+      btnFontUp,
+      btnMinimap,
+      btnEditorSplit,
+      btnCloseSplit,
+      btnToggleSymbols
+    ],
+    appListenOpts
+  );
 
   splitController = createSplitEditorController({
     btnEditorSplit,
@@ -1160,10 +1016,11 @@ async function initApp() {
     getActiveFileId: () => activeFileId,
     getFilesOnly: () => filesOnly,
     getOpenTabIds: () => openTabIds,
-    ensureFileContentLoaded,
+    ensureFileContentLoaded: (fileObj) => githubLazySync.ensureFileContentLoaded(fileObj),
     isFileDirtyForProject,
-    renderTabs,
-    scheduleAutosave,
+    renderTabs: (opts) => tabManager.renderTabs(opts),
+    onDirtyChange: (target, nowDirty) => tabManager.updateTabDirtyBadge(target.id, nowDirty),
+    scheduleAutosave: (pid, path, content) => autosaveManager.scheduleAutosave(pid, path, content),
     onSyncMainDoc: (filePath, newContent) => editor.syncDoc(filePath, newContent),
     onFocusMain: () => editor.focus()
   });
@@ -1189,116 +1046,22 @@ async function initApp() {
 
   keyboardRouter.registerGlobalShortcut("alt+shift+f", () => formatActiveDocument());
 
-  btnUndo?.addEventListener("click", () => editor.triggerUndo());
-  btnRedo?.addEventListener("click", () => editor.triggerRedo());
-  btnSearch?.addEventListener("click", () => editor.triggerSearch());
-  btnFormat?.addEventListener("click", () => formatActiveDocument());
+  btnUndo?.addEventListener("click", () => editor.triggerUndo(), appListenOpts);
+  btnRedo?.addEventListener("click", () => editor.triggerRedo(), appListenOpts);
+  btnSearch?.addEventListener("click", () => editor.triggerSearch(), appListenOpts);
+  btnFormat?.addEventListener("click", () => formatActiveDocument(), appListenOpts);
   btnWrap?.addEventListener("click", () => {
-    const enabled = editor.toggleWordWrap();
-    btnWrap.setAttribute("aria-pressed", String(enabled));
-  });
+    statusBar.syncWordWrapPressed(editor.toggleWordWrap());
+  }, appListenOpts);
   btnMinimap?.addEventListener("click", () => {
-    const visible = editor.toggleMinimap();
-    btnMinimap.setAttribute("aria-pressed", String(visible));
-  });
+    statusBar.syncMinimapPressed(editor.toggleMinimap());
+  }, appListenOpts);
   btnFontDown?.addEventListener("click", () => {
-    const size = editor.stepFontSize(-1);
-    if (zoomReadoutEl) zoomReadoutEl.textContent = `${size}px`;
-  });
+    statusBar.syncZoomReadout(editor.stepFontSize(-1));
+  }, appListenOpts);
   btnFontUp?.addEventListener("click", () => {
-    const size = editor.stepFontSize(1);
-    if (zoomReadoutEl) zoomReadoutEl.textContent = `${size}px`;
-  });
-
-  const AUTOSAVE_STORAGE_KEY = "studio_autosave_delay";
-  function getAutosaveDelay() {
-    try {
-      const stored = localStorage.getItem(AUTOSAVE_STORAGE_KEY);
-      if (stored === "manual") return -1;
-      if (stored === "1000") return 1000;
-      return 240;
-    } catch {
-      return 240;
-    }
-  }
-
-  function hasPendingSavesForProject(projectId) {
-    if (!projectId) return false;
-    for (const item of saveTimers.values()) {
-      if (item && item.projectId === projectId) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  function clearProjectEmergencyBackupIfIdle(projectId) {
-    if (!projectId || hasPendingSavesForProject(projectId)) return;
-    clearEmergencyBackup(window.localStorage, projectId, tabInstanceId);
-  }
-
-  function scheduleAutosave(projectId, filePath, content) {
-    const delay = getAutosaveDelay();
-    const timerKey = `${projectId}::${filePath}`;
-    const prev = saveTimers.get(timerKey);
-    if (prev && prev.timerId) {
-      window.clearTimeout(prev.timerId);
-    }
-
-    if (delay < 0) {
-      saveTimers.set(timerKey, { timerId: 0, projectId, filePath, content });
-      explorer.setAutosaveStatus("Modificado (Guardar con Cmd+S)");
-      return;
-    }
-
-    explorer.setAutosaveStatus("Guardando…");
-    const item = { timerId: 0, projectId, filePath, content };
-    item.timerId = window.setTimeout(async () => {
-      item.timerId = 0;
-      try {
-        // La entrada sigue registrada mientras se escribe: así el respaldo de emergencia y
-        // flushPendingSaves también cubren un guardado que está "en vuelo".
-        await updateFileContent(projectId, filePath, content);
-        if (saveTimers.get(timerKey) === item) {
-          saveTimers.delete(timerKey);
-        }
-        clearProjectEmergencyBackupIfIdle(projectId);
-        explorer.setAutosaveStatus("Autoguardado en IndexedDB");
-        explorer.refreshStorageIndicator?.();
-        await github.refreshTopbarBadge();
-      } catch (err) {
-        const isQuota = err && err.name === "QuotaExceededError";
-        explorer.setAutosaveStatus(
-          isQuota ? "Error: Almacenamiento local lleno" : "Error al guardar en IndexedDB"
-        );
-      }
-    }, delay);
-
-    saveTimers.set(timerKey, item);
-  }
-
-  async function flushPendingSaves() {
-    if (saveTimers.size === 0) return;
-    const entries = [...saveTimers.entries()];
-    const flushedProjectIds = new Set();
-    for (const [key, item] of entries) {
-      if (item && item.timerId) {
-        window.clearTimeout(item.timerId);
-        item.timerId = 0;
-      }
-      if (item && item.projectId && item.filePath && typeof item.content === "string") {
-        await updateFileContent(item.projectId, item.filePath, item.content);
-        flushedProjectIds.add(item.projectId);
-      }
-      if (saveTimers.get(key) === item) {
-        saveTimers.delete(key);
-      }
-    }
-    for (const pid of flushedProjectIds) {
-      clearProjectEmergencyBackupIfIdle(pid);
-    }
-    explorer.setAutosaveStatus("Autoguardado en IndexedDB");
-  }
+    statusBar.syncZoomReadout(editor.stepFontSize(1));
+  }, appListenOpts);
 
   async function switchProject(projectId) {
     const nextProj = await getProject(projectId);
@@ -1333,7 +1096,7 @@ async function initApp() {
       const activeTarget = filesOnly.find((f) => f.id === activeFileId);
       if (activeTarget && activeTarget.contentLoaded === false) {
         try {
-          await ensureFileContentLoaded(activeTarget);
+          await githubLazySync.ensureFileContentLoaded(activeTarget);
         } catch {
           openTabIds = openTabIds.filter((id) => id !== activeFileId);
           activeFileId = openTabIds[0] || null;
@@ -1348,8 +1111,12 @@ async function initApp() {
   }
 
   async function reloadProjectEntries() {
-    entries = await getProjectEntries(activeProject.id);
-    filesOnly = entries
+    const rawEntries = await getProjectEntries(activeProject.id);
+    treeEntries = rawEntries.map((e) => ({
+      path: e.path,
+      isFolder: Boolean(e.isFolder)
+    }));
+    filesOnly = rawEntries
       .filter((e) => !e.isFolder)
       .map((e) => {
         const meta = inferFileMeta(e.path);
@@ -1374,134 +1141,6 @@ async function initApp() {
       });
   }
 
-  function syncOfflineButtonState() {
-    if (!activeProject || activeProject.kind !== "github") {
-      explorer.setOfflineRepoState({ visible: false });
-      return;
-    }
-    const pendingCount = filesOnly.filter((f) => f.contentLoaded === false && f.blobSha).length;
-    explorer.setOfflineRepoState({
-      visible: true,
-      isOfflineReady: pendingCount === 0,
-      pendingCount,
-      busy: false
-    });
-  }
-
-  async function ensureFileContentLoaded(fileObj) {
-    if (
-      !fileObj ||
-      fileObj.contentLoaded !== false ||
-      activeProject.kind !== "github" ||
-      !activeProject.github ||
-      !fileObj.blobSha
-    ) {
-      return;
-    }
-
-    // Fijar el proyecto ANTES de esperar a la red: si el usuario cambia de proyecto mientras se descarga,
-    // el contenido debe guardarse en el repositorio de origen y nunca en el proyecto que quedó activo.
-    const sourceProjectId = activeProject.id;
-    const blobPayload = await fetchSingleRepoBlob({
-      token: getGithubToken(),
-      owner: activeProject.github.owner,
-      repo: activeProject.github.repo,
-      blobSha: fileObj.blobSha,
-      path: fileObj.path,
-      isBinary: Boolean(fileObj.isBinary)
-    });
-    const { deleted } = await cacheAndSyncGithubFile({
-      projectId: sourceProjectId,
-      fileObj,
-      remotePayload: blobPayload ?? "",
-      blobSha: fileObj.blobSha
-    });
-    await finalizeLoadedProjectFiles(sourceProjectId, [fileObj], deleted);
-  }
-
-  async function ensureFilesLoaded(fileList, onProgress) {
-    const unloaded = fileList.filter((f) => f && f.contentLoaded === false && f.blobSha);
-    if (unloaded.length === 0 || activeProject.kind !== "github" || !activeProject.github) {
-      return;
-    }
-
-    const sourceProjectId = activeProject.id;
-    const loadedItems = await downloadBatchBlobs({
-      token: getGithubToken(),
-      owner: activeProject.github.owner,
-      repo: activeProject.github.repo,
-      items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha, isBinary: Boolean(f.isBinary) })),
-      onProgress
-    });
-
-    const byPath = new Map(loadedItems.map((item) => [item.path, item]));
-    const syncedFiles = [];
-    let hasDeleted = false;
-    for (const fileObj of unloaded) {
-      const hit = byPath.get(fileObj.path);
-      if (!hit) continue;
-      const { deleted } = await cacheAndSyncGithubFile({
-        projectId: sourceProjectId,
-        fileObj,
-        remotePayload: hit,
-        blobSha: hit.blobSha || fileObj.blobSha
-      });
-      if (deleted) {
-        hasDeleted = true;
-      }
-      syncedFiles.push(fileObj);
-    }
-
-    await finalizeLoadedProjectFiles(sourceProjectId, syncedFiles, hasDeleted);
-  }
-
-  async function finalizeLoadedProjectFiles(sourceProjectId, loadedFiles, hasDeleted = false) {
-    if (activeProject.id !== sourceProjectId) {
-      return;
-    }
-
-    if (hasDeleted) {
-      const deletedIds = new Set(loadedFiles.filter((f) => f?.deleted).map((f) => f.id));
-      if (deletedIds.size > 0) {
-        entries = entries.filter((entry) => !deletedIds.has(entry.id));
-        filesOnly = filesOnly.filter((file) => !deletedIds.has(file.id));
-        openTabIds = openTabIds.filter((id) => !deletedIds.has(id));
-        if (activeFileId && deletedIds.has(activeFileId)) {
-          activeFileId = openTabIds[0] || null;
-          await persistTabsState();
-          renderWorkspaceView();
-        } else {
-          renderTabs();
-        }
-        explorer.renderTree(entries, activeFileId);
-        for (const deletedId of deletedIds) {
-          editor.dropFileState(deletedId);
-          splitController?.dropFileState?.(deletedId);
-        }
-      }
-    }
-
-    for (const fileObj of loadedFiles) {
-      if (fileObj && !fileObj.deleted) {
-        editor.dropFileState(fileObj.id);
-      }
-    }
-
-    if (filesOnly.length > 0 && filesOnly.every((f) => f.contentLoaded !== false)) {
-      activeProject.offlineCached = true;
-      await markProjectOfflineCached(activeProject.id, true);
-      projects = await listProjects();
-      explorer.renderProjects(projects, activeProject.id);
-    }
-    syncOfflineButtonState();
-  }
-
-  async function persistTabsState() {
-    activeProject.openTabIds = [...openTabIds];
-    activeProject.activeFileId = activeFileId;
-    await saveProjectState(activeProject);
-  }
-
   let openRequestSeq = 0;
 
   async function openOrFocusFile(filePath) {
@@ -1514,7 +1153,7 @@ async function initApp() {
     if (target.contentLoaded === false) {
       explorer.setAutosaveStatus(`Abriendo ${target.shortName}…`);
       try {
-        await ensureFileContentLoaded(target);
+        await githubLazySync.ensureFileContentLoaded(target);
         if (currentSeq !== openRequestSeq || activeProject?.id !== currentProjId) {
           return;
         }
@@ -1541,99 +1180,10 @@ async function initApp() {
       openTabIds.push(target.id);
     }
     activeFileId = target.id;
-    await persistTabsState();
-
-    // Guardia de archivos binarios: si es binario/Base64, evitar pasarlo a CodeMirror como texto plano
-    if (isBinaryFile(target)) {
-      renderWorkspaceView();
-      layout.closeLeftOnCompactSelect();
-      return;
-    }
+    await tabManager.persistTabsState();
 
     renderWorkspaceView();
     layout.closeLeftOnCompactSelect();
-  }
-
-  let activeConfirmCleanup = null;
-
-  function showConfirmDialog({
-    title,
-    message,
-    confirmText = "Confirmar",
-    confirmVariant = "btn-primary",
-    onConfirm
-  }) {
-    const dialog = document.getElementById("confirm-dialog");
-    const titleEl = document.getElementById("confirm-dialog-title");
-    const msgEl = document.getElementById("confirm-dialog-message");
-    const cancelBtn = document.getElementById("btn-confirm-cancel");
-    const actionBtn = document.getElementById("btn-confirm-action");
-    const closeBtn = document.getElementById("btn-close-confirm");
-
-    if (!dialog) {
-      if (window.confirm(message)) {
-        onConfirm?.();
-      }
-      return;
-    }
-
-    activeConfirmCleanup?.();
-    if (dialog.open) {
-      dialog.close();
-    }
-
-    if (titleEl) titleEl.textContent = title;
-    if (msgEl) msgEl.textContent = message;
-    if (actionBtn) {
-      actionBtn.textContent = confirmText;
-      actionBtn.className = `btn ${confirmVariant}`;
-    }
-
-    let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      if (activeConfirmCleanup === cleanup) {
-        activeConfirmCleanup = null;
-      }
-      keyboardRouter.popModal("confirm-dialog");
-      cancelBtn?.removeEventListener("click", onCancel);
-      closeBtn?.removeEventListener("click", onCancel);
-      actionBtn?.removeEventListener("click", onProceed);
-      dialog.removeEventListener("close", onDialogClose);
-    };
-    activeConfirmCleanup = cleanup;
-
-    const onCancel = () => {
-      cleanup();
-      if (dialog.open) dialog.close();
-    };
-
-    const onProceed = () => {
-      cleanup();
-      if (dialog.open) dialog.close();
-      onConfirm?.();
-    };
-
-    const onDialogClose = () => {
-      cleanup();
-    };
-
-    cancelBtn?.addEventListener("click", onCancel);
-    closeBtn?.addEventListener("click", onCancel);
-    actionBtn?.addEventListener("click", onProceed);
-    dialog.addEventListener("close", onDialogClose);
-
-    dialog.showModal();
-    keyboardRouter.pushModal({
-      id: "confirm-dialog",
-      blockGlobalShortcuts: true,
-      onEscape: () => onCancel(),
-      onEnter: () => {
-        onProceed();
-        return true;
-      }
-    });
   }
 
   function requestCloseTab(filePath) {
@@ -1660,20 +1210,7 @@ async function initApp() {
     const idx = openTabIds.indexOf(filePath);
     if (idx === -1) return;
 
-    // Si había un guardado pendiente para este archivo, aplicarlo de inmediato antes de limpiar el timer
-    const timerKey = `${activeProject.id}::${filePath}`;
-    const pending = saveTimers.get(timerKey);
-    if (pending) {
-      if (pending.timerId) {
-        window.clearTimeout(pending.timerId);
-        pending.timerId = 0;
-      }
-      await updateFileContent(pending.projectId, pending.filePath, pending.content);
-      if (saveTimers.get(timerKey) === pending) {
-        saveTimers.delete(timerKey);
-      }
-      clearProjectEmergencyBackupIfIdle(pending.projectId);
-    }
+    await autosaveManager.flushFile(activeProject.id, filePath);
 
     openTabIds.splice(idx, 1);
     editor.dropFileState(filePath);
@@ -1681,15 +1218,15 @@ async function initApp() {
     if (activeFileId === filePath) {
       activeFileId = openTabIds.length > 0 ? openTabIds[Math.min(idx, openTabIds.length - 1)] : null;
     }
-    await persistTabsState();
+    await tabManager.persistTabsState();
     renderWorkspaceView();
   }
 
   function renderWorkspaceView() {
     explorer.renderProjects(projects, activeProject.id);
-    explorer.renderTree(entries, activeFileId);
-    syncOfflineButtonState();
-    renderTabs();
+    explorer.renderTree(treeEntries, activeFileId);
+    githubLazySync.syncOfflineButtonState();
+    tabManager.renderTabs();
 
     const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
 
@@ -1699,109 +1236,26 @@ async function initApp() {
         if (editorMountEl) editorMountEl.hidden = true;
         binaryPreview.render(activeFile);
         symbolBar.setLanguage(activeFile.lang);
-        setEditorToolbarDisabled(false, true);
+        statusBar.setEditorToolbarDisabled(false, true);
       } else {
         binaryPreview.hide();
         if (editorMountEl) editorMountEl.hidden = false;
         editor.openFile(activeFile);
         symbolBar.setLanguage(activeFile.lang);
-        setEditorToolbarDisabled(false, false);
+        statusBar.setEditorToolbarDisabled(false, false);
       }
     } else {
       binaryPreview.hide();
       editor.clearActiveFile();
       if (editorMountEl) editorMountEl.hidden = true;
       if (emptyStateEl) emptyStateEl.hidden = false;
-      renderEmptyQuickList();
-      setEditorToolbarDisabled(true, false);
+      tabManager.renderEmptyQuickList();
+      statusBar.setEditorToolbarDisabled(true, false);
     }
 
-    updateAssistantContextLabel();
-    updateStatusBar();
+    statusBar.updateAssistantContextLabel();
+    statusBar.updateStatusBar();
     chat.notifyWorkspaceChanged();
-  }
-
-  function renderTabs() {
-    if (!tabStripEl) return;
-    tabStripEl.innerHTML = "";
-
-    for (const tabId of openTabIds) {
-      const file = filesOnly.find((f) => f.id === tabId);
-      if (!file) continue;
-
-      const isActive = file.id === activeFileId;
-      const dirty = isFileDirtyForProject(file);
-
-      const wrapper = document.createElement("div");
-      wrapper.className = isActive ? "editor-tab-item is-active" : "editor-tab-item";
-
-      const selectBtn = document.createElement("button");
-      selectBtn.type = "button";
-      selectBtn.role = "tab";
-      selectBtn.className = "editor-tab-trigger";
-      selectBtn.title = file.path;
-      selectBtn.setAttribute("aria-selected", String(isActive));
-      selectBtn.innerHTML = `
-        ${icon(file.icon)}
-        <span>${escapeHtml(file.shortName)}</span>
-        ${dirty ? '<span class="editor-tab-dirty" title="Modificado frente al repositorio" aria-label="Modificado"></span>' : ""}
-      `;
-      selectBtn.addEventListener("click", () => openOrFocusFile(file.id));
-
-      const closeBtn = document.createElement("button");
-      closeBtn.type = "button";
-      closeBtn.className = "editor-tab-close";
-      closeBtn.setAttribute("aria-label", `Cerrar pestaña ${file.shortName}`);
-      closeBtn.innerHTML = icon("x");
-      closeBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        requestCloseTab(file.id);
-      });
-
-      wrapper.addEventListener("auxclick", (event) => {
-        if (event.button === 1) {
-          event.preventDefault();
-          event.stopPropagation();
-          requestCloseTab(file.id);
-        }
-      });
-
-      wrapper.append(selectBtn, closeBtn);
-      tabStripEl.appendChild(wrapper);
-    }
-
-    revealActiveTab();
-    splitController?.refreshIfOpen();
-  }
-
-  /** En pantallas angostas desplaza la tira de pestañas hasta la activa (sin mover el resto de la página). */
-  function revealActiveTab() {
-    if (!tabStripEl) return;
-    const activeEl = tabStripEl.querySelector(".editor-tab-item.is-active");
-    if (!(activeEl instanceof HTMLElement)) return;
-    const strip = tabStripEl.getBoundingClientRect();
-    const tab = activeEl.getBoundingClientRect();
-    if (tab.width >= strip.width) {
-      // Más ancha que la tira: alinear el comienzo para que se lea el nombre del archivo
-      tabStripEl.scrollLeft += tab.left - strip.left;
-    } else if (tab.left < strip.left) {
-      tabStripEl.scrollLeft -= strip.left - tab.left + 8;
-    } else if (tab.right > strip.right) {
-      tabStripEl.scrollLeft += tab.right - strip.right + 8;
-    }
-  }
-
-  function renderEmptyQuickList() {
-    if (!emptyQuickListEl) return;
-    emptyQuickListEl.innerHTML = "";
-    for (const file of filesOnly.slice(0, 6)) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "btn";
-      btn.innerHTML = `${icon(file.icon)}<span>${escapeHtml(file.shortName)}</span>`;
-      btn.addEventListener("click", () => openOrFocusFile(file.id));
-      emptyQuickListEl.appendChild(btn);
-    }
   }
 
   function isFileDirtyForProject(file) {
@@ -1818,90 +1272,6 @@ async function initApp() {
     return false;
   }
 
-  function syncToolbarState() {
-    if (btnWrap) {
-      btnWrap.setAttribute("aria-pressed", String(editor.isWordWrapEnabled()));
-    }
-    if (btnMinimap) {
-      btnMinimap.setAttribute("aria-pressed", String(editor.isMinimapVisible()));
-    }
-    if (zoomReadoutEl) {
-      zoomReadoutEl.textContent = `${editor.getFontSize()}px`;
-    }
-  }
-
-  function setEditorToolbarDisabled(disabled, isBinary = false) {
-    if (btnUndo) btnUndo.disabled = disabled || isBinary;
-    if (btnRedo) btnRedo.disabled = disabled || isBinary;
-    if (btnSearch) btnSearch.disabled = disabled || isBinary;
-    if (btnExportFile) btnExportFile.disabled = disabled;
-    if (btnWrap) btnWrap.disabled = disabled || isBinary;
-    if (btnMinimap) btnMinimap.disabled = disabled || isBinary;
-  }
-
-  function updateNetworkIndicator() {
-    if (!statusNetworkEl) return;
-    const isOnline = navigator.onLine !== false;
-    statusNetworkEl.textContent = isOnline ? "En línea" : "Sin conexión";
-    statusNetworkEl.classList.toggle("is-offline", !isOnline);
-  }
-
-  function updateStatusBar() {
-    const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
-    if (!activeFile) {
-      if (statusFilePathEl) statusFilePathEl.textContent = "Sin archivo abierto";
-      if (statusFileLangEl) statusFileLangEl.textContent = "—";
-      if (statusCursorPosEl) statusCursorPosEl.textContent = "—";
-    } else if (isBinaryFile(activeFile)) {
-      if (statusFilePathEl) statusFilePathEl.textContent = activeFile.path;
-      if (statusFileLangEl) statusFileLangEl.textContent = activeFile.badge || "BIN";
-      if (statusCursorPosEl) statusCursorPosEl.textContent = "Binario (Solo lectura)";
-    } else {
-      if (statusFilePathEl) statusFilePathEl.textContent = activeFile.path;
-      if (statusFileLangEl) statusFileLangEl.textContent = activeFile.badge;
-      const line = activeSelection.cursorLine || 1;
-      const col = activeSelection.cursorCol || 1;
-      const selSuffix =
-        activeSelection.lineCount > 0 ? ` (${activeSelection.lineCount} sel.)` : "";
-      if (statusCursorPosEl) {
-        statusCursorPosEl.textContent = `Línea ${line}, Col ${col}${selSuffix}`;
-      }
-    }
-    updateNetworkIndicator();
-  }
-
-  window.addEventListener("online", updateNetworkIndicator);
-  window.addEventListener("offline", updateNetworkIndicator);
-
-  function updateAssistantContextLabel() {
-    const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
-    if (!activeFile) {
-      if (contextStatusEl) contextStatusEl.textContent = "Sin archivo activo";
-      if (contextFileEl) contextFileEl.textContent = "Ninguno";
-      return;
-    }
-
-    if (isBinaryFile(activeFile)) {
-      if (contextStatusEl) contextStatusEl.textContent = "Recurso binario (no editable)";
-      if (contextFileEl) contextFileEl.textContent = activeFile.shortName;
-      return;
-    }
-
-    if (activeSelection.lineCount > 0) {
-      const label =
-        activeSelection.lineCount === 1
-          ? "1 línea seleccionada"
-          : `${activeSelection.lineCount} líneas seleccionadas`;
-      if (contextStatusEl) contextStatusEl.textContent = label;
-    } else {
-      if (contextStatusEl) contextStatusEl.textContent = "Leyendo archivo activo";
-    }
-
-    if (contextFileEl) {
-      contextFileEl.textContent = activeFile.shortName;
-    }
-  }
-
   await switchProject(activeProject.id);
   if (restoredFromBackup > 0) {
     explorer.setAutosaveStatus(
@@ -1911,6 +1281,23 @@ async function initApp() {
     );
   }
   void github.syncExplorerReposInBackground();
+
+  return {
+    destroy() {
+      appListeners?.abort();
+      broadcastSync?.destroy?.();
+      autosaveManager?.destroy?.();
+      statusBar?.destroy?.();
+      splitController?.destroy?.();
+      explorer?.destroy?.();
+      quickOpenModal?.destroy?.();
+      globalSearchModal?.destroy?.();
+      settingsModal?.destroy?.();
+      livePreviewModal?.destroy?.();
+      layout?.destroy?.();
+      keyboardRouter?.destroy?.();
+    }
+  };
 }
 
 function defaultStarterTemplate(path) {
@@ -1933,11 +1320,11 @@ function defaultStarterTemplate(path) {
   }
 }
 
-function preventFocusSteal(buttons) {
+function preventFocusSteal(buttons, listenOpts) {
   for (const btn of buttons) {
     btn?.addEventListener("pointerdown", (event) => {
       event.preventDefault();
-    });
+    }, listenOpts);
   }
 }
 
@@ -1951,7 +1338,6 @@ function registerPwaServiceWorker() {
     new URLSearchParams(window.location.search).get("sw") === "1";
 
   if (isLocalDev && !allowLocalSw) {
-    // En servidor local de PC desactivamos cualquier Service Worker viejo para ver cambios al instante
     navigator.serviceWorker.getRegistrations().then((regs) => {
       for (const reg of regs) {
         reg.unregister();
@@ -1986,15 +1372,6 @@ function registerPwaServiceWorker() {
       window.addEventListener("load", startRegistration);
     }
   }
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 /**

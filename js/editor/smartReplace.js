@@ -1,3 +1,75 @@
+const ASSIGN_REGEX = /^(?:(?:const|let|var|int|float|double|long|short|char|bool|auto|std::\w+|string|final|public|private|protected|static)\s+)?([A-Za-z_$][\w$.]*)\s*(?:[+\-*/%&|^]?=(?!=)|:(?!:))/;
+const SIG_REGEX = /^(?:(?:export|default|async|public|private|protected|static|virtual|inline|fn|func|def|function|class|struct|interface|type)\s+)*([A-Za-z_$][\w$]*)\s*\(/;
+const STMT_REGEX = /^(print|console\.\w+|std::cout|std::cerr|printf|fmt\.Print\w*|println!|System\.out\.print\w*|Console\.Write\w*|return|throw|yield|#include|import|from)\b/;
+const TAG_REGEX = /^<([A-Za-z][A-Za-z0-9-]*)\b/;
+const TOKEN_REGEX = /[A-Za-z_$\u00C0-\u024F][A-Za-z0-9_$\u00C0-\u024F]*|\d+|[^\s\w]/g;
+
+const MAX_PREPARED_DOC_LINES = 6000;
+const MAX_WINDOW_CHECKS = 60000;
+
+/**
+ * Pre-tokeniza una línea para evitar repetir expresiones regulares y asignaciones de Map
+ * dentro de bucles deslizantes sobre el documento.
+ * @param {string} rawLine
+ */
+function prepareLineForSimilarity(rawLine) {
+  const trimmed = String(rawLine || "").trim();
+  if (!trimmed) {
+    return null;
+  }
+  const lhsMatch = trimmed.match(ASSIGN_REGEX);
+  const sigMatch = trimmed.match(SIG_REGEX);
+  const stmtMatch = trimmed.match(STMT_REGEX);
+  const tagMatch = trimmed.match(TAG_REGEX);
+  const tokens = trimmed.match(TOKEN_REGEX) || [];
+
+  const tokenCounts = new Map();
+  for (const t of tokens) {
+    tokenCounts.set(t, (tokenCounts.get(t) || 0) + 1);
+  }
+
+  return {
+    trimmed,
+    lhs: lhsMatch ? lhsMatch[1] : null,
+    sig: sigMatch ? sigMatch[1] : null,
+    stmt: stmtMatch ? stmtMatch[1] : null,
+    tag: tagMatch ? tagMatch[1].toLowerCase() : null,
+    tokenLength: tokens.length,
+    tokenCounts
+  };
+}
+
+function scorePreparedLines(prepA, prepB) {
+  if (!prepA || !prepB) return 0;
+  if (prepA.trimmed === prepB.trimmed) return 1;
+
+  let bonus = 0;
+  if (prepA.lhs && prepA.lhs === prepB.lhs) {
+    bonus = Math.max(bonus, 0.68);
+  }
+  if (prepA.sig && prepA.sig === prepB.sig) {
+    bonus = Math.max(bonus, 0.62);
+  }
+  if (prepA.stmt && prepA.stmt === prepB.stmt) {
+    bonus = Math.max(bonus, 0.52);
+  }
+  if (prepA.tag && prepA.tag === prepB.tag) {
+    bonus = Math.max(bonus, 0.50);
+  }
+
+  if (prepA.tokenLength === 0 || prepB.tokenLength === 0) return bonus;
+
+  let intersection = 0;
+  for (const [token, countB] of prepB.tokenCounts.entries()) {
+    const countA = prepA.tokenCounts.get(token) || 0;
+    if (countA > 0) {
+      intersection += countA < countB ? countA : countB;
+    }
+  }
+  const dice = (2 * intersection) / (prepA.tokenLength + prepB.tokenLength);
+  return Math.min(1, bonus + dice * (1 - bonus * 0.65));
+}
+
 /**
  * Calcula la similitud estructural y léxica entre dos líneas de código (0 a 1).
  * Prioriza coincidencias de asignación/declaración (LHS), llamadas a funciones, etiquetas HTML y selectores.
@@ -6,65 +78,9 @@
  * @returns {number}
  */
 export function scoreLineSimilarity(docLine, snippetLine) {
-  const a = String(docLine || "").trim();
-  const b = String(snippetLine || "").trim();
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-
-  let bonus = 0;
-
-  // 1. Coincidencia de declaración / asignación (LHS antes de = o :)
-  const assignRegex = /^(?:(?:const|let|var|int|float|double|long|short|char|bool|auto|std::\w+|string|final|public|private|protected|static)\s+)?([A-Za-z_$][\w$.]*)\s*(?:[+\-*/%&|^]?=(?!=)|:(?!:))/;
-  const lhsA = a.match(assignRegex);
-  const lhsB = b.match(assignRegex);
-  if (lhsA && lhsB && lhsA[1] === lhsB[1]) {
-    bonus = Math.max(bonus, 0.68);
-  }
-
-  // 2. Coincidencia de firma de función / método / bloque de control
-  const sigRegex = /^(?:(?:export|default|async|public|private|protected|static|virtual|inline|fn|func|def|function|class|struct|interface|type)\s+)*([A-Za-z_$][\w$]*)\s*\(/;
-  const sigA = a.match(sigRegex);
-  const sigB = b.match(sigRegex);
-  if (sigA && sigB && sigA[1] === sigB[1]) {
-    bonus = Math.max(bonus, 0.62);
-  }
-
-  // 3. Coincidencia de sentencia de salida / comando común (print, console.log, std::cout, printf, return)
-  const stmtRegex = /^(print|console\.\w+|std::cout|std::cerr|printf|fmt\.Print\w*|println!|System\.out\.print\w*|Console\.Write\w*|return|throw|yield|#include|import|from)\b/;
-  const stmtA = a.match(stmtRegex);
-  const stmtB = b.match(stmtRegex);
-  if (stmtA && stmtB && stmtA[1] === stmtB[1]) {
-    bonus = Math.max(bonus, 0.52);
-  }
-
-  // 4. Coincidencia de etiqueta HTML de apertura/cierre
-  const tagRegex = /^<([A-Za-z][A-Za-z0-9-]*)\b/;
-  const tagA = a.match(tagRegex);
-  const tagB = b.match(tagRegex);
-  if (tagA && tagB && tagA[1].toLowerCase() === tagB[1].toLowerCase()) {
-    bonus = Math.max(bonus, 0.50);
-  }
-
-  // 5. Similitud por tokens (coeficiente de Dice sobre identificadores, números y operadores)
-  const tokenRegex = /[A-Za-z_$\u00C0-\u024F][A-Za-z0-9_$\u00C0-\u024F]*|\d+|[^\s\w]/g;
-  const tokensA = a.match(tokenRegex) || [];
-  const tokensB = b.match(tokenRegex) || [];
-  if (tokensA.length === 0 || tokensB.length === 0) return bonus;
-
-  const countsA = new Map();
-  for (const t of tokensA) {
-    countsA.set(t, (countsA.get(t) || 0) + 1);
-  }
-  let intersection = 0;
-  for (const t of tokensB) {
-    const c = countsA.get(t) || 0;
-    if (c > 0) {
-      intersection += 1;
-      countsA.set(t, c - 1);
-    }
-  }
-  const dice = (2 * intersection) / (tokensA.length + tokensB.length);
-  return Math.min(1, bonus + dice * (1 - bonus * 0.65));
+  const prepA = prepareLineForSimilarity(docLine);
+  const prepB = prepareLineForSimilarity(snippetLine);
+  return scorePreparedLines(prepA, prepB);
 }
 
 /**
@@ -278,16 +294,75 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
 
   const safeCursorIdx = Math.min(Math.max(0, (Number(cursorLine) || 1) - 1), docLines.length - 1);
 
+  // Acotar el análisis léxico en archivos masivos para mantener tiempos interactivos
+  if (docLines.length > MAX_PREPARED_DOC_LINES) {
+    const windowRadius = 400;
+    const scanStart = Math.max(0, safeCursorIdx - windowRadius);
+    const scanEnd = Math.min(docLines.length - 1, safeCursorIdx + windowRadius);
+    const snippetPrep = snippetLines.map(prepareLineForSimilarity);
+
+    if (snippetLines.length === 1) {
+      let bestIdx = -1;
+      let bestScore = -1;
+      for (let i = scanStart; i <= scanEnd; i++) {
+        if (!docLines[i].trim()) continue;
+        const prepDoc = prepareLineForSimilarity(docLines[i]);
+        let score = scorePreparedLines(prepDoc, snippetPrep[0]);
+        if (i === hintedLineIdx) score += 0.35;
+        const proximityBonus = 0.04 / (1 + Math.abs(i - safeCursorIdx) * 0.25);
+        const totalScore = score + (score >= 0.25 ? proximityBonus : 0);
+        if (totalScore > bestScore) {
+          bestScore = totalScore;
+          bestIdx = i;
+        }
+      }
+      const targetIdx = bestIdx !== -1 && bestScore >= 0.32
+        ? bestIdx
+        : (hintedLineIdx !== -1 ? hintedLineIdx : safeCursorIdx);
+      const { from, to } = lineRangeToOffsets(targetIdx, targetIdx);
+      const inserted = applyBaseIndentation(docLines[targetIdx], [snippetLines[0]]);
+      return {
+        text: rawDoc.slice(0, from) + inserted + rawDoc.slice(to),
+        from,
+        to,
+        insertedText: inserted,
+        targetLineNumber: targetIdx + 1,
+        mode: "single-line"
+      };
+    }
+
+    return {
+      text: rawSnippet,
+      from: 0,
+      to: rawDoc.length,
+      insertedText: rawSnippet,
+      mode: "full"
+    };
+  }
+
+  // Pre-tokenizar líneas una sola vez antes de búsquedas y ventanas deslizantes O(N*M)
+  let preparedDoc = null;
+  const getPreparedDocLine = (idx) => {
+    if (!preparedDoc) preparedDoc = new Array(docLines.length);
+    let cached = preparedDoc[idx];
+    if (cached === undefined) {
+      cached = prepareLineForSimilarity(docLines[idx]);
+      preparedDoc[idx] = cached;
+    }
+    return cached;
+  };
+
   // 4. Caso Crítico: El código devuelto por la IA es UNA SOLA LÍNEA en un archivo de múltiples líneas
   if (snippetLines.length === 1) {
     const singleSnippet = snippetLines[0];
+    const prepSnippet = prepareLineForSimilarity(singleSnippet);
     let bestIdx = -1;
     let bestScore = -1;
 
     for (let i = 0; i < docLines.length; i++) {
       const candidateLine = docLines[i];
       if (!candidateLine.trim()) continue;
-      let score = scoreLineSimilarity(candidateLine, singleSnippet);
+      let score = scorePreparedLines(getPreparedDocLine(i), prepSnippet);
       if (i === hintedLineIdx) {
         score += 0.35;
       }
@@ -329,11 +404,13 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
   // Buscar si el primer renglón del snippet ancla el inicio de una función o bloque interior del archivo
   const firstSnippetLine = snippetLines.find((l) => l.trim().length > 0) || snippetLines[0];
   const lastSnippetLine = [...snippetLines].reverse().find((l) => l.trim().length > 0) || snippetLines[snippetLines.length - 1];
+  const preparedFirstSnippet = prepareLineForSimilarity(firstSnippetLine);
+  const preparedLastSnippet = prepareLineForSimilarity(lastSnippetLine);
 
   let bestStartIdx = -1;
   let bestStartScore = 0;
   for (let i = 0; i < docLines.length; i++) {
-    const s = scoreLineSimilarity(docLines[i], firstSnippetLine);
+    const s = scorePreparedLines(getPreparedDocLine(i), preparedFirstSnippet);
     if (s > bestStartScore) {
       bestStartScore = s;
       bestStartIdx = i;
@@ -370,7 +447,7 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
       );
       let bestEndScore = 0;
       for (let k = searchFrom; k <= searchTo; k++) {
-        const sim = scoreLineSimilarity(docLines[k], lastSnippetLine);
+        const sim = scorePreparedLines(getPreparedDocLine(k), preparedLastSnippet);
         if (sim <= 0) continue;
         const proximityBonus = 0.02 / (1 + Math.abs(k - expectedEnd));
         const s = sim + proximityBonus;
@@ -408,17 +485,29 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     nonEmptyDocLines >= 3 &&
     nonEmptySnippetLines < nonEmptyDocLines &&
     nonEmptySnippetLines <= maxFragmentLines &&
-    scoreLineSimilarity(docLines[0], firstSnippetLine) < 0.7;
+    scorePreparedLines(getPreparedDocLine(0), preparedFirstSnippet) < 0.7;
 
   if (isSmallFragment) {
     const winLen = Math.min(snippetLines.length, docLines.length);
+    const preparedSnippet = snippetLines.map(prepareLineForSimilarity);
     let bestWinIdx = safeCursorIdx;
     let bestWinScore = -1;
 
-    for (let i = 0; i <= docLines.length - winLen; i++) {
+    // Acotar ventana deslizante para entradas muy grandes
+    const totalPositions = docLines.length - winLen + 1;
+    const maxPositions = Math.max(1, Math.floor(MAX_WINDOW_CHECKS / Math.max(1, winLen)));
+    let winStart = 0;
+    let winEnd = docLines.length - winLen;
+    if (totalPositions > maxPositions) {
+      const half = Math.floor(maxPositions / 2);
+      winStart = Math.max(0, safeCursorIdx - half);
+      winEnd = Math.min(docLines.length - winLen, winStart + maxPositions - 1);
+    }
+
+    for (let i = winStart; i <= winEnd; i++) {
       let sum = 0;
       for (let j = 0; j < winLen; j++) {
-        sum += scoreLineSimilarity(docLines[i + j], snippetLines[j]);
+        sum += scorePreparedLines(getPreparedDocLine(i + j), preparedSnippet[j]);
       }
       const avg = sum / winLen;
       if (avg > bestWinScore) {

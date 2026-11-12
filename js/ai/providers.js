@@ -27,6 +27,34 @@ const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
 const GH_USER_CACHE_KEY = "ide.github.userLogin";
 
 const liveSyncedByProvider = new Map();
+const liveModelsByProvider = new Map();
+
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
+
+function getStorageArea(kind) {
+  if (typeof window !== "undefined") {
+    try {
+      if (window[kind]) return window[kind];
+    } catch {
+      return null;
+    }
+  }
+  try {
+    return kind === "sessionStorage"
+      ? typeof sessionStorage !== "undefined"
+        ? sessionStorage
+        : null
+      : typeof localStorage !== "undefined"
+        ? localStorage
+        : null;
+  } catch {
+    return null;
+  }
+}
+
+export function getProviderModels(providerId) {
+  return liveModelsByProvider.get(providerId) || AI_PROVIDERS[providerId]?.models || [];
+}
 
 export const PROVIDER_SHORT_NAMES = {
   gemini: "Google Gemini",
@@ -128,7 +156,8 @@ export function getModelContextWindow(providerId, modelId) {
   const provider = AI_PROVIDERS[providerId];
   if (!provider) return 16000;
   if (modelId) {
-    const found = provider.models?.find((m) => m.id === modelId);
+    const models = getProviderModels(providerId);
+    const found = models.find((m) => m.id === modelId) || provider.models?.find((m) => m.id === modelId);
     if (found?.contextWindow) return found.contextWindow;
   }
   return provider.contextWindow || 16000;
@@ -181,7 +210,8 @@ function isActiveGroqChatModelId(id) {
 
 export function getKeyStorageMode() {
   try {
-    const mode = window.localStorage.getItem(STORAGE_MODE_KEY);
+    const local = getStorageArea("localStorage");
+    const mode = local?.getItem(STORAGE_MODE_KEY);
     return mode === "session" ? "session" : "local";
   } catch {
     return "session";
@@ -195,33 +225,35 @@ export function setKeyStorageMode(nextMode) {
   }
 
   try {
-    window.localStorage.setItem(STORAGE_MODE_KEY, nextMode);
-    const fromStore = prevMode === "session" ? window.sessionStorage : window.localStorage;
-    const toStore = nextMode === "session" ? window.sessionStorage : window.localStorage;
+    const local = getStorageArea("localStorage");
+    const session = getStorageArea("sessionStorage");
+    local?.setItem(STORAGE_MODE_KEY, nextMode);
+    const fromStore = prevMode === "session" ? session : local;
+    const toStore = nextMode === "session" ? session : local;
 
     for (const id of Object.keys(AI_PROVIDERS)) {
       const k = `${KEY_PREFIX}${id}`;
-      const val = fromStore.getItem(k);
+      const val = fromStore?.getItem(k);
       if (val) {
-        toStore.setItem(k, val);
+        toStore?.setItem(k, val);
       }
       if (fromStore !== toStore) {
-        fromStore.removeItem(k);
+        fromStore?.removeItem(k);
       }
       if (nextMode === "session") {
-        window.localStorage.removeItem(k);
+        local?.removeItem(k);
       }
     }
     for (const extraKey of [GH_TOKEN_STORAGE_KEY, GH_REPOS_CACHE_KEY, GH_USER_CACHE_KEY]) {
-      const val = fromStore.getItem(extraKey);
+      const val = fromStore?.getItem(extraKey);
       if (val) {
-        toStore.setItem(extraKey, val);
+        toStore?.setItem(extraKey, val);
       }
       if (fromStore !== toStore) {
-        fromStore.removeItem(extraKey);
+        fromStore?.removeItem(extraKey);
       }
       if (nextMode === "session") {
-        window.localStorage.removeItem(extraKey);
+        local?.removeItem(extraKey);
       }
     }
     if (nextMode === "session") {
@@ -233,30 +265,41 @@ export function setKeyStorageMode(nextMode) {
 }
 
 export function getApiKey(providerId) {
+  if (!Object.hasOwn(AI_PROVIDERS, providerId)) {
+    return "";
+  }
   const k = `${KEY_PREFIX}${providerId}`;
   try {
-    return window.sessionStorage.getItem(k) || window.localStorage.getItem(k) || "";
+    return getStorageArea("sessionStorage")?.getItem(k) || getStorageArea("localStorage")?.getItem(k) || "";
   } catch {
     return "";
   }
 }
 
 export function saveApiKey(providerId, apiKey) {
+  if (!Object.hasOwn(AI_PROVIDERS, providerId)) {
+    return;
+  }
   const k = `${KEY_PREFIX}${providerId}`;
   const raw = String(apiKey || "");
-  if (/[\x00-\x1f\x7f]/.test(raw)) {
+  if (CONTROL_CHARS_RE.test(raw)) {
     return;
   }
   const trimmed = raw.trim();
   liveSyncedByProvider.delete(providerId);
+  if (providerId !== "openrouter") {
+    liveModelsByProvider.delete(providerId);
+  }
   try {
-    window.localStorage.removeItem(k);
-    window.sessionStorage.removeItem(k);
+    const local = getStorageArea("localStorage");
+    const session = getStorageArea("sessionStorage");
+    local?.removeItem(k);
+    session?.removeItem(k);
     if (!trimmed) {
       return;
     }
-    const target = getKeyStorageMode() === "session" ? window.sessionStorage : window.localStorage;
-    target.setItem(k, trimmed);
+    const target = getKeyStorageMode() === "session" ? session : local;
+    target?.setItem(k, trimmed);
   } catch {
     // Entorno restringido
   }
@@ -276,8 +319,8 @@ export function exportKeysBundle() {
   }
   try {
     const ghToken =
-      window.sessionStorage.getItem(GH_TOKEN_STORAGE_KEY) ||
-      window.localStorage.getItem(GH_TOKEN_STORAGE_KEY) ||
+      getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
+      getStorageArea("localStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
       "";
     if (ghToken) {
       bundle.githubPat = ghToken;
@@ -292,6 +335,14 @@ export function exportKeysBundle() {
   return JSON.stringify(bundle);
 }
 
+function isValidImportedSecretString(raw) {
+  if (typeof raw !== "string" || CONTROL_CHARS_RE.test(raw)) {
+    return false;
+  }
+  const trimmed = raw.trim();
+  return trimmed.length > 0 && trimmed.length <= 512 && !/\s/.test(trimmed);
+}
+
 export function importKeysBundle(rawJson) {
   const parsed = JSON.parse(rawJson);
   if (!parsed || typeof parsed !== "object") {
@@ -299,25 +350,27 @@ export function importKeysBundle(rawJson) {
   }
   let count = 0;
   for (const id of Object.keys(AI_PROVIDERS)) {
-    if (typeof parsed[id] === "string" && parsed[id].trim()) {
+    if (Object.hasOwn(parsed, id) && isValidImportedSecretString(parsed[id])) {
       saveApiKey(id, parsed[id].trim());
       count += 1;
     }
   }
   const ghVal = parsed.githubPat || parsed.github || parsed.ghToken || parsed.token;
-  if (typeof ghVal === "string" && ghVal.trim()) {
+  if (isValidImportedSecretString(ghVal)) {
     try {
       const cleanPat = ghVal.trim();
-      window.localStorage.removeItem(GH_TOKEN_STORAGE_KEY);
-      window.sessionStorage.removeItem(GH_TOKEN_STORAGE_KEY);
-      const target = getKeyStorageMode() === "session" ? window.sessionStorage : window.localStorage;
-      target.setItem(GH_TOKEN_STORAGE_KEY, cleanPat);
+      const local = getStorageArea("localStorage");
+      const session = getStorageArea("sessionStorage");
+      local?.removeItem(GH_TOKEN_STORAGE_KEY);
+      session?.removeItem(GH_TOKEN_STORAGE_KEY);
+      const target = getKeyStorageMode() === "session" ? session : local;
+      target?.setItem(GH_TOKEN_STORAGE_KEY, cleanPat);
       count += 1;
     } catch {
       // Ignorar
     }
   }
-  if (typeof parsed.activeProvider === "string" && AI_PROVIDERS[parsed.activeProvider]) {
+  if (typeof parsed.activeProvider === "string" && Object.hasOwn(AI_PROVIDERS, parsed.activeProvider)) {
     saveProviderId(parsed.activeProvider);
   }
   return count;
@@ -329,8 +382,8 @@ export function hasStoredCredentials() {
       if (getApiKey(id)) return true;
     }
     const ghToken =
-      window.sessionStorage.getItem(GH_TOKEN_STORAGE_KEY) ||
-      window.localStorage.getItem(GH_TOKEN_STORAGE_KEY) ||
+      getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
+      getStorageArea("localStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
       "";
     return Boolean(ghToken && ghToken.trim());
   } catch {
@@ -340,12 +393,13 @@ export function hasStoredCredentials() {
 
 export function getSavedProviderId() {
   try {
-    const saved = window.localStorage.getItem(ACTIVE_PROVIDER_KEY);
-    if (saved && AI_PROVIDERS[saved]) {
+    const local = getStorageArea("localStorage");
+    const saved = local?.getItem(ACTIVE_PROVIDER_KEY);
+    if (saved && Object.hasOwn(AI_PROVIDERS, saved)) {
       return saved;
     }
-    if (saved && !AI_PROVIDERS[saved]) {
-      window.localStorage.setItem(ACTIVE_PROVIDER_KEY, "gemini");
+    if (saved && !Object.hasOwn(AI_PROVIDERS, saved)) {
+      local?.setItem(ACTIVE_PROVIDER_KEY, "gemini");
     }
     return "gemini";
   } catch {
@@ -354,39 +408,41 @@ export function getSavedProviderId() {
 }
 
 export function saveProviderId(providerId) {
+  if (!Object.hasOwn(AI_PROVIDERS, providerId)) return;
   try {
-    window.localStorage.setItem(ACTIVE_PROVIDER_KEY, providerId);
+    getStorageArea("localStorage")?.setItem(ACTIVE_PROVIDER_KEY, providerId);
   } catch {
     // Ignorar
   }
 }
 
 export function getSavedModel(providerId) {
-  const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS.gemini;
+  const provider = Object.hasOwn(AI_PROVIDERS, providerId) ? AI_PROVIDERS[providerId] : AI_PROVIDERS.gemini;
+  const fallbackModel = getProviderModels(provider.id)[0]?.id || provider.models[0].id;
   try {
-    const saved = window.localStorage.getItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`);
+    const local = getStorageArea("localStorage");
+    const saved = local?.getItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`);
     if (saved) {
       if (provider.id === "gemini" && !isFreeActiveGoogleModelId(saved)) {
-        const cleanDefault = provider.models[0].id;
-        window.localStorage.setItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`, cleanDefault);
-        return cleanDefault;
+        local?.setItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`, fallbackModel);
+        return fallbackModel;
       }
       if (provider.id === "groq" && !isActiveGroqChatModelId(saved)) {
-        const cleanDefault = provider.models[0].id;
-        window.localStorage.setItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`, cleanDefault);
-        return cleanDefault;
+        local?.setItem(`${CUSTOM_MODEL_PREFIX}${provider.id}`, fallbackModel);
+        return fallbackModel;
       }
       return saved;
     }
-    return provider.models[0].id;
+    return fallbackModel;
   } catch {
-    return provider.models[0].id;
+    return fallbackModel;
   }
 }
 
 export function saveModel(providerId, modelId) {
+  if (!Object.hasOwn(AI_PROVIDERS, providerId)) return;
   try {
-    window.localStorage.setItem(`${CUSTOM_MODEL_PREFIX}${providerId}`, modelId.trim());
+    getStorageArea("localStorage")?.setItem(`${CUSTOM_MODEL_PREFIX}${providerId}`, String(modelId || "").trim());
   } catch {
     // Ignorar
   }
@@ -448,7 +504,7 @@ export async function validateApiKey(providerId, apiKey, signal) {
   try {
     res = await fetch(check.url, { headers, signal });
   } catch (error) {
-    if (error instanceof DOMException && error.name === "AbortError") {
+    if (isAbortError(error)) {
       throw error;
     }
     const friendly = toFriendlyNetworkError(error, label);
@@ -494,7 +550,7 @@ export async function validateApiKey(providerId, apiKey, signal) {
   return { status: "unknown", message: `No se pudo verificar la clave de ${label} (respuesta ${res.status}).` };
 }
 
-function isAbortError(error) {
+export function isAbortError(error) {
   return Boolean(error && typeof error === "object" && error.name === "AbortError");
 }
 
@@ -560,7 +616,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     filtered.sort((a, b) => scoreGoogleModel(a.id) - scoreGoogleModel(b.id));
 
     if (filtered.length > 0) {
-      AI_PROVIDERS.gemini.models = filtered;
+      liveModelsByProvider.set("gemini", filtered);
       liveSyncedByProvider.set("gemini", apiKey);
     }
     return filtered;
@@ -594,7 +650,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     filtered.sort((a, b) => scoreGroqModel(a.id) - scoreGroqModel(b.id));
 
     if (filtered.length > 0) {
-      AI_PROVIDERS.groq.models = filtered;
+      liveModelsByProvider.set("groq", filtered);
       liveSyncedByProvider.set("groq", apiKey);
     }
     return filtered;
@@ -619,7 +675,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
       ...freeItems.filter((m) => m.id !== "openrouter/free")
     ];
 
-    AI_PROVIDERS.openrouter.models = combined;
+    liveModelsByProvider.set("openrouter", combined);
     liveSyncedByProvider.set("openrouter", "public");
     return combined;
   }
@@ -659,13 +715,13 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
         }
         return a.id.localeCompare(b.id);
       });
-      AI_PROVIDERS.mistral.models = filtered;
+      liveModelsByProvider.set("mistral", filtered);
       liveSyncedByProvider.set("mistral", apiKey);
     }
     return filtered;
   }
 
-  return AI_PROVIDERS[providerId]?.models || [];
+  return getProviderModels(providerId);
 }
 
 function formatGroqLabel(id) {
@@ -685,8 +741,8 @@ function scoreGroqModel(id) {
 
 function scoreGoogleModel(id) {
   if (id.includes("flash-lite")) return 1;
-  if (id.startsWith("gemini-3.6-flash")) return 2;
-  if (id.startsWith("gemini-3.8-flash")) return 3;
+  if (id.startsWith("gemini-2.5-flash")) return 2;
+  if (id.startsWith("gemini-3")) return 3;
   if (id.startsWith("gemini-")) return 4;
   if (id.startsWith("gemma-") && id.includes("-it")) return 5;
   return 6;
@@ -778,12 +834,12 @@ async function streamGeminiWithFallback({
     }
   }
 
-  const activeIds = AI_PROVIDERS.gemini.models.map((m) => m.id);
+  const activeIds = getProviderModels("gemini").map((m) => m.id);
   if (
     !isFreeActiveGoogleModelId(cleanRequested) ||
     (liveSyncedByProvider.get("gemini") === apiKey && activeIds.length > 0 && !activeIds.includes(cleanRequested))
   ) {
-    cleanRequested = activeIds[0] || "gemini-3.8-flash";
+    cleanRequested = activeIds[0] || AI_PROVIDERS.gemini.models[0].id;
   }
 
   const candidates = [cleanRequested, ...activeIds].filter(
@@ -825,7 +881,7 @@ async function streamGeminiWithFallback({
         });
         return;
       } catch (rawError) {
-        if (rawError instanceof DOMException && rawError.name === "AbortError") {
+        if (isAbortError(rawError)) {
           throw rawError;
         }
         const error = toFriendlyNetworkError(rawError, providerLabel("gemini"));
@@ -888,7 +944,7 @@ async function streamOpenAiWithFallback({
     }
   }
 
-  const activeIds = provider.models.map((m) => m.id);
+  const activeIds = getProviderModels(provider.id).map((m) => m.id);
   let startModel = model;
   if (
     liveSyncedByProvider.get(provider.id) === syncToken &&
@@ -929,7 +985,7 @@ async function streamOpenAiWithFallback({
       });
       return;
     } catch (rawError) {
-      if (rawError instanceof DOMException && rawError.name === "AbortError") {
+      if (isAbortError(rawError)) {
         throw rawError;
       }
       const error = toFriendlyNetworkError(rawError, providerLabel(provider.id));
@@ -966,9 +1022,10 @@ function waitAbortable(ms, signal) {
   if (signal?.aborted) {
     return Promise.reject(new DOMException("Aborted", "AbortError"));
   }
+  const timerApi = typeof window !== "undefined" ? window : globalThis;
   return new Promise((resolve, reject) => {
     let onAbort = null;
-    const timer = window.setTimeout(() => {
+    const timer = timerApi.setTimeout(() => {
       if (onAbort) {
         signal?.removeEventListener("abort", onAbort);
       }
@@ -976,7 +1033,7 @@ function waitAbortable(ms, signal) {
     }, ms);
     if (signal) {
       onAbort = () => {
-        window.clearTimeout(timer);
+        timerApi.clearTimeout(timer);
         reject(new DOMException("Aborted", "AbortError"));
       };
       signal.addEventListener("abort", onAbort, { once: true });
@@ -1111,7 +1168,9 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
   };
 
   if (providerId === "openrouter") {
-    headers["HTTP-Referer"] = window.location.origin || "https://github.io";
+    const origin =
+      typeof window !== "undefined" ? window.location?.origin || "https://github.io" : "https://github.io";
+    headers["HTTP-Referer"] = origin;
     headers["X-Title"] = "Studio IDE";
   }
 
@@ -1167,25 +1226,6 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
   } finally {
     connect.cleanup();
   }
-}
-
-function findNextSseLineBreak(buf, isFinal) {
-  for (let i = 0; i < buf.length; i += 1) {
-    const ch = buf[i];
-    if (ch === "\n") {
-      return { index: i, length: 1 };
-    }
-    if (ch === "\r") {
-      if (i + 1 < buf.length) {
-        return { index: i, length: buf[i + 1] === "\n" ? 2 : 1 };
-      }
-      if (isFinal) {
-        return { index: i, length: 1 };
-      }
-      return null;
-    }
-  }
-  return null;
 }
 
 function readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs) {
@@ -1290,6 +1330,37 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
     }
   };
 
+  const drainLines = (isFinal) => {
+    let pos = 0;
+    while (pos < buffer.length) {
+      const nlIdx = buffer.indexOf("\n", pos);
+      const crIdx = buffer.indexOf("\r", pos);
+      let brIdx = -1;
+      let brLen = 0;
+      if (crIdx !== -1 && (nlIdx === -1 || crIdx < nlIdx)) {
+        if (crIdx + 1 < buffer.length) {
+          brIdx = crIdx;
+          brLen = buffer.charCodeAt(crIdx + 1) === 10 ? 2 : 1;
+        } else if (isFinal) {
+          brIdx = crIdx;
+          brLen = 1;
+        } else {
+          break;
+        }
+      } else if (nlIdx !== -1) {
+        brIdx = nlIdx;
+        brLen = 1;
+      } else {
+        break;
+      }
+      processLine(buffer.slice(pos, brIdx));
+      pos = brIdx + brLen;
+    }
+    if (pos > 0) {
+      buffer = buffer.slice(pos);
+    }
+  };
+
   try {
     while (true) {
       const { value, done } = await readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs);
@@ -1298,23 +1369,10 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
         break;
       }
       buffer += decoder.decode(value, { stream: true });
-
-      let br = findNextSseLineBreak(buffer, false);
-      while (br !== null) {
-        const rawLine = buffer.slice(0, br.index);
-        buffer = buffer.slice(br.index + br.length);
-        processLine(rawLine);
-        br = findNextSseLineBreak(buffer, false);
-      }
+      drainLines(false);
     }
 
-    let br = findNextSseLineBreak(buffer, true);
-    while (br !== null) {
-      const rawLine = buffer.slice(0, br.index);
-      buffer = buffer.slice(br.index + br.length);
-      processLine(rawLine);
-      br = findNextSseLineBreak(buffer, true);
-    }
+    drainLines(true);
     if (buffer.length > 0) {
       processLine(buffer);
     }
@@ -1341,7 +1399,7 @@ export const AI_THINKING_SPEED_STORAGE_KEY = "studio_ai_thinking_speed";
 
 export function getAiThinkingSpeed() {
   try {
-    const val = localStorage.getItem(AI_THINKING_SPEED_STORAGE_KEY);
+    const val = getStorageArea("localStorage")?.getItem(AI_THINKING_SPEED_STORAGE_KEY);
     if (val === "baja" || val === "media" || val === "alta") return val;
   } catch (_) {}
   return "media";
@@ -1349,7 +1407,7 @@ export function getAiThinkingSpeed() {
 
 export function setAiThinkingSpeed(speed) {
   try {
-    localStorage.setItem(AI_THINKING_SPEED_STORAGE_KEY, String(speed));
+    getStorageArea("localStorage")?.setItem(AI_THINKING_SPEED_STORAGE_KEY, String(speed));
   } catch (_) {}
 }
 
@@ -1367,7 +1425,7 @@ export function getThinkingBudget(speed = getAiThinkingSpeed()) {
 
 export function getAiTemperature() {
   try {
-    const val = parseFloat(localStorage.getItem(AI_TEMP_STORAGE_KEY));
+    const val = parseFloat(getStorageArea("localStorage")?.getItem(AI_TEMP_STORAGE_KEY));
     if (!isNaN(val) && val >= 0 && val <= 2) return val;
   } catch (_) {}
   return 0.25;
@@ -1375,13 +1433,13 @@ export function getAiTemperature() {
 
 export function setAiTemperature(temp) {
   try {
-    localStorage.setItem(AI_TEMP_STORAGE_KEY, String(temp));
+    getStorageArea("localStorage")?.setItem(AI_TEMP_STORAGE_KEY, String(temp));
   } catch (_) {}
 }
 
 export function getAiContextBudget() {
   try {
-    const val = localStorage.getItem(AI_BUDGET_STORAGE_KEY);
+    const val = getStorageArea("localStorage")?.getItem(AI_BUDGET_STORAGE_KEY);
     if (val === "compact") return 8000;
     if (val === "large") return 40000;
   } catch (_) {}
@@ -1390,7 +1448,7 @@ export function getAiContextBudget() {
 
 export function setAiContextBudget(mode) {
   try {
-    localStorage.setItem(AI_BUDGET_STORAGE_KEY, String(mode));
+    getStorageArea("localStorage")?.setItem(AI_BUDGET_STORAGE_KEY, String(mode));
   } catch (_) {}
 }
 

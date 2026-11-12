@@ -512,17 +512,57 @@ export function scoreCompletionMatch(query, candidateLabel) {
   return 0;
 }
 
+const IDENTIFIER_SCAN_REGEX = /[A-Za-z_][A-Za-z0-9_]{2,50}/g;
+const MAX_IDENT_SCAN_CHARS = 120000;
+const IDENT_CACHE_MAX_ENTRIES = 12;
+const docIdentifierCache = new Map();
+
+/**
+ * Extrae y memoiza en un caché LRU acotado el vocabulario de identificadores del documento
+ * para evitar re-escanear y re-tokenizar todo el texto en cada pulsación de tecla.
+ * @param {string} docText
+ * @returns {string[]}
+ */
+export function extractDocumentIdentifiers(docText) {
+  if (!docText || typeof docText !== "string") return [];
+  const sample = docText.length > MAX_IDENT_SCAN_CHARS ? docText.slice(0, MAX_IDENT_SCAN_CHARS) : docText;
+  const cacheKey = `${sample.length}:${sample.slice(0, 64)}:${sample.slice(-64)}`;
+  const cached = docIdentifierCache.get(cacheKey);
+  if (cached && cached.source === sample) {
+    docIdentifierCache.delete(cacheKey);
+    docIdentifierCache.set(cacheKey, cached);
+    return cached.words;
+  }
+
+  const seenWords = new Set();
+  const matches = sample.match(IDENTIFIER_SCAN_REGEX);
+  if (matches) {
+    for (const w of matches) {
+      seenWords.add(w);
+    }
+  }
+  const words = Array.from(seenWords);
+  if (docIdentifierCache.size >= IDENT_CACHE_MAX_ENTRIES) {
+    const oldestKey = docIdentifierCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      docIdentifierCache.delete(oldestKey);
+    }
+  }
+  docIdentifierCache.set(cacheKey, { source: sample, words });
+  return words;
+}
+
 /**
  * Obtiene la lista ordenada de sugerencias de autocompletado para el lenguaje activo y el documento actual.
  * En C++ incluye tanto el vocabulario de C++ como las funciones estándar de C (`printf`, `scanf`, etc.).
  *
  * @param {string} lang
  * @param {string} query
- * @param {string} [docText=""]
+ * @param {string | Iterable<string>} [docTextOrWords=""]
  * @param {number} [limit=8]
  * @returns {Array<{ label: string, apply: string, detail: string, type: string, score: number }>}
  */
-export function getLanguageCompletions(lang, query, docText = "", limit = 8) {
+export function getLanguageCompletions(lang, query, docTextOrWords = "", limit = 8) {
   const cleanQuery = String(query || "").trim();
   if (cleanQuery.length < 2) return [];
 
@@ -559,10 +599,13 @@ export function getLanguageCompletions(lang, query, docText = "", limit = 8) {
     }
   }
 
-  // Extraer también identificadores definidos por el usuario en el archivo actual
-  if (docText && typeof docText === "string") {
-    const matches = docText.match(/[A-Za-z_][A-Za-z0-9_]{2,50}/g) || [];
-    for (const word of matches) {
+  // Extraer o reutilizar vocabulario de identificadores definidos por el usuario en el archivo actual
+  const docWords = typeof docTextOrWords === "string"
+    ? extractDocumentIdentifiers(docTextOrWords)
+    : (docTextOrWords && typeof docTextOrWords[Symbol.iterator] === "function" ? docTextOrWords : null);
+
+  if (docWords) {
+    for (const word of docWords) {
       if (seen.has(word) || word === cleanQuery) continue;
       const score = scoreCompletionMatch(cleanQuery, word);
       if (score > 0) {

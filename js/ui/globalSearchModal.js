@@ -1,11 +1,14 @@
 import { searchInFiles } from "../search/projectSearch.js";
 import { hydrateIcons } from "./icons.js";
 import { keyboardRouter } from "./keyboardRouter.js";
+import { escapeHtml } from "../utils/dom.js";
 
 /**
  * Controlador del Diálogo de Búsqueda Global en Archivos (Cmd/Ctrl + Shift + F)
  */
 export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = controller ? { signal: controller.signal } : undefined;
   const dialog = document.getElementById("global-search-dialog");
   const openBtn = document.getElementById("btn-global-search");
   const closeBtn = document.getElementById("btn-close-global-search");
@@ -207,19 +210,19 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   }
 
   // Eventos de interfaz
-  openBtn?.addEventListener("click", () => open());
-  closeBtn?.addEventListener("click", () => close());
+  openBtn?.addEventListener("click", () => open(), listenOpts);
+  closeBtn?.addEventListener("click", () => close(), listenOpts);
 
   dialog?.addEventListener("click", (e) => {
     if (e.target === dialog) close();
-  });
+  }, listenOpts);
 
   input?.addEventListener("input", () => {
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       performSearch();
     }, 150);
-  });
+  }, listenOpts);
 
   input?.addEventListener("keydown", (e) => {
     if (e.key === "ArrowDown") {
@@ -236,41 +239,37 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
         close();
       }
     }
-  });
+  }, listenOpts);
 
   btnCase?.addEventListener("click", () => {
     isCaseSensitive = !isCaseSensitive;
     btnCase.setAttribute("aria-pressed", String(isCaseSensitive));
     btnCase.classList.toggle("is-active", isCaseSensitive);
     performSearch();
-  });
+  }, listenOpts);
 
   btnWord?.addEventListener("click", () => {
     isMatchWholeWord = !isMatchWholeWord;
     btnWord.setAttribute("aria-pressed", String(isMatchWholeWord));
     btnWord.classList.toggle("is-active", isMatchWholeWord);
     performSearch();
-  });
+  }, listenOpts);
 
   btnRegex?.addEventListener("click", () => {
     isRegex = !isRegex;
     btnRegex.setAttribute("aria-pressed", String(isRegex));
     btnRegex.classList.toggle("is-active", isRegex);
     performSearch();
-  });
+  }, listenOpts);
 
   return {
     open,
     close,
-    search: performSearch
+    search: performSearch,
+    destroy() {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+      controller?.abort();
+    }
   };
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

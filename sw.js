@@ -40,6 +40,32 @@ const APP_SHELL_URLS = [
   "./css/workspace.css",
   "./css/app.css",
   "./js/app.js",
+  "./js/utils/encoding.js",
+  "./js/utils/dom.js",
+  "./js/utils/storage.js",
+  "./js/preview/previewUtils.js",
+  "./js/preview/jsTokenUtils.js",
+  "./js/preview/loopGuard.js",
+  "./js/preview/tsTranspiler.js",
+  "./js/preview/moduleBundler.js",
+  "./js/preview/markdownPreview.js",
+  "./js/preview/pythonRunner.js",
+  "./js/preview/htmlBundler.js",
+  "./js/preview/cRunner.js",
+  "./js/preview/sqlRunner.js",
+  "./js/editor/editorManager.js",
+  "./js/editor/languageConfig.js",
+  "./js/editor/errorMarkersController.js",
+  "./js/editor/fallbackEditor.js",
+  "./js/editor/minimap.js",
+  "./js/editor/codeFormatter.js",
+  "./js/editor/smartReplace.js",
+  "./js/editor/autocompleteCatalog.js",
+  "./js/editor/splitEditorController.js",
+  "./js/workspace/autosaveManager.js",
+  "./js/workspace/tabManager.js",
+  "./js/workspace/githubLazySync.js",
+  "./js/workspace/broadcastSync.js",
   "./js/ui/icons.js",
   "./js/ui/layout.js",
   "./js/ui/symbolBar.js",
@@ -49,14 +75,10 @@ const APP_SHELL_URLS = [
   "./js/ui/settingsModal.js",
   "./js/ui/keyboardRouter.js",
   "./js/ui/diffModal.js",
+  "./js/ui/confirmDialog.js",
+  "./js/ui/statusBarController.js",
   "./js/ui/livePreviewModal.js",
   "./js/ui/binaryPreview.js",
-  "./js/editor/editorManager.js",
-  "./js/editor/minimap.js",
-  "./js/editor/codeFormatter.js",
-  "./js/editor/smartReplace.js",
-  "./js/editor/autocompleteCatalog.js",
-  "./js/editor/splitEditorController.js",
   "./js/search/projectSearch.js",
   "./js/ai/providers.js",
   "./js/ai/chatController.js",
@@ -66,15 +88,6 @@ const APP_SHELL_URLS = [
   "./js/storage/storageQuota.js",
   "./js/storage/zipExporter.js",
   "./js/net/networkErrors.js",
-  "./js/preview/previewUtils.js",
-  "./js/preview/loopGuard.js",
-  "./js/preview/tsTranspiler.js",
-  "./js/preview/moduleBundler.js",
-  "./js/preview/markdownPreview.js",
-  "./js/preview/pythonRunner.js",
-  "./js/preview/htmlBundler.js",
-  "./js/preview/cRunner.js",
-  "./js/preview/sqlRunner.js",
   "./js/github/githubService.js",
   "./js/github/githubMerge.js",
   "./js/github/githubLocalBackupPanel.js",
@@ -86,10 +99,63 @@ const APP_SHELL_URLS = [
 const CACHEABLE_CDN_HOSTS = new Set([
   "esm.sh",
   "cdn.jsdelivr.net",
-  "cdnjs.cloudflare.com",
   "fonts.googleapis.com",
   "fonts.gstatic.com"
 ]);
+
+const CDN_WARM_CONCURRENCY = 5;
+const APP_SHELL_FETCH_TIMEOUT_MS = 3500;
+
+function isCacheableCdnUrl(parsedUrl) {
+  return Boolean(
+    parsedUrl &&
+      parsedUrl.protocol === "https:" &&
+      CACHEABLE_CDN_HOSTS.has(parsedUrl.hostname)
+  );
+}
+
+function isImmutableVersionedCdnUrl(parsedUrl) {
+  if (!isCacheableCdnUrl(parsedUrl)) {
+    return false;
+  }
+  if (parsedUrl.hostname === "fonts.gstatic.com") {
+    return true;
+  }
+  if (parsedUrl.hostname === "esm.sh") {
+    return /@\d+\.\d+\.\d+(?:[-+][^/?#]+)?(?:\/|$)/.test(parsedUrl.pathname);
+  }
+  if (parsedUrl.hostname === "cdn.jsdelivr.net") {
+    return (
+      /\/pyodide\/v\d+\.\d+\.\d+\//.test(parsedUrl.pathname) ||
+      /@\d+\.\d+\.\d+(?:[-+][^/?#]+)?(?:\/|$)/.test(parsedUrl.pathname)
+    );
+  }
+  return false;
+}
+
+function createConcurrencyLimiter(maxConcurrent = CDN_WARM_CONCURRENCY) {
+  let activeCount = 0;
+  const queue = [];
+  const pump = () => {
+    if (activeCount >= maxConcurrent || queue.length === 0) {
+      return;
+    }
+    activeCount += 1;
+    const { task, resolve, reject } = queue.shift();
+    Promise.resolve()
+      .then(task)
+      .then(resolve, reject)
+      .finally(() => {
+        activeCount -= 1;
+        pump();
+      });
+  };
+  return (task) =>
+    new Promise((resolve, reject) => {
+      queue.push({ task, resolve, reject });
+      pump();
+    });
+}
 
 function isEssentialShellUrl(url) {
   return CORE_SHELL_URLS.has(url) || url.endsWith(".css") || url.endsWith(".js");
@@ -110,22 +176,34 @@ function safeCachePut(cache, key, response) {
   }
 }
 
-async function fetchWithTimeout(request, timeoutMs = 12000) {
+async function fetchWithTimeout(request, timeoutMs = 12000, fetchInit = undefined) {
   const AbortCtrl =
     typeof self !== "undefined" && typeof self.AbortController === "function"
       ? self.AbortController
       : null;
   if (!AbortCtrl) {
-    return fetch(request);
+    return fetchInit ? fetch(request, fetchInit) : fetch(request);
   }
   const controller = new AbortCtrl();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(request, { signal: controller.signal });
+    const init = fetchInit ? { ...fetchInit, signal: controller.signal } : { signal: controller.signal };
+    return await fetch(request, init);
   } finally {
     if (typeof clearTimeout === "function") {
       clearTimeout(timer);
     }
+  }
+}
+
+function hasSafeRedirectOrigin(response, originalUrl) {
+  if (!response || !response.url || response.url === originalUrl) {
+    return true;
+  }
+  try {
+    return isCacheableCdnUrl(new URL(response.url));
+  } catch {
+    return false;
   }
 }
 
@@ -156,7 +234,7 @@ async function precacheShellUrl(cache, url) {
   console.warn("PWA prefetch skip:", url, lastError);
 }
 
-async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
+async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0, limitFetch = (fn) => fn()) {
   if (!targetUrl || state.visited.has(targetUrl) || state.visited.size >= 80 || depth > 2) {
     return;
   }
@@ -166,34 +244,52 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
   } catch {
     return;
   }
-  if (!CACHEABLE_CDN_HOSTS.has(parsed.hostname)) {
+  if (!isCacheableCdnUrl(parsed)) {
     return;
   }
   state.visited.add(targetUrl);
 
-  let res;
-  try {
-    res = await fetchWithTimeout(new Request(targetUrl, { mode: "cors" }), 12000);
-  } catch {
-    return;
-  }
-  if (!isCacheableResponse(res)) {
-    return;
-  }
-
-  let cloneForFinal = null;
+  const cached = await cache.match(targetUrl).catch(() => undefined);
+  let res = cached;
   let cloneForText = null;
-  try {
-    cloneForFinal = res.url && res.url !== targetUrl ? res.clone() : null;
-    cloneForText = res.clone();
-  } catch {
-    return;
-  }
+  let baseForRel = targetUrl;
 
-  await safeCachePut(cache, targetUrl, res);
-  if (cloneForFinal) {
-    state.visited.add(res.url);
-    await Promise.resolve(cache.put(res.url, cloneForFinal)).catch(() => undefined);
+  if (cached) {
+    if (parsed.hostname !== "esm.sh" || depth >= 2) {
+      return;
+    }
+    if (cached.url && hasSafeRedirectOrigin(cached, targetUrl)) {
+      baseForRel = cached.url;
+    }
+    try {
+      cloneForText = typeof cached.clone === "function" ? cached.clone() : cached;
+    } catch {
+      return;
+    }
+  } else {
+    try {
+      res = await limitFetch(() => fetchWithTimeout(new Request(targetUrl, { mode: "cors" }), 12000));
+    } catch {
+      return;
+    }
+    if (!isCacheableResponse(res) || !hasSafeRedirectOrigin(res, targetUrl)) {
+      return;
+    }
+
+    let cloneForFinal = null;
+    try {
+      cloneForFinal = res.url && res.url !== targetUrl ? res.clone() : null;
+      cloneForText = res.clone();
+    } catch {
+      return;
+    }
+
+    await safeCachePut(cache, targetUrl, res);
+    if (cloneForFinal) {
+      state.visited.add(res.url);
+      baseForRel = res.url;
+      await safeCachePut(cache, res.url, cloneForFinal);
+    }
   }
 
   if (parsed.hostname !== "esm.sh" || depth >= 2) {
@@ -211,7 +307,6 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
     return;
   }
 
-  const baseForRel = res.url || targetUrl;
   const specifiers = new Set();
   const reStatic = /(?:from|import)\s*["']([^"']+)["']/g;
   const reDynamic = /import\s*\(\s*["']([^"']+)["']\s*\)/g;
@@ -225,7 +320,7 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0) {
     if (spec.startsWith("/") || spec.startsWith("./") || spec.startsWith("../") || spec.startsWith("https://")) {
       try {
         const resolved = new URL(spec, baseForRel).href;
-        childTasks.push(warmExternalScriptUrl(cache, resolved, state, depth + 1));
+        childTasks.push(warmExternalScriptUrl(cache, resolved, state, depth + 1, limitFetch));
       } catch {
         // Ignorar especificador malformado
       }
@@ -244,13 +339,24 @@ self.addEventListener("install", (event) => {
         .open(RUNTIME_CACHE)
         .then(async (cache) => {
           const state = { visited: new Set() };
+          const limitFetch = createConcurrencyLimiter(CDN_WARM_CONCURRENCY);
+          const warmPyodide = async () => {
+            const existing = await cache.match(PYODIDE_ENTRY_URL).catch(() => undefined);
+            if (existing) {
+              return;
+            }
+            const res = await limitFetch(() =>
+              fetchWithTimeout(new Request(PYODIDE_ENTRY_URL, { mode: "cors" }), 12000)
+            );
+            if (isCacheableResponse(res) && hasSafeRedirectOrigin(res, PYODIDE_ENTRY_URL)) {
+              await safeCachePut(cache, PYODIDE_ENTRY_URL, res);
+            }
+          };
           const warmTasks = [
-            warmExternalScriptUrl(cache, ACORN_CDN_URL, state, 0),
-            ...IMPORTMAP_CDN_URLS.map((cdnUrl) => warmExternalScriptUrl(cache, cdnUrl, state, 0)),
+            warmExternalScriptUrl(cache, ACORN_CDN_URL, state, 0, limitFetch),
+            ...IMPORTMAP_CDN_URLS.map((cdnUrl) => warmExternalScriptUrl(cache, cdnUrl, state, 0, limitFetch)),
             // Precalentamiento best-effort para el entrypoint de Pyodide (limitado por sandbox 'null' en #preview-iframe)
-            fetchWithTimeout(new Request(PYODIDE_ENTRY_URL, { mode: "cors" }), 12000)
-              .then((res) => (isCacheableResponse(res) ? safeCachePut(cache, PYODIDE_ENTRY_URL, res) : undefined))
-              .catch(() => undefined)
+            warmPyodide().catch(() => undefined)
           ];
           await Promise.all(warmTasks.map((p) => p.catch(() => undefined)));
         })
@@ -276,16 +382,26 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  const url = new URL(request.url);
+  let url;
+  try {
+    url = new URL(request.url);
+  } catch {
+    return;
+  }
 
   // Cachear módulos ESM (CodeMirror 6, Octokit) y tipografías para uso rápido y offline en el iPad
-  if (CACHEABLE_CDN_HOSTS.has(url.hostname)) {
+  if (isCacheableCdnUrl(url)) {
+    const isImmutable = isImmutableVersionedCdnUrl(url);
     event.respondWith(
       caches.open(RUNTIME_CACHE).then(async (cache) => {
         const cached = await cache.match(request);
+        if (isImmutable && cached) {
+          return cached;
+        }
+
         const networkPromise = fetch(request)
           .then(async (response) => {
-            if (isCacheableResponse(response)) {
+            if (isCacheableResponse(response) && hasSafeRedirectOrigin(response, request.url)) {
               await safeCachePut(cache, request, response);
               return response;
             }
@@ -316,8 +432,8 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Estrategia Network-First para el App Shell propio: siempre trae los últimos cambios con internet
-  // y cae automáticamente a la caché local si el iPad está sin conexión.
+  // Estrategia Network-First con timeout acotado para el App Shell propio: siempre trae los últimos cambios
+  // con internet y cae automáticamente a la caché local si el iPad está sin conexión o en red lenta.
   if (url.origin === self.location.origin) {
     event.respondWith(
       caches.open(SHELL_CACHE).then(async (cache) => {
@@ -333,7 +449,7 @@ self.addEventListener("fetch", (event) => {
           (await cache.match("./", { ignoreSearch: true }));
 
         try {
-          const fresh = await fetch(request, { cache: "no-cache" });
+          const fresh = await fetchWithTimeout(request, APP_SHELL_FETCH_TIMEOUT_MS, { cache: "no-cache" });
           if (isCacheableResponse(fresh)) {
             await safeCachePut(cache, request, fresh);
             return fresh;

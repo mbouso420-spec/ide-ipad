@@ -2,11 +2,11 @@
  * Renderizador seguro 100% offline de documentos Markdown (.md / README.md) para Vista Previa.
  */
 
-import { escapeHtmlText } from "./previewUtils.js";
+import { escapeHtml } from "./previewUtils.js";
 
 export function buildMarkdownPreview(mdFile) {
   const renderedBody = renderMarkdownDocumentHtml(mdFile.content || "");
-  const safeTitle = escapeHtmlText(mdFile.shortName);
+  const safeTitle = escapeHtml(mdFile.shortName);
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -115,32 +115,89 @@ export function buildMarkdownPreview(mdFile) {
 </html>`;
 }
 
-export function renderMarkdownDocumentHtml(rawMd) {
+/**
+ * Divide un documento Markdown en bloques alternos de prosa y cercos de código
+ * con longitud variable de backticks (```, ````, etc.) para soportar bloques anidados.
+ */
+export function splitMarkdownCodeFences(rawMd) {
+  const lines = String(rawMd || "").replace(/\r\n/g, "\n").split("\n");
   const blocks = [];
-  const fenceRe = /```([^\r\n]*)\r?\n?([\s\S]*?)```/g;
-  let cursor = 0;
-  let m;
+  let proseLines = [];
+  let inFence = false;
+  let fenceLen = 0;
+  let rawHeader = "";
+  let codeLines = [];
 
-  while ((m = fenceRe.exec(rawMd)) !== null) {
-    if (m.index > cursor) {
-      blocks.push({ type: "prose", text: rawMd.slice(cursor, m.index) });
+  const flushProse = () => {
+    if (proseLines.length === 0) return;
+    blocks.push({ type: "prose", text: proseLines.join("\n") });
+    proseLines = [];
+  };
+
+  const pushCode = (unclosed) => {
+    let lang = (rawHeader.split(/\s+/)[0] || "").toLowerCase();
+    if (lang.includes(":")) {
+      lang = lang.split(":")[0];
     }
-    const rawHeader = (m[1] || "").trim();
-    const lang = (rawHeader.split(/\s+/)[0] || "").toLowerCase();
-    blocks.push({ type: "code", lang, code: m[2].replace(/\n$/, "") });
-    cursor = fenceRe.lastIndex;
+    let code = codeLines.join("\n");
+    if (unclosed) {
+      code = code.replace(/\n$/, "");
+    }
+    blocks.push({
+      type: "code",
+      rawHeader,
+      lang,
+      code,
+      unclosed
+    });
+  };
+
+  for (const line of lines) {
+    if (!inFence) {
+      const openMatch = line.match(/^ {0,3}(`{3,})([^`]*)$/);
+      if (openMatch) {
+        flushProse();
+        inFence = true;
+        fenceLen = openMatch[1].length;
+        rawHeader = openMatch[2].trim();
+        codeLines = [];
+        continue;
+      }
+      proseLines.push(line);
+    } else {
+      const closeMatch = line.match(/^ {0,3}(`{3,})[ \t]*$/);
+      if (closeMatch && closeMatch[1].length >= fenceLen) {
+        pushCode(false);
+        inFence = false;
+        fenceLen = 0;
+        rawHeader = "";
+        codeLines = [];
+        continue;
+      }
+      codeLines.push(line);
+    }
   }
-  if (cursor < rawMd.length) {
-    blocks.push({ type: "prose", text: rawMd.slice(cursor) });
+
+  if (inFence) {
+    pushCode(true);
+  } else {
+    flushProse();
   }
+
+  return blocks;
+}
+
+export function renderMarkdownDocumentHtml(rawMd) {
+  const blocks = splitMarkdownCodeFences(rawMd);
 
   return blocks
     .map((b) => {
       if (b.type === "code") {
-        return `<pre><code>${escapeHtmlText(b.code)}</code></pre>`;
+        return `<pre><code>${escapeHtml(b.code)}</code></pre>`;
       }
-      return renderMarkdownProseBlock(b.text);
+      return b.text.trim() ? renderMarkdownProseBlock(b.text) : "";
     })
+    .filter(Boolean)
     .join("\n");
 }
 
@@ -260,7 +317,7 @@ export function formatMdInline(str) {
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
   const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
-    codes.push(`<code>${escapeHtmlText(c)}</code>`);
+    codes.push(`<code>${escapeHtml(c)}</code>`);
     return `\u0000C${i}\u0000`;
   });
 
@@ -269,7 +326,7 @@ export function formatMdInline(str) {
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
 
-  let safe = escapeHtmlText(masked);
+  let safe = escapeHtml(masked);
   safe = safe.replace(
     /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
     (_, label, url) => {

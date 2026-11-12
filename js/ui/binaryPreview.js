@@ -1,6 +1,40 @@
 import { icon } from "./icons.js";
 import { getImageMimeType, isImageFile } from "../storage/fileImport.js";
 
+const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function sanitizeBase64Payload(raw) {
+  if (typeof raw !== "string") return null;
+  const compact = raw.replace(/\s+/g, "");
+  if (!compact || compact.length % 4 !== 0 || !STRICT_BASE64_RE.test(compact)) {
+    return null;
+  }
+  return compact;
+}
+
+/**
+ * Sanea SVG antes de pasarlo a `data:image/svg+xml` para neutralizar scripts embebidos,
+ * `foreignObject`, manejadores de eventos `on*` y URIs `javascript:` / `vbscript:` / `data:text/html`.
+ * @param {string} svgMarkup
+ * @returns {string|null}
+ */
+export function sanitizeSvgMarkup(svgMarkup) {
+  if (typeof svgMarkup !== "string" || !svgMarkup.trim()) return null;
+  let cleaned = svgMarkup
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
+    .replace(/<script\b[^>]*\/?>/gi, "")
+    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
+    .replace(/<foreignObject\b[^>]*\/?>/gi, "")
+    .replace(/<(iframe|object|embed|applet|meta|base)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
+    .replace(/<(iframe|object|embed|applet|meta|base)\b[^>]*\/?>/gi, "")
+    .replace(/\s+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+    .replace(/(href|xlink:href|src)\s*=\s*(?:"\s*(?:javascript|vbscript|data\s*:\s*text\/html)[^"]*"|'\s*(?:javascript|vbscript|data\s*:\s*text\/html)[^']*'|[^\s>]*javascript:[^\s>]*)/gi, '$1="#"');
+  if (!/<svg[\s>]/i.test(cleaned)) {
+    return null;
+  }
+  return cleaned;
+}
+
 /**
  * Renderiza la tarjeta de inspección visual para imágenes y archivos binarios
  * que no deben abrirse como texto en CodeMirror.
@@ -22,12 +56,13 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
     card.className = "editor-binary-card";
 
     const isImg = isImageFile(file);
-    const base64Data = file.base64 || (file.isBinary && typeof file.content === "string" ? file.content : null);
+    const rawBase64 = file.base64 || (file.isBinary && typeof file.content === "string" ? file.content : null);
+    const safeBase64 = rawBase64 ? sanitizeBase64Payload(rawBase64) : null;
     const ext = (file.path || "").split(".").pop().toLowerCase();
 
     let sizeFormatted = "";
-    if (base64Data) {
-      const bytesLen = Math.floor((base64Data.length * 3) / 4);
+    if (safeBase64) {
+      const bytesLen = Math.floor((safeBase64.length * 3) / 4);
       if (bytesLen < 1024) {
         sizeFormatted = `${bytesLen} B`;
       } else if (bytesLen < 1024 * 1024) {
@@ -37,11 +72,15 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile }) {
       }
     }
 
-    if (isImg && (base64Data || (ext === "svg" && typeof file.content === "string"))) {
+    const safeSvg = !safeBase64 && ext === "svg" && typeof file.content === "string"
+      ? sanitizeSvgMarkup(file.content)
+      : null;
+
+    if (isImg && (safeBase64 || safeSvg)) {
       const mime = getImageMimeType(file.path);
-      const imgSrc = base64Data
-        ? `data:${mime};base64,${base64Data}`
-        : `data:image/svg+xml;utf8,${encodeURIComponent(file.content)}`;
+      const imgSrc = safeBase64
+        ? `data:${mime};base64,${safeBase64}`
+        : `data:image/svg+xml;utf8,${encodeURIComponent(safeSvg)}`;
 
       const imgContainer = document.createElement("div");
       imgContainer.className = "editor-binary-image-container";

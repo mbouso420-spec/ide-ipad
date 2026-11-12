@@ -8,6 +8,12 @@
 import { normalizePath } from "../storage/workspaceDb.js";
 import { transpileTypeScriptAndJsx, tokenizeJsWithOffsets } from "./tsTranspiler.js";
 import {
+  skipTrivia,
+  prevSigIndex as prevNonTriviaIndex,
+  hasNewlineBetween,
+  findMatchingDelimiter as findMatchingBrace
+} from "./jsTokenUtils.js";
+import {
   TS_EXTENSIONS,
   IGNORED_PREVIEW_DIRS,
   getFileExtension,
@@ -144,30 +150,6 @@ function unquoteStringToken(tok) {
   return tok.value.slice(1, -1).replace(/\\(.)/g, "$1");
 }
 
-function skipTrivia(tokens, idx) {
-  let j = idx;
-  while (j < tokens.length && (tokens[j].type === "ws" || tokens[j].type === "comment")) {
-    j += 1;
-  }
-  return j;
-}
-
-function prevNonTriviaIndex(tokens, idx) {
-  let j = idx - 1;
-  while (j >= 0 && (tokens[j].type === "ws" || tokens[j].type === "comment")) {
-    j -= 1;
-  }
-  return j;
-}
-
-function hasNewlineBetween(tokens, fromIdx, toIdx) {
-  for (let k = fromIdx; k < toIdx; k += 1) {
-    const val = tokens[k]?.value || "";
-    if (val.includes("\n") || val.includes("\r")) return true;
-  }
-  return false;
-}
-
 function canStartTopLevelKeyword(tokens, idx, prevSigIdx) {
   if (prevSigIdx < 0) return true;
   const prev = tokens[prevSigIdx];
@@ -175,19 +157,6 @@ function canStartTopLevelKeyword(tokens, idx, prevSigIdx) {
   if (prev.value === ";" || prev.value === "}") return true;
   if (prev.value === ".") return false;
   return hasNewlineBetween(tokens, prevSigIdx + 1, idx);
-}
-
-function findMatchingBrace(tokens, openIdx, openChar = "{", closeChar = "}") {
-  let depth = 0;
-  for (let i = openIdx; i < tokens.length; i += 1) {
-    const t = tokens[i];
-    if (t.type === "punct" && t.value === openChar) depth += 1;
-    else if (t.type === "punct" && t.value === closeChar) {
-      depth -= 1;
-      if (depth === 0) return i;
-    }
-  }
-  return tokens.length - 1;
 }
 
 function consumeImportAttributesAndSemi(tokens, startIdx, sourceLen) {
@@ -339,123 +308,122 @@ function parseImportClause(tokens, startIdx, fromIdx) {
   return { defaultIdent, namespaceIdent, namedSpecs };
 }
 
-function extractBindingNamesFromPattern(tokens, startIdx) {
-  const names = [];
-  let i = skipTrivia(tokens, startIdx);
-  if (i >= tokens.length) return { names, nextTokenIdx: i };
+function skipPatternDefaultValue(tokens, startIdx, closeIdx) {
+  let cur = skipTrivia(tokens, startIdx);
+  if (cur >= closeIdx || tokens[cur].type !== "punct" || tokens[cur].value !== "=") {
+    return cur;
+  }
+  cur += 1;
+  let b = 0;
+  let p = 0;
+  let br = 0;
+  while (cur < closeIdx) {
+    const dt = tokens[cur];
+    if (dt.type === "punct") {
+      if (dt.value === "{") b += 1;
+      else if (dt.value === "}") b = Math.max(0, b - 1);
+      else if (dt.value === "(") p += 1;
+      else if (dt.value === ")") p = Math.max(0, p - 1);
+      else if (dt.value === "[") br += 1;
+      else if (dt.value === "]") br = Math.max(0, br - 1);
+      else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
+    }
+    cur += 1;
+  }
+  return cur;
+}
 
-  const tok = tokens[i];
-  if (tok.type === "ident") {
-    names.push(tok.value);
-    return { names, nextTokenIdx: i + 1 };
+/**
+ * Recorre un patrón de binding JS/destructuring (identificador, `{...}`, `[...]`)
+ * extrayendo los nombres ligados y, opcionalmente, marcando índices no-referencia en `nonRefOut`.
+ */
+function traverseBindingPattern(tokens, startIdx, namesOut, nonRefOut = null) {
+  const i = skipTrivia(tokens, startIdx);
+  if (i >= tokens.length) return i;
+
+  const t = tokens[i];
+  if (t.type === "ident") {
+    namesOut.push(t.value);
+    if (nonRefOut) nonRefOut.add(i);
+    return i + 1;
   }
 
-  if (tok.type === "punct" && tok.value === "{") {
+  if (t.type === "punct" && t.value === "{") {
     const closeIdx = findMatchingBrace(tokens, i);
     let cur = i + 1;
     while (cur < closeIdx) {
       cur = skipTrivia(tokens, cur);
       if (cur >= closeIdx) break;
-      if (tokens[cur].type === "punct" && tokens[cur].value === ",") {
+      const ct = tokens[cur];
+      if (ct.type === "punct" && ct.value === ",") {
         cur += 1;
         continue;
       }
-      if (tokens[cur].type === "punct" && tokens[cur].value === "...") {
+      if (ct.type === "punct" && ct.value === "...") {
         cur = skipTrivia(tokens, cur + 1);
         if (cur < closeIdx && tokens[cur].type === "ident") {
-          names.push(tokens[cur].value);
+          namesOut.push(tokens[cur].value);
+          if (nonRefOut) nonRefOut.add(cur);
           cur += 1;
         }
         continue;
       }
-      // Propiedad computada `{ [expr]: target }`
-      if (tokens[cur].type === "punct" && tokens[cur].value === "[") {
+      if (ct.type === "punct" && ct.value === "[") {
         cur = findMatchingBrace(tokens, cur, "[", "]") + 1;
         cur = skipTrivia(tokens, cur);
         if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === ":") {
-          const inner = extractBindingNamesFromPattern(tokens, cur + 1);
-          names.push(...inner.names);
-          cur = inner.nextTokenIdx;
+          cur = traverseBindingPattern(tokens, cur + 1, namesOut, nonRefOut);
         }
-      } else if (tokens[cur].type === "ident" || tokens[cur].type === "string" || tokens[cur].type === "number") {
-        const keyTok = tokens[cur];
-        const afterKey = skipTrivia(tokens, cur + 1);
-        if (afterKey < closeIdx && tokens[afterKey].type === "punct" && tokens[afterKey].value === ":") {
-          const inner = extractBindingNamesFromPattern(tokens, afterKey + 1);
-          names.push(...inner.names);
-          cur = inner.nextTokenIdx;
+      } else if (ct.type === "ident" || ct.type === "string" || ct.type === "number") {
+        const keyIdx = cur;
+        const n1 = skipTrivia(tokens, cur + 1);
+        if (n1 < closeIdx && tokens[n1].type === "punct" && tokens[n1].value === ":") {
+          if (nonRefOut) nonRefOut.add(keyIdx);
+          cur = traverseBindingPattern(tokens, n1 + 1, namesOut, nonRefOut);
         } else {
-          if (keyTok.type === "ident") names.push(keyTok.value);
-          cur = afterKey;
+          if (ct.type === "ident") {
+            namesOut.push(ct.value);
+            if (nonRefOut) nonRefOut.add(keyIdx);
+          }
+          cur = n1;
         }
       } else {
         cur += 1;
+        continue;
       }
-      // Saltar valor por defecto `= expr` hasta coma o cierre `}` de este patrón
-      cur = skipTrivia(tokens, cur);
-      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
-        let p = 0;
-        let b = 0;
-        let br = 0;
-        cur += 1;
-        while (cur < closeIdx) {
-          const t = tokens[cur];
-          if (t.type === "punct") {
-            if (p === 0 && b === 0 && br === 0 && t.value === ",") break;
-            if (t.value === "(") p += 1;
-            else if (t.value === ")") p = Math.max(0, p - 1);
-            else if (t.value === "[") b += 1;
-            else if (t.value === "]") b = Math.max(0, b - 1);
-            else if (t.value === "{") br += 1;
-            else if (t.value === "}") br = Math.max(0, br - 1);
-          }
-          cur += 1;
-        }
-      }
+      cur = skipPatternDefaultValue(tokens, cur, closeIdx);
     }
-    return { names, nextTokenIdx: closeIdx + 1 };
+    return closeIdx + 1;
   }
 
-  if (tok.type === "punct" && tok.value === "[") {
+  if (t.type === "punct" && t.value === "[") {
     const closeIdx = findMatchingBrace(tokens, i, "[", "]");
     let cur = i + 1;
     while (cur < closeIdx) {
       cur = skipTrivia(tokens, cur);
       if (cur >= closeIdx) break;
-      if (tokens[cur].type === "punct" && tokens[cur].value === ",") {
+      const ct = tokens[cur];
+      if (ct.type === "punct" && ct.value === ",") {
         cur += 1;
         continue;
       }
-      if (tokens[cur].type === "punct" && tokens[cur].value === "...") {
-        cur += 1;
+      if (ct.type === "punct" && ct.value === "...") {
+        cur = traverseBindingPattern(tokens, cur + 1, namesOut, nonRefOut);
+        continue;
       }
-      const inner = extractBindingNamesFromPattern(tokens, cur);
-      names.push(...inner.names);
-      cur = skipTrivia(tokens, inner.nextTokenIdx);
-      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
-        let p = 0;
-        let b = 0;
-        let br = 0;
-        cur += 1;
-        while (cur < closeIdx) {
-          const t = tokens[cur];
-          if (t.type === "punct") {
-            if (p === 0 && b === 0 && br === 0 && t.value === ",") break;
-            if (t.value === "(") p += 1;
-            else if (t.value === ")") p = Math.max(0, p - 1);
-            else if (t.value === "[") b += 1;
-            else if (t.value === "]") b = Math.max(0, b - 1);
-            else if (t.value === "{") br += 1;
-            else if (t.value === "}") br = Math.max(0, br - 1);
-          }
-          cur += 1;
-        }
-      }
+      cur = traverseBindingPattern(tokens, cur, namesOut, nonRefOut);
+      cur = skipPatternDefaultValue(tokens, cur, closeIdx);
     }
-    return { names, nextTokenIdx: closeIdx + 1 };
+    return closeIdx + 1;
   }
 
-  return { names, nextTokenIdx: i + 1 };
+  return i + 1;
+}
+
+function extractBindingNamesFromPattern(tokens, startIdx) {
+  const names = [];
+  const nextTokenIdx = traverseBindingPattern(tokens, startIdx, names, null);
+  return { names, nextTokenIdx };
 }
 
 function parseVarDeclBindingsAndEnd(tokens, kwIdx, sourceLen) {
@@ -819,120 +787,7 @@ const LIVE_OBJ_BEFORE_KEYWORD = new Set([
  * Recolecta identificadores ligados y tokens de clave/patrón que no son referencias de lectura en LHS.
  */
 function collectPatternInfo(tokens, startIdx, namesOut, nonRefOut) {
-  let i = skipTrivia(tokens, startIdx);
-  if (i >= tokens.length) return i;
-  const t = tokens[i];
-  if (t.type === "ident") {
-    namesOut.push(t.value);
-    nonRefOut.add(i);
-    return i + 1;
-  }
-  if (t.type === "punct" && t.value === "{") {
-    const closeIdx = findMatchingBrace(tokens, i);
-    let cur = i + 1;
-    while (cur < closeIdx) {
-      cur = skipTrivia(tokens, cur);
-      if (cur >= closeIdx) break;
-      const ct = tokens[cur];
-      if (ct.type === "punct" && ct.value === ",") {
-        cur += 1;
-        continue;
-      }
-      if (ct.type === "punct" && ct.value === "...") {
-        cur = skipTrivia(tokens, cur + 1);
-        if (cur < closeIdx && tokens[cur].type === "ident") {
-          namesOut.push(tokens[cur].value);
-          nonRefOut.add(cur);
-          cur += 1;
-        }
-        continue;
-      }
-      if (ct.type === "punct" && ct.value === "[") {
-        cur = findMatchingBrace(tokens, cur, "[", "]") + 1;
-        cur = skipTrivia(tokens, cur);
-        if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === ":") {
-          cur = collectPatternInfo(tokens, cur + 1, namesOut, nonRefOut);
-        }
-      } else if (ct.type === "ident" || ct.type === "string" || ct.type === "number") {
-        const keyIdx = cur;
-        const n1 = skipTrivia(tokens, cur + 1);
-        if (n1 < closeIdx && tokens[n1].type === "punct" && tokens[n1].value === ":") {
-          nonRefOut.add(keyIdx);
-          cur = collectPatternInfo(tokens, n1 + 1, namesOut, nonRefOut);
-        } else {
-          if (ct.type === "ident") {
-            namesOut.push(ct.value);
-            nonRefOut.add(keyIdx);
-          }
-          cur = n1;
-        }
-      } else {
-        cur += 1;
-        continue;
-      }
-      cur = skipTrivia(tokens, cur);
-      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
-        cur += 1;
-        let b = 0;
-        let p = 0;
-        let br = 0;
-        while (cur < closeIdx) {
-          const dt = tokens[cur];
-          if (dt.type === "punct") {
-            if (dt.value === "{") b += 1;
-            else if (dt.value === "}") b = Math.max(0, b - 1);
-            else if (dt.value === "(") p += 1;
-            else if (dt.value === ")") p = Math.max(0, p - 1);
-            else if (dt.value === "[") br += 1;
-            else if (dt.value === "]") br = Math.max(0, br - 1);
-            else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
-          }
-          cur += 1;
-        }
-      }
-    }
-    return closeIdx + 1;
-  }
-  if (t.type === "punct" && t.value === "[") {
-    const closeIdx = findMatchingBrace(tokens, i, "[", "]");
-    let cur = i + 1;
-    while (cur < closeIdx) {
-      cur = skipTrivia(tokens, cur);
-      if (cur >= closeIdx) break;
-      const ct = tokens[cur];
-      if (ct.type === "punct" && ct.value === ",") {
-        cur += 1;
-        continue;
-      }
-      if (ct.type === "punct" && ct.value === "...") {
-        cur = collectPatternInfo(tokens, cur + 1, namesOut, nonRefOut);
-        continue;
-      }
-      cur = collectPatternInfo(tokens, cur, namesOut, nonRefOut);
-      cur = skipTrivia(tokens, cur);
-      if (cur < closeIdx && tokens[cur].type === "punct" && tokens[cur].value === "=") {
-        cur += 1;
-        let b = 0;
-        let p = 0;
-        let br = 0;
-        while (cur < closeIdx) {
-          const dt = tokens[cur];
-          if (dt.type === "punct") {
-            if (dt.value === "{") b += 1;
-            else if (dt.value === "}") b = Math.max(0, b - 1);
-            else if (dt.value === "(") p += 1;
-            else if (dt.value === ")") p = Math.max(0, p - 1);
-            else if (dt.value === "[") br += 1;
-            else if (dt.value === "]") br = Math.max(0, br - 1);
-            else if (dt.value === "," && b === 0 && p === 0 && br === 0) break;
-          }
-          cur += 1;
-        }
-      }
-    }
-    return closeIdx + 1;
-  }
-  return i + 1;
+  return traverseBindingPattern(tokens, startIdx, namesOut, nonRefOut);
 }
 
 function collectParamNamesAndNonRefs(tokens, openParenIdx, closeParenIdx, nonRefOut) {
@@ -1706,12 +1561,20 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
   if (splices.length === 0) {
     return code;
   }
-  splices.sort((a, b) => b.pos - a.pos || (a.isStart === b.isStart ? 0 : a.isStart ? 1 : -1));
-  let out = code;
+  splices.sort((a, b) => a.pos - b.pos || (a.isStart === b.isStart ? 0 : a.isStart ? 1 : -1));
+  const chunks = [];
+  let cursor = 0;
   for (const sp of splices) {
-    out = out.slice(0, sp.pos) + sp.text + out.slice(sp.pos);
+    if (sp.pos > cursor) {
+      chunks.push(code.slice(cursor, sp.pos));
+    }
+    chunks.push(sp.text);
+    cursor = sp.pos;
   }
-  return `const __studioSync = function(__v) { __studioNotify(exports); return __v; };\n${out}`;
+  if (cursor < code.length) {
+    chunks.push(code.slice(cursor));
+  }
+  return `const __studioSync = function(__v) { __studioNotify(exports); return __v; };\n${chunks.join("")}`;
 }
 
 /**
@@ -2156,12 +2019,22 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
     prevSig = i;
   }
 
-  // Aplicar reemplazos de atrás hacia adelante sin alterar offsets anteriores
-  edits.sort((a, b) => b.end - a.end || b.start - a.start);
-  let body = source;
+  // Aplicar reemplazos en orden ascendente en O(N + E log E)
+  edits.sort((a, b) => a.start - b.start || a.end - b.end);
+  const bodyChunks = [];
+  let bodyCursor = 0;
   for (const edit of edits) {
-    body = body.slice(0, edit.start) + edit.text + body.slice(edit.end);
+    if (edit.start < bodyCursor) continue;
+    if (edit.start > bodyCursor) {
+      bodyChunks.push(source.slice(bodyCursor, edit.start));
+    }
+    bodyChunks.push(edit.text);
+    bodyCursor = edit.end;
   }
+  if (bodyCursor < source.length) {
+    bodyChunks.push(source.slice(bodyCursor));
+  }
+  const body = bodyChunks.join("");
   const rewrittenBody = rewriteLiveExportWritesInCode(body, liveExportNames);
 
   const head = hoistedExports
@@ -2183,14 +2056,12 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
 
 /**
  * Comprueba si el script necesita resolverse con el empaquetador virtual local (contiene imports relativos
- * `./`, `../`, `/` o exportaciones desde rutas locales que resuelven contra el proyecto o son explícitamente relativas).
+ * `./`, `../`, `/` o exportaciones desde rutas locales).
  * @param {string} rawCode
  * @param {string} sourcePath
- * @param {Map<string, object>} exactMap
- * @param {{ allowParentTraversal?: boolean }} [options]
  * @returns {boolean}
  */
-export function hasLocalModuleDependencies(rawCode, sourcePath, exactMap, options = {}) {
+export function hasLocalModuleDependencies(rawCode, sourcePath) {
   const ext = getFileExtension(sourcePath);
   let jsLike = String(rawCode || "");
   if (TS_EXTENSIONS.has(ext) || ext === "jsx") {
@@ -2199,8 +2070,6 @@ export function hasLocalModuleDependencies(rawCode, sourcePath, exactMap, option
       fileName: sourcePath || "entry.tsx"
     }).code;
   }
-  void exactMap;
-  void options;
   const usage = inspectModuleUsage(jsLike);
   for (const spec of [...usage.staticImports, ...usage.dynamicLocalImports]) {
     if (isRelativeModuleSpecifier(spec)) {
@@ -2224,9 +2093,11 @@ export function extractModuleDependencyPaths(entryPath, rawCode, allFiles, optio
   const discovered = new Set();
   const visited = new Set();
   const queue = [{ path: normalizePath(entryPath), content: rawCode }];
+  let head = 0;
 
-  while (queue.length > 0) {
-    const current = queue.shift();
+  while (head < queue.length) {
+    const current = queue[head];
+    head += 1;
     const clean = normalizePath(current.path);
     if (!clean || visited.has(clean)) continue;
     visited.add(clean);
@@ -2425,7 +2296,9 @@ export function buildVirtualModuleBundle({
   exactMap,
   transformJs = (c) => c,
   transformCss = (css) => css,
-  allowParentTraversal = true
+  allowParentTraversal = true,
+  precompiledEntryCode = null,
+  precomputedEntryUsage = null
 }) {
   const safeTransformJs = typeof transformJs === "function" ? transformJs : (c) => c;
   const safeTransformCss = typeof transformCss === "function" ? transformCss : (css) => css;
@@ -2433,14 +2306,16 @@ export function buildVirtualModuleBundle({
   const compiledModules = [];
   const externalSet = new Set();
   const visited = new Set();
-  const queue = [{ id: entryId, content: String(entryCode ?? ""), ext: getFileExtension(entryId) }];
+  const queue = [{ id: entryId, content: String(entryCode ?? ""), ext: getFileExtension(entryId), isEntry: true }];
 
   // Paso 1: descubrir el grafo completo y detectar si algún módulo tiene top-level await o imports externos
   const graphNodes = [];
   let anyTopLevelAwait = false;
+  let head = 0;
 
-  while (queue.length > 0) {
-    const node = queue.shift();
+  while (head < queue.length) {
+    const node = queue[head];
+    head += 1;
     if (visited.has(node.id)) continue;
     visited.add(node.id);
 
@@ -2454,7 +2329,9 @@ export function buildVirtualModuleBundle({
     }
 
     let jsCode = node.content;
-    if (TS_EXTENSIONS.has(node.ext) || node.ext === "jsx") {
+    if (node.isEntry && typeof precompiledEntryCode === "string") {
+      jsCode = precompiledEntryCode;
+    } else if (TS_EXTENSIONS.has(node.ext) || node.ext === "jsx") {
       jsCode = transpileTypeScriptAndJsx(jsCode, {
         jsx: node.ext === "tsx" || node.ext === "jsx",
         fileName: node.id
@@ -2463,7 +2340,8 @@ export function buildVirtualModuleBundle({
       jsCode = transpileTypeScriptAndJsx(jsCode, { jsx: false, fileName: node.id }).code;
     }
 
-    const usage = inspectModuleUsage(jsCode);
+    const usage =
+      node.isEntry && precomputedEntryUsage ? precomputedEntryUsage : inspectModuleUsage(jsCode);
     if (usage.hasTopLevelAwait) {
       anyTopLevelAwait = true;
     }

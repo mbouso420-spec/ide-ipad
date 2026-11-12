@@ -3,12 +3,15 @@
  * mediante Web Crypto API para exportar e importar bóvedas portables de credenciales.
  */
 
+import { base64ToBytes, bytesToBase64 } from "../utils/encoding.js";
+
 export const VAULT_FORMAT = "studio-ide-key-vault";
 export const VAULT_VERSION = 1;
 export const DEFAULT_PBKDF2_ITERATIONS = 210_000;
 export const MIN_PBKDF2_ITERATIONS = 10_000;
 export const MAX_PBKDF2_ITERATIONS = 2_000_000;
 export const MIN_PASSPHRASE_LENGTH = 6;
+export const MAX_VAULT_JSON_BYTES = 1024 * 1024; // 1 MB límite seguro antes de JSON.parse
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
 
@@ -20,27 +23,11 @@ function getWebCrypto() {
   return api;
 }
 
-function bytesToBase64(bytes) {
-  const chunk = 8192;
-  let binary = "";
-  for (let i = 0; i < bytes.length; i += chunk) {
-    const slice = bytes.subarray(i, i + chunk);
-    binary += String.fromCharCode(...slice);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(b64) {
+function decodeVaultFieldBase64(b64) {
   if (typeof b64 !== "string" || !b64.trim()) {
     throw new Error("Datos binarios Base64 faltantes o inválidos.");
   }
-  const clean = b64.replace(/\s+/g, "");
-  const binary = atob(clean);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
+  return base64ToBytes(b64, { strict: true });
 }
 
 function validatePassphrase(passphrase) {
@@ -86,7 +73,9 @@ async function deriveAesGcmKey(cryptoApi, passphrase, saltBytes, iterations, usa
  * @returns {boolean}
  */
 export function isEncryptedKeyVault(rawText) {
-  if (typeof rawText !== "string" || !rawText.trim()) return false;
+  if (typeof rawText !== "string" || !rawText.trim() || rawText.length > MAX_VAULT_JSON_BYTES) {
+    return false;
+  }
   try {
     const parsed = JSON.parse(rawText);
     return Boolean(
@@ -176,6 +165,9 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
   if (typeof encryptedJson !== "string" || !encryptedJson.trim()) {
     throw new Error("El archivo de respaldo está vacío.");
   }
+  if (encryptedJson.length > MAX_VAULT_JSON_BYTES) {
+    throw new Error("El archivo de respaldo excede el tamaño máximo permitido.");
+  }
   validatePassphrase(passphrase);
 
   let parsed;
@@ -215,9 +207,9 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
   let iv;
   let ciphertext;
   try {
-    salt = base64ToBytes(parsed.salt);
-    iv = base64ToBytes(parsed.iv);
-    ciphertext = base64ToBytes(parsed.ciphertext);
+    salt = decodeVaultFieldBase64(parsed.salt);
+    iv = decodeVaultFieldBase64(parsed.iv);
+    ciphertext = decodeVaultFieldBase64(parsed.ciphertext);
   } catch {
     throw new Error("La estructura binaria de la bóveda está dañada.");
   }

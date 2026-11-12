@@ -9,7 +9,6 @@
   --space-xl: 40px;
   --space-2xl: 64px;
   --space-3xl: 96px;
-  --space-4xl: 144px;
 
   /* Safe areas y viewport visual dinámico para teclado virtual de iPadOS */
   --safe-top: env(safe-area-inset-top, 0px);
@@ -24,14 +23,6 @@
   --text-sm: 0.84rem;
   --text-md: 0.9375rem;
   --text-lg: 1.125rem;
-  --text-xl: 1.35rem;
-  --text-2xl: 1.6rem;
-  --text-3xl: 1.95rem;
-  --text-display-s: 1.35rem;
-  --text-display: 1.6rem;
-  --text-section: 1.125rem;
-  --text-title: 0.9375rem;
-  --text-lead: 0.9375rem;
   --text-code: 0.875rem;
   --text-touch-input: 1rem;
   --editor-font-size: 14px;
@@ -105,11 +96,8 @@
 
   /* Movimiento y curvas */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
-  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
-  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
   --dur-micro: 120ms;
   --dur-short: 220ms;
-  --dur-long: 360ms;
 
   /* Dimensiones de layout e islas */
   --topbar-height: 46px;
@@ -119,23 +107,13 @@
   --left-panel-w: 250px;
   --right-panel-w: 340px;
   --resizer-track: 8px;
-  --container: 1440px;
-  --gutter: 32px;
-  --gap-columns: 24px;
-  --section-gap-s: 64px;
-  --section-gap: 96px;
-  --section-gap-l: 120px;
   --tracking-display: -0.015em;
 
   /* Capas Z */
-  --z-base: 1;
   --z-raised: 10;
-  --z-dropdown: 100;
   --z-sticky: 200;
   --z-sticky-nav: 300;
   --z-modal: 400;
-  --z-toast: 500;
-  --z-tooltip: 600;
 }
 
 /* ==========================================================================

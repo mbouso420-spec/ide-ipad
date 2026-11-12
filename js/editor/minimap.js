@@ -3,6 +3,8 @@
  * Dibuja una representación proporcional del documento y permite navegar visualmente arrastrando o haciendo clic.
  */
 
+import { readStoredBool, saveStoredValue } from "../utils/storage.js";
+
 const PREF_MINIMAP_KEY = "ide.editor.minimap";
 
 const safeRequestAnim = typeof requestAnimationFrame === "function"
@@ -15,15 +17,28 @@ const safeCancelAnim = typeof cancelAnimationFrame === "function"
 
 /**
  * Crea y administra el minimapa del editor.
+ * Admite muestreo directo (`getLineCount` + `getLine` o `sampleDocLines`) para evitar alocar
+ * arreglos completos de todo el documento en cada cuadro, conservando `getDocLines` por compatibilidad.
  *
  * @param {{
  *   mountEl: HTMLElement,
- *   getDocLines: () => string[],
+ *   getDocLines?: () => string[],
+ *   getLineCount?: () => number,
+ *   getLine?: (index: number) => string,
+ *   sampleDocLines?: (maxSamples: number) => { totalLines: number, samples: Array<{ index: number, text: string }> },
  *   getViewport: () => { top: number, height: number, totalHeight: number },
  *   onScrollToRatio: (ratio: number) => void
  * }} config
  */
-export function createMinimapController({ mountEl, getDocLines, getViewport, onScrollToRatio }) {
+export function createMinimapController({
+  mountEl,
+  getDocLines,
+  getLineCount,
+  getLine,
+  sampleDocLines,
+  getViewport,
+  onScrollToRatio
+}) {
   let isVisible = readStoredBool(PREF_MINIMAP_KEY, true);
   let canvas = null;
   let ctx = null;
@@ -167,8 +182,36 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     }
     ctx.clearRect(0, 0, width, height);
 
-    const lines = typeof getDocLines === "function" ? getDocLines() : [];
-    const totalLines = Math.max(1, lines.length);
+    let totalLines = 1;
+    let lines = null;
+    if (typeof sampleDocLines === "function") {
+      const sampled = sampleDocLines(Math.max(1, Math.round(height)));
+      totalLines = Math.max(1, sampled?.totalLines || 1);
+      const lineHeight = Math.min(3, Math.max(1, height / totalLines));
+      const maxChars = 80;
+      ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
+
+      for (const sample of sampled?.samples || []) {
+        const line = sample?.text || "";
+        if (!line.trim()) continue;
+        const y = (sample.index / totalLines) * height;
+        const indent = line.search(/\S|$/);
+        const startX = Math.min(width - 6, indent * 1.5);
+        const textLen = Math.min(maxChars, line.trim().length);
+        const lineWidth = Math.max(2, Math.min(width - startX - 2, textLen * 0.8));
+        ctx.fillRect(startX, y, lineWidth, Math.max(0.8, lineHeight - 0.5));
+      }
+      updateSlider();
+      return;
+    }
+
+    const useIndexed = typeof getLineCount === "function" && typeof getLine === "function";
+    if (useIndexed) {
+      totalLines = Math.max(1, getLineCount());
+    } else {
+      lines = typeof getDocLines === "function" ? getDocLines() : [];
+      totalLines = Math.max(1, lines.length);
+    }
 
     // Altura por línea proporcional
     const lineHeight = Math.min(3, Math.max(1, height / totalLines));
@@ -179,7 +222,7 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     const step = totalLines > height * 2 ? Math.max(1, Math.floor(totalLines / height)) : 1;
 
     for (let i = 0; i < totalLines; i += step) {
-      const line = lines[i] || "";
+      const line = (useIndexed ? getLine(i) : lines[i]) || "";
       if (!line.trim()) continue;
 
       const y = (i / totalLines) * height;
@@ -225,9 +268,7 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
 
   function toggle(forcedValue) {
     isVisible = forcedValue !== undefined ? Boolean(forcedValue) : !isVisible;
-    try {
-      localStorage.setItem(PREF_MINIMAP_KEY, String(isVisible));
-    } catch (_) {}
+    saveStoredValue(PREF_MINIMAP_KEY, String(isVisible));
 
     if (containerEl) {
       containerEl.hidden = !isVisible;
@@ -260,14 +301,4 @@ export function createMinimapController({ mountEl, getDocLines, getViewport, onS
     isVisible: () => isVisible,
     destroy
   };
-}
-
-function readStoredBool(key, fallback) {
-  try {
-    const val = localStorage.getItem(key);
-    if (val === null) return fallback;
-    return val === "true";
-  } catch (_) {
-    return fallback;
-  }
 }

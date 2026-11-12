@@ -1,4 +1,4 @@
-import { getIndentSize } from "./editorManager.js";
+import { getIndentSize } from "./languageConfig.js";
 
 const VOID_HTML_TAGS = new Set([
   "!doctype",
@@ -19,6 +19,9 @@ const VOID_HTML_TAGS = new Set([
 ]);
 
 const RAW_HTML_TAGS = new Set(["pre", "textarea", "script", "style"]);
+const RAW_HTML_CLOSE_REGEXES = new Map(
+  Array.from(RAW_HTML_TAGS, (tag) => [tag, new RegExp(`</${tag}\\s*>`, "i")])
+);
 
 const BRACE_LANGUAGES = new Set([
   "js",
@@ -589,8 +592,8 @@ function scanHtmlTagsInLine(trimmed, startIdx = 0) {
 
     delta += 1;
     if (RAW_HTML_TAGS.has(tagName)) {
-      const closeRe = new RegExp(`</${tagName}\\s*>`, "i");
-      const closeMatch = closeRe.exec(trimmed.slice(j + 1));
+      const closeRe = RAW_HTML_CLOSE_REGEXES.get(tagName);
+      const closeMatch = closeRe ? closeRe.exec(trimmed.slice(j + 1)) : null;
       if (closeMatch) {
         delta -= 1;
         i = j + 1 + closeMatch.index + closeMatch[0].length - 1;
@@ -616,8 +619,8 @@ function formatHtml(code, indentSize) {
 
   for (const rawLine of lines) {
     if (rawTag) {
-      const closeRe = new RegExp(`</${rawTag}\\s*>`, "i");
-      if (closeRe.test(rawLine)) {
+      const closeRe = RAW_HTML_CLOSE_REGEXES.get(rawTag);
+      if (closeRe && closeRe.test(rawLine)) {
         rawTag = null;
         if (depth > 0) depth -= 1;
         out.push(rawLine.trim().startsWith("</") ? `${unit.repeat(depth)}${rawLine.trim()}` : rawLine);

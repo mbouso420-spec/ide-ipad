@@ -1,6 +1,7 @@
 import { normalizePath } from "../storage/workspaceDb.js";
 import { redactSensitiveTokens } from "../security/credentialGuard.js";
 import { instrumentLoops } from "../preview/loopGuard.js";
+import { isBlockedPreviewUrlScheme } from "../preview/previewUtils.js";
 import { buildSqlRunnerPreview } from "../preview/sqlRunner.js";
 import { mountCRunnerView } from "../preview/cRunner.js";
 
@@ -112,7 +113,14 @@ export function initLivePreviewModal({
   const forwardBtn = document.getElementById("btn-preview-forward");
   const navControls = dialog?.querySelector(".preview-nav-controls");
 
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = controller ? { signal: controller.signal } : undefined;
+
   let consoleVisible = true;
+  let hasControlledSrcdoc = false;
+  let expectingControlledLoad = false;
+  let idleAcornHandle = null;
+  let idleAcornUsesIdleApi = false;
   let previewRunSeq = 0;
   let renderSeq = 0;
   let currentPreviewPath = null;
@@ -193,21 +201,21 @@ export function initLivePreviewModal({
       savePreviewHtml(snap?.projectId, pageSelect.value);
       void navigateToHtml(pageSelect.value, true);
     }
-  });
+  }, listenOpts);
 
   backBtn?.addEventListener("click", () => {
     if (historyIndex > 0) {
       historyIndex -= 1;
       void navigateToHtml(historyStack[historyIndex], false);
     }
-  });
+  }, listenOpts);
 
   forwardBtn?.addEventListener("click", () => {
     if (historyIndex < historyStack.length - 1) {
       historyIndex += 1;
       void navigateToHtml(historyStack[historyIndex], false);
     }
-  });
+  }, listenOpts);
 
   const MAX_TRANSITIVE_DEPS = 250;
 
@@ -359,15 +367,17 @@ export function initLivePreviewModal({
       if (iframe) {
         iframe.className = `preview-iframe device-${device}`;
       }
-    });
+    }, listenOpts);
   });
 
   // Precargar el analizador Acorn en segundo plano para tener el guardián listo de inmediato
   if (typeof window !== "undefined") {
     if (typeof window.requestIdleCallback === "function") {
-      window.requestIdleCallback(() => void loadAcorn());
+      idleAcornUsesIdleApi = true;
+      idleAcornHandle = window.requestIdleCallback(() => void loadAcorn());
     } else {
-      window.setTimeout(() => void loadAcorn(), 1500);
+      idleAcornUsesIdleApi = false;
+      idleAcornHandle = window.setTimeout(() => void loadAcorn(), 1500);
     }
   }
 
@@ -376,18 +386,18 @@ export function initLivePreviewModal({
     tsRunOverride = "auto";
     await loadAcorn();
     await openPreview();
-  });
+  }, listenOpts);
 
   closeBtn?.addEventListener("click", () => {
     renderSeq += 1;
     stopIframe();
     dialog?.close();
-  });
+  }, listenOpts);
 
   dialog?.addEventListener("close", () => {
     renderSeq += 1;
     stopIframe();
-  });
+  }, listenOpts);
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
@@ -395,7 +405,7 @@ export function initLivePreviewModal({
       stopIframe();
       dialog.close();
     }
-  });
+  }, listenOpts);
 
   jsModeBtn?.addEventListener("click", () => {
     if (TS_EXTENSIONS.has(activePreviewExt)) {
@@ -404,12 +414,12 @@ export function initLivePreviewModal({
       jsRunOverride = jsRunOverride === "folder" ? "standalone" : "folder";
     }
     void renderActiveTabPreview();
-  });
+  }, listenOpts);
 
   replForm?.addEventListener("submit", (event) => {
     event.preventDefault();
     const code = String(replInput?.value || "").trim();
-    if (!code || !iframe?.contentWindow) return;
+    if (!code || !iframe?.contentWindow || !hasControlledSrcdoc) return;
     if (replHistory[replHistory.length - 1] !== code) {
       replHistory.push(code);
       if (replHistory.length > 50) replHistory.shift();
@@ -420,7 +430,7 @@ export function initLivePreviewModal({
       "*"
     );
     if (replInput) replInput.value = "";
-  });
+  }, listenOpts);
 
   replInput?.addEventListener("keydown", (event) => {
     if (replHistory.length === 0) return;
@@ -436,11 +446,11 @@ export function initLivePreviewModal({
       replHistoryIdx = Math.min(replHistory.length, replHistoryIdx + 1);
       replInput.value = replHistoryIdx < replHistory.length ? replHistory[replHistoryIdx] : "";
     }
-  });
+  }, listenOpts);
 
   reloadBtn?.addEventListener("click", () => {
     void renderActiveTabPreview();
-  });
+  }, listenOpts);
 
   toggleConsoleBtn?.addEventListener("click", () => {
     consoleVisible = !consoleVisible;
@@ -448,18 +458,30 @@ export function initLivePreviewModal({
       consolePanel.hidden = !consoleVisible;
     }
     toggleConsoleBtn.setAttribute("aria-pressed", String(consoleVisible));
-  });
+  }, listenOpts);
 
   clearConsoleBtn?.addEventListener("click", () => {
     clearConsoleOutput();
-  });
+  }, listenOpts);
+
+  iframe?.addEventListener("load", () => {
+    if (expectingControlledLoad) {
+      expectingControlledLoad = false;
+      return;
+    }
+    // Navegación inesperada dentro del sandbox: invalidar confianza en el documento activo
+    hasControlledSrcdoc = false;
+  }, listenOpts);
 
   window.addEventListener("message", (event) => {
+    if (event.origin !== "null") {
+      return;
+    }
     const data = event.data;
     if (!data || data.source !== "studio-ide-preview") {
       return;
     }
-    if (!iframe || event.source !== iframe.contentWindow) {
+    if (!iframe || !hasControlledSrcdoc || event.source !== iframe.contentWindow) {
       return;
     }
     if (data.action === "clear") {
@@ -471,9 +493,13 @@ export function initLivePreviewModal({
       return;
     }
     appendConsoleLine(data.level || "log", data.text || "");
-  });
+  }, listenOpts);
 
   function handlePreviewNavigation(href) {
+    if (isBlockedPreviewUrlScheme(href)) {
+      appendConsoleLine("warn", "Navegación bloqueada por política de seguridad.");
+      return;
+    }
     const { files } = getWorkspaceSnapshot();
     const targetFile = findTargetHtmlFile(files, currentPreviewPath, href);
     if (!targetFile) {
@@ -485,6 +511,8 @@ export function initLivePreviewModal({
   }
 
   function stopIframe() {
+    hasControlledSrcdoc = false;
+    expectingControlledLoad = false;
     if (iframe) {
       iframe.srcdoc = "";
     }
@@ -593,6 +621,8 @@ export function initLivePreviewModal({
     if (iframe) {
       previewRunSeq += 1;
       iframe.hidden = false;
+      expectingControlledLoad = true;
+      hasControlledSrcdoc = true;
       iframe.srcdoc = `${compiledHtml}\n<!-- studio-run:${previewRunSeq} -->`;
     }
     if (consolePanel) {
@@ -974,6 +1004,19 @@ export function initLivePreviewModal({
   }
 
   return {
-    openPreview
+    openPreview,
+    destroy() {
+      renderSeq += 1;
+      if (idleAcornHandle !== null && typeof window !== "undefined") {
+        if (idleAcornUsesIdleApi && typeof window.cancelIdleCallback === "function") {
+          window.cancelIdleCallback(idleAcornHandle);
+        } else {
+          window.clearTimeout(idleAcornHandle);
+        }
+        idleAcornHandle = null;
+      }
+      stopIframe();
+      controller?.abort();
+    }
   };
 }

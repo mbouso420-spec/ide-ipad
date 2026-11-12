@@ -9,7 +9,7 @@
 - **Versión actual:** `1.2.0`
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 563 pruebas automatizadas en 129 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
+- **Suite de pruebas automáticas:** 588 pruebas automatizadas en 139 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
 
 ---
 
@@ -185,7 +185,7 @@
 │       ├── diffModal.js        # Visor de diferencias LCS línea por línea
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas, REPL y medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 563 pruebas en 129 suites + E2E Chromium y WebKit
+└── tests/                      # Suite automatizada con 588 pruebas en 139 suites + E2E Chromium y WebKit
 ```
 
 ---
@@ -203,7 +203,7 @@ npm --prefix tests run test:e2e:webkit
 
 Resultado actual:
 - **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js`, `sw.js`, `scripts/*.js` y `tests/*.{js,mjs}` (`no-undef` + `no-unused-vars`).
-- **563 pruebas automatizadas en Node** distribuidas en **129 suites** (`npm --prefix tests test`: unitarias, regresiones de auditoría y ronda 2, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX), **0 fallos, 0 pruebas canceladas**.
+- **588 pruebas automatizadas en Node** distribuidas en **139 suites** (`npm --prefix tests test`: unitarias, regresiones de auditoría y ronda 2, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX), **0 fallos, 0 pruebas canceladas**.
 - **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v30, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless (ejecutada en CI fuera de sandbox).
 - **Suite E2E Cross-Engine en WebKit (`tests/webkit.e2e.mjs`):** render táctil iPadOS portrait/landscape sin desbordes, IndexedDB, formateador, ES Modules multi-archivo en CSP y WebCrypto verificados en motor WebKit (Playwright, ejecutada en CI fuera de sandbox).
 

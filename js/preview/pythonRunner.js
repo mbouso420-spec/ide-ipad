@@ -385,7 +385,10 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       try {
         var py = await ensurePyodide();
         send({ type: "status", text: "running" });
-        writeFiles(py, job);
+        if (!filesWritten) {
+          writeFiles(py, job);
+          filesWritten = true;
+        }
         py.globals.set("__studio_entry_name", job.entryName);
         py.globals.set("__studio_entry_code", job.code);
         py.globals.set("__studio_seed", job.seed);

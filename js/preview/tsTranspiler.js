@@ -4,6 +4,13 @@
  * expresiones regulares, comentarios u objetos literales.
  */
 
+import {
+  nextSigIndex,
+  prevSigIndex,
+  hasNewlineBetween,
+  findMatchingDelimiter
+} from "./jsTokenUtils.js";
+
 const JSX_RUNTIME_HELPER = `const __studioFragment = Symbol.for("studio.jsx.fragment");
 function __studioJsx(type, props) {
   var children = [];
@@ -316,20 +323,16 @@ function tokenize(source) {
   return tokens;
 }
 
-function nextSigIndex(tokens, idx) {
-  let j = idx;
-  while (j < tokens.length && (tokens[j].type === "ws" || tokens[j].type === "comment")) {
-    j += 1;
-  }
-  return j;
+function prevSigToken(tokens, idx) {
+  const prevIdx = prevSigIndex(tokens, idx);
+  return prevIdx >= 0 ? tokens[prevIdx] : null;
 }
 
-function prevSigToken(tokens, idx) {
-  let j = idx - 1;
-  while (j >= 0 && (tokens[j].type === "ws" || tokens[j].type === "comment")) {
-    j -= 1;
+function findTopBrace(stack) {
+  for (let s = stack.length - 1; s >= 0; s -= 1) {
+    if (stack[s].kind === "brace") return stack[s];
   }
-  return j >= 0 ? tokens[j] : null;
+  return null;
 }
 
 const DISALLOW_ARROW_GENERIC_OPS = new Set([
@@ -366,12 +369,8 @@ function angleCloseCount(tok) {
 }
 
 function hasNewlineBeforeToken(tokens, idx) {
-  for (let t = idx - 1; t >= 0 && (tokens[t].type === "ws" || tokens[t].type === "comment"); t -= 1) {
-    if (tokens[t].value.includes("\n")) {
-      return true;
-    }
-  }
-  return false;
+  const prevIdx = prevSigIndex(tokens, idx);
+  return hasNewlineBetween(tokens, prevIdx + 1, idx);
 }
 
 function isArrowGenericAhead(tokens, ltIdx) {
@@ -458,11 +457,13 @@ function canStartJsxAt(tokens, idx) {
 
 function expandJsxInSource(source, fileName) {
   let cursor = 0;
-  let out = "";
+  const outChunks = [];
   let usedJsx = false;
 
   function findBalancedCurly(src, openIdx) {
     let p = openIdx + 1;
+    let cursorCurly = openIdx + 1;
+    const chunks = [];
     let depth = 1;
     let lastSig = null;
 
@@ -483,22 +484,28 @@ function expandJsxInSource(source, fileName) {
 
     const skipTemplate = (idx) => {
       let j = idx + 1;
+      let tplCursor = idx;
+      const tplChunks = [];
       while (j < src.length) {
         if (src[j] === "\\") {
           j += 2;
           continue;
         }
         if (src[j] === "`") {
-          return j + 1;
+          tplChunks.push(src.slice(tplCursor, j + 1));
+          return { endIdx: j + 1, text: tplChunks.join("") };
         }
         if (src[j] === "$" && src[j + 1] === "{") {
           const nested = findBalancedCurly(src, j + 1);
+          tplChunks.push(src.slice(tplCursor, j + 2), nested.inner, "}");
+          tplCursor = nested.endIdx;
           j = nested.endIdx;
           continue;
         }
         j += 1;
       }
-      return src.length;
+      tplChunks.push(src.slice(tplCursor, src.length));
+      return { endIdx: src.length, text: tplChunks.join("") };
     };
 
     while (p < src.length) {
@@ -527,7 +534,11 @@ function expandJsxInSource(source, fileName) {
       }
 
       if (ch === "`") {
-        p = skipTemplate(p);
+        const tplStart = p;
+        const tplRes = skipTemplate(p);
+        chunks.push(src.slice(cursorCurly, tplStart), tplRes.text);
+        cursorCurly = tplRes.endIdx;
+        p = tplRes.endIdx;
         lastSig = { type: "template_full", value: "`" };
         continue;
       }
@@ -579,6 +590,8 @@ function expandJsxInSource(source, fileName) {
             if (!isArrowGen) {
               const parsed = parseJsxElement(src, p);
               if (parsed) {
+                chunks.push(src.slice(cursorCurly, p), parsed.js);
+                cursorCurly = parsed.endIdx;
                 p = parsed.endIdx;
                 lastSig = { type: "punct", value: ")" };
                 continue;
@@ -597,8 +610,9 @@ function expandJsxInSource(source, fileName) {
       if (ch === "}") {
         depth -= 1;
         if (depth === 0) {
+          chunks.push(src.slice(cursorCurly, p));
           return {
-            inner: src.slice(openIdx + 1, p),
+            inner: chunks.join(""),
             endIdx: p + 1
           };
         }
@@ -749,9 +763,8 @@ function expandJsxInSource(source, fileName) {
             p = endQ;
           } else if (src[p] === "{") {
             const exprRes = findBalancedCurly(src, p);
-            const transformedExpr = transpileCore(exprRes.inner, true, fileName);
+            const transformedExpr = transpileCore(exprRes.inner, false, fileName);
             propParts.push(`${JSON.stringify(attrName)}: (${transformedExpr.code.trim()})`);
-            if (transformedExpr.usedJsx) usedJsx = true;
             p = exprRes.endIdx;
           } else {
             return null;
@@ -807,8 +820,7 @@ function expandJsxInSource(source, fileName) {
           const trimmed = exprRes.inner.trim();
           // Omitir comentarios JSX {/* ... */}
           if (trimmed && !/^\/\*[\s\S]*\*\/$/.test(trimmed)) {
-            const sub = transpileCore(exprRes.inner, true, fileName);
-            if (sub.usedJsx) usedJsx = true;
+            const sub = transpileCore(exprRes.inner, false, fileName);
             if (sub.code.trim()) childArgs.push(sub.code.trim());
           }
           p = exprRes.endIdx;
@@ -854,34 +866,33 @@ function expandJsxInSource(source, fileName) {
         parsed = null;
       }
       if (parsed) {
-        out += source.slice(cursor, pos) + parsed.js;
+        outChunks.push(source.slice(cursor, pos), parsed.js);
         cursor = parsed.endIdx;
       }
     }
     pos += tok.value.length;
   }
-  out += source.slice(cursor);
+  outChunks.push(source.slice(cursor));
 
-  return { code: out, usedJsx };
+  return { code: outChunks.join(""), usedJsx };
 }
 
 function skipBalancedPair(tokens, startIdx, openChar, closeChar) {
+  if (openChar !== "<" || closeChar !== ">") {
+    return Math.min(tokens.length, findMatchingDelimiter(tokens, startIdx, openChar, closeChar) + 1);
+  }
   let depth = 0;
   let k = startIdx;
-  const isAngle = openChar === "<" && closeChar === ">";
   while (k < tokens.length) {
     const t = tokens[k];
     if (t.type === "punct" && t.value === openChar) {
       depth += 1;
-    } else if (isAngle) {
+    } else {
       const closeCount = angleCloseCount(t);
       if (closeCount > 0) {
         depth -= closeCount;
         if (depth <= 0) return k + 1;
       }
-    } else if (t.type === "punct" && t.value === closeChar) {
-      depth -= 1;
-      if (depth === 0) return k + 1;
     }
     k += 1;
   }
@@ -1099,14 +1110,16 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
 }
 
 function isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack) {
-  const prev = prevSigToken(tokens, openParenIdx);
-  if (!prev) return false;
+  const prevIdx = prevSigIndex(tokens, openParenIdx);
+  if (prevIdx < 0) return false;
+  const prev = tokens[prevIdx];
   if (prev.type === "ident" && (prev.value === "function" || prev.value === "constructor")) {
     return true;
   }
+  let nameIdx = prevIdx;
   let nameTok = prev;
   if (angleCloseCount(prev) > 0) {
-    let j = tokens.indexOf(prev);
+    let j = prevIdx;
     let angle = angleCloseCount(prev);
     j -= 1;
     while (j >= 0 && angle > 0) {
@@ -1119,17 +1132,18 @@ function isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack) {
       if (angle === 0) break;
       j -= 1;
     }
-    nameTok = prevSigToken(tokens, j);
-    if (!nameTok) return false;
+    nameIdx = prevSigIndex(tokens, j);
+    if (nameIdx < 0) return false;
+    nameTok = tokens[nameIdx];
   }
   if (nameTok.type !== "ident" || EXPR_START_KEYWORDS.has(nameTok.value)) {
     return false;
   }
-  const beforeName = prevSigToken(tokens, tokens.indexOf(nameTok));
+  const beforeName = prevSigToken(tokens, nameIdx);
   if (beforeName && (beforeName.value === "function" || beforeName.value === "*")) {
     return true;
   }
-  const topBrace = [...stack].reverse().find((s) => s.kind === "brace");
+  const topBrace = findTopBrace(stack);
   if (topBrace?.inClass) {
     return !beforeName || beforeName.value !== "=";
   }
@@ -1143,7 +1157,8 @@ function isBeforeMethodOrNamedFuncHeader(tokens, openParenIdx, stack) {
 }
 
 function classifyParamParen(tokens, openParenIdx, stack) {
-  const prev = prevSigToken(tokens, openParenIdx);
+  const prevIdx = prevSigIndex(tokens, openParenIdx);
+  const prev = prevIdx >= 0 ? tokens[prevIdx] : null;
   if (prev) {
     if (prev.type === "ident" && prev.value === "catch") {
       return { isParams: false, isMethodOrFunc: false };
@@ -1176,11 +1191,11 @@ function classifyParamParen(tokens, openParenIdx, stack) {
   }
   // Verificar método de clase o función nombrada: `ident (` seguido de `) {`
   if (prev && prev.type === "ident" && !EXPR_START_KEYWORDS.has(prev.value)) {
-    const beforeName = prevSigToken(tokens, tokens.indexOf(prev));
+    const beforeName = prevSigToken(tokens, prevIdx);
     if (beforeName && beforeName.value === "function") {
       return { isParams: true, isMethodOrFunc: true };
     }
-    const topBrace = [...stack].reverse().find((s) => s.kind === "brace");
+    const topBrace = findTopBrace(stack);
     if ((topBrace?.inClass || topBrace?.isObject) && afterClose < tokens.length && tokens[afterClose].value === "{") {
       return { isParams: true, isMethodOrFunc: true };
     }
@@ -1936,6 +1951,8 @@ function stripTypeScriptFromTokens(tokens) {
   return out;
 }
 
+const SIMPLE_JS_EXPR_RE = /^[A-Za-z0-9_$.\s()[\],'"`+\-*/%&|^~?]+$/;
+
 function transpileCore(source, jsx, fileName) {
   let working = String(source ?? "");
   let usedJsx = false;
@@ -1943,6 +1960,8 @@ function transpileCore(source, jsx, fileName) {
     const jsxRes = expandJsxInSource(working, fileName);
     working = jsxRes.code;
     usedJsx = jsxRes.usedJsx;
+  } else if (SIMPLE_JS_EXPR_RE.test(working) && !/\b(?:as|satisfies)\b/.test(working)) {
+    return { code: working, usedJsx: false };
   }
   const tokens = tokenize(working);
   const stripped = stripTypeScriptFromTokens(tokens);

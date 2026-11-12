@@ -5,12 +5,14 @@ import {
   publishProjectAsNewRepository,
   saveProjectToGist
 } from "./githubService.js";
+import { formatSafeErrorMessage } from "../security/credentialGuard.js";
 import {
   convertLocalProjectToGithub,
   createProjectFromGistBackup,
   getProjectEntries,
   saveProjectState
 } from "../storage/workspaceDb.js";
+import { slugifyName } from "../utils/encoding.js";
 
 /**
  * Actualiza un mensaje de estado en el diálogo de GitHub (`neutral`, `ok` o `error`).
@@ -50,6 +52,8 @@ export function initGithubLocalBackupPanel({
   const restoreGistBtn = document.getElementById("btn-gh-restore-gist");
   const gistRestoreStatus = document.getElementById("gh-gist-restore-status");
 
+  let gistRefreshSeq = 0;
+
   function hidePublishRepoBox() {
     if (publishRepoBox) publishRepoBox.hidden = true;
   }
@@ -81,6 +85,7 @@ export function initGithubLocalBackupPanel({
 
     const token = getGithubToken();
     if (gistSelect) {
+      const seq = ++gistRefreshSeq;
       if (!token) {
         gistSelect.innerHTML = '<option value="">Conectá tu token arriba para listar tus respaldos en Gists</option>';
         if (restoreGistBtn) restoreGistBtn.disabled = true;
@@ -89,6 +94,7 @@ export function initGithubLocalBackupPanel({
 
       fetchUserGistBackups(token)
         .then((backups) => {
+          if (seq !== gistRefreshSeq) return;
           gistSelect.innerHTML = "";
           if (backups.length === 0) {
             gistSelect.innerHTML = '<option value="">No tenés respaldos de Studio IDE en tus Gists</option>';
@@ -110,7 +116,8 @@ export function initGithubLocalBackupPanel({
           if (restoreGistBtn) restoreGistBtn.disabled = true;
         })
         .catch((err) => {
-          const msg = String(err?.message || "");
+          if (seq !== gistRefreshSeq) return;
+          const msg = formatSafeErrorMessage(err, [token], "");
           const isPermission403 =
             err?.status === 403 &&
             (msg.includes("Resource not accessible") ||
@@ -163,7 +170,7 @@ export function initGithubLocalBackupPanel({
         backupGistText.textContent = "Actualizar Gist Privado";
       }
     } catch (err) {
-      const msg = err?.message || "No se pudo guardar el Gist.";
+      const msg = formatSafeErrorMessage(err, [token], "No se pudo guardar el Gist.");
       if (msg.includes("Resource not accessible") || msg.includes("permiso para Gists")) {
         setGithubStatus(
           localBackupStatus,
@@ -194,7 +201,7 @@ export function initGithubLocalBackupPanel({
       publishRepoBox.hidden = !willShow;
       if (willShow && publishNameInput) {
         publishNameInput.value =
-          project.name.toLowerCase().replace(/[^a-z0-9._-]/g, "-").replace(/^-+|-+$/g, "") || project.name;
+          slugifyName(project.name, { allowDots: true, collapse: false, fallback: "" }) || project.name;
         publishNameInput.focus();
         publishNameInput.select();
       }
@@ -262,7 +269,7 @@ export function initGithubLocalBackupPanel({
       await onProjectClonedOrSynced?.(converted?.id || project.id);
       await onRefreshSyncPanel?.();
     } catch (err) {
-      const msg = err?.message || "No se pudo crear el repositorio en GitHub.";
+      const msg = formatSafeErrorMessage(err, [token], "No se pudo crear el repositorio en GitHub.");
       if (msg.includes("Resource not accessible")) {
         setGithubStatus(
           localBackupStatus,
@@ -300,10 +307,10 @@ export function initGithubLocalBackupPanel({
       await onProjectClonedOrSynced?.(newProject.id);
       dialog?.close();
     } catch (err) {
-      const msg = err?.message || "No se pudo restaurar el Gist.";
+      const msg = formatSafeErrorMessage(err, [token], "No se pudo restaurar el Gist.");
       setGithubStatus(gistRestoreStatus, `Error al restaurar: ${msg}`, "error");
     } finally {
-      restoreGistBtn.disabled = false;
+      restoreGistBtn.disabled = !gistSelect?.value;
     }
   });
 

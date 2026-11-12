@@ -91,7 +91,12 @@ export function classifyRemotePullChanges({
       if (prevPath) {
         const localPrev = localPendingByPath.get(prevPath);
         if (localPrev) {
-          recordConflict(prevPath, "removed", localPrev.status, null);
+          if (localPrev.status === "deleted") {
+            // El origen fue movido en remoto y ya estaba borrado localmente: limpiar el registro sin conflicto.
+            safeDeletions.push({ path: prevPath, status: "removed" });
+          } else {
+            recordConflict(prevPath, "removed", localPrev.status, null);
+          }
         } else if (localEntryByPath.has(prevPath)) {
           safeDeletions.push({ path: prevPath, status: "removed" });
         }
@@ -179,6 +184,8 @@ export async function buildRemotePullPlan({
   const deletions = (classification?.safeDeletions || []).map((d) => d.path);
   const keepLocalRebases = [];
   const offlineFull = Boolean(project?.offlineCached);
+  const blobTasks = [];
+  const PULL_BLOB_CONCURRENCY = 6;
 
   for (const item of classification?.safeUpdates || []) {
     const existing = localByPath.get(item.path);
@@ -189,14 +196,23 @@ export async function buildRemotePullPlan({
     );
 
     if (shouldFetchContent) {
-      const parsed = normalizeFetchedBlob(await fetchBlob(item.blobSha, item.path));
-      updates.push({
+      const target = {
         path: item.path,
         blobSha: item.blobSha,
-        content: parsed.content,
-        isBinary: parsed.isBinary,
-        base64: parsed.base64,
+        content: "",
+        isBinary: false,
+        base64: null,
         contentLoaded: true
+      };
+      updates.push(target);
+      blobTasks.push({
+        blobSha: item.blobSha,
+        path: item.path,
+        apply(parsed) {
+          target.content = parsed.content;
+          target.isBinary = parsed.isBinary;
+          target.base64 = parsed.base64;
+        }
       });
     } else if (item.blobSha) {
       updates.push({
@@ -216,14 +232,23 @@ export async function buildRemotePullPlan({
       if (conflict.remoteStatus === "removed") {
         deletions.push(conflict.path);
       } else if (conflict.blobSha && typeof fetchBlob === "function") {
-        const parsed = normalizeFetchedBlob(await fetchBlob(conflict.blobSha, conflict.path));
-        updates.push({
+        const target = {
           path: conflict.path,
           blobSha: conflict.blobSha,
-          content: parsed.content,
-          isBinary: parsed.isBinary,
-          base64: parsed.base64,
+          content: "",
+          isBinary: false,
+          base64: null,
           contentLoaded: true
+        };
+        updates.push(target);
+        blobTasks.push({
+          blobSha: conflict.blobSha,
+          path: conflict.path,
+          apply(parsed) {
+            target.content = parsed.content;
+            target.isBinary = parsed.isBinary;
+            target.base64 = parsed.base64;
+          }
         });
       }
       continue;
@@ -240,28 +265,44 @@ export async function buildRemotePullPlan({
         remoteBase64: null
       });
     } else {
-      let remoteContent = null;
-      let remoteIsBinary = false;
-      let remoteBase64 = null;
+      const target = {
+        path: conflict.path,
+        remoteRemoved: false,
+        remoteBlobSha: conflict.blobSha || null,
+        remoteContent: null,
+        remoteIsBinary: false,
+        remoteBase64: null
+      };
+      keepLocalRebases.push(target);
       if (
         conflict.blobSha &&
         conflict.localStatus !== "deleted" &&
         typeof fetchBlob === "function"
       ) {
-        const parsed = normalizeFetchedBlob(await fetchBlob(conflict.blobSha, conflict.path));
-        remoteContent = parsed.content;
-        remoteIsBinary = parsed.isBinary;
-        remoteBase64 = parsed.base64;
+        blobTasks.push({
+          blobSha: conflict.blobSha,
+          path: conflict.path,
+          apply(parsed) {
+            target.remoteContent = parsed.content;
+            target.remoteIsBinary = parsed.isBinary;
+            target.remoteBase64 = parsed.base64;
+          }
+        });
       }
-      keepLocalRebases.push({
-        path: conflict.path,
-        remoteRemoved: false,
-        remoteBlobSha: conflict.blobSha || null,
-        remoteContent,
-        remoteIsBinary,
-        remoteBase64
-      });
     }
+  }
+
+  if (blobTasks.length > 0) {
+    let nextTaskIdx = 0;
+    const workerCount = Math.min(PULL_BLOB_CONCURRENCY, blobTasks.length);
+    async function blobWorker() {
+      while (nextTaskIdx < blobTasks.length) {
+        const task = blobTasks[nextTaskIdx++];
+        const parsed = normalizeFetchedBlob(await fetchBlob(task.blobSha, task.path));
+        task.apply(parsed);
+      }
+    }
+    await Promise.all(Array.from({ length: workerCount }, () => blobWorker()));
   }
 
   return {

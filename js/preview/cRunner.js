@@ -4,6 +4,15 @@
  * para proyectos universitarios y profesionales con headers (.h/.hpp) y módulos (.c/.cpp).
  */
 
+import {
+  getFileExtension,
+  getParentFolder,
+  normalizePath,
+  escapeHtml
+} from "./previewUtils.js";
+
+const mountedRunnerInstances = new WeakMap();
+
 export const C_SOURCE_EXTENSIONS = new Set(["c"]);
 export const C_HEADER_EXTENSIONS = new Set(["h"]);
 export const CPP_SOURCE_EXTENSIONS = new Set(["cpp", "cxx", "cc"]);
@@ -228,7 +237,10 @@ export function injectInteractiveInputGuard(code, filePath = "main.c", isC = tru
     return src;
   }
 
-  const safeFile = String(filePath || "main.c").replace(/\\/g, "/").replace(/"/g, "");
+  const safeFile = String(filePath || "main.c")
+    .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+    .replace(/\\/g, "/")
+    .replace(/"/g, "");
   const lines = [
     '#pragma GCC diagnostic push',
     '#pragma GCC diagnostic ignored "-Wunused-function"',
@@ -297,8 +309,14 @@ export function injectInteractiveInputGuard(code, filePath = "main.c", isC = tru
   return `${lines.join("\n")}\n${src}`;
 }
 
-export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
-  const ext = getFileExtension(activeFile.path);
+/**
+ * Detecta metadatos de lenguaje y compilador Wandbox a partir de la ruta del archivo activo
+ * y sus archivos compañeros.
+ * @param {string} filePath
+ * @param {Array<{ path?: string }>} [companionFiles=[]]
+ */
+function detectRunnerLanguage(filePath, companionFiles = []) {
+  const ext = getFileExtension(filePath);
   const isRust = RUST_SOURCE_EXTENSIONS.has(ext);
   const isGo = GO_SOURCE_EXTENSIONS.has(ext);
   const isJava = JAVA_SOURCE_EXTENSIONS.has(ext);
@@ -306,12 +324,14 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
   const isTypeScript = TS_SOURCE_EXTENSIONS.has(ext);
   const isCSource = C_SOURCE_EXTENSIONS.has(ext);
   const isCHeader = C_HEADER_EXTENSIONS.has(ext);
-  const isC = isCSource || (isCHeader && !companionFiles.some((f) => CPP_SOURCE_EXTENSIONS.has(getFileExtension(f?.path || ""))));
+  const isHeader = ALL_HEADER_EXTENSIONS.has(ext);
+  const isC =
+    isCSource ||
+    (isCHeader && !companionFiles.some((f) => CPP_SOURCE_EXTENSIONS.has(getFileExtension(f?.path || ""))));
   const isCppFamily = !isRust && !isGo && !isJava && !isCSharp && !isTypeScript;
 
   let compiler = "gcc-head";
   let options = "c++20,warning";
-
   if (isRust) {
     compiler = "rust-head";
     options = "";
@@ -331,6 +351,56 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
     compiler = "gcc-head-c";
     options = "c17,warning";
   }
+
+  const langLabel = isRust
+    ? "Rust (Wandbox / rustc)"
+    : isGo
+      ? "Go (Wandbox / golang)"
+      : isJava
+        ? "Java (OpenJDK)"
+        : isCSharp
+          ? "C# (.NET)"
+          : isTypeScript
+            ? "TypeScript"
+            : isHeader
+              ? isC
+                ? "C Header (.h)"
+                : "C++ Header (.hpp)"
+              : isC
+                ? "C (GCC 14 / C17)"
+                : "C++ (GCC 14 / C++20)";
+
+  return {
+    ext,
+    isRust,
+    isGo,
+    isJava,
+    isCSharp,
+    isTypeScript,
+    isCSource,
+    isCHeader,
+    isHeader,
+    isC,
+    isCppFamily,
+    compiler,
+    options,
+    langLabel
+  };
+}
+
+export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
+  const {
+    ext,
+    isRust,
+    isGo,
+    isJava,
+    isCSharp,
+    isTypeScript,
+    isC,
+    isCppFamily,
+    compiler,
+    options
+  } = detectRunnerLanguage(activeFile.path, companionFiles);
 
   // Si el archivo activo es un header (.h/.hpp) o un módulo auxiliar sin `main()`,
   // buscar si entre los archivos compañeros compatibles existe el punto de entrada con `main()`.
@@ -399,10 +469,18 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
       }
     }
 
-    // Obtener ruta relativa respecto al archivo principal
-    const relName = prefix && compClean.startsWith(prefix)
+    // Obtener ruta relativa respecto al archivo principal y sanitizar contra inyección de flags/opciones
+    const rawRelName = prefix && compClean.startsWith(prefix)
       ? compClean.slice(prefix.length)
       : comp.shortName || compClean.split("/").pop();
+    let relName = String(rawRelName || "companion.c")
+      .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+      .replace(/\\/g, "/")
+      .replace(/^\/+/, "");
+    if (!relName) relName = "companion.c";
+    if (relName.startsWith("-") || relName.startsWith("@")) {
+      relName = `./${relName}`;
+    }
 
     const isHeader = ALL_HEADER_EXTENSIONS.has(compExt);
     const compContent = String(comp.content || "");
@@ -679,32 +757,14 @@ export function mountCRunnerView(containerEl, {
   fetchFn = (typeof window !== "undefined" ? window.fetch : fetch)
 }) {
   if (!containerEl) return { destroy: () => {}, run: async () => {} };
+  mountedRunnerInstances.get(containerEl)?.destroy();
   containerEl.innerHTML = "";
 
-  const ext = getFileExtension(activeFile.path);
-  const isRust = RUST_SOURCE_EXTENSIONS.has(ext);
-  const isGo = GO_SOURCE_EXTENSIONS.has(ext);
-  const isJava = JAVA_SOURCE_EXTENSIONS.has(ext);
-  const isCSharp = CSHARP_SOURCE_EXTENSIONS.has(ext);
-  const isTypeScript = TS_SOURCE_EXTENSIONS.has(ext);
-  const isCSource = C_SOURCE_EXTENSIONS.has(ext);
-  const isCHeader = C_HEADER_EXTENSIONS.has(ext);
-  const isHeader = ALL_HEADER_EXTENSIONS.has(ext);
-  const isC = isCSource || (isCHeader && !companionFiles.some((f) => CPP_SOURCE_EXTENSIONS.has(getFileExtension(f?.path || ""))));
-  const isCppFamily = !isRust && !isGo && !isJava && !isCSharp && !isTypeScript;
-  const langLabel = isRust
-    ? "Rust (Wandbox / rustc)"
-    : isGo
-    ? "Go (Wandbox / golang)"
-    : isJava
-    ? "Java (OpenJDK)"
-    : isCSharp
-    ? "C# (.NET)"
-    : isTypeScript
-    ? "TypeScript"
-    : isHeader
-    ? (isC ? "C Header (.h)" : "C++ Header (.hpp)")
-    : (isC ? "C (GCC 14 / C17)" : "C++ (GCC 14 / C++20)");
+  const listenerAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const listenerOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
+  let focusTimerId = 0;
+
+  const { isC, isCppFamily, langLabel } = detectRunnerLanguage(activeFile.path, companionFiles);
   const initialPayload = buildWandboxPayload({ activeFile, companionFiles, stdin: "" });
   const companionCount = initialPayload.codes.length;
   const companionLabel = companionCount > 0
@@ -858,8 +918,8 @@ export function mountCRunnerView(containerEl, {
   async function executeStep(userInput = null) {
     if (isCompiling) return;
 
-    if (userInput !== null && String(userInput).trim() !== "") {
-      sessionInputs.push(String(userInput).trim());
+    if (userInput !== null) {
+      sessionInputs.push(String(userInput));
     }
 
     isCompiling = true;
@@ -1039,13 +1099,21 @@ export function mountCRunnerView(containerEl, {
 
       termBody.scrollTop = termBody.scrollHeight;
 
+      const scheduleFocus = () => {
+        if (focusTimerId) clearTimeout(focusTimerId);
+        focusTimerId = setTimeout(() => {
+          focusTimerId = 0;
+          if (!isDestroyed) termInput.focus();
+        }, 60);
+      };
+
       if (waitingForInput) {
         termStatus.className = "c-term-status is-running";
         termStatus.textContent = sessionInputs.length === 0
           ? `Esperando dato en consola (${ms} ms)`
           : `Paso ${sessionInputs.length} — Esperando dato (${ms} ms)`;
         termInput.placeholder = "Escribí el dato solicitado y presioná Enter...";
-        setTimeout(() => termInput.focus(), 60);
+        scheduleFocus();
       } else if (res.status === 0 && !hasInteractiveInput) {
         termStatus.className = "c-term-status is-ok";
         termStatus.textContent = `Código de salida: 0 (Éxito) — ${ms} ms`;
@@ -1054,7 +1122,7 @@ export function mountCRunnerView(containerEl, {
         termStatus.className = "c-term-status is-ok";
         termStatus.textContent = `Paso ${sessionInputs.length} — Finalizado (${ms} ms)`;
         termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
-        setTimeout(() => termInput.focus(), 60);
+        scheduleFocus();
       }
     } catch (err) {
       if (isDestroyed) return;
@@ -1091,26 +1159,27 @@ export function mountCRunnerView(containerEl, {
 
   btnCompile.addEventListener("click", () => {
     triggerFreshRun(false);
-  });
+  }, listenerOpts);
 
   btnSendStdin.addEventListener("click", () => {
     triggerFreshRun(false);
-  });
+  }, listenerOpts);
 
   btnReset.addEventListener("click", () => {
     triggerFreshRun(true);
-  });
+  }, listenerOpts);
 
   function handleSendInteractiveInput() {
     if (isCompiling) return;
-    const text = termInput.value.trim();
-    if (!text) return;
-    terminalHistory.push(text);
+    const text = String(termInput.value ?? "");
+    if (text.trim() !== "") {
+      terminalHistory.push(text);
+    }
     termInput.value = "";
     executeStep(text);
   }
 
-  btnSendStep.addEventListener("click", handleSendInteractiveInput);
+  btnSendStep.addEventListener("click", handleSendInteractiveInput, listenerOpts);
 
   termInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
@@ -1135,12 +1204,12 @@ export function mountCRunnerView(containerEl, {
         } catch (_) {}
       }
     }
-  });
+  }, listenerOpts);
 
   btnClearStdin.addEventListener("click", () => {
     stdinTextarea.value = "";
     stdinTextarea.focus();
-  });
+  }, listenerOpts);
 
   stdinTextarea.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -1148,7 +1217,7 @@ export function mountCRunnerView(containerEl, {
       e.stopPropagation();
       triggerFreshRun(false);
     }
-  });
+  }, listenerOpts);
 
   function handleKeydown(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
@@ -1156,52 +1225,31 @@ export function mountCRunnerView(containerEl, {
       triggerFreshRun(false);
     }
   }
-  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-    window.addEventListener("keydown", handleKeydown);
-  }
+  containerEl.addEventListener("keydown", handleKeydown, listenerOpts);
 
   // Ejecución inicial automática al montar
   executeStep(null);
 
-  return {
+  const instance = {
     destroy() {
       isDestroyed = true;
+      if (focusTimerId) {
+        clearTimeout(focusTimerId);
+        focusTimerId = 0;
+      }
       try { activeRequestController?.abort(); } catch (_) {}
-      if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
-        window.removeEventListener("keydown", handleKeydown);
+      try { listenerAbort?.abort(); } catch (_) {}
+      if (!listenerAbort) {
+        containerEl.removeEventListener("keydown", handleKeydown);
+      }
+      if (mountedRunnerInstances.get(containerEl) === instance) {
+        mountedRunnerInstances.delete(containerEl);
       }
     },
     run: () => executeStep(null)
   };
-}
-
-function getFileExtension(path) {
-  const base = String(path || "").split("/").pop() || "";
-  if (!base.includes(".")) return "";
-  return base.split(".").pop().toLowerCase();
-}
-
-function getParentFolder(path) {
-  const clean = normalizePath(path);
-  return clean.includes("/") ? clean.slice(0, clean.lastIndexOf("/")) : "";
-}
-
-function normalizePath(path) {
-  return String(path || "")
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/^\.\//, "")
-    .replace(/^\/+/, "")
-    .replace(/\/+$/, "");
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  mountedRunnerInstances.set(containerEl, instance);
+  return instance;
 }
 
 /**
@@ -1211,29 +1259,7 @@ function escapeHtml(str) {
  * @returns {string}
  */
 export function buildCRunnerPreview(activeFile, companionFiles = []) {
-  const ext = getFileExtension(activeFile.path);
-  const isRust = RUST_SOURCE_EXTENSIONS.has(ext);
-  const isGo = GO_SOURCE_EXTENSIONS.has(ext);
-  const isJava = JAVA_SOURCE_EXTENSIONS.has(ext);
-  const isCSharp = CSHARP_SOURCE_EXTENSIONS.has(ext);
-  const isTypeScript = TS_SOURCE_EXTENSIONS.has(ext);
-  const isCSource = C_SOURCE_EXTENSIONS.has(ext);
-  const isCHeader = C_HEADER_EXTENSIONS.has(ext);
-  const isHeader = ALL_HEADER_EXTENSIONS.has(ext);
-  const isC = isCSource || (isCHeader && !companionFiles.some((f) => CPP_SOURCE_EXTENSIONS.has(getFileExtension(f?.path || ""))));
-  const langLabel = isRust
-    ? "Rust (Wandbox / rustc)"
-    : isGo
-    ? "Go (Wandbox / golang)"
-    : isJava
-    ? "Java (OpenJDK)"
-    : isCSharp
-    ? "C# (.NET)"
-    : isTypeScript
-    ? "TypeScript"
-    : isHeader
-    ? (isC ? "C Header (.h)" : "C++ Header (.hpp)")
-    : (isC ? "C (GCC 14 / C17)" : "C++ (GCC 14 / C++20)");
+  const { langLabel } = detectRunnerLanguage(activeFile.path, companionFiles);
   const safeTitle = escapeHtml(activeFile.shortName || activeFile.path);
 
   const initialPayload = buildWandboxPayload({ activeFile, companionFiles, stdin: "" });

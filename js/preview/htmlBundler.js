@@ -28,7 +28,7 @@ import {
 import {
   buildExactModuleMap,
   inspectModuleUsage,
-  hasLocalModuleDependencies,
+  isRelativeModuleSpecifier,
   extractModuleDependencyPaths,
   buildVirtualModuleBundle,
   formatVirtualModuleExecution
@@ -282,10 +282,13 @@ export function extractCssImportPaths(cssPath, cssContent) {
   if (!cssContent || typeof cssContent !== "string") return [];
   const dir = getParentFolder(cssPath);
   const paths = new Set();
-  const importRegex = /@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
+  // Ignorar comentarios /* ... */ para no extraer @import comentados
+  const importRegex =
+    /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
   let match;
   while ((match = importRegex.exec(cssContent)) !== null) {
-    const importUrl = match[1] || match[2] || match[3];
+    if (match[1]) continue;
+    const importUrl = match[2] || match[3] || match[4];
     if (importUrl && !/^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
       const cleanRef = importUrl.split("?")[0].split("#")[0];
       const resolved = resolveRelativePath(dir, cleanRef);
@@ -513,14 +516,26 @@ ${buildLoopGuardRuntime()}
       send("error", [err && err.message ? err.message : String(err)]);
     }
   });
+  function normalizeNavRef(ref) {
+    return String(ref == null ? "" : ref).replace(/[\\u0000-\\u001f\\u007f]+/g, "").trim().toLowerCase();
+  }
+  function isBlockedNavScheme(normRef) {
+    return /^(javascript:|vbscript:|data:)/.test(normRef);
+  }
   // Interceptor total de navegación local en enlaces
   document.addEventListener("click", function (e) {
     var a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
     if (!a) return;
     var href = a.getAttribute("href");
     if (!href) return;
-    if (href.startsWith("#") || href.startsWith("javascript:")) return;
-    if (/^(https?:|mailto:|tel:|blob:|data:)/i.test(href)) {
+    var normHref = normalizeNavRef(href);
+    if (isBlockedNavScheme(normHref)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (normHref.startsWith("#")) return;
+    if (/^(https?:|mailto:|tel:|blob:)/.test(normHref)) {
       a.setAttribute("target", "_blank");
       a.setAttribute("rel", "noopener noreferrer");
       return;
@@ -539,7 +554,14 @@ ${buildLoopGuardRuntime()}
     var form = e.target;
     if (!form || !form.getAttribute) return;
     var action = form.getAttribute("action");
-    if (!action || action.startsWith("#") || action.startsWith("javascript:") || /^(https?:|mailto:|tel:)/i.test(action)) return;
+    if (!action) return;
+    var normAction = normalizeNavRef(action);
+    if (isBlockedNavScheme(normAction)) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (normAction.startsWith("#") || /^(https?:|mailto:|tel:)/.test(normAction)) return;
     e.preventDefault();
     e.stopPropagation();
     parent.postMessage({
@@ -553,8 +575,10 @@ ${buildLoopGuardRuntime()}
   try {
     var triggerNav = function (targetUrl) {
       if (!targetUrl || typeof targetUrl !== "string") return;
-      if (targetUrl.startsWith("#") || targetUrl.startsWith("javascript:") || /^(https?:|mailto:|tel:)/i.test(targetUrl)) {
-        window.open(targetUrl, "_blank");
+      var normTarget = normalizeNavRef(targetUrl);
+      if (!normTarget || isBlockedNavScheme(normTarget)) return;
+      if (normTarget.startsWith("#") || /^(https?:|mailto:|tel:)/.test(normTarget)) {
+        window.open(targetUrl, "_blank", "noopener,noreferrer");
         return;
       }
       parent.postMessage({
@@ -633,7 +657,7 @@ export function bundleHtmlWithFolderAssets(
 
   const resolveAsset = (rawHref) => {
     const asset = resolveRawEntry(rawHref);
-    if (!asset || asset.content == null || typeof asset.content !== "string") {
+    if (!asset || typeof asset.content !== "string") {
       return null;
     }
     return asset;
@@ -688,68 +712,345 @@ export function bundleHtmlWithFolderAssets(
     );
   }
 
+  const escapeCommentBody = (txt) => String(txt || "").replace(/\*\//g, "* /");
+
   /**
    * Incrusta recursivamente directivas CSS `@import` locales resolviéndolas desde la memoria del bundle,
-   * preservando condiciones complejas (@media, @layer, @supports) y aplicando límites estrictos de tamaño.
+   * preservando condiciones complejas (@media, @layer, @supports), usando pila `ancestors` para ciclos reales
+   * y aplicando límites estrictos de tamaño.
    *
    * @param {string} cssContent
    * @param {string} cssPath
-   * @param {Set<string>} [visited]
+   * @param {Set<string>} [ancestors]
    * @returns {string}
    */
-  function inlineCssImports(cssContent, cssPath, visited = new Set()) {
+  function inlineCssImports(cssContent, cssPath, ancestors = new Set()) {
     const cleanPath = normalizePath(cssPath);
-    if (visited.has(cleanPath)) return "";
-    visited.add(cleanPath);
+    if (ancestors.has(cleanPath)) return "";
+    ancestors.add(cleanPath);
 
-    const cssDir = getParentFolder(cleanPath);
-    const importRegex = /@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
+    try {
+      const cssDir = getParentFolder(cleanPath);
+      const importRegex =
+        /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
 
-    const withImports = cssContent.replace(importRegex, (match, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
-      const importUrl = urlGroup1 || urlGroup2 || urlGroup3;
-      if (!importUrl || /^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
-        return match;
-      }
-      const cleanRef = importUrl.split("?")[0].split("#")[0];
-      const importedAsset = resolveEntryFromDir(importUrl, cssDir);
+      const withImports = cssContent.replace(
+        importRegex,
+        (match, commentBlock, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
+          if (commentBlock) {
+            return commentBlock;
+          }
+          const importUrl = urlGroup1 || urlGroup2 || urlGroup3;
+          if (!importUrl || /^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
+            return match;
+          }
+          const cleanRef = importUrl.split("?")[0].split("#")[0];
+          const safeRefComment = escapeCommentBody(cleanRef);
+          const importedAsset = resolveEntryFromDir(importUrl, cssDir);
 
-      if (!importedAsset || typeof importedAsset.content !== "string") {
-        return match;
-      }
+          if (!importedAsset || typeof importedAsset.content !== "string") {
+            return match;
+          }
 
-      // 1. Control de límite de tamaño por recurso individual
-      if (importedAsset.content.length > MAX_PREVIEW_ASSET_BYTES) {
-        return `/* [Studio IDE]: @import "${cleanRef}" omitido: excede el límite de tamaño individual (${importedAsset.content.length} bytes > ${MAX_PREVIEW_ASSET_BYTES} bytes) */`;
-      }
+          // 1. Control de límite de tamaño por recurso individual
+          if (importedAsset.content.length > MAX_PREVIEW_ASSET_BYTES) {
+            return `/* [Studio IDE]: @import "${safeRefComment}" omitido: excede el límite de tamaño individual (${importedAsset.content.length} bytes > ${MAX_PREVIEW_ASSET_BYTES} bytes) */`;
+          }
 
-      // 2. Control de presupuesto total acumulado de CSS inlined
-      if (totalInlinedCssBytes + importedAsset.content.length > MAX_TOTAL_INLINED_CSS) {
-        return `/* [Studio IDE]: @import "${cleanRef}" omitido: presupuesto total de CSS superado */`;
-      }
+          // 2. Control de presupuesto total acumulado de CSS inlined
+          if (totalInlinedCssBytes + importedAsset.content.length > MAX_TOTAL_INLINED_CSS) {
+            return `/* [Studio IDE]: @import "${safeRefComment}" omitido: presupuesto total de CSS superado */`;
+          }
 
-      totalInlinedCssBytes += importedAsset.content.length;
+          totalInlinedCssBytes += importedAsset.content.length;
 
-      // 3. Resolución recursiva de dependencias hijas
-      const inlinedChild = inlineCssImports(importedAsset.content, importedAsset.path, visited);
+          // 3. Resolución recursiva de dependencias hijas
+          const inlinedChild = inlineCssImports(importedAsset.content, importedAsset.path, ancestors);
 
-      // 4. Extracción y preservación de condiciones (layer, supports, media)
-      const conds = parseCssImportConditions(rawConditions);
-      const cleanConditionsStr = (rawConditions || "").trim();
-      const headerComment = `/* @import "${cleanRef}"${cleanConditionsStr ? " " + cleanConditionsStr : ""} */`;
+          // 4. Extracción y preservación de condiciones (layer, supports, media)
+          const conds = parseCssImportConditions(rawConditions);
+          const cleanConditionsStr = escapeCommentBody((rawConditions || "").trim());
+          const headerComment = `/* @import "${safeRefComment}"${cleanConditionsStr ? " " + cleanConditionsStr : ""} */`;
 
-      return wrapCssWithConditions(inlinedChild, {
-        ...conds,
-        commentHeader: headerComment
-      });
-    });
+          return wrapCssWithConditions(inlinedChild, {
+            ...conds,
+            commentHeader: headerComment
+          });
+        }
+      );
 
-    return inlineCssUrls(withImports, cssDir);
+      return inlineCssUrls(withImports, cssDir);
+    } finally {
+      ancestors.delete(cleanPath);
+    }
   }
 
   const escapeCloseStyle = (css) => css.replace(/<\/style(?=[\s>/]|$)/gi, "<\\/style");
   const escapeCloseScript = (js) => js.replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
 
-  let html = rawHtml.replace(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi, (_fullTag, attrs, cssBody) => {
+  const SCRIPT_REGEX_KEYWORDS = new Set([
+    "return",
+    "throw",
+    "case",
+    "default",
+    "delete",
+    "void",
+    "typeof",
+    "await",
+    "yield",
+    "in",
+    "instanceof",
+    "of",
+    "new",
+    "else",
+    "do"
+  ]);
+
+  function scanScriptOpenTagEnd(src, fromIdx) {
+    let p = fromIdx;
+    let quote = null;
+    while (p < src.length) {
+      const ch = src[p];
+      if (quote) {
+        if (ch === quote) quote = null;
+        p += 1;
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        p += 1;
+        continue;
+      }
+      if (ch === ">") return p;
+      p += 1;
+    }
+    return -1;
+  }
+
+  function scanScriptCloseTag(src, bodyStart, isJsLike) {
+    if (!isJsLike) {
+      const rest = src.slice(bodyStart);
+      const m = /<\/script(?:\s[^>]*)?>/i.exec(rest);
+      if (!m) return null;
+      return { bodyEnd: bodyStart + m.index, tagEnd: bodyStart + m.index + m[0].length };
+    }
+
+    let p = bodyStart;
+    let lastSig = { kind: "start", value: "" };
+    const tplDepthStack = [];
+
+    const skipQuoted = (start, q) => {
+      let j = start + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === q) return j + 1;
+        j += 1;
+      }
+      return src.length;
+    };
+
+    const canRegex = () => {
+      if (lastSig.kind === "start") return true;
+      if (lastSig.kind === "op") return lastSig.value !== "++" && lastSig.value !== "--";
+      if (lastSig.kind === "ident") return SCRIPT_REGEX_KEYWORDS.has(lastSig.value);
+      return false;
+    };
+
+    const skipRegex = (start) => {
+      let j = start + 1;
+      let inClass = false;
+      while (j < src.length) {
+        const rc = src[j];
+        if (rc === "\\") {
+          j += 2;
+          continue;
+        }
+        if (rc === "[") inClass = true;
+        else if (rc === "]") inClass = false;
+        else if (rc === "/" && !inClass) {
+          j += 1;
+          break;
+        } else if (rc === "\n") {
+          break;
+        }
+        j += 1;
+      }
+      while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
+      return j;
+    };
+
+    while (p < src.length) {
+      if (tplDepthStack.length > 0 && tplDepthStack[tplDepthStack.length - 1] === 0) {
+        const tc = src[p];
+        if (tc === "\\") {
+          p += 2;
+          continue;
+        }
+        if (tc === "`") {
+          tplDepthStack.pop();
+          lastSig = { kind: "literal", value: "`" };
+          p += 1;
+          continue;
+        }
+        if (tc === "$" && src[p + 1] === "{") {
+          tplDepthStack[tplDepthStack.length - 1] = 1;
+          lastSig = { kind: "op", value: "{" };
+          p += 2;
+          continue;
+        }
+        p += 1;
+        continue;
+      }
+
+      const ch = src[p];
+      if (ch === "<" && src[p + 1] === "/" && tplDepthStack.length === 0) {
+        const closeMatch = /^<\/script(?:\s[^>]*)?>/i.exec(src.slice(p, Math.min(src.length, p + 256)));
+        if (closeMatch) {
+          return { bodyEnd: p, tagEnd: p + closeMatch[0].length };
+        }
+      }
+
+      if (/\s/.test(ch)) {
+        p += 1;
+        continue;
+      }
+      if (ch === "/" && src[p + 1] === "/") {
+        const nl = src.indexOf("\n", p + 2);
+        p = nl === -1 ? src.length : nl + 1;
+        continue;
+      }
+      if (ch === "/" && src[p + 1] === "*") {
+        const endC = src.indexOf("*/", p + 2);
+        p = endC === -1 ? src.length : endC + 2;
+        continue;
+      }
+      if (ch === "'" || ch === '"') {
+        p = skipQuoted(p, ch);
+        lastSig = { kind: "literal", value: ch };
+        continue;
+      }
+      if (ch === "`") {
+        tplDepthStack.push(0);
+        p += 1;
+        continue;
+      }
+      if (ch === "/" && canRegex()) {
+        p = skipRegex(p);
+        lastSig = { kind: "literal", value: "/" };
+        continue;
+      }
+      if (ch === "{") {
+        if (tplDepthStack.length > 0) {
+          tplDepthStack[tplDepthStack.length - 1] += 1;
+        }
+        lastSig = { kind: "op", value: "{" };
+        p += 1;
+        continue;
+      }
+      if (ch === "}") {
+        if (tplDepthStack.length > 0) {
+          tplDepthStack[tplDepthStack.length - 1] -= 1;
+        }
+        lastSig = { kind: "close", value: "}" };
+        p += 1;
+        continue;
+      }
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = p + 1;
+        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
+        lastSig = { kind: "ident", value: src.slice(p, j) };
+        p = j;
+        continue;
+      }
+      if (/[0-9]/.test(ch)) {
+        let j = p + 1;
+        while (j < src.length && /[0-9A-Za-z._]/.test(src[j])) j += 1;
+        lastSig = { kind: "literal", value: "0" };
+        p = j;
+        continue;
+      }
+      if (ch === ")" || ch === "]") {
+        lastSig = { kind: "close", value: ch };
+        p += 1;
+      } else if ((ch === "+" && src[p + 1] === "+") || (ch === "-" && src[p + 1] === "-")) {
+        lastSig = { kind: "op", value: ch + ch };
+        p += 2;
+      } else {
+        lastSig = { kind: "op", value: ch };
+        p += 1;
+      }
+    }
+    return null;
+  }
+
+  function maskHtmlScripts(src) {
+    let prefix = "__STUDIO_SCRIPT_MASK_";
+    while (src.includes(prefix)) prefix += "X";
+
+    const entries = [];
+    const chunks = [];
+    let cursor = 0;
+
+    while (cursor < src.length) {
+      const commentIdx = src.indexOf("<!--", cursor);
+      const scriptRe = /<script(?=[\s>])/gi;
+      scriptRe.lastIndex = cursor;
+      const scriptMatch = scriptRe.exec(src);
+      if (!scriptMatch) break;
+
+      if (commentIdx !== -1 && commentIdx < scriptMatch.index) {
+        const endComment = src.indexOf("-->", commentIdx + 4);
+        const nextPos = endComment === -1 ? src.length : endComment + 3;
+        chunks.push(src.slice(cursor, nextPos));
+        cursor = nextPos;
+        continue;
+      }
+
+      const ltIdx = scriptMatch.index;
+      const openEnd = scanScriptOpenTagEnd(src, ltIdx + 7);
+      if (openEnd === -1) break;
+
+      const attrs = src.slice(ltIdx + 7, openEnd);
+      const bodyStart = openEnd + 1;
+      const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
+      const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
+      const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+      const isJsLike =
+        !hasSrc &&
+        (!typeVal ||
+          typeVal === "module" ||
+          typeVal === "text/javascript" ||
+          typeVal === "application/javascript" ||
+          typeVal === "text/typescript" ||
+          typeVal === "application/typescript" ||
+          typeVal === "text/tsx" ||
+          typeVal === "text/jsx" ||
+          typeVal === "text/babel");
+
+      const closeRes = scanScriptCloseTag(src, bodyStart, isJsLike);
+      if (!closeRes) break;
+
+      const idx = entries.length;
+      entries.push({
+        fullTag: src.slice(ltIdx, closeRes.tagEnd),
+        attrs,
+        inlineCode: src.slice(bodyStart, closeRes.bodyEnd)
+      });
+      chunks.push(src.slice(cursor, ltIdx), `${prefix}${idx}__`);
+      cursor = closeRes.tagEnd;
+    }
+
+    chunks.push(src.slice(cursor));
+    return { maskedHtml: chunks.join(""), entries, prefix };
+  }
+
+  // Enmascarar <script>...</script> antes de transformar <style>/<link>/<img> para no alterar strings JS
+  const { maskedHtml, entries: scriptEntries, prefix: scriptMaskPrefix } = maskHtmlScripts(rawHtml);
+
+  let html = maskedHtml.replace(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi, (_fullTag, attrs, cssBody) => {
     const safeCss = escapeCloseStyle(inlineCssImports(cssBody, entryPath));
     return `<style${attrs}>${safeCss}</style>`;
   });
@@ -833,30 +1134,55 @@ export function bundleHtmlWithFolderAssets(
   const exactModuleMap = buildExactModuleMap(fileMap);
   let inlineScriptCounter = 0;
 
-  function compileScriptContent(rawCode, sourcePath, explicitType = "", isModule = false) {
-    const ext = getFileExtension(sourcePath || "");
-    const t = String(explicitType || "").trim().toLowerCase();
-    const isTsOrJsxType =
-      t === "text/typescript" ||
-      t === "application/typescript" ||
-      t === "text/tsx" ||
-      t === "text/jsx" ||
-      t === "text/babel";
-    const needsTranspile = TS_EXTENSIONS.has(ext) || ext === "jsx" || isTsOrJsxType;
-    let executable = String(rawCode || "");
-    if (needsTranspile) {
-      const enableJsx = ext === "tsx" || ext === "jsx" || t === "text/tsx" || t === "text/jsx" || t === "text/babel";
-      executable = transpileTypeScriptAndJsx(executable, {
-        jsx: enableJsx,
-        fileName: sourcePath || "inline.tsx"
-      }).code;
+  function compileScriptContent(rawCode, sourcePath, explicitType = "", isModule = false, pretranspiled = null) {
+    let executable;
+    if (typeof pretranspiled === "string") {
+      executable = pretranspiled;
+    } else {
+      const ext = getFileExtension(sourcePath || "");
+      const t = String(explicitType || "").trim().toLowerCase();
+      const isTsOrJsxType =
+        t === "text/typescript" ||
+        t === "application/typescript" ||
+        t === "text/tsx" ||
+        t === "text/jsx" ||
+        t === "text/babel";
+      const needsTranspile = TS_EXTENSIONS.has(ext) || ext === "jsx" || isTsOrJsxType;
+      executable = String(rawCode || "");
+      if (needsTranspile) {
+        const enableJsx = ext === "tsx" || ext === "jsx" || t === "text/tsx" || t === "text/jsx" || t === "text/babel";
+        executable = transpileTypeScriptAndJsx(executable, {
+          jsx: enableJsx,
+          fileName: sourcePath || "inline.tsx"
+        }).code;
+      }
     }
     const rendered = typeof transformJs === "function" ? transformJs(executable, isModule) : executable;
     return escapeCloseScript(rendered);
   }
 
-  function tryBundleLocalModules(rawCode, sourcePath) {
-    if (!hasLocalModuleDependencies(rawCode, sourcePath, exactModuleMap, { allowParentTraversal })) {
+  function hasRelativeDepsInUsage(usage) {
+    for (const spec of usage.staticImports) {
+      if (isRelativeModuleSpecifier(spec)) return true;
+    }
+    for (const spec of usage.dynamicLocalImports) {
+      if (isRelativeModuleSpecifier(spec)) return true;
+    }
+    return false;
+  }
+
+  function tryBundleLocalModules(rawCode, sourcePath, pretranspiled = null) {
+    if (exactModuleMap.size === 0) return null;
+    const ext = getFileExtension(sourcePath || "");
+    let jsCode = typeof pretranspiled === "string" ? pretranspiled : String(rawCode || "");
+    if (typeof pretranspiled !== "string" && (TS_EXTENSIONS.has(ext) || ext === "jsx")) {
+      jsCode = transpileTypeScriptAndJsx(jsCode, {
+        jsx: ext === "tsx" || ext === "jsx",
+        fileName: sourcePath || "entry.tsx"
+      }).code;
+    }
+    const usage = inspectModuleUsage(jsCode);
+    if (!hasRelativeDepsInUsage(usage)) {
       return null;
     }
     const bundle = buildVirtualModuleBundle({
@@ -865,12 +1191,14 @@ export function bundleHtmlWithFolderAssets(
       exactMap: exactModuleMap,
       transformJs,
       transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
-      allowParentTraversal
+      allowParentTraversal,
+      precompiledEntryCode: jsCode,
+      precomputedEntryUsage: usage
     });
     return formatVirtualModuleExecution(bundle);
   }
 
-  html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (fullTag, attrs, inlineCode) => {
+  function processScannedScript({ fullTag, attrs, inlineCode }) {
     const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
     if (!srcMatch) {
       const typeMatch = attrs.match(/\btype=["']([^"']*)["']/i);
@@ -896,12 +1224,19 @@ export function bundleHtmlWithFolderAssets(
               ? "jsx"
               : "js";
       const virtualPath = resolveRelativePath(dir, `__inline_${inlineScriptCounter++}.${virtualExt}`);
-      const bundledExec = tryBundleLocalModules(inlineCode, virtualPath);
+      const needsTs = TS_EXTENSIONS.has(virtualExt) || virtualExt === "jsx";
+      const precompiled = needsTs
+        ? transpileTypeScriptAndJsx(inlineCode, {
+            jsx: virtualExt === "tsx" || virtualExt === "jsx",
+            fileName: virtualPath
+          }).code
+        : inlineCode;
+      const bundledExec = tryBundleLocalModules(inlineCode, virtualPath, precompiled);
       if (bundledExec) {
         const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
         return `<script${modAttr}>\n${bundledExec.scriptCode}\n</script>`;
       }
-      const safeInline = compileScriptContent(inlineCode, virtualPath, type, isMod);
+      const safeInline = compileScriptContent(inlineCode, virtualPath, type, isMod, precompiled);
       const outAttrs = type && type !== "module" ? attrs.replace(/\btype=["'][^"']*["']/i, "").trim() : attrs.trim();
       return `<script${outAttrs ? " " + outAttrs : ""}>${safeInline}</script>`;
     }
@@ -917,7 +1252,15 @@ export function bundleHtmlWithFolderAssets(
 
     const isModule = /\btype=["']module["']/i.test(attrs);
     const hasDefer = /\bdefer\b/i.test(attrs);
-    const bundledExec = tryBundleLocalModules(asset.content, asset.path);
+    const ext = getFileExtension(asset.path || "");
+    const precompiled =
+      TS_EXTENSIONS.has(ext) || ext === "jsx"
+        ? transpileTypeScriptAndJsx(asset.content || "", {
+            jsx: ext === "tsx" || ext === "jsx",
+            fileName: asset.path
+          }).code
+        : asset.content;
+    const bundledExec = tryBundleLocalModules(asset.content, asset.path, precompiled);
     if (bundledExec) {
       const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
       const scriptTag = `<script${modAttr} data-source="${escapeAttr(asset.path)}">\n${bundledExec.scriptCode}\n</script>`;
@@ -928,7 +1271,7 @@ export function bundleHtmlWithFolderAssets(
       return scriptTag;
     }
 
-    const safeJs = compileScriptContent(asset.content, asset.path, "", isModule);
+    const safeJs = compileScriptContent(asset.content, asset.path, "", isModule, precompiled);
 
     if (!isModule && hasDefer) {
       deferredScripts.push(`<script data-source="${escapeAttr(asset.path)}">\n${safeJs}\n</script>`);
@@ -936,7 +1279,12 @@ export function bundleHtmlWithFolderAssets(
     }
 
     return `<script${isModule ? ' type="module"' : ""} data-source="${escapeAttr(asset.path)}">\n${safeJs}\n</script>`;
-  });
+  }
+
+  if (scriptEntries.length > 0) {
+    const maskRe = new RegExp(`${scriptMaskPrefix}(\\d+)__`, "g");
+    html = html.replace(maskRe, (_, idxStr) => processScannedScript(scriptEntries[Number(idxStr)]));
+  }
 
   if (ensureJsFile && !inlinedActiveJs) {
     const bundledExtra = tryBundleLocalModules(ensureJsFile.content, ensureJsFile.path);
@@ -968,41 +1316,64 @@ export function bundleHtmlWithFolderAssets(
 }
 
 export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code, options = {}) {
-  const exactMap = buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
-  const allowParentTraversal = options?.allowParentTraversal !== false;
-  if (
-    exactMap.size > 0 &&
-    hasLocalModuleDependencies(tsFile?.content || "", tsFile?.path || "main.ts", exactMap, {
-      allowParentTraversal
-    })
-  ) {
-    return buildStandaloneJsPreview(tsFile, transformJs, options);
-  }
+  const exactMap = options?.prebuiltExactMap || buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
   const ext = getFileExtension(tsFile?.path || "");
   const isJsx = ext === "tsx" || ext === "jsx";
   const compiled = transpileTypeScriptAndJsx(tsFile?.content || "", {
     jsx: isJsx,
     fileName: tsFile?.path || "main.ts"
   });
+  const precomputedUsage = inspectModuleUsage(compiled.code);
   return buildStandaloneJsPreview(
     {
       ...tsFile,
       content: compiled.code
     },
     transformJs,
-    options
+    {
+      ...options,
+      prebuiltExactMap: exactMap,
+      precompiledEntryCode: compiled.code,
+      precomputedUsage
+    }
   );
 }
 
 export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, options = {}) {
   const bridge = buildConsoleBridgeScript(true);
-  const exactMap = buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
+  const exactMap = options?.prebuiltExactMap || buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
   const allowParentTraversal = options?.allowParentTraversal !== false;
-  const usesLocalModules =
-    exactMap.size > 0 &&
-    hasLocalModuleDependencies(jsFile.content, jsFile.path, exactMap, { allowParentTraversal });
+  const entryCode = typeof options?.precompiledEntryCode === "string"
+    ? options.precompiledEntryCode
+    : String(jsFile?.content || "");
+  const entryExt = getFileExtension(jsFile?.path || "");
+  const needsEntryTranspile =
+    typeof options?.precompiledEntryCode !== "string" && (TS_EXTENSIONS.has(entryExt) || entryExt === "jsx");
+  const normalizedJsCode = needsEntryTranspile
+    ? transpileTypeScriptAndJsx(entryCode, {
+        jsx: entryExt === "tsx" || entryExt === "jsx",
+        fileName: jsFile?.path || "main.ts"
+      }).code
+    : entryCode;
 
-  const moduleUsage = usesLocalModules ? null : inspectModuleUsage(jsFile.content || "");
+  const moduleUsage = options?.precomputedUsage || inspectModuleUsage(normalizedJsCode);
+  let usesLocalModules = false;
+  if (exactMap.size > 0) {
+    for (const spec of moduleUsage.staticImports) {
+      if (isRelativeModuleSpecifier(spec)) {
+        usesLocalModules = true;
+        break;
+      }
+    }
+    if (!usesLocalModules) {
+      for (const spec of moduleUsage.dynamicLocalImports) {
+        if (isRelativeModuleSpecifier(spec)) {
+          usesLocalModules = true;
+          break;
+        }
+      }
+    }
+  }
   const isModule = Boolean(!usesLocalModules && (moduleUsage.hasModuleSyntax || moduleUsage.hasTopLevelAwait));
   const safeName = escapeHtmlText(jsFile.path);
 
@@ -1013,7 +1384,9 @@ export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, o
       entryCode: jsFile.content,
       exactMap,
       transformJs,
-      allowParentTraversal
+      allowParentTraversal,
+      precompiledEntryCode: normalizedJsCode,
+      precomputedEntryUsage: moduleUsage
     });
     const exec = formatVirtualModuleExecution(bundle);
     const statusFooter = `

@@ -390,15 +390,6 @@
   color: var(--color-accent-text);
 }
 
-.chat-composer-info {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-xs);
-  padding-inline: var(--space-2xs);
-  padding-bottom: var(--space-3xs);
-}
-
 /* ==========================================================================
    Compositor de Chat: Gaveta Desplegable de Herramientas y Razonamiento
    ========================================================================== */
@@ -619,11 +610,6 @@ button.chat-tools-toggle-btn:focus-visible {
   button.chat-tools-toggle-btn {
     transition: none;
   }
-}
-
-.chat-token-counter {
-  font-size: var(--text-xs);
-  color: var(--color-muted);
 }
 
 .btn-xs {

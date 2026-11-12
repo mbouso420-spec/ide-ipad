@@ -9,7 +9,8 @@
  * @returns {string}
  */
 export function formatStorageBytes(bytes) {
-  const n = Math.max(0, Number(bytes) || 0);
+  const num = Number(bytes);
+  const n = Number.isFinite(num) ? Math.max(0, num) : 0;
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
@@ -31,8 +32,10 @@ export async function getStorageQuotaEstimate() {
   if (typeof navigator !== "undefined" && navigator.storage && typeof navigator.storage.estimate === "function") {
     try {
       const estimate = await navigator.storage.estimate();
-      const usage = estimate.usage || 0;
-      const quota = estimate.quota || 0;
+      const rawUsage = Number(estimate?.usage);
+      const rawQuota = Number(estimate?.quota);
+      const usage = Number.isFinite(rawUsage) ? Math.max(0, rawUsage) : 0;
+      const quota = Number.isFinite(rawQuota) ? Math.max(0, rawQuota) : 0;
       return {
         supported: true,
         usageBytes: usage,

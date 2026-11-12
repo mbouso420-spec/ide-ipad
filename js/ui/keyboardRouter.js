@@ -29,15 +29,21 @@ export class KeyboardRouter {
     if (!root || typeof root.querySelectorAll !== "function") return;
     const dialogs = root.querySelectorAll("dialog");
     dialogs.forEach((dialog) => {
+      if (dialog.__kr_hooked) return;
+      dialog.__kr_hooked = true;
+      const resolvedModalId = dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`;
+      dialog.__kr_modalId = resolvedModalId;
+
       dialog.addEventListener("close", () => {
-        if (dialog.id) this.popModal(dialog.id);
+        this.popModal(dialog.__kr_modalId);
       });
+
       const originalShowModal = dialog.showModal;
-      if (typeof originalShowModal === "function" && !dialog.__kr_hooked) {
-        dialog.__kr_hooked = true;
+      if (typeof originalShowModal === "function") {
         dialog.showModal = (...args) => {
           const res = originalShowModal.apply(dialog, args);
-          const modalId = dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`;
+          const modalId = dialog.id || dialog.__kr_modalId;
+          dialog.__kr_modalId = modalId;
           const existing = this.modalStack.find((m) => m.id === modalId);
           this.pushModal({
             blockGlobalShortcuts: true,
@@ -137,7 +143,7 @@ export class KeyboardRouter {
    * @param {KeyboardEvent} event
    */
   handleKeyDown(event) {
-    if (!event) return;
+    if (!event || typeof event.key !== "string") return;
 
     // 1. Si hay modales en la pila, el modal superior tiene máxima prioridad
     const activeModal = this.getActiveModal();
@@ -168,12 +174,16 @@ export class KeyboardRouter {
         }
       }
 
-      if (activeModal.blockGlobalShortcuts) {
+      if (activeModal.blockGlobalShortcuts !== false) {
         return;
       }
     }
 
-    // 2. Atajos globales cuando no son bloqueados por el modal activo
+    if (this.shouldBlockGlobalShortcuts()) {
+      return;
+    }
+
+    // 2. Atajos globales cuando no son bloqueados por el modal o diálogo abierto
     const modParts = [];
     if (event.ctrlKey) modParts.push("ctrl");
     if (event.metaKey) modParts.push("meta");
@@ -187,6 +197,12 @@ export class KeyboardRouter {
       event.preventDefault();
       shortcut(event);
     }
+  }
+
+  destroy() {
+    this.detach();
+    this.modalStack = [];
+    this.globalShortcuts.clear();
   }
 }
 

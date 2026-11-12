@@ -369,18 +369,6 @@
   margin-top: var(--space-xs);
 }
 
-@media (pointer: coarse) {
-  .editor-tab-close {
-    width: 32px;
-    height: 32px;
-  }
-
-  .editor-tab-close .icon-svg {
-    width: 15px;
-    height: 15px;
-  }
-}
-
 /* Menú de autocompletado inteligente de CodeMirror 6 y barra inferior de sugerencias en vivo */
 .editor-mount .cm-tooltip,
 .editor-split-body .cm-tooltip {
@@ -805,6 +793,16 @@
 }
 
 @media (pointer: coarse) {
+  .editor-tab-close {
+    width: 32px;
+    height: 32px;
+  }
+
+  .editor-tab-close .icon-svg {
+    width: 15px;
+    height: 15px;
+  }
+
   .editor-mount .cm-textfield,
   .editor-split-select {
     font-size: var(--text-touch-input);

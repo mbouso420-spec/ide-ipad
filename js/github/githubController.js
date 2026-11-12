@@ -12,6 +12,7 @@ import {
   getCachedGithubUserLogin,
   getCachedUserRepositories,
   getGithubToken,
+  parseRepoFullName,
   pushAtomicCommit,
   RemoteAheadError,
   saveGithubToken,
@@ -19,6 +20,7 @@ import {
 } from "./githubService.js";
 import {
   applyRemotePullPlan,
+  countPendingGithubChanges,
   getPendingGithubChanges,
   getProjectEntries,
   hydrateGithubProject,
@@ -34,6 +36,7 @@ import { exportKeysBundle, getKeyStorageMode, hasStoredCredentials } from "../ai
 import {
   checkAuthLockout,
   formatRemainingCooldown,
+  formatSafeErrorMessage,
   maskCredentialPreview,
   redactSensitiveTokens
 } from "../security/credentialGuard.js";
@@ -132,6 +135,11 @@ export function initGithubController({
   let activeConflict = null;
   let activeMergeClassification = null;
   let isPushing = false;
+  let isOpeningRepo = false;
+  let isPulling = false;
+  let isSwitchingBranch = false;
+  let branchesRequestSeq = 0;
+  let syncPanelRequestSeq = 0;
 
   function applyConnectedSessionUi(login, repos) {
     const cleanLogin = String(login || "").trim();
@@ -213,6 +221,16 @@ export function initGithubController({
 
   let lockoutUiTimer = 0;
 
+  function cleanupDialogTransientState() {
+    if (tokenInput) tokenInput.value = "";
+    window.clearTimeout(lockoutUiTimer);
+    lockoutUiTimer = 0;
+    resetPullConfirm();
+    resetOpenConfirm();
+    hideConflictBox();
+    hidePublishRepoBox();
+  }
+
   function syncTokenPlaceholder(storedToken) {
     if (!tokenInput) return;
     tokenInput.value = "";
@@ -259,22 +277,16 @@ export function initGithubController({
     }
   });
 
+  dialog?.addEventListener("close", cleanupDialogTransientState);
+
   closeDialogBtn?.addEventListener("click", () => {
-    if (tokenInput) tokenInput.value = "";
-    resetPullConfirm();
-    resetOpenConfirm();
-    hideConflictBox();
-    hidePublishRepoBox();
+    cleanupDialogTransientState();
     dialog?.close();
   });
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
-      if (tokenInput) tokenInput.value = "";
-      resetPullConfirm();
-      resetOpenConfirm();
-      hideConflictBox();
-      hidePublishRepoBox();
+      cleanupDialogTransientState();
       dialog.close();
     }
   });
@@ -336,6 +348,7 @@ export function initGithubController({
   clearTokenBtn?.addEventListener("click", () => {
     clearGithubToken();
     hideTokenWarning();
+    cleanupDialogTransientState();
     try {
       if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
         void saveCredentialsBackup("");
@@ -374,7 +387,7 @@ export function initGithubController({
   manualRepoInput?.addEventListener("change", async () => {
     resetOpenConfirm();
     const fullName = manualRepoInput.value.trim();
-    if (fullName.includes("/")) {
+    if (parseRepoFullName(fullName)) {
       await loadBranchesForRepo(fullName);
     }
   });
@@ -407,25 +420,42 @@ export function initGithubController({
     return true;
   }
 
-  openLiveBtn?.addEventListener("click", async () => {
-    await onFlushPendingSaves?.();
-    const token = getGithubToken();
+  async function handleOpenOrClone(kind, triggerBtn, fallbackErrorMsg, runAction) {
+    if (isOpeningRepo) return;
     const targetFullName = (manualRepoInput?.value || repoSelect?.value || "").trim();
-    const [owner, repo] = targetFullName.split("/");
+    const parsedRepo = parseRepoFullName(targetFullName);
     const branch = (branchSelect?.value || "main").trim();
 
-    if (!owner || !repo) {
-      setStatus(cloneStatusEl, "Elegí un repositorio o escribí usuario/repositorio.", "error");
+    if (!parsedRepo) {
+      setStatus(cloneStatusEl, "Elegí un repositorio válido (usuario/repositorio).", "error");
       return;
     }
 
-    const canProceed = await guardOverwritePendingChanges(owner, repo, branch, "live", openLiveBtn);
-    if (!canProceed) return;
-
-    openLiveBtn.disabled = true;
-    setStatus(cloneStatusEl, `Cargando árbol de ${owner}/${repo} (${branch})…`, "neutral");
+    // Bloquear ambos botones ANTES del primer await para impedir envíos duplicados al doble toque.
+    isOpeningRepo = true;
+    if (openLiveBtn) openLiveBtn.disabled = true;
+    if (cloneBtn) cloneBtn.disabled = true;
+    const token = getGithubToken();
 
     try {
+      await onFlushPendingSaves?.();
+      const { owner, repo } = parsedRepo;
+      const canProceed = await guardOverwritePendingChanges(owner, repo, branch, kind, triggerBtn);
+      if (!canProceed) return;
+
+      await runAction({ token, owner, repo, branch });
+    } catch (error) {
+      setStatus(cloneStatusEl, formatSafeErrorMessage(error, [token], fallbackErrorMsg), "error");
+    } finally {
+      isOpeningRepo = false;
+      if (openLiveBtn) openLiveBtn.disabled = false;
+      if (cloneBtn) cloneBtn.disabled = false;
+    }
+  }
+
+  openLiveBtn?.addEventListener("click", () => {
+    void handleOpenOrClone("live", openLiveBtn, "No se pudo abrir el repositorio.", async ({ token, owner, repo, branch }) => {
+      setStatus(cloneStatusEl, `Cargando árbol de ${owner}/${repo} (${branch})…`, "neutral");
       const index = await fetchRepoTreeIndex({ token, owner, repo, branch });
       const project = await hydrateLazyGithubProject({
         owner,
@@ -451,32 +481,12 @@ export function initGithubController({
       await onProjectClonedOrSynced(project.id);
       await refreshSyncPanel();
       dialog?.close();
-    } catch (error) {
-      setStatus(cloneStatusEl, error instanceof Error ? error.message : "No se pudo abrir el repositorio.", "error");
-    } finally {
-      openLiveBtn.disabled = false;
-    }
+    });
   });
 
-  cloneBtn?.addEventListener("click", async () => {
-    await onFlushPendingSaves?.();
-    const token = getGithubToken();
-    const targetFullName = (manualRepoInput?.value || repoSelect?.value || "").trim();
-    const [owner, repo] = targetFullName.split("/");
-    const branch = (branchSelect?.value || "main").trim();
-
-    if (!owner || !repo) {
-      setStatus(cloneStatusEl, "Elegí un repositorio o escribí usuario/repositorio.", "error");
-      return;
-    }
-
-    const canProceed = await guardOverwritePendingChanges(owner, repo, branch, "clone", cloneBtn);
-    if (!canProceed) return;
-
-    cloneBtn.disabled = true;
-    setStatus(cloneStatusEl, `Conectando con ${owner}/${repo} (${branch})…`, "neutral");
-
-    try {
+  cloneBtn?.addEventListener("click", () => {
+    void handleOpenOrClone("clone", cloneBtn, "No se pudo descargar el repositorio.", async ({ token, owner, repo, branch }) => {
+      setStatus(cloneStatusEl, `Conectando con ${owner}/${repo} (${branch})…`, "neutral");
       const { commitSha, files, isTruncated } = await downloadRepoFiles({
         token,
         owner,
@@ -506,43 +516,42 @@ export function initGithubController({
       }
       await onProjectClonedOrSynced(project.id);
       await refreshSyncPanel();
-    } catch (error) {
-      setStatus(cloneStatusEl, error instanceof Error ? error.message : "No se pudo descargar el repositorio.", "error");
-    } finally {
-      cloneBtn.disabled = false;
-    }
+    });
   });
 
   pullBtn?.addEventListener("click", async () => {
+    if (isPulling) return;
     const project = getActiveProject();
     if (!project || project.kind !== "github" || !project.github) return;
 
-    await onFlushPendingSaves?.();
-    const pendingChanges = await getPendingGithubChanges(project.id);
-
-    if (pendingChanges.length > 0 && !pendingPullConfirm) {
-      pendingPullConfirm = true;
-      pullBtn.className = "tree-confirm-delete";
-      pullBtn.textContent = "Confirmar descarte";
-      setStatus(
-        pushStatusEl,
-        `Tenés ${pendingChanges.length} archivo(s) locales sin subir. Tocá Confirmar descarte si querés sobrescribirlos con la versión remota.`,
-        "error"
-      );
-      pullConfirmTimer = window.setTimeout(() => {
-        resetPullConfirm();
-      }, 4500);
-      return;
-    }
-
-    resetPullConfirm();
-
-    const token = getGithubToken();
-    const { owner, repo, branch } = project.github;
+    isPulling = true;
     pullBtn.disabled = true;
-    setStatus(pushStatusEl, `Actualizando ${owner}/${repo} (${branch}) desde GitHub…`, "neutral");
+    const token = getGithubToken();
 
     try {
+      await onFlushPendingSaves?.();
+      const pendingChanges = await getPendingGithubChanges(project.id);
+
+      if (pendingChanges.length > 0 && !pendingPullConfirm) {
+        pendingPullConfirm = true;
+        pullBtn.className = "tree-confirm-delete";
+        pullBtn.textContent = "Confirmar descarte";
+        setStatus(
+          pushStatusEl,
+          `Tenés ${pendingChanges.length} archivo(s) locales sin subir. Tocá Confirmar descarte si querés sobrescribirlos con la versión remota.`,
+          "error"
+        );
+        pullConfirmTimer = window.setTimeout(() => {
+          resetPullConfirm();
+        }, 4500);
+        return;
+      }
+
+      resetPullConfirm();
+
+      const { owner, repo, branch } = project.github;
+      setStatus(pushStatusEl, `Actualizando ${owner}/${repo} (${branch}) desde GitHub…`, "neutral");
+
       let updated;
       let wasTruncated = false;
       if (project.offlineCached) {
@@ -568,8 +577,9 @@ export function initGithubController({
         setStatus(pushStatusEl, "Árbol y archivos sincronizados con la última versión remota.", "ok");
       }
     } catch (error) {
-      setStatus(pushStatusEl, error instanceof Error ? error.message : "Error al actualizar.", "error");
+      setStatus(pushStatusEl, formatSafeErrorMessage(error, [token], "Error al actualizar."), "error");
     } finally {
+      isPulling = false;
       pullBtn.disabled = false;
     }
   });
@@ -583,6 +593,7 @@ export function initGithubController({
     if (pushBtn) pushBtn.disabled = true;
     if (conflictForceBtn) conflictForceBtn.disabled = true;
     let token = "";
+    let changes = [];
 
     try {
       await onFlushPendingSaves?.();
@@ -600,7 +611,7 @@ export function initGithubController({
         return;
       }
 
-      const changes = await getPendingGithubChanges(project.id);
+      changes = await getPendingGithubChanges(project.id);
       if (changes.length === 0) {
         setStatus(pushStatusEl, "No hay cambios pendientes frente al repositorio.", "neutral");
         return;
@@ -627,13 +638,24 @@ export function initGithubController({
       await refreshSyncPanel();
       setStatus(pushStatusEl, `Commit publicado con éxito (${commitSha.slice(0, 7)}).`, "ok");
     } catch (error) {
+      if (error?.partialCommitSha && error?.initializedFilePath) {
+        // Si un repo vacío alcanzó a crear el commit inicial antes de fallar fase 2, sincronizar ese archivo.
+        try {
+          const initializedChange = changes.find((c) => c.path === error.initializedFilePath);
+          if (initializedChange) {
+            await markProjectSynced(project.id, error.partialCommitSha, [initializedChange]);
+            await onProjectClonedOrSynced(project.id);
+            await refreshSyncPanel();
+          }
+        } catch {}
+      }
       if (error instanceof RemoteAheadError) {
-        showConflictBox(error, project, token);
-      } else if (error?.status === 401) {
+        showConflictBox(error, project);
+      } else if (error?.status === 401 || error?.credentialRejected) {
         setStatus(pushStatusEl, INVALID_TOKEN_MSG, "error");
         showTokenWarning("Tu token de GitHub venció o fue revocado: no se pudo hacer push.");
       } else {
-        setStatus(pushStatusEl, error instanceof Error ? error.message : "Error al publicar commit.", "error");
+        setStatus(pushStatusEl, formatSafeErrorMessage(error, [token], "Error al publicar commit."), "error");
       }
     } finally {
       isPushing = false;
@@ -642,12 +664,12 @@ export function initGithubController({
     }
   }
 
-  function showConflictBox(error, project, token) {
+  function showConflictBox(error, project) {
+    // Nunca almacenar el token en memoria dentro de activeConflict: leerlo dinámicamente vía getGithubToken().
     activeConflict = {
       remoteSha: error.remoteSha,
       expectedSha: error.expectedSha,
-      project,
-      token
+      project
     };
     activeMergeClassification = null;
     if (conflictApplyBtn) conflictApplyBtn.hidden = true;
@@ -669,13 +691,14 @@ export function initGithubController({
 
   async function openRemoteVsLocalDiff(file) {
     if (!activeConflict) return;
+    const token = getGithubToken();
     const allEntries = await getProjectEntries(activeConflict.project.id);
     const localFile = allEntries.find((f) => f.path === file.path);
     let remoteContent = "";
     if (file.blobSha) {
       try {
         const fetched = await fetchSingleRepoBlob({
-          token: activeConflict.token,
+          token,
           owner: activeConflict.project.github.owner,
           repo: activeConflict.project.github.repo,
           blobSha: file.blobSha,
@@ -695,7 +718,7 @@ export function initGithubController({
       } else if (localFile.blobSha) {
         try {
           const fetchedLocal = await fetchSingleRepoBlob({
-            token: activeConflict.token,
+            token,
             owner: activeConflict.project.github.owner,
             repo: activeConflict.project.github.repo,
             blobSha: localFile.blobSha,
@@ -745,11 +768,16 @@ export function initGithubController({
       setStatus(pushStatusEl, "Sin commit base local para comparar automáticamente.", "error");
       return;
     }
+    const token = getGithubToken();
+    if (!token) {
+      setStatus(pushStatusEl, "Conectá tu Personal Access Token arriba para comparar cambios.", "error");
+      return;
+    }
     if (conflictApplyBtn) conflictApplyBtn.hidden = true;
     conflictViewBtn.disabled = true;
     try {
       const diffFiles = await compareRemoteCommits({
-        token: activeConflict.token,
+        token,
         owner: activeConflict.project.github.owner,
         repo: activeConflict.project.github.repo,
         base: activeConflict.expectedSha,
@@ -784,7 +812,7 @@ export function initGithubController({
         }
       }
     } catch (err) {
-      setStatus(pushStatusEl, err instanceof Error ? err.message : "No se pudo comparar con GitHub.", "error");
+      setStatus(pushStatusEl, formatSafeErrorMessage(err, [token], "No se pudo comparar con GitHub."), "error");
     } finally {
       conflictViewBtn.disabled = false;
     }
@@ -796,12 +824,17 @@ export function initGithubController({
       setStatus(pushStatusEl, "No hay commit base previo; usá Actualizar remoto o Forzar igual.", "error");
       return;
     }
+    const token = getGithubToken();
+    if (!token) {
+      setStatus(pushStatusEl, "Conectá tu Personal Access Token arriba para analizar la integración.", "error");
+      return;
+    }
     conflictMergeBtn.disabled = true;
     setStatus(pushStatusEl, "Analizando diferencias remotas frente a tus cambios locales…", "neutral");
     try {
       const [diffFiles, localEntries, localPendingChanges] = await Promise.all([
         compareRemoteCommits({
-          token: activeConflict.token,
+          token,
           owner: activeConflict.project.github.owner,
           repo: activeConflict.project.github.repo,
           base: activeConflict.expectedSha,
@@ -889,7 +922,7 @@ export function initGithubController({
         conflicts.length > 0 ? "neutral" : "ok"
       );
     } catch (err) {
-      setStatus(pushStatusEl, err instanceof Error ? err.message : "No se pudo preparar la integración.", "error");
+      setStatus(pushStatusEl, formatSafeErrorMessage(err, [token], "No se pudo preparar la integración."), "error");
     } finally {
       conflictMergeBtn.disabled = false;
     }
@@ -897,11 +930,15 @@ export function initGithubController({
 
   conflictApplyBtn?.addEventListener("click", async () => {
     if (!activeConflict || !activeMergeClassification) return;
+    const targetToken = getGithubToken();
+    if (!targetToken) {
+      setStatus(pushStatusEl, "Conectá tu Personal Access Token arriba para aplicar la integración.", "error");
+      return;
+    }
     conflictApplyBtn.disabled = true;
     setStatus(pushStatusEl, "Aplicando integración segura en el workspace…", "neutral");
     try {
       const targetProject = activeConflict.project;
-      const targetToken = activeConflict.token;
       const remoteSha = activeConflict.remoteSha;
       const localEntries = await getProjectEntries(targetProject.id);
 
@@ -930,7 +967,7 @@ export function initGithubController({
         "ok"
       );
     } catch (err) {
-      setStatus(pushStatusEl, err instanceof Error ? err.message : "Error al aplicar la integración.", "error");
+      setStatus(pushStatusEl, formatSafeErrorMessage(err, [targetToken], "Error al aplicar la integración."), "error");
     } finally {
       conflictApplyBtn.disabled = false;
     }
@@ -1014,7 +1051,7 @@ export function initGithubController({
     } catch (err) {
       if (branchStatusEl) {
         branchStatusEl.hidden = false;
-        branchStatusEl.textContent = err instanceof Error ? err.message : "Error al crear la rama";
+        branchStatusEl.textContent = formatSafeErrorMessage(err, [token], "Error al crear la rama");
       }
     } finally {
       if (btnCreateBranch) btnCreateBranch.disabled = false;
@@ -1022,29 +1059,33 @@ export function initGithubController({
   });
 
   syncBranchSelect?.addEventListener("change", async () => {
+    if (isSwitchingBranch) return;
     const project = getActiveProject();
     if (!project || !project.github) return;
     const prevBranch = project.github.branch;
     const chosen = syncBranchSelect.value;
     if (!chosen || chosen === prevBranch) return;
 
-    await onFlushPendingSaves?.();
-    const pendingChanges = await getPendingGithubChanges(project.id);
-    if (pendingChanges.length > 0) {
-      syncBranchSelect.value = prevBranch;
-      setStatus(
-        pushStatusEl,
-        `Tenés ${pendingChanges.length} cambio(s) locales pendientes en "${prevBranch}". Hacé commit/push o creá una nueva rama (+) para no mezclar bases.`,
-        "error"
-      );
-      return;
-    }
-
-    const token = getGithubToken();
-    const { owner, repo } = project.github;
+    // Bloquear selector ANTES del primer await para evitar cambios concurrentes de rama.
+    isSwitchingBranch = true;
     syncBranchSelect.disabled = true;
-    setStatus(pushStatusEl, `Cambiando y sincronizando rama "${chosen}" desde GitHub…`, "neutral");
+    const token = getGithubToken();
+
     try {
+      await onFlushPendingSaves?.();
+      const pendingChanges = await getPendingGithubChanges(project.id);
+      if (pendingChanges.length > 0) {
+        syncBranchSelect.value = prevBranch;
+        setStatus(
+          pushStatusEl,
+          `Tenés ${pendingChanges.length} cambio(s) locales pendientes en "${prevBranch}". Hacé commit/push o creá una nueva rama (+) para no mezclar bases.`,
+          "error"
+        );
+        return;
+      }
+
+      const { owner, repo } = project.github;
+      setStatus(pushStatusEl, `Cambiando y sincronizando rama "${chosen}" desde GitHub…`, "neutral");
       const updated = project.offlineCached
         ? await (() =>
             downloadRepoFiles({ token, owner, repo, branch: chosen }).then(({ commitSha, files }) =>
@@ -1065,8 +1106,9 @@ export function initGithubController({
       setStatus(pushStatusEl, `Rama activa cambiada a "${chosen}".`, "ok");
     } catch (error) {
       syncBranchSelect.value = prevBranch;
-      setStatus(pushStatusEl, error instanceof Error ? error.message : "No se pudo cambiar de rama.", "error");
+      setStatus(pushStatusEl, formatSafeErrorMessage(error, [token], "No se pudo cambiar de rama."), "error");
     } finally {
+      isSwitchingBranch = false;
       syncBranchSelect.disabled = false;
     }
   });
@@ -1090,12 +1132,12 @@ export function initGithubController({
         await loadBranchesForRepo(reposCache[0].full_name, reposCache[0].default_branch);
       }
     } catch (error) {
-      if (error?.status === 401) {
+      if (error?.status === 401 || error?.credentialRejected) {
         isSessionConnected = false;
         setStatus(authMsgEl, INVALID_TOKEN_MSG, "error");
         showTokenWarning("Tu token de GitHub venció o fue revocado. Conectá uno nuevo para ver tus repos y hacer push.");
       } else {
-        setStatus(authMsgEl, error instanceof Error ? error.message : "Token inválido o sin permisos.", "error");
+        setStatus(authMsgEl, formatSafeErrorMessage(error, [token], "Token inválido o sin permisos."), "error");
       }
     } finally {
       if (connectBtn) connectBtn.disabled = false;
@@ -1103,12 +1145,14 @@ export function initGithubController({
   }
 
   async function loadBranchesForRepo(fullName, preferredBranch) {
-    const [owner, repo] = fullName.split("/");
-    if (!owner || !repo || !branchSelect) return;
+    const parsed = parseRepoFullName(fullName);
+    if (!parsed || !branchSelect) return;
 
+    const seq = ++branchesRequestSeq;
     const token = getGithubToken();
     try {
-      const branches = await fetchRepositoryBranches(token, owner, repo);
+      const branches = await fetchRepositoryBranches(token, parsed.owner, parsed.repo);
+      if (seq !== branchesRequestSeq) return;
       branchSelect.innerHTML = "";
       for (const b of branches) {
         const opt = document.createElement("option");
@@ -1120,11 +1164,13 @@ export function initGithubController({
         branchSelect.value = preferredBranch;
       }
     } catch {
+      if (seq !== branchesRequestSeq) return;
       branchSelect.innerHTML = '<option value="main">main</option><option value="master">master</option>';
     }
   }
 
   async function refreshSyncPanel() {
+    const seq = ++syncPanelRequestSeq;
     const project = getActiveProject();
     if (!project || project.kind !== "github" || !project.github) {
       if (syncSection) syncSection.hidden = true;
@@ -1153,6 +1199,7 @@ export function initGithubController({
       if (token && project.github.owner && project.github.repo) {
         fetchRepositoryBranches(token, project.github.owner, project.github.repo)
           .then((branches) => {
+            if (seq !== syncPanelRequestSeq) return;
             if (!Array.isArray(branches) || branches.length === 0) {
               renderFallbackBranchOption();
               return;
@@ -1169,6 +1216,7 @@ export function initGithubController({
             }
           })
           .catch(() => {
+            if (seq !== syncPanelRequestSeq) return;
             renderFallbackBranchOption();
           });
       } else {
@@ -1177,6 +1225,7 @@ export function initGithubController({
     }
 
     const changes = await getPendingGithubChanges(project.id);
+    if (seq !== syncPanelRequestSeq) return;
     if (changesListEl) {
       changesListEl.innerHTML = "";
       if (changes.length === 0) {
@@ -1242,7 +1291,7 @@ export function initGithubController({
     const count =
       typeof precomputedCount === "number"
         ? precomputedCount
-        : (await getPendingGithubChanges(project.id)).length;
+        : await countPendingGithubChanges(project.id);
 
     topbarRepoLabel.textContent = count > 0 ? `Commit (${count})` : "Repositorio";
   }
@@ -1282,7 +1331,7 @@ export function initGithubController({
       applyConnectedSessionUi(connectedUserLogin, reposCache);
       hideTokenWarning();
     } catch (error) {
-      if (error?.status === 401) {
+      if (error?.status === 401 || error?.credentialRejected) {
         // El token guardado dejó de funcionar: avisar ahora y no recién al intentar el push.
         showTokenWarning("Tu token de GitHub venció o fue revocado. Conectá uno nuevo para ver tus repos y hacer push.");
       }

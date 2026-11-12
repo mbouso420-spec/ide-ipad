@@ -1,6 +1,7 @@
 import { keyboardRouter } from "./keyboardRouter.js";
 import { getStorageQuotaEstimate, formatStorageBytes } from "../storage/storageQuota.js";
-import { saveCredentialsBackup } from "../storage/workspaceDb.js";
+import { saveCredentialsBackup, broadcastWorkspaceChange } from "../storage/workspaceDb.js";
+import { escapeHtml, downloadBlob } from "../utils/dom.js";
 import {
   encryptKeysPayload,
   decryptKeysPayload,
@@ -57,7 +58,19 @@ export const KEYBOARD_SHORTCUTS = [
  *   onSelectProvider?: (providerId: string) => void
  * }} config
  */
-export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardChange, getContextSnapshot, onSelectProvider }) {
+export function initSettingsModal({
+  editor,
+  onThemeChange,
+  onHardwareKeyboardChange,
+  onWordWrapChange,
+  onMinimapChange,
+  onThinkingSpeedChange,
+  onKeyStorageModeChange,
+  getContextSnapshot,
+  onSelectProvider
+}) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = controller ? { signal: controller.signal } : undefined;
   const dialog = document.getElementById("settings-dialog");
   const openBtn = document.getElementById("btn-open-settings");
   const closeBtn = document.getElementById("btn-close-settings");
@@ -432,12 +445,12 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
   });
 
   // Control Events
-  openBtn?.addEventListener("click", () => open());
-  closeBtn?.addEventListener("click", () => close());
+  openBtn?.addEventListener("click", () => open(), listenOpts);
+  closeBtn?.addEventListener("click", () => close(), listenOpts);
 
   dialog?.addEventListener("click", (e) => {
     if (e.target === dialog) close();
-  });
+  }, listenOpts);
 
   selectTheme?.addEventListener("change", (e) => {
     const chosen = (e?.target ? e.target.value : selectTheme?.value) || "default";
@@ -453,25 +466,33 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
       } catch (_) {}
     }
     onThemeChange?.(chosen);
-  });
+  }, listenOpts);
 
   chkWordWrap?.addEventListener("change", () => {
     if (editor) {
       const enabled = editor.toggleWordWrap();
       chkWordWrap.checked = enabled;
-      const btnWrap = document.getElementById("btn-editor-wrap");
-      if (btnWrap) btnWrap.setAttribute("aria-pressed", String(enabled));
+      if (typeof onWordWrapChange === "function") {
+        onWordWrapChange(enabled);
+      } else {
+        const btnWrap = document.getElementById("btn-editor-wrap");
+        if (btnWrap) btnWrap.setAttribute("aria-pressed", String(enabled));
+      }
     }
-  });
+  }, listenOpts);
 
   chkMinimap?.addEventListener("change", () => {
     if (editor) {
       const enabled = editor.toggleMinimap();
       chkMinimap.checked = enabled;
-      const btnMinimap = document.getElementById("btn-editor-minimap");
-      if (btnMinimap) btnMinimap.setAttribute("aria-pressed", String(enabled));
+      if (typeof onMinimapChange === "function") {
+        onMinimapChange(enabled);
+      } else {
+        const btnMinimap = document.getElementById("btn-editor-minimap");
+        if (btnMinimap) btnMinimap.setAttribute("aria-pressed", String(enabled));
+      }
     }
-  });
+  }, listenOpts);
 
   chkHardwareKeyboard?.addEventListener("change", () => {
     if (editor && typeof editor.setHardwareKeyboardMode === "function") {
@@ -479,7 +500,23 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
       chkHardwareKeyboard.checked = enabled;
       onHardwareKeyboardChange?.(enabled);
     }
-  });
+  }, listenOpts);
+
+  function showKeyStorageNotice(mode) {
+    if (!selectKeyStorage?.parentElement || typeof document === "undefined") return;
+    let notice = document.getElementById("setting-key-storage-notice");
+    if (!notice) {
+      notice = document.createElement("p");
+      notice.id = "setting-key-storage-notice";
+      notice.className = "settings-hint-text";
+      notice.setAttribute("role", "status");
+      selectKeyStorage.parentElement.appendChild(notice);
+    }
+    notice.textContent =
+      mode === "session"
+        ? "Modo solo sesión activo: se limpió el respaldo persistente y las pestañas abiertas se sincronizaron."
+        : "Modo almacenamiento local activo: las credenciales cifradas se sincronizaron entre pestañas.";
+  }
 
   selectKeyStorage?.addEventListener("change", (e) => {
     const mode = e.target.value;
@@ -492,39 +529,46 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
           void saveCredentialsBackup(exportKeysBundle());
         }
       } catch (_) {}
+      broadcastWorkspaceChange({ type: "KEY_STORAGE_MODE_CHANGED", mode });
+      showKeyStorageNotice(mode);
+      onKeyStorageModeChange?.(mode);
     }
-  });
+  }, listenOpts);
 
   selectAutosave?.addEventListener("change", (e) => {
     const val = (e?.target ? e.target.value : selectAutosave?.value) || "240";
     try {
       localStorage.setItem("studio_autosave_delay", val);
     } catch (_) {}
-  });
+  }, listenOpts);
 
   selectAiTemp?.addEventListener("change", (e) => {
     const val = parseFloat((e?.target ? e.target.value : selectAiTemp?.value) || "0.7");
     setAiTemperature(val);
-  });
+  }, listenOpts);
 
   selectAiBudget?.addEventListener("change", (e) => {
     const val = (e?.target ? e.target.value : selectAiBudget?.value) || "standard";
     setAiContextBudget(val);
     refreshTokensMeter();
-  });
+  }, listenOpts);
 
   selectAiThinkingSpeed?.addEventListener("change", (e) => {
     const val = (e?.target ? e.target.value : selectAiThinkingSpeed?.value) || "media";
     if (val === "baja" || val === "media" || val === "alta") {
       setAiThinkingSpeed(val);
-      const chatBtns = document.querySelectorAll(".chat-thinking-btn");
-      chatBtns?.forEach((btn) => {
-        const active = (btn.dataset?.speed || btn.getAttribute?.("data-speed")) === val;
-        btn.classList.toggle("is-active", active);
-        btn.setAttribute("aria-checked", String(active));
-      });
+      if (typeof onThinkingSpeedChange === "function") {
+        onThinkingSpeedChange(val);
+      } else {
+        const chatBtns = document.querySelectorAll(".chat-thinking-btn");
+        chatBtns?.forEach((btn) => {
+          const active = (btn.dataset?.speed || btn.getAttribute?.("data-speed")) === val;
+          btn.classList.toggle("is-active", active);
+          btn.setAttribute("aria-checked", String(active));
+        });
+      }
     }
-  });
+  }, listenOpts);
 
   function setVaultStatus(message, type = "neutral") {
     if (!vaultStatusEl) return;
@@ -540,14 +584,7 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
 
   function triggerVaultDownload(encryptedJson) {
     const blob = new Blob([encryptedJson], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "studio-ide-claves.vault.json";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, "studio-ide-claves.vault.json");
   }
 
   async function readSelectedFileText(file) {
@@ -639,20 +676,14 @@ export function initSettingsModal({ editor, onThemeChange, onHardwareKeyboardCha
 
   shortcutsFilter?.addEventListener("input", (e) => {
     renderShortcutsList((e?.target ? e.target.value : shortcutsFilter?.value) || "");
-  });
+  }, listenOpts);
 
   return {
     open,
     close,
-    syncControls: syncControlsWithState
+    syncControls: syncControlsWithState,
+    destroy() {
+      controller?.abort();
+    }
   };
-}
-
-function escapeHtml(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

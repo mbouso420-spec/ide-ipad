@@ -1,7 +1,35 @@
+import { bytesToBase64, base64ToBytes, hasNullBytes } from "../utils/encoding.js";
+
 /**
  * Decide si un archivo elegido para importar es texto editable o un recurso binario soportado.
  * Los binarios no soportados (ZIP, ejecutables, audio masivo…) se rechazan para evitar corrupciones.
  */
+
+function extractBaseAndExtension(filePathOrName) {
+  const base = String(filePathOrName || "").split(/[/\\]/).pop() || "";
+  const ext = base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+  return { base, ext };
+}
+
+/**
+ * Rechaza cargas con extensión de imagen/PDF cuyo encabezado sea claramente marcado activo (HTML/SVG/script)
+ * para mitigar spoofing de MIME/extensión sin bloquear binarios sintéticos de prueba.
+ * @param {Uint8Array} view
+ * @returns {boolean}
+ */
+function hasDisguisedActiveMarkup(view) {
+  const probeLen = Math.min(view.length, 1024);
+  if (probeLen === 0 || hasNullBytes(view, probeLen)) return false;
+  let head = "";
+  for (let i = 0; i < probeLen; i += 1) {
+    head += String.fromCharCode(view[i]);
+  }
+  const normalized = head.replace(/^\uFEFF|^\xEF\xBB\xBF/, "").trimStart();
+  return (
+    /^(?:<!doctype\s+html\b|<html\b|<script\b|<svg\b)/i.test(normalized) ||
+    /^<\?xml\b[\s\S]{0,256}<(?:svg|script)\b/i.test(normalized)
+  );
+}
 export const BINARY_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "tif", "tiff", "heic", "psd",
   "pdf", "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz",
@@ -34,8 +62,7 @@ export function isBinaryFile(file) {
     if (file.encoding === "base64") return true;
   }
   const path = typeof file === "string" ? file : (file.path || file.name || file.id || "");
-  const base = String(path || "").split("/").pop() || "";
-  const ext = base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+  const { ext } = extractBaseAndExtension(path);
   return BINARY_EXTENSIONS.has(ext);
 }
 
@@ -46,8 +73,7 @@ export function isBinaryFile(file) {
  */
 export function isImageFile(file) {
   const path = typeof file === "string" ? file : (file?.path || file?.name || file?.id || "");
-  const base = String(path || "").split("/").pop() || "";
-  const ext = base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+  const { ext } = extractBaseAndExtension(path);
   return IMAGE_EXTENSIONS.has(ext);
 }
 
@@ -57,7 +83,7 @@ export function isImageFile(file) {
  * @returns {string}
  */
 export function getImageMimeType(fileNameOrPath) {
-  const ext = String(fileNameOrPath || "").split(".").pop().toLowerCase();
+  const { ext } = extractBaseAndExtension(fileNameOrPath);
   switch (ext) {
     case "png": return "image/png";
     case "jpg":
@@ -76,50 +102,17 @@ export const MAX_IMPORT_FILE_BYTES = 5 * 1024 * 1024; // 5 MB
 const SNIFF_BYTES = 8000;
 
 export function uint8ArrayToBase64(bytes) {
-  if (!bytes || bytes.length === 0) return "";
-  let binary = "";
-  const chunkSize = 8192;
-  const len = bytes.length;
-  for (let i = 0; i < len; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, chunk);
-  }
-  const btoaFn = typeof btoa === "function" ? btoa : (globalThis.btoa || (typeof window !== "undefined" ? window.btoa : null));
-  return btoaFn(binary);
+  return bytesToBase64(bytes);
 }
 
 /**
  * Convierte una cadena codificada en Base64 a su representación cruda en Uint8Array.
+ * Mantiene modo tolerante (`strict: false`) por compatibilidad con utilidades tolerantes de importación.
  * @param {string} base64
  * @returns {Uint8Array}
  */
 export function base64ToUint8Array(base64) {
-  if (!base64 || typeof base64 !== "string") return new Uint8Array(0);
-  const clean = base64.replace(/\s+/g, "");
-  if (!clean) return new Uint8Array(0);
-  const atobFn = typeof atob === "function" ? atob : (globalThis.atob || (typeof window !== "undefined" ? window.atob : null));
-  if (!atobFn) {
-    const nodeBuf = typeof globalThis !== "undefined" ? globalThis.Buffer : null;
-    if (nodeBuf && typeof nodeBuf.from === "function") {
-      try {
-        return new Uint8Array(nodeBuf.from(clean, "base64"));
-      } catch {
-        return new Uint8Array(0);
-      }
-    }
-    return new Uint8Array(0);
-  }
-  try {
-    const binary = atobFn(clean);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-  } catch {
-    return new Uint8Array(0);
-  }
+  return base64ToBytes(base64, { strict: false });
 }
 
 /**
@@ -145,10 +138,12 @@ export function decodeImportedFile(bytes, fileName, options = {}) {
   if (view.length > MAX_IMPORT_FILE_BYTES) {
     return { ok: false, reason: "supera el límite de 5 MB por archivo" };
   }
-  const base = String(fileName || "").split("/").pop() || "";
-  const ext = base.includes(".") ? base.split(".").pop().toLowerCase() : "";
+  const { base, ext } = extractBaseAndExtension(fileName);
 
   if (options.allowBinaryAssets && SUPPORTED_BINARY_ASSET_EXTENSIONS.has(ext)) {
+    if (hasDisguisedActiveMarkup(view)) {
+      return { ok: false, reason: "el contenido activo HTML/SVG no coincide con la extensión binaria" };
+    }
     return {
       ok: true,
       isBinary: true,
@@ -161,11 +156,8 @@ export function decodeImportedFile(bytes, fileName, options = {}) {
     return { ok: false, reason: "es un archivo binario: imagen, documento o comprimido" };
   }
 
-  const limit = Math.min(view.length, SNIFF_BYTES);
-  for (let i = 0; i < limit; i += 1) {
-    if (view[i] === 0) {
-      return { ok: false, reason: "parece un archivo binario" };
-    }
+  if (hasNullBytes(view, SNIFF_BYTES)) {
+    return { ok: false, reason: "parece un archivo binario" };
   }
 
   try {

@@ -11,9 +11,11 @@ import {
   recordAuthFailure,
   recordAuthSuccess,
   redactSensitiveTokens,
+  sanitizeErrorCause,
   validateCredentialFormat
 } from "../security/credentialGuard.js";
-import { base64ToUint8Array, isBinaryFile, MAX_IMPORT_FILE_BYTES } from "../storage/fileImport.js";
+import { isBinaryFile, MAX_IMPORT_FILE_BYTES } from "../storage/fileImport.js";
+import { base64ToBytes, hasNullBytes, slugifyName, utf8ToBase64 } from "../utils/encoding.js";
 
 const GH_TOKEN_KEY = "ide.github.pat";
 const GH_SCOPE = "github";
@@ -21,6 +23,127 @@ const GH_REPOS_CACHE_KEY = "ide.github.reposCache";
 const GH_USER_CACHE_KEY = "ide.github.userLogin";
 
 const MAX_TEXT_FILE_BYTES = 350000;
+const GITHUB_REQUEST_TIMEOUT_MS = 25000;
+const GIST_PRETTY_JSON_THRESHOLD_CHARS = 512 * 1024;
+const MAX_GIST_PAYLOAD_BYTES = 9 * 1024 * 1024;
+const VALID_REPO_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
+const RESERVED_GIST_FILENAMES = new Set(["__proto__", "constructor", "prototype", "studio_project.json"]);
+
+/**
+ * Valida estrictamente un segmento de propietario o repositorio en GitHub (sin traversal ni separadores).
+ * @param {string} segment
+ * @returns {boolean}
+ */
+export function isValidGithubRepoSegment(segment) {
+  return (
+    typeof segment === "string" &&
+    segment.length > 0 &&
+    segment !== "." &&
+    segment !== ".." &&
+    VALID_REPO_SEGMENT_RE.test(segment)
+  );
+}
+
+/**
+ * Analiza `"owner/repo"` exigiendo exactamente dos segmentos válidos de GitHub.
+ * @param {string} fullName
+ * @returns {{ owner: string, repo: string } | null}
+ */
+export function parseRepoFullName(fullName) {
+  const parts = String(fullName || "").trim().split("/");
+  if (parts.length !== 2) return null;
+  const [owner, repo] = parts;
+  if (!isValidGithubRepoSegment(owner) || !isValidGithubRepoSegment(repo)) {
+    return null;
+  }
+  return { owner, repo };
+}
+
+function validateGithubRouteParam(key, rawValue) {
+  const val = String(rawValue ?? "");
+  if (!val || /[\x00-\x1f\x7f?#\\]/.test(val)) {
+    throw new Error(`Parámetro de ruta GitHub inválido (${key}).`);
+  }
+  if (key === "owner" || key === "repo") {
+    if (!isValidGithubRepoSegment(val)) {
+      throw new Error(`Identificador GitHub inválido para "${key}".`);
+    }
+    return val;
+  }
+  if (key === "branch" || key === "ref" || key === "path") {
+    const segments = val.split("/");
+    if (segments.some((seg) => seg === "." || seg === "..")) {
+      throw new Error(`Segmento relativo no permitido en "${key}".`);
+    }
+    return segments.map(encodeURIComponent).join("/");
+  }
+  if (val.includes("/") || val === "." || val === "..") {
+    throw new Error(`Parámetro GitHub inválido para "${key}".`);
+  }
+  return encodeURIComponent(val);
+}
+
+function createRequestTimeoutSignal(externalSignal = null, timeoutMs = GITHUB_REQUEST_TIMEOUT_MS) {
+  let timerId = null;
+  let controller = null;
+  let onExternalAbort = null;
+
+  let timeoutSignal;
+  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    timeoutSignal = AbortSignal.timeout(timeoutMs);
+  } else {
+    controller = new AbortController();
+    timerId = setTimeout(() => controller.abort(new Error("Tiempo de espera agotado.")), timeoutMs);
+    if (typeof timerId?.unref === "function") {
+      timerId.unref();
+    }
+    timeoutSignal = controller.signal;
+  }
+
+  let signal = timeoutSignal;
+  if (externalSignal) {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") {
+      signal = AbortSignal.any([externalSignal, timeoutSignal]);
+    } else {
+      const combined = new AbortController();
+      const forwardAbort = (source) => {
+        if (!combined.signal.aborted) {
+          combined.abort(source?.reason);
+        }
+      };
+      if (externalSignal.aborted) {
+        forwardAbort(externalSignal);
+      } else {
+        onExternalAbort = () => forwardAbort(externalSignal);
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+        timeoutSignal.addEventListener("abort", () => forwardAbort(timeoutSignal), { once: true });
+      }
+      signal = combined.signal;
+    }
+  }
+
+  return {
+    signal,
+    dispose() {
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      if (externalSignal && onExternalAbort) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+        onExternalAbort = null;
+      }
+    }
+  };
+}
+
+function isRemoteRepoEmpty(err, { allowNotFound = false } = {}) {
+  const status = Number(err?.status) || 0;
+  const msg = String(err?.message || "").toLowerCase();
+  if (status === 409 || msg.includes("empty")) return true;
+  if (allowNotFound && (status === 404 || msg.includes("not found"))) return true;
+  return false;
+}
 
 export function getGithubToken() {
   try {
@@ -175,8 +298,9 @@ async function createGithubClient(token, { requireToken = true } = {}) {
             `GitHub rechazó el token (inválido, vencido o revocado). Conectá uno nuevo desde el botón Repositorio.${lockSuffix}`
           );
           authError.status = 401;
+          authError.credentialRejected = true;
           authError.lockout = failure.locked ? failure : null;
-          authError.cause = error;
+          authError.cause = sanitizeErrorCause(error, [cleanToken]);
           throw authError;
         }
 
@@ -186,11 +310,22 @@ async function createGithubClient(token, { requireToken = true } = {}) {
           if (failure.locked) {
             throw new AuthLockoutError(GH_SCOPE, failure.remainingMs, failure.failedAttempts);
           }
+          const rejectedErr = toFriendlyNetworkError(error, "GitHub");
+          rejectedErr.status = 403;
+          rejectedErr.credentialRejected = true;
+          rejectedErr.cause = sanitizeErrorCause(error, [cleanToken]);
+          if (rejectedErr.message) {
+            rejectedErr.message = redactSensitiveTokens(rejectedErr.message, [cleanToken]);
+          }
+          throw rejectedErr;
         }
 
         const safeErr = toFriendlyNetworkError(error, "GitHub");
-        if (safeErr instanceof Error && safeErr.message) {
-          safeErr.message = redactSensitiveTokens(safeErr.message, [cleanToken]);
+        if (safeErr instanceof Error) {
+          safeErr.cause = sanitizeErrorCause(safeErr.cause ?? error, [cleanToken]);
+          if (safeErr.message) {
+            safeErr.message = redactSensitiveTokens(safeErr.message, [cleanToken]);
+          }
         }
         throw safeErr;
       }
@@ -241,8 +376,18 @@ async function createRawGithubClient(token) {
       const octokit = new mod.Octokit({ auth: token || undefined });
       return {
         async request(route, params = {}) {
-          const res = await octokit.request(route, params);
-          return res.data;
+          const [, rawPath = ""] = route.split(" ");
+          rawPath.replace(/\{([^}]+)\}/g, (_, key) => validateGithubRouteParam(key, params?.[key]));
+          const timeout = createRequestTimeoutSignal(params?.signal || null);
+          try {
+            const res = await octokit.request(route, {
+              ...params,
+              request: { ...(params?.request || {}), signal: timeout.signal }
+            });
+            return res.data;
+          } finally {
+            timeout.dispose();
+          }
         }
       };
     }
@@ -255,14 +400,13 @@ async function createRawGithubClient(token) {
       const [method, rawPath] = route.split(" ");
       let path = rawPath;
       const bodyPayload = { ...params };
+      const externalSignal = bodyPayload.signal || null;
+      delete bodyPayload.signal;
 
       path = path.replace(/\{([^}]+)\}/g, (_, key) => {
-        const val = String(bodyPayload[key] ?? "");
+        const val = bodyPayload[key];
         delete bodyPayload[key];
-        if (key === "ref" || key === "branch" || key === "path") {
-          return val.split("/").map(encodeURIComponent).join("/");
-        }
-        return encodeURIComponent(val);
+        return validateGithubRouteParam(key, val);
       });
 
       let url = `https://api.github.com${path}`;
@@ -291,7 +435,14 @@ async function createRawGithubClient(token) {
         init.body = JSON.stringify(bodyPayload);
       }
 
-      const res = await fetch(url, init);
+      const timeout = createRequestTimeoutSignal(externalSignal);
+      init.signal = timeout.signal;
+      let res;
+      try {
+        res = await fetch(url, init);
+      } finally {
+        timeout.dispose();
+      }
       if (!res.ok) {
         let detail = `HTTP ${res.status}`;
         try {
@@ -356,7 +507,7 @@ export async function verifyGithubToken(token) {
     if (error?.isNetworkFailure) {
       return { status: "offline", message: "Sin conexión: no se pudo verificar el token con GitHub." };
     }
-    if (error?.status === 401) {
+    if (error?.status === 401 || error?.credentialRejected) {
       const postFailureLock = checkAuthLockout(GH_SCOPE);
       if (postFailureLock.locked) {
         return {
@@ -480,16 +631,14 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
       branch
     });
   } catch (err) {
-    const msg = String(err?.message || "").toLowerCase();
-    const st = err?.status;
-    if (st === 404 || st === 409 || msg.includes("not found") || msg.includes("empty")) {
+    if (isRemoteRepoEmpty(err, { allowNotFound: true })) {
       // Verificar si el repositorio existe pero aún no tiene commits (vacío)
       const repoInfo = await client.request("GET /repos/{owner}/{repo}", { owner, repo });
       if (!repoInfo) {
         throw err;
       }
       const defaultBranch = repoInfo.default_branch || branch || "main";
-      if (st === 409 || msg.includes("empty")) {
+      if (isRemoteRepoEmpty(err)) {
         return {
           commitSha: null,
           isEmptyRepo: true,
@@ -511,8 +660,7 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
             repoHasCommits = true;
           }
         } catch (defErr) {
-          const defMsg = String(defErr?.message || "").toLowerCase();
-          if (defErr?.status === 409 || defMsg.includes("empty")) {
+          if (isRemoteRepoEmpty(defErr)) {
             return {
               commitSha: null,
               isEmptyRepo: true,
@@ -543,8 +691,7 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
             }
           }
         } catch (listErr) {
-          const listMsg = String(listErr?.message || "").toLowerCase();
-          if (listErr?.status === 409 || listMsg.includes("empty")) {
+          if (isRemoteRepoEmpty(listErr)) {
             return {
               commitSha: null,
               isEmptyRepo: true,
@@ -591,7 +738,7 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
       recursive: "1"
     });
   } catch (err) {
-    if (err?.status === 409 || String(err?.message || "").toLowerCase().includes("empty")) {
+    if (isRemoteRepoEmpty(err)) {
       return { commitSha: null, isEmptyRepo: true, branch, entries: [] };
     }
     throw err;
@@ -773,6 +920,8 @@ export async function pushAtomicCommit({
   let latestCommitSha = null;
   let baseTreeSha = null;
   let remainingChanges = [...changes];
+  let initializedFilePath = null;
+  let initializedCommitSha = null;
 
   try {
     const branchData = await client.request("GET /repos/{owner}/{repo}/branches/{branch}", {
@@ -783,9 +932,7 @@ export async function pushAtomicCommit({
     latestCommitSha = branchData?.commit?.sha || null;
     baseTreeSha = branchData?.commit?.commit?.tree?.sha || null;
   } catch (err) {
-    const st = err?.status;
-    const msg = String(err?.message || "").toLowerCase();
-    if (st === 404 || st === 409 || msg.includes("not found") || msg.includes("empty")) {
+    if (isRemoteRepoEmpty(err, { allowNotFound: true })) {
       if (expectedBaseSha && !force) {
         throw new Error(
           `La rama ${branch} ya no existe en GitHub o fue reiniciada. Tocá Actualizar remoto antes de subir.`
@@ -800,7 +947,7 @@ export async function pushAtomicCommit({
       const isBin = firstFile.isBinary || firstFile.encoding === "base64" || Boolean(firstFile.base64);
       const contentPayload = isBin
         ? (firstFile.base64 || firstFile.content)
-        : encodeUtf8Base64(firstFile.content);
+        : utf8ToBase64(firstFile.content);
       const initRes = await client.request("PUT /repos/{owner}/{repo}/contents/{path}", {
         owner,
         repo,
@@ -811,6 +958,8 @@ export async function pushAtomicCommit({
       });
       latestCommitSha = initRes?.commit?.sha || null;
       baseTreeSha = initRes?.commit?.tree?.sha || null;
+      initializedFilePath = firstFile.path;
+      initializedCommitSha = latestCommitSha;
       remainingChanges.splice(firstAddedIdx, 1);
 
       if (remainingChanges.length === 0 && latestCommitSha) {
@@ -823,8 +972,11 @@ export async function pushAtomicCommit({
           repo,
           branch
         });
-        latestCommitSha = branchDataAfter?.commit?.sha || null;
+        latestCommitSha = branchDataAfter?.commit?.sha || latestCommitSha;
         baseTreeSha = branchDataAfter?.commit?.commit?.tree?.sha || null;
+        if (latestCommitSha) {
+          initializedCommitSha = latestCommitSha;
+        }
       }
     } else {
       throw err;
@@ -843,84 +995,97 @@ export async function pushAtomicCommit({
   const treeItems = new Array(remainingChanges.length);
   let nextIdx = 0;
 
-  async function uploadWorker() {
-    while (nextIdx < remainingChanges.length) {
-      const idx = nextIdx++;
-      const change = remainingChanges[idx];
-      if (change.status === "deleted") {
-        treeItems[idx] = {
-          path: change.path,
-          mode: "100644",
-          type: "blob",
-          sha: null
-        };
-        continue;
-      }
-      const mode = change.mode === "100755" ? "100755" : "100644";
-      if (change.isBinary || change.encoding === "base64" || (change.base64 && typeof change.base64 === "string")) {
-        const b64 = change.base64 || (typeof change.content === "string" ? change.content : "");
-        const createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
-          owner,
-          repo,
-          content: b64,
-          encoding: "base64"
-        });
-        const blobSha = createdBlob?.sha || createdBlob?.data?.sha || null;
-        treeItems[idx] = {
-          path: change.path,
-          mode,
-          type: "blob",
-          sha: blobSha
-        };
-      } else {
-        treeItems[idx] = {
-          path: change.path,
-          // Conserva el bit de ejecución (100755) de scripts existentes; el resto se publica como archivo normal.
-          mode,
-          type: "blob",
-          content: typeof change.content === "string" ? change.content : ""
-        };
+  try {
+    async function uploadWorker() {
+      while (nextIdx < remainingChanges.length) {
+        const idx = nextIdx++;
+        const change = remainingChanges[idx];
+        if (change.status === "deleted") {
+          treeItems[idx] = {
+            path: change.path,
+            mode: "100644",
+            type: "blob",
+            sha: null
+          };
+          continue;
+        }
+        const mode = change.mode === "100755" ? "100755" : "100644";
+        if (change.isBinary || change.encoding === "base64" || (change.base64 && typeof change.base64 === "string")) {
+          const b64 = change.base64 || (typeof change.content === "string" ? change.content : "");
+          const createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
+            owner,
+            repo,
+            content: b64,
+            encoding: "base64"
+          });
+          const blobSha = createdBlob?.sha || createdBlob?.data?.sha || "";
+          if (typeof blobSha !== "string" || !blobSha.trim()) {
+            throw new Error(`GitHub no devolvió un SHA de blob válido para "${change.path}".`);
+          }
+          treeItems[idx] = {
+            path: change.path,
+            mode,
+            type: "blob",
+            sha: blobSha
+          };
+        } else {
+          treeItems[idx] = {
+            path: change.path,
+            // Conserva el bit de ejecución (100755) de scripts existentes; el resto se publica como archivo normal.
+            mode,
+            type: "blob",
+            content: typeof change.content === "string" ? change.content : ""
+          };
+        }
       }
     }
+
+    await Promise.all(
+      Array.from({ length: Math.min(BLOB_UPLOAD_CONCURRENCY, remainingChanges.length) }, () => uploadWorker())
+    );
+
+    const createdTree = await client.request("POST /repos/{owner}/{repo}/git/trees", {
+      owner,
+      repo,
+      base_tree: baseTreeSha,
+      tree: treeItems
+    });
+    if (!createdTree?.sha) {
+      throw new Error("GitHub no devolvió un SHA de árbol válido al crear el commit.");
+    }
+
+    const createdCommit = await client.request("POST /repos/{owner}/{repo}/git/commits", {
+      owner,
+      repo,
+      message: cleanMsg,
+      tree: createdTree.sha,
+      parents: [latestCommitSha]
+    });
+    if (!createdCommit?.sha) {
+      throw new Error("GitHub no devolvió un SHA de commit válido.");
+    }
+
+    await client.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", {
+      owner,
+      repo,
+      ref: `heads/${branch}`,
+      sha: createdCommit.sha
+    });
+
+    return {
+      commitSha: createdCommit.sha
+    };
+  } catch (phase2Err) {
+    // Si falló la fase 2 después de inicializar un repo vacío en fase 1, propagar qué archivo ya se publicó
+    // para evitar reintentar el push completo sobre un estado divergente.
+    if (initializedCommitSha && initializedFilePath && phase2Err && typeof phase2Err === "object") {
+      phase2Err.partialCommitSha = initializedCommitSha;
+      phase2Err.initializedFilePath = initializedFilePath;
+      const baseMsg = phase2Err.message || "Error al completar el commit atómico.";
+      phase2Err.message = `El repositorio se inicializó con "${initializedFilePath}" (${initializedCommitSha.slice(0, 7)}), pero falló el resto de archivos: ${baseMsg}`;
+    }
+    throw phase2Err;
   }
-
-  await Promise.all(
-    Array.from({ length: Math.min(BLOB_UPLOAD_CONCURRENCY, remainingChanges.length) }, () => uploadWorker())
-  );
-
-  const createdTree = await client.request("POST /repos/{owner}/{repo}/git/trees", {
-    owner,
-    repo,
-    base_tree: baseTreeSha,
-    tree: treeItems
-  });
-
-  const createdCommit = await client.request("POST /repos/{owner}/{repo}/git/commits", {
-    owner,
-    repo,
-    message: cleanMsg,
-    tree: createdTree.sha,
-    parents: [latestCommitSha]
-  });
-
-  await client.request("PATCH /repos/{owner}/{repo}/git/refs/{ref}", {
-    owner,
-    repo,
-    ref: `heads/${branch}`,
-    sha: createdCommit.sha
-  });
-
-  return {
-    commitSha: createdCommit.sha
-  };
-}
-
-function hasBinaryBytes(bytes) {
-  const limit = Math.min(bytes.length, 8000);
-  for (let i = 0; i < limit; i += 1) {
-    if (bytes[i] === 0) return true;
-  }
-  return false;
 }
 
 function parseGithubBlobPayload(blob, { path = "", isBinary = false } = {}) {
@@ -931,7 +1096,7 @@ function parseGithubBlobPayload(blob, { path = "", isBinary = false } = {}) {
     if (markedBinary) {
       return {
         isBinary: true,
-        base64: encodeUtf8Base64(raw),
+        base64: utf8ToBase64(raw),
         content: ""
       };
     }
@@ -943,16 +1108,9 @@ function parseGithubBlobPayload(blob, { path = "", isBinary = false } = {}) {
   }
 
   const cleanBase64 = String(blob.content || "").replace(/\s+/g, "");
-  if (markedBinary) {
-    return {
-      isBinary: true,
-      base64: cleanBase64,
-      content: ""
-    };
-  }
-
-  const bytes = base64ToUint8Array(cleanBase64);
-  if (hasBinaryBytes(bytes)) {
+  // Modo estricto: propaga error explícito ante Base64 corrupto en lugar de degradar a "".
+  const bytes = base64ToBytes(cleanBase64, { strict: true });
+  if (markedBinary || hasNullBytes(bytes)) {
     return {
       isBinary: true,
       base64: cleanBase64,
@@ -974,19 +1132,6 @@ function parseGithubBlobPayload(blob, { path = "", isBinary = false } = {}) {
       content: ""
     };
   }
-}
-
-function encodeUtf8Base64(text) {
-  const bytes = new TextEncoder().encode(String(text ?? ""));
-  let binary = "";
-  const chunkSize = 8192;
-  const len = bytes.length;
-  for (let i = 0; i < len; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, chunk);
-  }
-  const btoaFn = typeof btoa === "function" ? btoa : (globalThis.btoa || (typeof window !== "undefined" ? window.btoa : null));
-  return btoaFn(binary);
 }
 
 /**
@@ -1014,21 +1159,32 @@ export async function saveProjectToGist(token, { projectName, entries, existingG
       }))
   };
 
-  const filesPayload = {
-    "studio_project.json": {
-      content: JSON.stringify(manifest, null, 2)
-    }
+  let manifestJson = JSON.stringify(manifest, null, 2);
+  if (manifestJson.length > GIST_PRETTY_JSON_THRESHOLD_CHARS) {
+    manifestJson = JSON.stringify(manifest);
+  }
+
+  const filesPayload = Object.create(null);
+  filesPayload["studio_project.json"] = {
+    content: manifestJson
   };
 
-  // Agregar hasta 10 archivos principales con nombres planos para previsualización directa en gist.github.com
-  manifest.entries.slice(0, 10).forEach((entry) => {
-    const flatName = entry.path.replace(/[/\\:]/g, "__");
-    if (flatName && flatName !== "studio_project.json") {
-      filesPayload[flatName] = { content: entry.content || "// vacío" };
-    }
-  });
+  // Agregar hasta 10 archivos de texto principales con nombres planos para previsualización en gist.github.com.
+  manifest.entries
+    .filter((entry) => !entry.isBinary)
+    .slice(0, 10)
+    .forEach((entry) => {
+      const flatName = String(entry.path || "").replace(/[/\\:]/g, "__");
+      if (flatName && !RESERVED_GIST_FILENAMES.has(flatName)) {
+        filesPayload[flatName] = { content: entry.content || "// vacío" };
+      }
+    });
 
   const description = `[Studio IDE Backup] ${cleanName}`;
+  const serializedSize = new TextEncoder().encode(JSON.stringify({ description, files: filesPayload })).length;
+  if (serializedSize > MAX_GIST_PAYLOAD_BYTES) {
+    throw new Error("El respaldo supera el límite máximo permitido (9 MB) para subir a GitHub Gist.");
+  }
 
   if (existingGistId) {
     try {
@@ -1108,9 +1264,14 @@ export async function fetchGistBackupContent(token, gistId) {
       try {
         const rawUrl = String(manifestFile.raw_url);
         if (/^https:\/\/(gist\.githubusercontent\.com|api\.github\.com)\//i.test(rawUrl)) {
-          const rawRes = await fetch(rawUrl);
-          if (rawRes.ok) {
-            manifestRawContent = await rawRes.text();
+          const timeout = createRequestTimeoutSignal();
+          try {
+            const rawRes = await fetch(rawUrl, { signal: timeout.signal });
+            if (rawRes.ok) {
+              manifestRawContent = await rawRes.text();
+            }
+          } finally {
+            timeout.dispose();
           }
         }
       } catch (_) {
@@ -1156,8 +1317,8 @@ export async function fetchGistBackupContent(token, gistId) {
 export async function publishProjectAsNewRepository(token, { repoName, isPrivate = true, entries = [] }) {
   if (!token) throw new Error("Conectá tu token de GitHub.");
   const client = await createGithubClient(token);
-  const cleanName = String(repoName || "").trim().toLowerCase().replace(/[^a-z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
-  if (!cleanName) throw new Error("Nombre de repositorio inválido.");
+  const cleanName = slugifyName(repoName, { allowDots: true, collapse: false, fallback: "" });
+  if (!cleanName || !isValidGithubRepoSegment(cleanName)) throw new Error("Nombre de repositorio inválido.");
 
   const createdRepo = await client.request("POST /user/repos", {
     name: cleanName,

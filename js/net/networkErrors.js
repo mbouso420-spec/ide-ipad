@@ -1,3 +1,5 @@
+import { sanitizeErrorCause } from "../security/credentialGuard.js";
+
 /**
  * Traduce los errores de red crudos del navegador ("Failed to fetch" en Chrome, "Load failed" en Safari,
  * "NetworkError when attempting to fetch resource." en Firefox) a un mensaje claro en español.
@@ -15,7 +17,11 @@ export function isNetworkFailure(error) {
   const name = /** @type {any} */ (error).name;
   if (name === "AbortError") return false;
   const message = String(/** @type {any} */ (error).message || "");
-  if (error instanceof TypeError && (NETWORK_MESSAGE_RE.test(message) || message === "")) {
+  const isOffline = typeof navigator !== "undefined" && navigator.onLine === false;
+  if (
+    error instanceof TypeError &&
+    (NETWORK_MESSAGE_RE.test(message) || (message.trim() === "" && isOffline))
+  ) {
     return true;
   }
   return NETWORK_MESSAGE_RE.test(message) && !(/** @type {any} */ (error).httpStatus);
@@ -36,7 +42,7 @@ export function toFriendlyNetworkError(error, serviceLabel) {
       ? `Estás sin conexión a internet: no se pudo contactar a ${serviceLabel}. Conectate y volvé a intentar.`
       : `Sin conexión con ${serviceLabel}. Revisá tu internet e intentá de nuevo.`
   );
-  /** @type {any} */ (friendly).cause = error;
+  /** @type {any} */ (friendly).cause = sanitizeErrorCause(error);
   /** @type {any} */ (friendly).isNetworkFailure = true;
   return friendly;
 }

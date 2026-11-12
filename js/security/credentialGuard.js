@@ -492,6 +492,127 @@ export function redactSensitiveTokens(input, extraKnownSecrets = []) {
   return out;
 }
 
+const SENSITIVE_HEADER_KEYS = new Set([
+  "authorization",
+  "proxy-authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "x-auth-token",
+  "cookie",
+  "set-cookie"
+]);
+
+function scrubSensitiveHeaders(headers, extraKnownSecrets = []) {
+  if (!headers || typeof headers !== "object") return headers;
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    const clean = {};
+    headers.forEach((value, key) => {
+      if (!SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
+        clean[key] = redactSensitiveTokens(value, extraKnownSecrets);
+      }
+    });
+    return clean;
+  }
+  const clean = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
+      continue;
+    }
+    clean[key] = typeof value === "string" ? redactSensitiveTokens(value, extraKnownSecrets) : value;
+  }
+  return clean;
+}
+
+/**
+ * Elimina cabeceras sensibles (Authorization, API keys, cookies) y redacta secretos
+ * en cadenas/causas anidadas antes de adjuntar `error.cause` en errores propagados.
+ * @param {unknown} error
+ * @param {Array<string>} [extraKnownSecrets=[]]
+ * @param {number} [depth=0]
+ * @param {WeakSet<object>} [seen=new WeakSet()]
+ * @returns {unknown}
+ */
+export function sanitizeErrorCause(error, extraKnownSecrets = [], depth = 0, seen = new WeakSet()) {
+  if (!error || typeof error !== "object") {
+    return typeof error === "string" ? redactSensitiveTokens(error, extraKnownSecrets) : error;
+  }
+  if (seen.has(error) || depth > 4) {
+    return undefined;
+  }
+  seen.add(error);
+
+  if (error instanceof Error) {
+    const safeMsg = redactSensitiveTokens(error.message || "", extraKnownSecrets);
+    const safeErr = new Error(safeMsg);
+    safeErr.name = error.name || "Error";
+    if (error.status !== undefined) safeErr.status = error.status;
+    if (error.code !== undefined) safeErr.code = error.code;
+    if (error.isNetworkFailure !== undefined) safeErr.isNetworkFailure = error.isNetworkFailure;
+    if (error.credentialRejected !== undefined) safeErr.credentialRejected = error.credentialRejected;
+    if (typeof error.stack === "string") {
+      safeErr.stack = redactSensitiveTokens(error.stack, extraKnownSecrets);
+    }
+    if (error.headers && typeof error.headers === "object") {
+      safeErr.headers = scrubSensitiveHeaders(error.headers, extraKnownSecrets);
+    }
+    if (error.request && typeof error.request === "object") {
+      const reqCopy = { ...error.request };
+      if (reqCopy.headers) {
+        reqCopy.headers = scrubSensitiveHeaders(reqCopy.headers, extraKnownSecrets);
+      }
+      if (typeof reqCopy.url === "string") {
+        reqCopy.url = redactSensitiveTokens(reqCopy.url, extraKnownSecrets);
+      }
+      safeErr.request = reqCopy;
+    }
+    if (error.config && typeof error.config === "object") {
+      const cfgCopy = { ...error.config };
+      if (cfgCopy.headers) {
+        cfgCopy.headers = scrubSensitiveHeaders(cfgCopy.headers, extraKnownSecrets);
+      }
+      safeErr.config = cfgCopy;
+    }
+    if (error.cause !== undefined) {
+      safeErr.cause = sanitizeErrorCause(error.cause, extraKnownSecrets, depth + 1, seen);
+    }
+    return safeErr;
+  }
+
+  const out = {};
+  for (const [k, v] of Object.entries(error)) {
+    if (k === "headers") {
+      out.headers = scrubSensitiveHeaders(v, extraKnownSecrets);
+    } else if (k === "cause" || k === "request" || k === "response" || k === "config") {
+      out[k] = sanitizeErrorCause(v, extraKnownSecrets, depth + 1, seen);
+    } else if (typeof v === "string") {
+      out[k] = redactSensitiveTokens(v, extraKnownSecrets);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Formatea un mensaje de error seguro para mostrar en UI/DOM, redactando secretos conocidos.
+ * @param {unknown} err
+ * @param {Array<string>} [extraKnownSecrets=[]]
+ * @param {string} [fallback="Ocurrió un error inesperado."]
+ * @returns {string}
+ */
+export function formatSafeErrorMessage(err, extraKnownSecrets = [], fallback = "Ocurrió un error inesperado.") {
+  const raw =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : err && typeof err === "object" && typeof (/** @type {any} */ (err).message) === "string"
+          ? /** @type {any} */ (err).message
+          : "";
+  const safe = redactSensitiveTokens(raw, extraKnownSecrets).trim();
+  return safe || fallback;
+}
+
 /**
  * Reinicia todo el estado de bloqueo y huellas rechazadas en memoria y almacenamiento
  * (útil para aislamiento entre suites de pruebas unitarias o cierre explícito).

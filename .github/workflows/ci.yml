@@ -6,10 +6,14 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   lint-and-unit-tests:
     name: Lint, PWA Integrity & QA Suites
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,6 +37,7 @@ jobs:
   e2e-browser:
     name: Real Browser E2E (Headless Chrome)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: lint-and-unit-tests
     steps:
       - name: Checkout repository
@@ -61,6 +66,7 @@ jobs:
   e2e-webkit:
     name: Cross-Engine E2E (Playwright WebKit / Safari Engine)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: lint-and-unit-tests
     steps:
       - name: Checkout repository

@@ -4,6 +4,8 @@
  * Permite ejecutar DDL/DML, tablas formateadas para SELECT, consultas interactivas y exportación a CSV/JSON.
  */
 
+import { escapeHtml } from "./previewUtils.js";
+
 /**
  * Convierte un conjunto de resultados de sql.js a formato CSV estándar.
  * @param {Array<{ columns: string[], values: any[][] }>} results
@@ -308,15 +310,6 @@ export function buildCountQuery(query) {
   const cleaned = stripSqlCommentsSafe(query).trim().replace(/;+\s*$/, "");
   if (!isSelectQuery(cleaned)) return "";
   return `SELECT COUNT(*) AS total_rows FROM (${cleaned});`;
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
 
 /**
@@ -778,13 +771,6 @@ export function buildSqlRunnerPreview(sqlFile) {
             btnPageCsv.title = "Descargar únicamente las filas mostradas en esta página (" + res.values.length + " filas)";
             btnPageCsv.textContent = "CSV (Esta página)";
             btnPageCsv.addEventListener("click", function () {
-              var safeCsvCell = function (v) {
-                if (v === null || v === undefined) return "";
-                var s = String(v);
-                var dangerous = typeof v !== "number" && s.length > 0 && (/^[=+\\t\\r@]/.test(s) || (/^-/.test(s) && !/^-\\d+(?:\\.\\d+)?$/.test(s)));
-                if (dangerous) s = "'" + s;
-                return dangerous || s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
-              };
               var lines = [res.columns.map(safeCsvCell).join(",")];
               res.values.forEach(function (row) {
                 lines.push(row.map(safeCsvCell).join(","));
@@ -896,71 +882,10 @@ export function buildSqlRunnerPreview(sqlFile) {
         }
       }
 
-      function stripSqlCommentsClient(sql) {
-        var src = String(sql || "");
-        var out = "";
-        var i = 0;
-        while (i < src.length) {
-          var ch = src[i];
-          var nxt = src[i + 1] || "";
-          if (ch === "'" || ch === '"' || ch === "\\u0060") {
-            var q = ch;
-            out += ch;
-            i++;
-            while (i < src.length) {
-              out += src[i];
-              if (src[i] === q) {
-                if (src[i + 1] === q) { out += src[i + 1]; i += 2; continue; }
-                i++;
-                break;
-              }
-              i++;
-            }
-            continue;
-          }
-          if (ch === "-" && nxt === "-") {
-            while (i < src.length && src[i] !== "\\n") i++;
-            continue;
-          }
-          if (ch === "/" && nxt === "*") {
-            var end = src.indexOf("*/", i + 2);
-            i = end === -1 ? src.length : end + 2;
-            out += " ";
-            continue;
-          }
-          out += ch;
-          i++;
-        }
-        return out;
-      }
-
-      function hasMultipleStatementsClient(sql) {
-        var src = stripSqlCommentsClient(sql);
-        var i = 0;
-        var seenSemi = false;
-        while (i < src.length) {
-          var ch = src[i];
-          if (ch === "'" || ch === '"' || ch === "\\u0060") {
-            var q = ch;
-            i++;
-            while (i < src.length) {
-              if (src[i] === q) {
-                if (src[i + 1] === q) { i += 2; continue; }
-                i++;
-                break;
-              }
-              i++;
-            }
-            continue;
-          }
-          if (ch === ";") seenSemi = true;
-          else if (seenSemi && !/\\s/.test(ch)) return true;
-          i++;
-        }
-        return false;
-      }
-
-      var stripSqlCommentsSafe = stripSqlCommentsClient;
+      var safeCsvCell = ${escapeCsvField.toString()};
+      var stripSqlCommentsSafe = ${stripSqlCommentsSafe.toString()};
+      var stripSqlCommentsClient = stripSqlCommentsSafe;
+      var hasMultipleStatementsClient = ${hasMultipleSqlStatements.toString()};
       var hasLimitClauseClient = ${hasLimitClause.toString()};
 
       function runCustomQuery() {
@@ -1106,13 +1031,6 @@ export function buildSqlRunnerPreview(sqlFile) {
           alert("No hay resultados de consultas SELECT para exportar.");
           return;
         }
-        var safeCsvCell = function (v) {
-          if (v === null || v === undefined) return "";
-          var s = String(v);
-          var dangerous = typeof v !== "number" && s.length > 0 && (/^[=+\\t\\r@]/.test(s) || (/^-/.test(s) && !/^-\\d+(?:\\.\\d+)?$/.test(s)));
-          if (dangerous) s = "'" + s;
-          return dangerous || s.indexOf(",") !== -1 || s.indexOf('"') !== -1 || s.indexOf("\\n") !== -1 || s.indexOf("\\r") !== -1 ? '"' + s.replace(/"/g, '""') + '"' : s;
-        };
         var lines = [];
         var totalRows = 0;
         exportRes.forEach(function (res) {
@@ -1152,6 +1070,15 @@ export function buildSqlRunnerPreview(sqlFile) {
         var filename = dataset.isFull ? "resultados_sql_completos.json" : "resultados_sql.json";
         downloadBlob(filename, JSON.stringify(out, null, 2), "application/json;charset=utf-8");
         sendLog("log", "Exportado JSON " + (dataset.isFull ? "completo (" : "(") + out.length + " filas): " + filename);
+      });
+
+      window.addEventListener("pagehide", function () {
+        if (db && typeof db.close === "function") {
+          try {
+            db.close();
+          } catch (_) {}
+          db = null;
+        }
       });
 
       initDatabase();

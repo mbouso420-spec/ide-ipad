@@ -53,6 +53,8 @@ const SAMPLE_OVERLAP_CHARS = (() => {
   for (let code = 32; code <= 126; code += 1) {
     chars.push(String.fromCharCode(code));
   }
+  // Muestras Unicode no-ASCII para detectar solapamientos entre clases Unicode/negadas (ej. [^\x00-\x7f], \W, [á-ú]).
+  chars.push("á", "é", "í", "ó", "ú", "ñ", "ü", "ç", "ß", "α", "Ω", "ж", "中", "😀");
   return chars;
 })();
 
@@ -95,12 +97,28 @@ function skipGroupHeader(src, lparenIndex) {
   return afterParen + 1;
 }
 
+const MAX_CONTIGUOUS_OPTIONALS = 10;
+
 function tokenizeRegexPattern(src) {
   const tokens = [];
   for (let i = 0; i < src.length; i += 1) {
     const ch = src[i];
     if (ch === "\\") {
       const next = src[i + 1] ?? "";
+      if (next >= "1" && next <= "9") {
+        i += 1;
+        while (src[i + 1] >= "0" && src[i + 1] <= "9") {
+          i += 1;
+        }
+        tokens.push({ type: "backref" });
+        continue;
+      }
+      if (next === "k" && src[i + 2] === "<") {
+        const closeGt = src.indexOf(">", i + 3);
+        i = closeGt !== -1 ? closeGt : i + 1;
+        tokens.push({ type: "backref" });
+        continue;
+      }
       i += 1;
       if (next === "b" || next === "B") {
         tokens.push({ type: "anchor" });
@@ -126,7 +144,14 @@ function tokenizeRegexPattern(src) {
       if (WILDCARD_EQUIV_CLASSES.has(rawClass)) {
         tokens.push({ type: "atom", kind: "wildcard", value: "." });
       } else {
-        tokens.push({ type: "atom", kind: "class", value: rawClass });
+        // Precompilar una sola vez para evitar instanciar new RegExp por cada carácter muestreado.
+        let compiledRe = null;
+        try {
+          compiledRe = new RegExp(`^${rawClass}$`);
+        } catch {
+          compiledRe = null;
+        }
+        tokens.push({ type: "atom", kind: "class", value: rawClass, compiledRe });
       }
       continue;
     }
@@ -153,6 +178,7 @@ function tokenizeRegexPattern(src) {
       continue;
     }
     if (ch === "?") {
+      if (src[i + 1] === "?") i += 1;
       tokens.push({ type: "optional" });
       continue;
     }
@@ -196,11 +222,7 @@ function atomMatchesChar(atom, ch) {
     }
   }
   if (atom.kind === "class") {
-    try {
-      return new RegExp(`^${atom.value}$`).test(ch);
-    } catch {
-      return true;
-    }
+    return atom.compiledRe ? atom.compiledRe.test(ch) : true;
   }
   return true;
 }
@@ -227,13 +249,33 @@ function anyAtomOverlaps(listA, listB) {
 
 function branchesTokensOverlap(branchA, branchB) {
   if (branchA.length === 0 || branchB.length === 0) return false;
-  const minLen = Math.min(branchA.length, branchB.length);
-  for (let idx = 0; idx < minLen; idx += 1) {
-    if (!atomsCanOverlap(branchA[idx], branchB[idx])) {
-      return false;
+  const lenA = branchA.length;
+  const lenB = branchB.length;
+  if (lenA * lenB > 4096) return true;
+  const memo = new Map();
+
+  // Modela átomos `isOptional` como anulables para detectar solapamientos tipo `(a?b|b)+` y `(a|b?a)+`.
+  function canAlign(i, j, matchedAny) {
+    if (i === lenA || j === lenB) {
+      return matchedAny;
     }
+    const key = ((i * (lenB + 1)) + j) * 2 + (matchedAny ? 1 : 0);
+    if (memo.has(key)) return memo.get(key);
+
+    let result = false;
+    if (atomsCanOverlap(branchA[i], branchB[j]) && canAlign(i + 1, j + 1, true)) {
+      result = true;
+    } else if (branchA[i]?.isOptional && canAlign(i + 1, j, matchedAny)) {
+      result = true;
+    } else if (branchB[j]?.isOptional && canAlign(i, j + 1, matchedAny)) {
+      result = true;
+    }
+
+    memo.set(key, result);
+    return result;
   }
-  return true;
+
+  return canAlign(0, 0, false);
 }
 
 function groupHasOverlappingBranches(branches) {
@@ -252,12 +294,14 @@ function createFrame(isRoot = false) {
   return {
     isRoot,
     hasQuantifier: false,
+    hasBackref: false,
     hasAlternationOverlap: false,
     branches: [[]],
     prevQuantified: null,
     startsWithQuantified: false,
     leadingQuantified: null,
-    sawFirstToken: false
+    sawFirstToken: false,
+    consecutiveOptionals: 0
   };
 }
 
@@ -265,7 +309,8 @@ function createFrame(isRoot = false) {
  * Detecta patrones de expresiones regulares susceptibles a Catastrophic Backtracking (ReDoS):
  * 1. Cuantificadores anidados a cualquier nivel de paréntesis: (a+)+, ((a)+)+, (a{1,5})+, ([a-z]+)*
  * 2. Cuantificadores adyacentes solapados en raíz u otro nivel: .*.*!$, a+a+!$
- * 3. Alternancias solapadas o con comodines dentro de grupos cuantificados: (a|a)+, (a|ab)+, (b|.)+, (?<g>a|ab)+
+ * 3. Alternancias solapadas (incluidos átomos opcionales anulables) o con comodines dentro de grupos cuantificados: (a|a)+, (a|ab)+, (a?b|b)+, (a|b?a)+
+ * 4. Backreferences cuantificadas ((a+)\1+) y cascadas de > 10 opcionales contiguos.
  * @param {string} rawPattern
  * @returns {boolean}
  */
@@ -286,6 +331,29 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       current.branches.push([]);
       current.prevQuantified = null;
       current.sawFirstToken = false;
+      current.consecutiveOptionals = 0;
+      continue;
+    }
+
+    if (tok.type === "backref") {
+      const nextTok = tokens[i + 1];
+      const isQuantified = nextTok?.type === "quant";
+      const isOptional = nextTok?.type === "optional";
+      if (isQuantified || isOptional) {
+        i += 1;
+      }
+      if (isQuantified) {
+        return true;
+      }
+      current.hasBackref = true;
+      if (isOptional) {
+        current.consecutiveOptionals += 1;
+        if (current.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
+      } else {
+        current.consecutiveOptionals = 0;
+        current.prevQuantified = null;
+      }
+      current.sawFirstToken = true;
       continue;
     }
 
@@ -309,10 +377,11 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       const hasNestedOverlap = group.hasAlternationOverlap || branchOverlap;
 
       if (groupQuantified) {
-        if (group.hasQuantifier || hasNestedOverlap) {
+        if (group.hasQuantifier || group.hasBackref || hasNestedOverlap) {
           return true;
         }
         parent.hasQuantifier = true;
+        parent.consecutiveOptionals = 0;
         const groupAtoms = group.branches.flat();
         if (groupAtoms.length > 0) {
           if (anyAtomOverlaps(parent.prevQuantified, groupAtoms)) {
@@ -335,12 +404,17 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       }
 
       if (group.hasQuantifier) parent.hasQuantifier = true;
+      if (group.hasBackref) parent.hasBackref = true;
       if (hasNestedOverlap) parent.hasAlternationOverlap = true;
 
       if (group.startsWithQuantified && anyAtomOverlaps(parent.prevQuantified, group.leadingQuantified)) {
         return true;
       }
-      if (!groupOptional) {
+      if (groupOptional) {
+        parent.consecutiveOptionals += 1;
+        if (parent.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
+      } else {
+        parent.consecutiveOptionals = 0;
         if (!parent.sawFirstToken && group.startsWithQuantified) {
           parent.startsWithQuantified = true;
           parent.leadingQuantified = group.leadingQuantified;
@@ -351,11 +425,15 @@ export function hasUnsafeReDoSPattern(rawPattern) {
 
       const branch = parent.branches[parent.branches.length - 1];
       if (group.branches.length === 1) {
-        branch.push(...group.branches[0]);
+        if (groupOptional && group.branches[0].length === 1) {
+          branch.push({ ...group.branches[0][0], isOptional: true });
+        } else {
+          branch.push(...group.branches[0]);
+        }
       } else {
         const flatAtoms = group.branches.flat();
         if (flatAtoms.length > 0) {
-          branch.push({ type: "alt-group", atoms: flatAtoms });
+          branch.push({ type: "alt-group", atoms: flatAtoms, isOptional: groupOptional });
         }
       }
       continue;
@@ -370,10 +448,11 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       }
 
       const branch = current.branches[current.branches.length - 1];
-      branch.push(tok);
+      branch.push(isOptional ? { ...tok, isOptional: true } : tok);
 
       if (isQuantified) {
         current.hasQuantifier = true;
+        current.consecutiveOptionals = 0;
         if (anyAtomOverlaps(current.prevQuantified, [tok])) {
           return true;
         }
@@ -382,7 +461,13 @@ export function hasUnsafeReDoSPattern(rawPattern) {
           current.startsWithQuantified = true;
           current.leadingQuantified = [tok];
         }
-      } else if (!isOptional) {
+      } else if (isOptional) {
+        current.consecutiveOptionals += 1;
+        if (current.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) {
+          return true;
+        }
+      } else {
+        current.consecutiveOptionals = 0;
         current.prevQuantified = null;
       }
       current.sawFirstToken = true;
@@ -445,81 +530,96 @@ export function searchInFiles(files, query, options = {}) {
     if (!file || file.isFolder || file.isBinary) continue;
     if (typeof file.content !== "string" || !file.content) continue;
 
-    const ext = file.path.includes(".") ? file.path.split(".").pop().toLowerCase() : "";
+    const baseName = file.path.split(/[/\\]/).pop() || file.path;
+    const ext = baseName.includes(".") ? baseName.split(".").pop().toLowerCase() : "";
     if (BINARY_EXTENSIONS.has(ext)) continue;
 
-    // Optimización: si el archivo no contiene el patrón, evitar la asignación de memoria
-    // que implica dividir todo el archivo en un arreglo de miles de líneas.
+    // Optimización: si el archivo no contiene el patrón, evitar escanear línea a línea.
     if (!isRegex || (!cleanQuery.includes("^") && !cleanQuery.includes("$"))) {
       regex.lastIndex = 0;
       if (!regex.test(file.content)) continue;
       regex.lastIndex = 0;
     }
 
-    const lines = file.content.split(/\r?\n/);
+    // Escaneo línea por línea con indexOf("\n") en lugar de split(/\r?\n/), evitando reservar
+    // arreglos masivos de miles de líneas cuando solo existen pocas coincidencias o se alcanza el límite.
+    const content = file.content;
+    const contentLen = content.length;
     const fileMatches = [];
+    let lineIdx = 0;
+    let lineStart = 0;
 
-    for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-      const lineText = lines[lineIdx];
-      regex.lastIndex = 0;
+    while (lineStart <= contentLen) {
+      const nlIdx = content.indexOf("\n", lineStart);
+      const hasNl = nlIdx !== -1;
+      const rawEnd = hasNl ? nlIdx : contentLen;
+      const lineEnd = rawEnd > lineStart && content.charCodeAt(rawEnd - 1) === 13 ? rawEnd - 1 : rawEnd;
 
-      let match;
-      while ((match = regex.exec(lineText)) !== null) {
-        const matchText = match[0];
-        if (matchText.length === 0) {
-          regex.lastIndex++;
-          continue;
-        }
+      if (lineEnd > lineStart) {
+        const lineText = content.slice(lineStart, lineEnd);
+        regex.lastIndex = 0;
 
-        const matchStart = match.index;
-        const matchEnd = matchStart + matchText.length;
-        let snippet = lineText;
-        let start = matchStart;
-        let end = matchEnd;
+        let match;
+        while ((match = regex.exec(lineText)) !== null) {
+          const matchText = match[0];
+          if (matchText.length === 0) {
+            // Avanzar un code point completo para no partir pares sustitutos UTF-16.
+            const cp = lineText.codePointAt(regex.lastIndex);
+            regex.lastIndex += cp !== undefined && cp > 0xffff ? 2 : 1;
+            continue;
+          }
 
-        if (lineText.length > MAX_LINE_SNIPPET_LENGTH) {
-          const fitsFromStart = matchEnd <= MAX_LINE_SNIPPET_LENGTH;
-          const windowStart = fitsFromStart
-            ? 0
-            : Math.max(0, Math.min(matchStart - SNIPPET_MATCH_LEADING_CONTEXT, lineText.length - MAX_LINE_SNIPPET_LENGTH));
-          const prefix = windowStart > 0 ? "…" : "";
-          const maxBodyLength = MAX_LINE_SNIPPET_LENGTH - prefix.length;
-          const windowEnd = Math.min(lineText.length, windowStart + maxBodyLength);
-          const suffix = windowEnd < lineText.length ? "…" : "";
-          snippet = `${prefix}${lineText.slice(windowStart, windowEnd)}${suffix}`;
+          const matchStart = match.index;
+          const matchEnd = matchStart + matchText.length;
+          let snippet = lineText;
+          let start = matchStart;
+          let end = matchEnd;
 
-          const minSnippetIdx = prefix.length;
-          const maxSnippetIdx = prefix.length + (windowEnd - windowStart);
-          start = Math.max(minSnippetIdx, Math.min(maxSnippetIdx, prefix.length + (matchStart - windowStart)));
-          end = Math.max(start, Math.min(maxSnippetIdx, prefix.length + (matchEnd - windowStart)));
-        }
+          if (lineText.length > MAX_LINE_SNIPPET_LENGTH) {
+            const fitsFromStart = matchEnd <= MAX_LINE_SNIPPET_LENGTH;
+            const windowStart = fitsFromStart
+              ? 0
+              : Math.max(0, Math.min(matchStart - SNIPPET_MATCH_LEADING_CONTEXT, lineText.length - MAX_LINE_SNIPPET_LENGTH));
+            const prefix = windowStart > 0 ? "…" : "";
+            const maxBodyLength = MAX_LINE_SNIPPET_LENGTH - prefix.length;
+            const windowEnd = Math.min(lineText.length, windowStart + maxBodyLength);
+            const suffix = windowEnd < lineText.length ? "…" : "";
+            snippet = `${prefix}${lineText.slice(windowStart, windowEnd)}${suffix}`;
 
-        fileMatches.push({
-          line: lineIdx + 1,
-          column: match.index + 1,
-          lineText: snippet,
-          matchText,
-          start,
-          end
-        });
+            const minSnippetIdx = prefix.length;
+            const maxSnippetIdx = prefix.length + (windowEnd - windowStart);
+            start = Math.max(minSnippetIdx, Math.min(maxSnippetIdx, prefix.length + (matchStart - windowStart)));
+            end = Math.max(start, Math.min(maxSnippetIdx, prefix.length + (matchEnd - windowStart)));
+          }
 
-        totalMatchesCount++;
+          fileMatches.push({
+            line: lineIdx + 1,
+            column: match.index + 1,
+            lineText: snippet,
+            matchText,
+            start,
+            end
+          });
 
-        if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
-          break;
+          totalMatchesCount++;
+
+          if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
+            break;
+          }
         }
       }
 
-      if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
+      if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches || !hasNl) {
         break;
       }
+      lineStart = nlIdx + 1;
+      lineIdx += 1;
     }
 
     if (fileMatches.length > 0) {
-      const shortName = file.path.split("/").pop() || file.path;
       results.push({
         path: file.path,
-        shortName,
+        shortName: baseName,
         totalMatches: fileMatches.length,
         matches: fileMatches
       });

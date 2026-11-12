@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org https://cdnjs.cloudflare.com; img-src 'self' data: https: blob:; frame-src 'self' blob: data:; worker-src 'self' blob:; form-action 'self'; object-src 'none'; base-uri 'self';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org; img-src 'self' data: https: blob:; frame-src 'self' blob: data:; worker-src 'self' blob:; form-action 'self'; object-src 'none'; base-uri 'self';">
   <meta name="theme-color" content="#10131a">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -16,6 +16,12 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@400;500;600&display=swap" rel="stylesheet" crossorigin="anonymous">
+  <link rel="stylesheet" href="./css/tokens.css">
+  <link rel="stylesheet" href="./css/base.css">
+  <link rel="stylesheet" href="./css/layout.css">
+  <link rel="stylesheet" href="./css/editor.css">
+  <link rel="stylesheet" href="./css/chat.css">
+  <link rel="stylesheet" href="./css/workspace.css">
   <link rel="stylesheet" href="./css/app.css">
   <script type="importmap">
     {
@@ -737,7 +743,7 @@
             </div>
 
             <!-- Formulario accesible para publicar como repositorio público o privado -->
-            <div id="gh-publish-repo-box" class="field-group gh-publish-box" style="margin-top: 12px; padding: 12px; border: 1px solid var(--borde); border-radius: var(--radio-md); background: var(--superficie-panel);" hidden>
+            <div id="gh-publish-repo-box" class="field-group gh-publish-box" hidden>
               <label for="gh-publish-name-input" class="field-label">Nombre del repositorio en GitHub</label>
               <div class="field-row">
                 <input type="text" id="gh-publish-name-input" class="field-control code-font field-grow-2" placeholder="mi-proyecto" spellcheck="false" autocomplete="off">
@@ -747,7 +753,7 @@
                   <option value="public">🌐 Público</option>
                 </select>
               </div>
-              <div class="field-row gh-open-actions" style="margin-top: 10px;">
+              <div class="field-row gh-open-actions gh-publish-actions">
                 <button type="button" id="btn-gh-confirm-publish" class="btn btn-primary btn-sm">
                   <span data-icon="cloudUpload"></span>
                   <span>Crear y Publicar</span>

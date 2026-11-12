@@ -1,4 +1,4 @@
-import { createEditorManager } from "./editorManager.js";
+import { applyDocumentEdit, createEditorManager } from "./editorManager.js";
 import { isBinaryFile } from "../storage/fileImport.js";
 
 /**
@@ -23,6 +23,7 @@ export function createSplitEditorController({
   ensureFileContentLoaded,
   isFileDirtyForProject,
   renderTabs,
+  onDirtyChange,
   scheduleAutosave,
   onSyncMainDoc,
   onFocusMain
@@ -32,6 +33,9 @@ export function createSplitEditorController({
   let openRequestSeq = 0;
   /** @type {any} */
   let editorSplit = null;
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenerOpts = listenerController ? { signal: listenerController.signal } : undefined;
+  let activeDragCleanup = null;
 
   async function initSplitEditorIfNeeded() {
     if (editorSplit) return editorSplit;
@@ -42,20 +46,19 @@ export function createSplitEditorController({
       enableGlobalRuler: false,
       enableAutocomplete: false,
       onDocChange(filePath, newContent) {
-        const filesOnly = getFilesOnly();
-        const target = filesOnly.find((f) => f.id === filePath);
-        if (!target) return;
-        const wasDirty = isFileDirtyForProject(target);
-        target.content = newContent;
-        const nowDirty = isFileDirtyForProject(target);
-        if (wasDirty !== nowDirty) {
-          renderTabs();
-        }
-        const activeProject = getActiveProject();
-        if (activeProject) {
-          scheduleAutosave(activeProject.id, filePath, newContent);
-        }
-        onSyncMainDoc?.(filePath, newContent);
+        applyDocumentEdit({
+          filePath,
+          newContent,
+          getFilesOnly,
+          isFileDirtyForProject,
+          renderTabs,
+          onDirtyChange,
+          getActiveProject,
+          scheduleAutosave,
+          onAfterEdit: (editedPath, editedContent) => {
+            onSyncMainDoc?.(editedPath, editedContent);
+          }
+        });
       },
       onSelectionChange() {
         // En editor secundario no sobreescribe la selección del principal
@@ -182,12 +185,12 @@ export function createSplitEditorController({
     }
   }
 
-  btnEditorSplit?.addEventListener("click", () => void toggle());
-  btnCloseSplit?.addEventListener("click", () => void toggle(false));
+  btnEditorSplit?.addEventListener("click", () => void toggle(), listenerOpts);
+  btnCloseSplit?.addEventListener("click", () => void toggle(false), listenerOpts);
   splitFileSelectEl?.addEventListener("change", () => {
     const chosen = getFilesOnly().find((f) => f.id === splitFileSelectEl.value);
     if (chosen) void openFile(chosen);
-  });
+  }, listenerOpts);
 
   if (splitDividerEl && editorStageEl) {
     let startX = 0;
@@ -220,6 +223,7 @@ export function createSplitEditorController({
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
+      activeDragCleanup = null;
     };
 
     splitDividerEl.addEventListener("pointerdown", (e) => {
@@ -239,7 +243,8 @@ export function createSplitEditorController({
       window.addEventListener("pointermove", onPointerMove);
       window.addEventListener("pointerup", onPointerUp);
       window.addEventListener("pointercancel", onPointerUp);
-    });
+      activeDragCleanup = onPointerUp;
+    }, listenerOpts);
   }
 
   keyboardRouter?.registerGlobalShortcut("ctrl+\\", () => void toggle());
@@ -326,6 +331,20 @@ export function createSplitEditorController({
       if (isSplitOpen) {
         populateSelect();
       }
+    },
+    destroy() {
+      openRequestSeq += 1;
+      activeDragCleanup?.();
+      activeDragCleanup = null;
+      listenerController?.abort();
+      keyboardRouter?.unregisterGlobalShortcut?.("ctrl+\\");
+      keyboardRouter?.unregisterGlobalShortcut?.("meta+\\");
+      if (editorSplit) {
+        editorSplit.destroy?.();
+        editorSplit = null;
+      }
+      splitActiveFileId = null;
+      isSplitOpen = false;
     }
   };
 }

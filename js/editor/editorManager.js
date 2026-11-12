@@ -1,12 +1,18 @@
 import { inferFileMeta } from "../storage/workspaceDb.js";
+import { readStoredBool, readStoredValue, saveStoredValue } from "../utils/storage.js";
 import { createMinimapController } from "./minimap.js";
 import { computeSmartReplacement } from "./smartReplace.js";
 import {
   extractWordBeforeCursor,
+  extractDocumentIdentifiers,
   getLanguageCompletions,
   createAutocompleteBarController
 } from "./autocompleteCatalog.js";
+import { getIndentSize } from "./languageConfig.js";
+import { createErrorMarkersController } from "./errorMarkersController.js";
+import { createFallbackEditor } from "./fallbackEditor.js";
 
+export { getIndentSize } from "./languageConfig.js";
 export { scoreLineSimilarity, computeSmartReplacement } from "./smartReplace.js";
 export {
   LANGUAGE_COMPLETIONS,
@@ -14,6 +20,43 @@ export {
   scoreCompletionMatch,
   getLanguageCompletions
 } from "./autocompleteCatalog.js";
+
+const MAX_IDENT_SLICE_CHARS = 120000;
+
+/**
+ * Helper compartido para procesar ediciones de documento desde el editor principal y el Split View,
+ * actualizando contenido, estado sucio y autoguardado sin duplicar lógica.
+ */
+export function applyDocumentEdit({
+  filePath,
+  newContent,
+  getFilesOnly,
+  isFileDirtyForProject,
+  renderTabs,
+  onDirtyChange,
+  getActiveProject,
+  scheduleAutosave,
+  onAfterEdit
+}) {
+  const target = getFilesOnly?.().find((f) => f.id === filePath);
+  if (!target) return false;
+  const wasDirty = Boolean(isFileDirtyForProject?.(target));
+  target.content = newContent;
+  const nowDirty = Boolean(isFileDirtyForProject?.(target));
+  if (wasDirty !== nowDirty) {
+    if (typeof onDirtyChange === "function") {
+      onDirtyChange(target, nowDirty);
+    } else {
+      renderTabs?.();
+    }
+  }
+  const activeProject = getActiveProject?.();
+  if (activeProject) {
+    scheduleAutosave?.(activeProject.id, filePath, newContent);
+  }
+  onAfterEdit?.(filePath, newContent, target);
+  return true;
+}
 const PREF_KEYS = {
   wordWrap: "ide.editor.wordWrap",
   fontSize: "ide.editor.fontSize",
@@ -70,16 +113,6 @@ export function applyHardwareKeyboardAttributes(hardwareKeyboard, targetEl = nul
   }
 }
 
-
-/**
- * Devuelve la cantidad de espacios de indentación inteligente según el lenguaje:
- * 4 espacios para Python, C, C++ y SQL; 2 espacios para HTML, CSS y JavaScript.
- * @param {string} lang
- * @returns {number}
- */
-export function getIndentSize(lang) {
-  return lang === "python" || lang === "cpp" || lang === "c" || lang === "sql" || lang === "rust" || lang === "go" || lang === "java" || lang === "csharp" ? 4 : 2;
-}
 
 /**
  * Envuelve un texto seleccionado entre delimitadores de apertura y cierre
@@ -142,6 +175,11 @@ export async function createEditorManager({
       initialWrap: wordWrap,
       initialFontSize: fontSize,
       initialHardwareKeyboard: hardwareKeyboard,
+      prefKeys: PREF_KEYS,
+      clampFontSize,
+      applyFontSize,
+      applyHardwareKeyboardAttributes,
+      wrapTextWithDelimiters,
       onDocChange,
       onSelectionChange,
       enableMinimap,
@@ -193,6 +231,32 @@ export async function createEditorManager({
   const wrapCompartment = new Compartment();
   const contentAttrsCompartment = new Compartment();
   const statesByFile = new Map();
+  const MAX_CACHED_STATES = isSplitInstance ? 4 : 15;
+  const stateCompartmentPrefs = new WeakMap();
+
+  function setCachedState(fileId, state) {
+    if (!fileId || !state) return;
+    if (statesByFile.has(fileId)) {
+      statesByFile.delete(fileId);
+    } else if (statesByFile.size >= MAX_CACHED_STATES) {
+      for (const candidateKey of statesByFile.keys()) {
+        if (candidateKey !== activeFileId && candidateKey !== fileId) {
+          statesByFile.delete(candidateKey);
+          break;
+        }
+      }
+    }
+    statesByFile.set(fileId, state);
+    stateCompartmentPrefs.set(state, { wordWrap, hardwareKeyboard });
+  }
+
+  function getCachedState(fileId) {
+    const state = statesByFile.get(fileId);
+    if (!state) return undefined;
+    statesByFile.delete(fileId);
+    statesByFile.set(fileId, state);
+    return state;
+  }
 
   const buildCmContentAttrsExtension = (hwKb) =>
     EditorView.contentAttributes && typeof EditorView.contentAttributes.of === "function"
@@ -207,16 +271,11 @@ export async function createEditorManager({
   const minimap = enableMinimap
     ? createMinimapController({
         mountEl: resolvedMinimapParent,
-        getDocLines: () => {
-          if (view?.state?.doc) {
-            const doc = view.state.doc;
-            const lines = [];
-            for (let i = 1; i <= doc.lines; i++) {
-              lines.push(doc.line(i).text);
-            }
-            return lines;
-          }
-          return [];
+        getLineCount: () => view?.state?.doc?.lines || 0,
+        getLine: (index) => {
+          const doc = view?.state?.doc;
+          if (!doc || index < 0 || index >= doc.lines) return "";
+          return doc.line(index + 1).text;
         },
         getViewport: () => {
           const scroller = view?.scrollDOM;
@@ -282,16 +341,13 @@ export async function createEditorManager({
         })
       : null;
 
-  const errorMarkersByFile = new Map();
-
-  function getActiveFileMarkers() {
-    const key = activeFileId || "__default__";
-    return errorMarkersByFile.get(key) || [];
-  }
+  const errorMarkers = createErrorMarkersController({
+    enableGlobalRuler,
+    onJump: goToLine
+  });
 
   function syncErrorRuler(totalLines = view?.state?.doc?.lines || 1) {
-    if (!enableGlobalRuler) return;
-    renderErrorRuler(getActiveFileMarkers(), totalLines, goToLine);
+    errorMarkers.syncRuler(activeFileId, totalLines);
   }
 
   // Tema sintáctico acoplado 100% a nuestros tokens CSS (:root)
@@ -370,6 +426,60 @@ export async function createEditorManager({
     }
   });
 
+  // Caché con debounce del vocabulario de identificadores del archivo activo
+  let docVocabFileId = null;
+  let docVocabWords = [];
+  let docVocabDocRef = null;
+  let docVocabTimer = null;
+
+  function computeDocWordsNow(doc) {
+    if (!doc) return [];
+    const sliceLen = Math.min(doc.length, MAX_IDENT_SLICE_CHARS);
+    const sample = doc.sliceString(0, sliceLen);
+    return extractDocumentIdentifiers(sample);
+  }
+
+  function getCachedDocWords(doc, { immediate = false } = {}) {
+    if (!doc) return [];
+    if (docVocabFileId === activeFileId && docVocabDocRef === doc) {
+      return docVocabWords;
+    }
+    if (immediate || docVocabFileId !== activeFileId || docVocabWords.length === 0) {
+      if (docVocabTimer) {
+        clearTimeout(docVocabTimer);
+        docVocabTimer = null;
+      }
+      docVocabFileId = activeFileId;
+      docVocabDocRef = doc;
+      docVocabWords = computeDocWordsNow(doc);
+      return docVocabWords;
+    }
+    // Reutilizar vocabulario reciente mientras el usuario teclea y refrescar tras breve pausa
+    if (!docVocabTimer) {
+      docVocabTimer = setTimeout(() => {
+        docVocabTimer = null;
+        const currentDoc = view?.state?.doc;
+        if (currentDoc) {
+          docVocabFileId = activeFileId;
+          docVocabDocRef = currentDoc;
+          docVocabWords = computeDocWordsNow(currentDoc);
+        }
+      }, 180);
+    }
+    return docVocabWords;
+  }
+
+  function extractPrefixWordFromDoc(doc, pos) {
+    const winStart = Math.max(0, pos - 128);
+    const prefixSlice = doc.sliceString(winStart, pos);
+    const rel = extractWordBeforeCursor(prefixSlice, prefixSlice.length);
+    return {
+      word: rel.word,
+      from: winStart + rel.from,
+      to: winStart + rel.to
+    };
+  }
+
   function refreshAutocompleteBar(state) {
     if (!state) {
       autocompleteBar.hide();
@@ -380,24 +490,24 @@ export async function createEditorManager({
       autocompleteBar.hide();
       return;
     }
-    const docText = state.doc.toString();
-    const wordRange = extractWordBeforeCursor(docText, main.head);
+    const wordRange = extractPrefixWordFromDoc(state.doc, main.head);
     if (!wordRange.word || wordRange.word.length < 2) {
       autocompleteBar.hide();
       return;
     }
-    const suggestions = getLanguageCompletions(activeLang, wordRange.word, docText, 6);
+    const docWords = getCachedDocWords(state.doc);
+    const suggestions = getLanguageCompletions(activeLang, wordRange.word, docWords, 6);
     autocompleteBar.update(suggestions, wordRange);
   }
 
   function createCmCompletionSource(lang) {
     return (context) => {
-      const docText = context.state.doc.toString();
-      const wordRange = extractWordBeforeCursor(docText, context.pos);
+      const wordRange = extractPrefixWordFromDoc(context.state.doc, context.pos);
       if (!wordRange.word || (wordRange.word.length < 2 && !context.explicit)) {
         return null;
       }
-      const items = getLanguageCompletions(lang, wordRange.word, docText, 12);
+      const docWords = getCachedDocWords(context.state.doc, { immediate: Boolean(context.explicit) });
+      const items = getLanguageCompletions(lang, wordRange.word, docWords, 12);
       if (items.length === 0) {
         return null;
       }
@@ -555,25 +665,31 @@ export async function createEditorManager({
       return;
     }
     if (view && activeFileId) {
-      statesByFile.set(activeFileId, view.state);
+      setCachedState(activeFileId, view.state);
     }
 
     activeFileId = file.id;
     activeLang = file.lang || inferFileMeta(file.id).lang || "js";
     autocompleteBar.hide();
-    let nextState = statesByFile.get(file.id);
+    let nextState = getCachedState(file.id);
 
     if (!nextState) {
       nextState = buildEditorState(file);
-      statesByFile.set(file.id, nextState);
+      setCachedState(file.id, nextState);
     } else {
-      // Sincronizar Word Wrap y atributos de teclado físico actual al recuperar estado en caché
-      nextState = nextState.update({
-        effects: [
-          wrapCompartment.reconfigure(wordWrap ? EditorView.lineWrapping : []),
-          contentAttrsCompartment.reconfigure(buildCmContentAttrsExtension(hardwareKeyboard))
-        ]
-      }).state;
+      // Sincronizar Word Wrap y atributos de teclado físico solo si cambiaron desde el último uso
+      const prevPrefs = stateCompartmentPrefs.get(nextState);
+      const effects = [];
+      if (!prevPrefs || prevPrefs.wordWrap !== wordWrap) {
+        effects.push(wrapCompartment.reconfigure(wordWrap ? EditorView.lineWrapping : []));
+      }
+      if (!prevPrefs || prevPrefs.hardwareKeyboard !== hardwareKeyboard) {
+        effects.push(contentAttrsCompartment.reconfigure(buildCmContentAttrsExtension(hardwareKeyboard)));
+      }
+      if (effects.length > 0) {
+        nextState = nextState.update({ effects }).state;
+        setCachedState(file.id, nextState);
+      }
     }
 
     if (!view) {
@@ -623,7 +739,12 @@ export async function createEditorManager({
 
   function dropFileState(fileId) {
     statesByFile.delete(fileId);
-    errorMarkersByFile.delete(fileId);
+    errorMarkers.dropFile(fileId);
+    if (docVocabFileId === fileId) {
+      docVocabFileId = null;
+      docVocabWords = [];
+      docVocabDocRef = null;
+    }
     if (activeFileId === fileId) {
       activeFileId = null;
       clearErrorMarkers();
@@ -634,18 +755,10 @@ export async function createEditorManager({
 
   function renameFileStates(oldPath, newPath, isFolder) {
     if (view && activeFileId) {
-      statesByFile.set(activeFileId, view.state);
+      setCachedState(activeFileId, view.state);
     }
 
-    for (const [markerKey, markerList] of [...errorMarkersByFile.entries()]) {
-      if (markerKey === oldPath) {
-        errorMarkersByFile.delete(markerKey);
-        errorMarkersByFile.set(newPath, markerList);
-      } else if (isFolder && markerKey.startsWith(`${oldPath}/`)) {
-        errorMarkersByFile.delete(markerKey);
-        errorMarkersByFile.set(`${newPath}${markerKey.slice(oldPath.length)}`, markerList);
-      }
-    }
+    errorMarkers.renamePaths(oldPath, newPath, isFolder);
 
     const updates = [];
     for (const [key, stateVal] of statesByFile.entries()) {
@@ -661,7 +774,7 @@ export async function createEditorManager({
       const oldLang = inferFileMeta(fromKey).lang;
       const newLang = inferFileMeta(toKey).lang;
       if (oldLang === newLang) {
-        statesByFile.set(toKey, stateVal);
+        setCachedState(toKey, stateVal);
         continue;
       }
       // Cambió la extensión: reconstruir con el nuevo lenguaje e indentación conservando texto y cursor
@@ -672,17 +785,19 @@ export async function createEditorManager({
       });
       const head = Math.min(stateVal.selection.main.head, rebuilt.doc.length);
       const anchor = Math.min(stateVal.selection.main.anchor, rebuilt.doc.length);
-      statesByFile.set(toKey, rebuilt.update({ selection: { anchor, head } }).state);
+      setCachedState(toKey, rebuilt.update({ selection: { anchor, head } }).state);
     }
 
     if (activeFileId === oldPath) {
       activeFileId = newPath;
+      activeLang = inferFileMeta(newPath).lang;
     } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
       activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
+      activeLang = inferFileMeta(activeFileId).lang;
     }
 
     if (view && activeFileId && statesByFile.get(activeFileId) !== view.state) {
-      const refreshed = statesByFile.get(activeFileId);
+      const refreshed = getCachedState(activeFileId);
       if (refreshed) {
         view.setState(refreshed);
         emitSelection(view.state);
@@ -798,26 +913,21 @@ export async function createEditorManager({
   }
 
   function addErrorMarker(lineNum, errorMessage) {
-    const num = Math.max(1, parseInt(lineNum, 10) || 1);
-    const msg = String(errorMessage || "Error de compilación / sintaxis");
-    const key = activeFileId || "__default__";
-    const list = errorMarkersByFile.get(key) || [];
-    list.push({ lineNum: num, errorMessage: msg });
-    errorMarkersByFile.set(key, list);
+    const { marker, isFirstForFile } = errorMarkers.addMarker(activeFileId, lineNum, errorMessage);
 
     if (view && addErrorEffect) {
       view.dispatch({
-        effects: addErrorEffect.of({ lineNum: num, errorMessage: msg })
+        effects: addErrorEffect.of({ lineNum: marker.lineNum, errorMessage: marker.errorMessage })
       });
-      if (list.length === 1) {
-        goToLine(num);
+      if (isFirstForFile) {
+        goToLine(marker.lineNum);
       }
     }
     syncErrorRuler(view?.state?.doc?.lines || 1);
   }
 
   function clearErrorMarkers() {
-    errorMarkersByFile.delete(activeFileId || "__default__");
+    errorMarkers.clearFile(activeFileId);
     if (view && clearErrorEffect) {
       view.dispatch({
         effects: clearErrorEffect.of(null)
@@ -827,7 +937,7 @@ export async function createEditorManager({
   }
 
   function getErrorMarkers() {
-    return [...getActiveFileMarkers()];
+    return errorMarkers.getMarkers(activeFileId);
   }
 
   function triggerUndo() {
@@ -857,6 +967,7 @@ export async function createEditorManager({
       view.dispatch({
         effects: wrapCompartment.reconfigure(wordWrap ? EditorView.lineWrapping : [])
       });
+      stateCompartmentPrefs.set(view.state, { wordWrap, hardwareKeyboard });
     }
     return wordWrap;
   }
@@ -880,6 +991,7 @@ export async function createEditorManager({
         view.dispatch({
           effects: contentAttrsCompartment.reconfigure(buildCmContentAttrsExtension(hardwareKeyboard))
         });
+        stateCompartmentPrefs.set(view.state, { wordWrap, hardwareKeyboard });
       } catch (_) {}
       if (view.contentDOM) {
         applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM);
@@ -945,16 +1057,25 @@ export async function createEditorManager({
     isHardwareKeyboardMode: () => hardwareKeyboard,
     getActiveFileId: () => activeFileId,
     getValue: () => (view ? view.state.doc.toString() : ""),
-    getCompletions: (prefix) =>
-      getLanguageCompletions(activeLang, prefix, view ? view.state.doc.toString() : ""),
+    getCompletions: (prefix) => {
+      const query = prefix !== undefined
+        ? prefix
+        : (view ? extractPrefixWordFromDoc(view.state.doc, view.state.selection.main.head).word : "");
+      const words = view ? getCachedDocWords(view.state.doc, { immediate: true }) : "";
+      return getLanguageCompletions(activeLang, query, words);
+    },
     acceptTopCompletion: () => autocompleteBar.acceptCurrent(),
     syncDoc,
     focus: () => view?.focus(),
     destroy() {
-      errorMarkersByFile.clear();
-      if (enableGlobalRuler) {
-        renderErrorRuler([], 1, goToLine);
+      if (docVocabTimer) {
+        clearTimeout(docVocabTimer);
+        docVocabTimer = null;
       }
+      docVocabWords = [];
+      docVocabDocRef = null;
+      docVocabFileId = null;
+      errorMarkers.destroy();
       if (view && clearErrorEffect) {
         try {
           view.dispatch({ effects: clearErrorEffect.of(null) });
@@ -1057,479 +1178,10 @@ async function loadCodeMirrorModules() {
   };
 }
 
-function renderErrorRuler(markers, totalLines, onJump) {
-  const rulerEl = typeof document !== "undefined" ? document.getElementById("editor-error-ruler") : null;
-  if (!rulerEl) return;
-  if (!markers || markers.length === 0) {
-    rulerEl.hidden = true;
-    rulerEl.innerHTML = "";
-    return;
-  }
-  rulerEl.hidden = false;
-  rulerEl.innerHTML = "";
-  const linesCount = Math.max(1, totalLines || 1);
-
-  for (const m of markers) {
-    const pill = document.createElement("button");
-    pill.type = "button";
-    const isWarn = /warning/i.test(m.errorMessage || "");
-    pill.className = isWarn ? "editor-error-marker-pill is-warning" : "editor-error-marker-pill";
-    pill.title = `Línea ${m.lineNum}: ${m.errorMessage} (tocá para ir a la línea)`;
-    pill.setAttribute("aria-label", `Línea ${m.lineNum}: ${m.errorMessage}`);
-    const pct = Math.min(97, Math.max(3, (m.lineNum / linesCount) * 100));
-    pill.style.top = `${pct}%`;
-    pill.addEventListener("click", (e) => {
-      e.stopPropagation();
-      onJump?.(m.lineNum);
-    });
-    rulerEl.appendChild(pill);
-  }
-}
-
-/**
- * Respaldo local ligero por si el usuario abre el IDE sin conexión antes del cacheo PWA.
- */
-function createFallbackEditor({
-  mountEl,
-  initialWrap,
-  initialFontSize,
-  initialHardwareKeyboard = true,
-  onDocChange,
-  onSelectionChange,
-  enableMinimap = true,
-  isSplitInstance = false,
-  enableGlobalRuler = !isSplitInstance,
-  enableAutocomplete = !isSplitInstance,
-  minimapParent = mountEl
-}) {
-  let wordWrap = initialWrap;
-  let fontSize = initialFontSize;
-  let hardwareKeyboard = initialHardwareKeyboard;
-  let activeFileId = null;
-  let activeLang = "js";
-
-  const textarea = document.createElement("textarea");
-  textarea.className = "editor-fallback-surface";
-  textarea.spellcheck = false;
-  textarea.autocapitalize = "off";
-  textarea.autocomplete = "off";
-  textarea.setAttribute("aria-label", "Editor de código");
-  applyHardwareKeyboardAttributes(hardwareKeyboard, textarea);
-  textarea.wrap = wordWrap ? "soft" : "off";
-  mountEl.innerHTML = "";
-  mountEl.appendChild(textarea);
-
-  const fallbackMinimap = enableMinimap
-    ? createMinimapController({
-        mountEl: minimapParent || mountEl,
-        getDocLines: () => (textarea ? textarea.value.split("\n") : []),
-        getViewport: () => {
-          if (textarea) {
-            return {
-              top: textarea.scrollTop,
-              height: textarea.clientHeight,
-              totalHeight: textarea.scrollHeight
-            };
-          }
-          return { top: 0, height: 100, totalHeight: 100 };
-        },
-        onScrollToRatio: (ratio) => {
-          if (textarea) {
-            textarea.scrollTop = ratio * (textarea.scrollHeight - textarea.clientHeight);
-          }
-        }
-      })
-    : null;
-
-  const fallbackAutocompleteBar = createAutocompleteBarController({
-    mountEl,
-    enabled: enableAutocomplete,
-    sharedGlobalBar: enableAutocomplete,
-    onAccept(item, wordRange) {
-      const docLen = textarea.value.length;
-      const from = Math.min(Math.max(0, wordRange.from), docLen);
-      const to = Math.min(Math.max(from, wordRange.to), docLen);
-      const insertText = item.apply || item.label;
-      textarea.focus();
-      textarea.setRangeText(insertText, from, to, "end");
-      const newPos = from + insertText.length;
-      textarea.setSelectionRange(newPos, newPos);
-      fallbackAutocompleteBar.hide();
-      if (activeFileId) {
-        onDocChange(activeFileId, textarea.value);
-      }
-      fallbackMinimap?.render();
-      emitSel();
-    }
-  });
-
-  function refreshFallbackAutocomplete() {
-    const start = textarea.selectionStart ?? 0;
-    const end = textarea.selectionEnd ?? 0;
-    if (start !== end) {
-      fallbackAutocompleteBar.hide();
-      return;
-    }
-    const wordRange = extractWordBeforeCursor(textarea.value, end);
-    if (!wordRange.word || wordRange.word.length < 2) {
-      fallbackAutocompleteBar.hide();
-      return;
-    }
-    const suggestions = getLanguageCompletions(activeLang, wordRange.word, textarea.value, 6);
-    fallbackAutocompleteBar.update(suggestions, wordRange);
-  }
-
-  textarea.addEventListener("scroll", () => {
-    fallbackMinimap?.updateSlider();
-  }, { passive: true });
-
-  textarea.addEventListener("input", () => {
-    if (activeFileId) {
-      onDocChange(activeFileId, textarea.value);
-    }
-    fallbackMinimap?.render();
-    refreshFallbackAutocomplete();
-    emitSel();
-  });
-
-  const emitSel = () => {
-    const start = textarea.selectionStart ?? 0;
-    const end = textarea.selectionEnd ?? 0;
-    const before = textarea.value.slice(0, end);
-    const lastNl = before.lastIndexOf("\n");
-    const cursorLine = lastNl === -1 ? 1 : before.split("\n").length;
-    const cursorCol = lastNl === -1 ? end + 1 : end - lastNl;
-
-    if (start === end) {
-      onSelectionChange({ text: "", lineCount: 0, cursorLine, cursorCol });
-      return;
-    }
-    const text = textarea.value.slice(start, end);
-    onSelectionChange({ text, lineCount: text.split("\n").length, cursorLine, cursorCol });
-  };
-
-  textarea.addEventListener("select", emitSel);
-  textarea.addEventListener("keyup", emitSel);
-  textarea.addEventListener("mouseup", emitSel);
-  textarea.addEventListener("click", emitSel);
-
-  textarea.addEventListener("keydown", (event) => {
-    if (event.key === "Tab") {
-      event.preventDefault();
-      // Si hay sugerencias activas o una palabra parcial antes del cursor, autocompletar primero
-      if (!fallbackAutocompleteBar.isOpen()) {
-        refreshFallbackAutocomplete();
-      }
-      if (fallbackAutocompleteBar.isOpen() && fallbackAutocompleteBar.acceptCurrent()) {
-        return;
-      }
-      const spaces = " ".repeat(getIndentSize(activeLang));
-      insertInTextarea(spaces, 0);
-      return;
-    }
-    if (event.key === "Escape" && fallbackAutocompleteBar.isOpen()) {
-      event.preventDefault();
-      fallbackAutocompleteBar.hide();
-    }
-  });
-
-  function insertInTextarea(text, cursorBack = 0) {
-    const start = textarea.selectionStart ?? textarea.value.length;
-    const end = textarea.selectionEnd ?? textarea.value.length;
-    textarea.focus();
-    if (start !== end && cursorBack > 0 && cursorBack < text.length) {
-      const selected = textarea.value.slice(start, end);
-      const wrapped = wrapTextWithDelimiters(text, selected, cursorBack);
-      textarea.setRangeText(wrapped.text, start, end, "select");
-      textarea.setSelectionRange(start + wrapped.selectFrom, start + wrapped.selectTo);
-    } else {
-      textarea.setRangeText(text, start, end, "end");
-      const pos = Math.max(0, start + text.length - cursorBack);
-      textarea.setSelectionRange(pos, pos);
-    }
-    if (activeFileId) {
-      onDocChange(activeFileId, textarea.value);
-    }
-    refreshFallbackAutocomplete();
-    emitSel();
-  }
-
-  const fallbackErrorMarkersByFile = new Map();
-
-  function getFallbackActiveMarkers() {
-    return fallbackErrorMarkersByFile.get(activeFileId || "__default__") || [];
-  }
-
-  function syncFallbackErrorRuler() {
-    const markers = getFallbackActiveMarkers();
-    if (markers.length > 0) {
-      const last = markers[markers.length - 1];
-      textarea.classList.add("has-error");
-      textarea.title = `Línea ${last.lineNum}: ${last.errorMessage}`;
-    } else {
-      textarea.classList.remove("has-error");
-      textarea.title = "";
-    }
-    if (!enableGlobalRuler) return;
-    const lineCount = Math.max(1, textarea.value.split("\n").length);
-    renderErrorRuler(markers, lineCount, (l) => goToFallbackLine(l));
-  }
-
-  function goToFallbackLine(lineNo) {
-    const target = Math.max(1, parseInt(lineNo, 10) || 1);
-    const lines = textarea.value.split("\n");
-    const boundedLine = Math.min(target, lines.length);
-    let offset = 0;
-    for (let i = 0; i < boundedLine - 1; i++) {
-      offset += lines[i].length + 1;
-    }
-    textarea.focus();
-    textarea.setSelectionRange(offset, offset);
-    const approxLineHeight = 20;
-    const targetScroll = Math.max(0, (boundedLine - 3) * approxLineHeight);
-    if (typeof textarea.scrollTo === "function") {
-      textarea.scrollTo({ top: targetScroll, behavior: "smooth" });
-    } else {
-      textarea.scrollTop = targetScroll;
-    }
-    emitSel();
-  }
-
-  return {
-    openFile(file) {
-      if (!file || file.isBinary || file.encoding === "base64") {
-        return;
-      }
-      activeFileId = file.id;
-      activeLang = file.lang;
-      if (!mountEl.contains(textarea)) {
-        mountEl.appendChild(textarea);
-      }
-      textarea.value = file.content;
-      fallbackAutocompleteBar.hide();
-      syncFallbackErrorRuler();
-      fallbackMinimap?.render();
-      fallbackMinimap?.updateSlider();
-      onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
-    },
-    clearActiveFile() {
-      activeFileId = null;
-      textarea.value = "";
-      fallbackAutocompleteBar.hide();
-      this.clearErrorMarkers();
-      onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
-    },
-    dropFileState(fileId) {
-      fallbackErrorMarkersByFile.delete(fileId);
-      if (activeFileId === fileId) {
-        activeFileId = null;
-        textarea.value = "";
-        this.clearErrorMarkers();
-        onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
-      }
-    },
-    purgeViewDocument() {
-      textarea.value = "";
-    },
-    renameFileStates(oldPath, newPath, isFolder) {
-      for (const [markerKey, markerList] of [...fallbackErrorMarkersByFile.entries()]) {
-        if (markerKey === oldPath) {
-          fallbackErrorMarkersByFile.delete(markerKey);
-          fallbackErrorMarkersByFile.set(newPath, markerList);
-        } else if (isFolder && markerKey.startsWith(`${oldPath}/`)) {
-          fallbackErrorMarkersByFile.delete(markerKey);
-          fallbackErrorMarkersByFile.set(`${newPath}${markerKey.slice(oldPath.length)}`, markerList);
-        }
-      }
-      if (!activeFileId) return;
-      if (activeFileId === oldPath) {
-        activeFileId = newPath;
-      } else if (isFolder && activeFileId.startsWith(`${oldPath}/`)) {
-        activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
-      } else {
-        return;
-      }
-      activeLang = inferFileMeta(activeFileId).lang;
-    },
-    insertAtCursor: insertInTextarea,
-    replaceSelection(text, contextHint = null) {
-      const start = textarea.selectionStart ?? 0;
-      const end = textarea.selectionEnd ?? 0;
-      if (start < end) {
-        insertInTextarea(text, 0);
-        return;
-      }
-      const before = textarea.value.slice(0, end);
-      const lastNl = before.lastIndexOf("\n");
-      const cursorLine = lastNl === -1 ? 1 : before.split("\n").length;
-      const smart = computeSmartReplacement(textarea.value, text, {
-        cursorLine,
-        selectionFrom: start,
-        selectionTo: end,
-        contextHint
-      });
-      if (smart.mode === "full") {
-        textarea.value = smart.insertedText;
-        textarea.setSelectionRange(0, 0);
-      } else {
-        textarea.value = smart.text;
-        textarea.setSelectionRange(smart.from, smart.from + smart.insertedText.length);
-      }
-      if (activeFileId) onDocChange(activeFileId, textarea.value);
-      emitSel();
-    },
-    replaceEntireDocument(text, { preserveCursorLine = false } = {}) {
-      let prevLine = 1;
-      if (preserveCursorLine) {
-        const head = textarea.selectionStart || 0;
-        prevLine = textarea.value.slice(0, head).split("\n").length;
-      }
-      textarea.value = text;
-      let nextOffset = 0;
-      if (preserveCursorLine && prevLine > 1) {
-        const lines = text.split("\n");
-        const clamped = Math.max(1, Math.min(prevLine, lines.length));
-        for (let i = 0; i < clamped - 1; i += 1) {
-          nextOffset += lines[i].length + 1;
-        }
-      }
-      textarea.setSelectionRange(nextOffset, nextOffset);
-      if (activeFileId) {
-        onDocChange?.(activeFileId, text);
-      }
-      emitSel();
-    },
-    replaceCode(text, forceWholeDoc = false, contextHint = null) {
-      if (forceWholeDoc) {
-        this.replaceEntireDocument(text);
-      } else {
-        this.replaceSelection(text, contextHint);
-      }
-    },
-    addErrorMarker(lineNum, errorMessage) {
-      const num = Math.max(1, parseInt(lineNum, 10) || 1);
-      const msg = String(errorMessage || "Error de compilación / sintaxis");
-      const key = activeFileId || "__default__";
-      const list = fallbackErrorMarkersByFile.get(key) || [];
-      list.push({ lineNum: num, errorMessage: msg });
-      fallbackErrorMarkersByFile.set(key, list);
-      const lines = textarea.value.split("\n");
-      const boundedLine = Math.min(num, lines.length);
-      let offset = 0;
-      for (let i = 0; i < boundedLine - 1; i++) {
-        offset += lines[i].length + 1;
-      }
-      textarea.setSelectionRange(offset, offset);
-      syncFallbackErrorRuler();
-    },
-    clearErrorMarkers() {
-      fallbackErrorMarkersByFile.delete(activeFileId || "__default__");
-      syncFallbackErrorRuler();
-    },
-    getErrorMarkers() {
-      return [...getFallbackActiveMarkers()];
-    },
-    goToLine: goToFallbackLine,
-    triggerUndo() {
-      textarea.focus();
-      document.execCommand?.("undo");
-    },
-    triggerRedo() {
-      textarea.focus();
-      document.execCommand?.("redo");
-    },
-    triggerSearch() {
-      textarea.focus();
-    },
-    toggleWordWrap() {
-      wordWrap = !wordWrap;
-      textarea.wrap = wordWrap ? "soft" : "off";
-      saveStoredValue(PREF_KEYS.wordWrap, String(wordWrap));
-      return wordWrap;
-    },
-    isWordWrapEnabled: () => wordWrap,
-    stepFontSize(delta) {
-      fontSize = clampFontSize(fontSize + delta);
-      saveStoredValue(PREF_KEYS.fontSize, String(fontSize));
-      applyFontSize(fontSize);
-      return fontSize;
-    },
-    getFontSize: () => fontSize,
-    toggleMinimap: (force) => fallbackMinimap?.toggle(force),
-    isMinimapVisible: () => (fallbackMinimap ? fallbackMinimap.isVisible() : false),
-    setHardwareKeyboardMode(nextState) {
-      hardwareKeyboard = Boolean(nextState);
-      saveStoredValue(PREF_KEYS.hardwareKeyboard, String(hardwareKeyboard));
-      applyHardwareKeyboardAttributes(hardwareKeyboard, textarea);
-      return hardwareKeyboard;
-    },
-    toggleHardwareKeyboardMode() {
-      return this.setHardwareKeyboardMode(!hardwareKeyboard);
-    },
-    isHardwareKeyboardMode: () => hardwareKeyboard,
-    getActiveFileId: () => activeFileId,
-    getValue: () => (textarea ? textarea.value : ""),
-    getCompletions: (prefix) => {
-      const query = prefix !== undefined
-        ? prefix
-        : extractWordBeforeCursor(textarea.value, textarea.selectionEnd ?? textarea.value.length).word;
-      return getLanguageCompletions(activeLang, query, textarea.value);
-    },
-    acceptTopCompletion: () => {
-      if (!fallbackAutocompleteBar.isOpen()) {
-        refreshFallbackAutocomplete();
-      }
-      return fallbackAutocompleteBar.acceptCurrent();
-    },
-    syncDoc: (fileId, newContent) => {
-      if (activeFileId === fileId && textarea) {
-        if (textarea.value !== newContent) {
-          textarea.value = newContent;
-        }
-      }
-    },
-    focus: () => textarea?.focus(),
-    destroy() {
-      fallbackErrorMarkersByFile.clear();
-      if (enableGlobalRuler) {
-        renderErrorRuler([], 1, () => {});
-      }
-      fallbackAutocompleteBar.destroy();
-      fallbackMinimap?.destroy?.();
-      textarea.value = "";
-      mountEl.innerHTML = "";
-      activeFileId = null;
-    }
-  };
-}
-
 function applyFontSize(px) {
   document.documentElement.style.setProperty("--editor-font-size", `${px}px`);
 }
 
 function clampFontSize(px) {
   return Math.min(Math.max(Math.round(px), MIN_FONT_SIZE), MAX_FONT_SIZE);
-}
-
-function readStoredBool(key, fallback) {
-  const raw = readStoredValue(key);
-  if (raw === "true") return true;
-  if (raw === "false") return false;
-  return fallback;
-}
-
-function readStoredValue(key) {
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function saveStoredValue(key, value) {
-  try {
-    window.localStorage.setItem(key, value);
-  } catch {
-    // Ignorar errores de almacenamiento restringido
-  }
 }

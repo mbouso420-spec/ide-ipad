@@ -58,13 +58,18 @@ const ICONS = {
 
 /**
  * Devuelve el string SVG de un icono Lucide.
+ * Sanea `extraClass` antes de interpolarlo para prevenir rupturas de atributo HTML.
  * @param {keyof typeof ICONS} name
  * @param {string} [extraClass=""]
  * @returns {string}
  */
 export function icon(name, extraClass = "") {
   const paths = ICONS[name] ?? ICONS.code;
-  const cls = extraClass ? `icon-svg ${extraClass}` : "icon-svg";
+  const safeExtra = String(extraClass || "")
+    .replace(/[^a-zA-Z0-9_\-\s]/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+  const cls = safeExtra ? `icon-svg ${safeExtra}` : "icon-svg";
   return `<svg class="${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`;
 }
 

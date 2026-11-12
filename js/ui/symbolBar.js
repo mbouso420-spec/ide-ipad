@@ -1,3 +1,5 @@
+import { readStoredBool, saveStoredValue } from "../utils/storage.js";
+
 const SYMBOL_STORAGE_KEY = "ide.symbols.visible";
 
 /**
@@ -275,7 +277,7 @@ export function initSymbolBar({ onInsert, onToggle }) {
 
   function setVisible(nextState) {
     visible = Boolean(nextState);
-    saveStoredBool(SYMBOL_STORAGE_KEY, visible);
+    saveStoredValue(SYMBOL_STORAGE_KEY, String(visible));
     applyVisibility();
     onToggle?.(visible);
     return visible;
@@ -340,23 +342,4 @@ function readDefaultVisibility() {
     return window.matchMedia("(pointer: coarse)").matches;
   }
   return true;
-}
-
-function readStoredBool(key, fallback) {
-  try {
-    const raw = window.localStorage.getItem(key);
-    if (raw === "true") return true;
-    if (raw === "false") return false;
-  } catch {
-    // Sin acceso a storage
-  }
-  return fallback;
-}
-
-function saveStoredBool(key, value) {
-  try {
-    window.localStorage.setItem(key, String(value));
-  } catch {
-    // Sin acceso a storage
-  }
 }

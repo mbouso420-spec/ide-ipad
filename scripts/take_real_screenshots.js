@@ -1,11 +1,15 @@
+/* global document */
 import http from "node:http";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(__dirname, "..");
+const REAL_ROOT_DIR = fs.realpathSync(ROOT_DIR);
+const ROOT_PREFIX = REAL_ROOT_DIR.endsWith(path.sep) ? REAL_ROOT_DIR : REAL_ROOT_DIR + path.sep;
 const OUT_DIR = path.join(ROOT_DIR, "docs", "screenshots");
 
 const puppeteerModulePath = path.join(
@@ -85,8 +89,23 @@ let tempUserDataDir = null;
 
 try {
   server = http.createServer((req, res) => {
-    const urlPath = (req.url || "/").split("?")[0];
-    let filePath = path.join(ROOT_DIR, urlPath === "/" ? "index.html" : urlPath);
+    let decodedPath;
+    try {
+      decodedPath = decodeURIComponent((req.url || "/").split("?")[0]);
+    } catch {
+      res.writeHead(400);
+      res.end("Bad request");
+      return;
+    }
+
+    const relativePath = decodedPath.replace(/^\/+/, "") || "index.html";
+    let filePath = path.resolve(REAL_ROOT_DIR, relativePath);
+
+    if (filePath !== REAL_ROOT_DIR && !filePath.startsWith(ROOT_PREFIX)) {
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
 
     if (!fs.existsSync(filePath)) {
       res.writeHead(404);
@@ -94,19 +113,38 @@ try {
       return;
     }
 
-    const stat = fs.statSync(filePath);
+    let stat = fs.statSync(filePath);
     if (stat.isDirectory()) {
       filePath = path.join(filePath, "index.html");
+      if (!filePath.startsWith(ROOT_PREFIX) || !fs.existsSync(filePath)) {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+      stat = fs.statSync(filePath);
     }
 
-    const ext = path.extname(filePath).toLowerCase();
+    const realFilePath = fs.realpathSync(filePath);
+    if (realFilePath !== REAL_ROOT_DIR && !realFilePath.startsWith(ROOT_PREFIX)) {
+      res.writeHead(403);
+      res.end("Forbidden");
+      return;
+    }
+
+    if (!stat.isFile()) {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
+    }
+
+    const ext = path.extname(realFilePath).toLowerCase();
     const contentType = MIME_TYPES[ext] || "application/octet-stream";
 
     res.writeHead(200, {
       "Content-Type": contentType,
       "Cache-Control": "no-cache"
     });
-    fs.createReadStream(filePath).pipe(res);
+    fs.createReadStream(realFilePath).pipe(res);
   });
 
   await new Promise((resolve, reject) => {
@@ -118,20 +156,20 @@ try {
   const executablePath = findBrowserExecutable();
   console.log("Launching browser from:", executablePath);
 
-  tempUserDataDir = path.join(ROOT_DIR, "scripts", `chrome_ud_${Date.now()}`);
-  fs.mkdirSync(tempUserDataDir, { recursive: true });
+  tempUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "studio-ide-chrome-"));
+
+  const launchArgs = [
+    ...(process.platform === "linux" ? ["--no-sandbox", "--disable-setuid-sandbox"] : []),
+    "--disable-gpu",
+    "--disable-dev-shm-usage",
+    "--window-size=1280,820"
+  ];
 
   browser = await puppeteer.launch({
     executablePath,
     headless: true,
     userDataDir: tempUserDataDir,
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-gpu",
-      "--disable-dev-shm-usage",
-      "--window-size=1280,820"
-    ]
+    args: launchArgs
   });
 
   const page = await browser.newPage();

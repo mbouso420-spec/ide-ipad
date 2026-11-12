@@ -1,3 +1,5 @@
+import { slugifyName } from "../utils/encoding.js";
+
 const DB_NAME = "studio_ide_db";
 const DB_VERSION = 1;
 const STORE_PROJECTS = "projects";
@@ -6,6 +8,7 @@ const ACTIVE_PROJECT_KEY = "ide.workspace.activeProjectId";
 
 const SEED_PROJECT_ID = "espacio-local";
 const MAX_STORED_CHAT_TURNS = 40;
+const MAX_GIST_RESTORE_ENTRY_BYTES = 5 * 1024 * 1024;
 
 const SEED_ENTRIES = [
   {
@@ -208,6 +211,7 @@ function openDb() {
     };
 
     let blockTimer = null;
+    let timedOut = false;
     const clearBlockTimer = () => {
       if (blockTimer !== null) {
         clearTimeout(blockTimer);
@@ -216,8 +220,10 @@ function openDb() {
     };
 
     req.onblocked = () => {
-      if (blockTimer !== null) return;
+      if (blockTimer !== null || timedOut) return;
       blockTimer = setTimeout(() => {
+        timedOut = true;
+        blockTimer = null;
         dbPromise = null;
         reject(new Error("IndexedDB bloqueada por otra pestaña abierta. Cerrá las demás pestañas o recargá la página."));
       }, 5000);
@@ -226,6 +232,11 @@ function openDb() {
     req.onsuccess = () => {
       clearBlockTimer();
       const db = req.result;
+      if (timedOut) {
+        // Si la apertura completó después del timeout de onblocked, cerrar la conexión huérfana.
+        try { db.close(); } catch (_) {}
+        return;
+      }
       db.onclose = () => {
         dbPromise = null;
       };
@@ -237,6 +248,7 @@ function openDb() {
     };
     req.onerror = () => {
       clearBlockTimer();
+      if (timedOut) return;
       dbPromise = null;
       reject(req.error || new Error("No se pudo abrir IndexedDB."));
     };
@@ -353,13 +365,18 @@ export async function getProject(projectId) {
 }
 
 export async function createLocalProject(name) {
-  const cleanName = name.trim();
-  const slug = cleanName
-    .toLowerCase()
-    .replace(/[^a-z0-9-_]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const id = `${slug || "proyecto"}-${Date.now().toString(36)}`;
+  const cleanName = String(name ?? "").trim();
+  if (!cleanName || /[\x00-\x1f\x7f]/.test(cleanName)) {
+    throw new Error("El nombre del proyecto no puede estar vacío ni contener caracteres de control.");
+  }
+  const slug = slugifyName(cleanName, { allowDots: false, collapse: true, fallback: "proyecto" });
+  const id = `${slug}-${Date.now().toString(36)}`;
   const now = Date.now();
+  const escapedCppName = cleanName
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n");
 
   const project = {
     id,
@@ -372,16 +389,25 @@ export async function createLocalProject(name) {
     updatedAt: now
   };
 
-  await putRecord(STORE_PROJECTS, project);
-  await putRecord(STORE_FILES, {
+  const initialFile = {
     key: makeFileKey(id, "main.cpp"),
     projectId: id,
     path: "main.cpp",
     isFolder: false,
-    content: `#include <iostream>\n\nint main() {\n    std::cout << "Proyecto ${cleanName}\\n";\n    return 0;\n}\n`,
+    content: `#include <iostream>\n\nint main() {\n    std::cout << "Proyecto ${escapedCppName}\\n";\n    return 0;\n}\n`,
     baseContent: "",
     deleted: false,
     updatedAt: now
+  };
+
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
+    tx.objectStore(STORE_PROJECTS).put(project);
+    tx.objectStore(STORE_FILES).put(initialFile);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("No se pudo crear el proyecto."));
   });
 
   return project;
@@ -532,86 +558,22 @@ export async function upsertEntry(
   }
 
   const key = makeFileKey(projectId, cleanPath);
-  const existing = await getRecord(STORE_FILES, key);
-  if (skipIfDeleted && existing?.deleted) {
-    return existing;
-  }
-  if (!allowOverwrite && existing && !existing.deleted) {
-    throw new Error(`Ya existe "${cleanPath}" en este proyecto.`);
-  }
-  if (existing && !existing.deleted && Boolean(existing.isFolder) !== Boolean(isFolder)) {
-    throw new Error(
-      existing.isFolder
-        ? `Ya existe una carpeta llamada "${cleanPath}" en este proyecto.`
-        : `Ya existe un archivo llamado "${cleanPath}" en este proyecto.`
-    );
-  }
-  if (!isFolder) {
-    const prefixKey = makeFileKey(projectId, `${cleanPath}/`);
-    const hasChildEntries = await hasActiveKeyWithPrefix(STORE_FILES, prefixKey);
-    if (hasChildEntries) {
-      throw new Error(`Ya existe una carpeta llamada "${cleanPath}" con contenido adentro.`);
-    }
-  }
-
-  // Asegurar carpetas padre implícitas si se escribe p. ej. "src/utils/math.cpp"
   const parts = cleanPath.split("/");
-  if (parts.length > 1) {
-    let prefix = "";
-    for (let i = 0; i < parts.length - 1; i += 1) {
-      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
-      const folderKey = makeFileKey(projectId, prefix);
-      const existingFolder = await getRecord(STORE_FILES, folderKey);
-      if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
-        throw new Error(`No se puede crear dentro de "${prefix}" porque es un archivo.`);
-      }
-      if (!existingFolder || existingFolder.deleted) {
-        await putRecord(STORE_FILES, {
-          key: folderKey,
-          projectId,
-          path: prefix,
-          isFolder: true,
-          content: "",
-          baseContent: "",
-          contentLoaded: true,
-          deleted: false,
-          updatedAt: Date.now()
-        });
-      }
-    }
-  }
-
   const db = await openDb();
   let writtenRecord = null;
   let skippedDeleted = false;
   let txErr = null;
 
+  // Todas las validaciones, creación de carpetas padre y escritura final ocurren en una única transacción readwrite (evita TOCTOU).
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_FILES, "readwrite");
     const store = tx.objectStore(STORE_FILES);
-    const req = store.get(key);
-    req.onsuccess = () => {
-      const latestExisting = req.result || null;
-      if (skipIfDeleted && latestExisting?.deleted) {
-        writtenRecord = latestExisting;
-        skippedDeleted = true;
-        return;
-      }
-      if (!allowOverwrite && latestExisting && !latestExisting.deleted) {
-        txErr = new Error(`Ya existe "${cleanPath}" en este proyecto.`);
-        tx.abort();
-        return;
-      }
-      if (latestExisting && !latestExisting.deleted && Boolean(latestExisting.isFolder) !== Boolean(isFolder)) {
-        txErr = new Error(
-          latestExisting.isFolder
-            ? `Ya existe una carpeta llamada "${cleanPath}" en este proyecto.`
-            : `Ya existe un archivo llamado "${cleanPath}" en este proyecto.`
-        );
-        tx.abort();
-        return;
-      }
+    const abortWith = (message) => {
+      txErr = new Error(message);
+      tx.abort();
+    };
 
+    const writeTarget = (latestExisting) => {
       const resolvedBase =
         baseContent !== null
           ? baseContent
@@ -660,6 +622,81 @@ export async function upsertEntry(
         updatedAt: Date.now()
       };
       store.put(writtenRecord);
+    };
+
+    const ensureParentAt = (idx, prefixAcc, latestExisting) => {
+      if (idx >= parts.length - 1) {
+        writeTarget(latestExisting);
+        return;
+      }
+      const nextPrefix = prefixAcc ? `${prefixAcc}/${parts[idx]}` : parts[idx];
+      const folderKey = makeFileKey(projectId, nextPrefix);
+      const fReq = store.get(folderKey);
+      fReq.onsuccess = () => {
+        const existingFolder = fReq.result || null;
+        if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
+          abortWith(`No se puede crear dentro de "${nextPrefix}" porque es un archivo.`);
+          return;
+        }
+        if (!existingFolder || existingFolder.deleted) {
+          store.put({
+            key: folderKey,
+            projectId,
+            path: nextPrefix,
+            isFolder: true,
+            content: "",
+            baseContent: "",
+            contentLoaded: true,
+            deleted: false,
+            updatedAt: Date.now()
+          });
+        }
+        ensureParentAt(idx + 1, nextPrefix, latestExisting);
+      };
+      fReq.onerror = () => reject(fReq.error);
+    };
+
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const latestExisting = req.result || null;
+      if (skipIfDeleted && latestExisting?.deleted) {
+        writtenRecord = latestExisting;
+        skippedDeleted = true;
+        return;
+      }
+      if (!allowOverwrite && latestExisting && !latestExisting.deleted) {
+        abortWith(`Ya existe "${cleanPath}" en este proyecto.`);
+        return;
+      }
+      if (latestExisting && !latestExisting.deleted && Boolean(latestExisting.isFolder) !== Boolean(isFolder)) {
+        abortWith(
+          latestExisting.isFolder
+            ? `Ya existe una carpeta llamada "${cleanPath}" en este proyecto.`
+            : `Ya existe un archivo llamado "${cleanPath}" en este proyecto.`
+        );
+        return;
+      }
+
+      if (!isFolder) {
+        const prefixKey = makeFileKey(projectId, `${cleanPath}/`);
+        const cursorReq = store.openCursor(IDBKeyRange.bound(prefixKey, `${prefixKey}\uffff`, false, true));
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result;
+          if (!cursor) {
+            ensureParentAt(0, "", latestExisting);
+            return;
+          }
+          if (!cursor.value?.deleted) {
+            abortWith(`Ya existe una carpeta llamada "${cleanPath}" con contenido adentro.`);
+            return;
+          }
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+        return;
+      }
+
+      ensureParentAt(0, "", latestExisting);
     };
     req.onerror = () => reject(req.error);
     tx.oncomplete = () => resolve();
@@ -756,124 +793,146 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
     throw new Error("No se puede mover una carpeta dentro de sí misma.");
   }
 
-  const all = await getAllRawProjectEntries(projectId);
-  const targetConflict = all.find(
-    (e) =>
-      !e.deleted &&
-      e.path !== fromPath &&
-      !(isFolder && e.path.startsWith(`${fromPath}/`)) &&
-      (e.path === toPath || e.path.startsWith(`${toPath}/`) || (!e.isFolder && toPath.startsWith(`${e.path}/`)))
-  );
-  if (targetConflict) {
-    throw new Error(`Ya existe "${targetConflict.path}" en esa ubicación.`);
-  }
-
-  const rawByPath = new Map(all.map((e) => [e.path, e]));
-  const affected = all.filter(
-    (e) => !e.deleted && (e.path === fromPath || (isFolder && e.path.startsWith(`${fromPath}/`)))
-  );
-
-  if (affected.length === 0) {
-    return;
-  }
-
-  // Validar colisiones con ancestros archivo antes de abrir la transacción
-  for (const item of affected) {
-    const suffix = item.path.slice(fromPath.length);
-    const targetPath = `${toPath}${suffix}`;
-    const parts = targetPath.split("/");
-    if (parts.length > 1) {
-      let prefix = "";
-      for (let i = 0; i < parts.length - 1; i += 1) {
-        prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
-        const existingFolder = rawByPath.get(prefix);
-        if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
-          throw new Error(`No se puede crear dentro de "${prefix}" porque es un archivo.`);
-        }
-      }
-    }
-  }
-
   const db = await openDb();
+  let didRename = false;
+  let txErr = null;
+
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_FILES, "readwrite");
     const store = tx.objectStore(STORE_FILES);
-    const now = Date.now();
-    const ensuredFolders = new Set();
+    const abortWith = (message) => {
+      txErr = new Error(message);
+      tx.abort();
+    };
 
-    for (const item of affected) {
-      const suffix = item.path.slice(fromPath.length);
-      const targetPath = `${toPath}${suffix}`;
-      const parts = targetPath.split("/");
-      if (parts.length > 1) {
-        let prefix = "";
-        for (let i = 0; i < parts.length - 1; i += 1) {
-          prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
-          if (ensuredFolders.has(prefix)) continue;
-          const existingFolder = rawByPath.get(prefix);
-          if (!existingFolder || existingFolder.deleted) {
-            const folderKey = makeFileKey(projectId, prefix);
-            store.put({
-              key: folderKey,
-              projectId,
-              path: prefix,
-              isFolder: true,
-              content: "",
-              baseContent: "",
-              contentLoaded: true,
-              deleted: false,
-              updatedAt: now
-            });
+    const req = store.index("byProject").getAll(projectId);
+    req.onsuccess = () => {
+      const all = Array.isArray(req.result) ? req.result : [];
+      const targetConflict = all.find(
+        (e) =>
+          !e.deleted &&
+          e.path !== fromPath &&
+          !(isFolder && e.path.startsWith(`${fromPath}/`)) &&
+          (e.path === toPath || e.path.startsWith(`${toPath}/`) || (!e.isFolder && toPath.startsWith(`${e.path}/`)))
+      );
+      if (targetConflict) {
+        abortWith(`Ya existe "${targetConflict.path}" en esa ubicación.`);
+        return;
+      }
+
+      const rawByPath = new Map(all.map((e) => [e.path, e]));
+      const affected = all.filter(
+        (e) => !e.deleted && (e.path === fromPath || (isFolder && e.path.startsWith(`${fromPath}/`)))
+      );
+
+      if (affected.length === 0) {
+        return;
+      }
+
+      // Validar colisiones con ancestros archivo dentro de la misma transacción.
+      for (const item of affected) {
+        const suffix = item.path.slice(fromPath.length);
+        const targetPath = `${toPath}${suffix}`;
+        const parts = targetPath.split("/");
+        if (parts.length > 1) {
+          let prefix = "";
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+            const existingFolder = rawByPath.get(prefix);
+            if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
+              abortWith(`No se puede crear dentro de "${prefix}" porque es un archivo.`);
+              return;
+            }
           }
-          ensuredFolders.add(prefix);
         }
       }
 
-      const prevTarget = rawByPath.get(targetPath);
-      const preserveTargetBase =
-        prevTarget && prevTarget.trackedInGithub ? prevTarget.baseContent : item.trackedInGithub ? "" : item.baseContent;
-      const recreatedOverUnloaded = Boolean(
-        !item.isFolder && prevTarget && prevTarget.trackedInGithub && prevTarget.contentLoaded === false
-      );
-      const targetKey = makeFileKey(projectId, targetPath);
-      const targetIsBinary = !item.isFolder && Boolean(item.isBinary);
-      const targetBase64 = targetIsBinary ? (item.base64 ?? null) : null;
+      didRename = true;
+      const now = Date.now();
+      const ensuredFolders = new Set();
 
-      store.put({
-        key: targetKey,
-        projectId,
-        path: targetPath,
-        isFolder: item.isFolder,
-        content: item.isFolder ? "" : item.content,
-        baseContent: item.isFolder ? "" : preserveTargetBase,
-        blobSha: item.isFolder ? null : prevTarget?.blobSha ?? null,
-        mode: item.isFolder ? null : item.mode ?? prevTarget?.mode ?? null,
-        contentLoaded: item.isFolder ? true : Boolean(item.contentLoaded ?? true),
-        trackedInGithub: Boolean(prevTarget?.trackedInGithub),
-        forceModified: recreatedOverUnloaded || Boolean(prevTarget?.forceModified),
-        isBinary: targetIsBinary,
-        base64: targetBase64,
-        deleted: false,
-        updatedAt: now
-      });
+      for (const item of affected) {
+        const suffix = item.path.slice(fromPath.length);
+        const targetPath = `${toPath}${suffix}`;
+        const parts = targetPath.split("/");
+        if (parts.length > 1) {
+          let prefix = "";
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+            if (ensuredFolders.has(prefix)) continue;
+            const existingFolder = rawByPath.get(prefix);
+            if (!existingFolder || existingFolder.deleted) {
+              const folderKey = makeFileKey(projectId, prefix);
+              store.put({
+                key: folderKey,
+                projectId,
+                path: prefix,
+                isFolder: true,
+                content: "",
+                baseContent: "",
+                contentLoaded: true,
+                deleted: false,
+                updatedAt: now
+              });
+            }
+            ensuredFolders.add(prefix);
+          }
+        }
 
-      if (item.trackedInGithub && !item.isFolder) {
-        item.deleted = true;
-        item.content = "";
-        item.base64 = null;
-        item.updatedAt = now;
-        store.put(item);
-      } else {
-        store.delete(item.key);
+        const prevTarget = rawByPath.get(targetPath);
+        const preserveTargetBase =
+          prevTarget && prevTarget.trackedInGithub ? prevTarget.baseContent : item.trackedInGithub ? "" : item.baseContent;
+        const preserveTargetBaseBase64 =
+          !item.isFolder && prevTarget && prevTarget.trackedInGithub
+            ? resolveEntryBaselineBase64(prevTarget)
+            : null;
+        const recreatedOverUnloaded = Boolean(
+          !item.isFolder && prevTarget && prevTarget.trackedInGithub && prevTarget.contentLoaded === false
+        );
+        const targetKey = makeFileKey(projectId, targetPath);
+        const targetIsBinary = !item.isFolder && Boolean(item.isBinary);
+        const targetBase64 = targetIsBinary ? (item.base64 ?? null) : null;
+
+        store.put({
+          key: targetKey,
+          projectId,
+          path: targetPath,
+          isFolder: item.isFolder,
+          content: item.isFolder ? "" : item.content,
+          baseContent: item.isFolder ? "" : preserveTargetBase,
+          blobSha: item.isFolder ? null : prevTarget?.blobSha ?? null,
+          mode: item.isFolder ? null : item.mode ?? prevTarget?.mode ?? null,
+          contentLoaded: item.isFolder ? true : Boolean(item.contentLoaded ?? true),
+          trackedInGithub: Boolean(prevTarget?.trackedInGithub),
+          forceModified: recreatedOverUnloaded || Boolean(prevTarget?.forceModified),
+          isBinary: targetIsBinary,
+          base64: targetBase64,
+          baseBase64: preserveTargetBaseBase64,
+          deleted: false,
+          updatedAt: now
+        });
+
+        if (item.trackedInGithub && !item.isFolder) {
+          item.deleted = true;
+          item.content = "";
+          item.base64 = null;
+          item.updatedAt = now;
+          store.put(item);
+        } else {
+          store.delete(item.key);
+        }
       }
-    }
+    };
 
+    req.onerror = () => reject(req.error);
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción de renombrado se canceló."));
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de renombrado se canceló."));
   });
 
-  broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder });
+  if (didRename) {
+    broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder });
+  }
 }
 
 export async function deleteProjectEntry(projectId, targetPath, isFolder) {
@@ -1201,6 +1260,54 @@ export async function hydrateGithubProject({ owner, repo, branch, commitSha, fil
   return project;
 }
 
+function classifyPendingChangeStatus(item) {
+  if (!item || item.isFolder) return null;
+  if (item.contentLoaded === false && !item.deleted) return null;
+
+  if (item.deleted && item.trackedInGithub) {
+    return "deleted";
+  }
+  if (!item.deleted && !item.trackedInGithub) {
+    return "added";
+  }
+  if (!item.deleted) {
+    const curBase64 = item.isBinary ? (item.base64 ?? null) : null;
+    const origBase64 = resolveEntryBaselineBase64(item);
+    if (item.forceModified || item.content !== item.baseContent || curBase64 !== origBase64) {
+      return "modified";
+    }
+  }
+  return null;
+}
+
+/**
+ * Cuenta de forma streaming vía cursor IndexedDB los cambios pendientes frente a GitHub
+ * sin cargar ni retener todos los contenidos/Base64 en RAM (usado por badges de UI).
+ * @param {string} projectId
+ * @returns {Promise<number>}
+ */
+export async function countPendingGithubChanges(projectId) {
+  if (!projectId) return 0;
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readonly");
+    const req = tx.objectStore(STORE_FILES).index("byProject").openCursor(projectId);
+    let count = 0;
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) {
+        resolve(count);
+        return;
+      }
+      if (classifyPendingChangeStatus(cursor.value) !== null) {
+        count += 1;
+      }
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
+  });
+}
+
 /**
  * Calcula los cambios pendientes frente al repositorio de GitHub (creados, modificados y borrados),
  * incluyendo baseContent para poder previsualizar el Diff línea por línea antes del commit.
@@ -1210,17 +1317,17 @@ export async function getPendingGithubChanges(projectId) {
   const changes = [];
 
   for (const item of all) {
-    if (item.isFolder) continue;
-    if (item.contentLoaded === false && !item.deleted) continue;
+    const status = classifyPendingChangeStatus(item);
+    if (!status) continue;
 
-    if (item.deleted && item.trackedInGithub) {
+    if (status === "deleted") {
       changes.push({
         path: item.path,
         status: "deleted",
         content: "",
         baseContent: item.baseContent || ""
       });
-    } else if (!item.deleted && !item.trackedInGithub) {
+    } else if (status === "added") {
       changes.push({
         path: item.path,
         status: "added",
@@ -1230,20 +1337,16 @@ export async function getPendingGithubChanges(projectId) {
         isBinary: Boolean(item.isBinary),
         base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
       });
-    } else if (!item.deleted) {
-      const curBase64 = item.isBinary ? (item.base64 ?? null) : null;
-      const origBase64 = resolveEntryBaselineBase64(item);
-      if (item.forceModified || item.content !== item.baseContent || curBase64 !== origBase64) {
-        changes.push({
-          path: item.path,
-          status: "modified",
-          content: item.content,
-          baseContent: item.baseContent || "",
-          mode: item.mode || null,
-          isBinary: Boolean(item.isBinary),
-          base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
-        });
-      }
+    } else {
+      changes.push({
+        path: item.path,
+        status: "modified",
+        content: item.content,
+        baseContent: item.baseContent || "",
+        mode: item.mode || null,
+        isBinary: Boolean(item.isBinary),
+        base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
+      });
     }
   }
 
@@ -1260,7 +1363,6 @@ export async function getPendingGithubChanges(projectId) {
  * @param {Array<{path: string, status: string, content: string}> | null} [pushedChanges]
  */
 export async function markProjectSynced(projectId, newCommitSha, pushedChanges = null) {
-  const all = await getAllRawProjectEntries(projectId);
   const db = await openDb();
   const pushedByPath = Array.isArray(pushedChanges)
     ? new Map(pushedChanges.map((c) => [normalizePath(c.path), c]))
@@ -1282,89 +1384,96 @@ export async function markProjectSynced(projectId, newCommitSha, pushedChanges =
       }
     };
 
-    for (const item of all) {
-      if (item.isFolder) continue;
+    const filesReq = store.index("byProject").getAll(projectId);
+    filesReq.onsuccess = () => {
+      const all = Array.isArray(filesReq.result) ? filesReq.result : [];
 
-      if (!pushedByPath) {
-        if (item.deleted) {
-          store.delete(item.key);
-        } else if (item.contentLoaded !== false) {
-          item.baseContent = item.content;
-          item.baseBase64 = item.isBinary ? (item.base64 ?? null) : null;
-          item.trackedInGithub = true;
-          item.forceModified = false;
-          item.contentLoaded = true;
-          item.updatedAt = now;
-          store.put(item);
+      for (const item of all) {
+        if (item.isFolder) continue;
+
+        if (!pushedByPath) {
+          if (item.deleted) {
+            store.delete(item.key);
+          } else if (item.contentLoaded !== false) {
+            item.baseContent = item.content;
+            item.baseBase64 = item.isBinary ? (item.base64 ?? null) : null;
+            item.trackedInGithub = true;
+            item.forceModified = false;
+            item.contentLoaded = true;
+            item.updatedAt = now;
+            store.put(item);
+          }
+          continue;
         }
-        continue;
-      }
 
-      const pushed = pushedByPath.get(item.path);
-      if (!pushed) {
-        if (item.deleted && !item.trackedInGithub) {
-          store.delete(item.key);
+        const pushed = pushedByPath.get(item.path);
+        if (!pushed) {
+          if (item.deleted && !item.trackedInGithub) {
+            store.delete(item.key);
+          }
+          continue;
         }
-        continue;
-      }
 
-      if (pushed.status === "deleted") {
-        if (item.deleted) {
-          store.delete(item.key);
-        } else {
-          // Se volvió a crear durante el push: en GitHub ya no existe, así que ahora es un archivo nuevo.
-          item.trackedInGithub = false;
-          item.baseContent = "";
-          item.baseBase64 = null;
-          item.blobSha = null;
-          item.forceModified = false;
-          item.updatedAt = now;
-          store.put(item);
+        if (pushed.status === "deleted") {
+          if (item.deleted) {
+            store.delete(item.key);
+          } else {
+            // Se volvió a crear durante el push: en GitHub ya no existe, así que ahora es un archivo nuevo.
+            item.trackedInGithub = false;
+            item.baseContent = "";
+            item.baseBase64 = null;
+            item.blobSha = null;
+            item.forceModified = false;
+            item.updatedAt = now;
+            store.put(item);
+          }
+          continue;
         }
-        continue;
-      }
 
-      // Alta o modificación: la versión remota pasa a ser exactamente la que se envió.
-      const pushedIsBinary = Boolean(pushed.isBinary);
-      item.baseContent = pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : "");
-      item.baseBase64 = pushedIsBinary ? (pushed.base64 ?? null) : null;
-      item.trackedInGithub = true;
-      item.forceModified = false;
-      if (!item.deleted) {
-        item.contentLoaded = true;
-      }
-      item.updatedAt = now;
-      store.put(item);
-    }
-
-    if (pushedByPath) {
-      // Lo publicado que ya no existe localmente (p. ej. un archivo nuevo borrado o renombrado mientras viajaba
-      // el push) ahora sí existe en GitHub: se registra como borrado pendiente para no divergir en silencio.
-      const presentPaths = new Set(all.map((e) => e.path));
-      for (const [path, pushed] of pushedByPath) {
-        if (pushed.status === "deleted" || presentPaths.has(path)) continue;
+        // Alta o modificación: la versión remota pasa a ser exactamente la que se envió.
         const pushedIsBinary = Boolean(pushed.isBinary);
-        store.put({
-          key: makeFileKey(projectId, path),
-          projectId,
-          path,
-          isFolder: false,
-          content: "",
-          baseContent: pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : ""),
-          blobSha: null,
-          mode: pushed.mode || null,
-          contentLoaded: true,
-          trackedInGithub: true,
-          forceModified: false,
-          isBinary: pushedIsBinary,
-          base64: null,
-          baseBase64: pushedIsBinary ? (pushed.base64 ?? null) : null,
-          deleted: true,
-          updatedAt: now
-        });
+        item.baseContent = pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : "");
+        item.baseBase64 = pushedIsBinary ? (pushed.base64 ?? null) : null;
+        item.trackedInGithub = true;
+        item.forceModified = false;
+        if (!item.deleted) {
+          item.contentLoaded = true;
+        }
+        item.updatedAt = now;
+        store.put(item);
       }
-    }
 
+      if (pushedByPath) {
+        // Lo publicado que ya no existe localmente (p. ej. un archivo nuevo borrado o renombrado mientras viajaba
+        // el push) ahora sí existe en GitHub: se registra como borrado pendiente para no divergir en silencio.
+        const presentPaths = new Set(all.map((e) => e.path));
+        for (const [path, pushed] of pushedByPath) {
+          if (pushed.status === "deleted" || presentPaths.has(path)) continue;
+          const pushedIsBinary = Boolean(pushed.isBinary);
+          store.put({
+            key: makeFileKey(projectId, path),
+            projectId,
+            path,
+            isFolder: false,
+            content: "",
+            baseContent: pushedIsBinary ? "" : (typeof pushed.content === "string" ? pushed.content : ""),
+            blobSha: null,
+            mode: pushed.mode || null,
+            contentLoaded: true,
+            trackedInGithub: true,
+            forceModified: false,
+            isBinary: pushedIsBinary,
+            base64: null,
+            baseBase64: pushedIsBinary ? (pushed.base64 ?? null) : null,
+            deleted: true,
+            updatedAt: now
+          });
+        }
+      }
+    };
+
+    projReq.onerror = () => reject(projReq.error);
+    filesReq.onerror = () => reject(filesReq.error);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error || new Error("La transacción de sincronización se canceló."));
@@ -1422,7 +1531,14 @@ export async function applyRemotePullPlan(
           for (let i = 0; i < parts.length - 1; i += 1) {
             prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
             const prevFolder = rawByPath.get(prefix);
-            if ((!prevFolder || prevFolder.deleted) && !recordsToPut.has(prefix)) {
+            const prevKey = prevFolder?.key || makeFileKey(projectId, prefix);
+            if (prevFolder && !prevFolder.deleted && !prevFolder.isFolder && !keysToDelete.has(prevKey)) {
+              txErr = new Error(`No se puede aplicar "${cleanPath}" porque "${prefix}" existe como archivo.`);
+              tx.abort();
+              return false;
+            }
+            if ((!prevFolder || prevFolder.deleted || keysToDelete.has(prevKey)) && !recordsToPut.has(prefix)) {
+              keysToDelete.delete(prevKey);
               recordsToPut.set(prefix, {
                 key: makeFileKey(projectId, prefix),
                 projectId,
@@ -1436,6 +1552,7 @@ export async function applyRemotePullPlan(
               });
             }
           }
+          return true;
         }
 
         for (const delPath of deletedSet) {
@@ -1448,9 +1565,26 @@ export async function applyRemotePullPlan(
           if (!cleanPath) continue;
           deletedSet.delete(cleanPath);
           keysToDelete.delete(makeFileKey(projectId, cleanPath));
-          ensureFolderParents(cleanPath);
+          if (!ensureFolderParents(cleanPath)) return;
 
           const existing = rawByPath.get(cleanPath);
+          if (existing && !existing.deleted && existing.isFolder) {
+            const hasRemainingChildren = allRaw.some(
+              (e) =>
+                !e.deleted &&
+                e.path.startsWith(`${cleanPath}/`) &&
+                !deletedSet.has(e.path) &&
+                !keysToDelete.has(e.key)
+            );
+            if (hasRemainingChildren) {
+              txErr = new Error(
+                `No se puede reemplazar la carpeta "${cleanPath}" con un archivo mientras conserve hijos activos.`
+              );
+              tx.abort();
+              return;
+            }
+          }
+
           const loaded = upd.contentLoaded !== false;
           const updIsBinary = Boolean(upd.isBinary);
           const textContent = loaded && !updIsBinary ? String(upd.content ?? "") : "";
@@ -1576,31 +1710,6 @@ function getRecord(storeName, key) {
   );
 }
 
-function hasActiveKeyWithPrefix(storeName, prefix) {
-  return openDb().then(
-    (db) =>
-      new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, "readonly");
-        const store = tx.objectStore(storeName);
-        const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`, false, false);
-        const req = store.openCursor(range);
-        req.onsuccess = () => {
-          const cursor = req.result;
-          if (!cursor) {
-            resolve(false);
-            return;
-          }
-          if (!cursor.value.deleted) {
-            resolve(true);
-            return;
-          }
-          cursor.continue();
-        };
-        req.onerror = () => reject(req.error);
-      })
-  );
-}
-
 function putRecord(storeName, value) {
   return openDb().then(
     (db) =>
@@ -1655,26 +1764,43 @@ export async function readCredentialsBackup() {
  * @param {{ projectName: string, entries: Array<{ path: string, content: string, mode?: string|null }> }} options
  */
 export async function createProjectFromGistBackup({ projectName, entries }) {
-  const cleanName = String(projectName || "proyecto-restaurado").trim();
-  const slug = cleanName
-    .toLowerCase()
-    .replace(/[^a-z0-9-_]+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  const id = `${slug || "proyecto"}-gist-${Date.now().toString(36)}`;
+  const rawName = String(projectName || "proyecto-restaurado").replace(/[\x00-\x1f\x7f]/g, "").trim();
+  const cleanName = rawName || "proyecto-restaurado";
+  const slug = slugifyName(cleanName, { allowDots: false, collapse: true, fallback: "proyecto" });
+  const id = `${slug}-gist-${Date.now().toString(36)}`;
   const now = Date.now();
 
   const fileEntries = [];
   for (const e of entries || []) {
-    if (!e || e.isFolder || !e.path) continue;
+    if (!e || e.isFolder || typeof e.path !== "string" || !e.path) continue;
+    let validPath;
     try {
-      const validPath = validateUserPath(e.path);
-      fileEntries.push({ ...e, path: validPath });
+      // Validación estricta sin degradar a regex laxa (protege contra traversal '..' y DEL 0x7f).
+      validPath = validateUserPath(e.path);
     } catch {
-      const fallbackPath = normalizePath(e.path);
-      if (fallbackPath && !/[\x00-\x1f:*?"<>|]/.test(fallbackPath)) {
-        fileEntries.push({ ...e, path: fallbackPath });
+      continue;
+    }
+
+    const isBinary = Boolean(e.isBinary);
+    if (isBinary) {
+      if (e.base64 !== undefined && e.base64 !== null && typeof e.base64 !== "string") continue;
+      if (typeof e.base64 === "string" && e.base64.length > Math.ceil((MAX_GIST_RESTORE_ENTRY_BYTES * 4) / 3) + 16) {
+        continue;
+      }
+    } else {
+      if (e.content !== undefined && e.content !== null && typeof e.content !== "string") continue;
+      if (typeof e.content === "string" && e.content.length > MAX_GIST_RESTORE_ENTRY_BYTES) {
+        continue;
       }
     }
+
+    fileEntries.push({
+      path: validPath,
+      isBinary,
+      content: isBinary ? "" : (typeof e.content === "string" ? e.content : ""),
+      base64: isBinary ? (typeof e.base64 === "string" ? e.base64 : null) : null,
+      mode: typeof e.mode === "string" ? e.mode : null
+    });
   }
   const firstFile = fileEntries[0]?.path || "main.cpp";
 
@@ -1689,17 +1815,21 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
     updatedAt: now
   };
 
-  await putRecord(STORE_PROJECTS, project);
-
   const records = new Map();
   for (const entry of fileEntries) {
-    const cleanPath = normalizePath(entry.path);
+    const cleanPath = entry.path;
     if (!cleanPath) continue;
     const parts = cleanPath.split("/");
     let prefix = "";
+    let ancestorBlocked = false;
     for (let i = 0; i < parts.length - 1; i += 1) {
       prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
-      if (!records.has(prefix)) {
+      const existingAncestor = records.get(prefix);
+      if (existingAncestor && !existingAncestor.isFolder) {
+        ancestorBlocked = true;
+        break;
+      }
+      if (!existingAncestor) {
         records.set(prefix, {
           key: makeFileKey(id, prefix),
           projectId: id,
@@ -1717,39 +1847,41 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
         });
       }
     }
-    const isBinary = Boolean(entry.isBinary);
+    if (ancestorBlocked) continue;
+    const existingTarget = records.get(cleanPath);
+    if (existingTarget && existingTarget.isFolder) continue;
+
     records.set(cleanPath, {
       key: makeFileKey(id, cleanPath),
       projectId: id,
       path: cleanPath,
       isFolder: false,
-      content: isBinary ? "" : (entry.content || ""),
+      content: entry.content,
       baseContent: "",
       blobSha: null,
-      mode: entry.mode || null,
+      mode: entry.mode,
       contentLoaded: true,
       trackedInGithub: false,
       forceModified: false,
-      isBinary,
-      base64: isBinary ? (entry.base64 || null) : null,
+      isBinary: entry.isBinary,
+      base64: entry.base64,
       deleted: false,
       updatedAt: now
     });
   }
 
-  if (records.size > 0) {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE_FILES, "readwrite");
-      const store = tx.objectStore(STORE_FILES);
-      for (const record of records.values()) {
-        store.put(record);
-      }
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error || new Error("La transacción de restauración de Gist se canceló."));
-    });
-  }
+  const db = await openDb();
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
+    tx.objectStore(STORE_PROJECTS).put(project);
+    const store = tx.objectStore(STORE_FILES);
+    for (const record of records.values()) {
+      store.put(record);
+    }
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de restauración de Gist se canceló."));
+  });
 
   return project;
 }

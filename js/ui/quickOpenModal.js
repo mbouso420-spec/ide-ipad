@@ -1,5 +1,6 @@
 import { icon } from "./icons.js";
 import { keyboardRouter } from "./keyboardRouter.js";
+import { escapeHtml } from "../utils/dom.js";
 
 /**
  * Parsea una consulta de apertura rápida separando el nombre de archivo de la línea de salto opcional.
@@ -29,6 +30,8 @@ export function parseQuickOpenQuery(rawQuery) {
  * ideal para saltar en un toque a cualquier archivo de un repositorio grande en el iPad o PC.
  */
 export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = controller ? { signal: controller.signal } : undefined;
   const openBtn = document.getElementById("btn-quick-open");
   const dialog = document.getElementById("quick-open-dialog");
   const closeBtn = document.getElementById("btn-close-quick-open");
@@ -53,7 +56,16 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
     keyboardRouter.pushModal({
       id: "quick-open-dialog",
       blockGlobalShortcuts: true,
-      onEscape: () => close()
+      onEscape: () => close(),
+      onKey: (event) => {
+        const key = typeof event?.key === "string" ? event.key.toLowerCase() : "";
+        if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && key === "p") {
+          event.preventDefault();
+          close();
+          return true;
+        }
+        return false;
+      }
     });
     window.requestAnimationFrame(() => {
       input?.focus();
@@ -65,19 +77,19 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
     dialog?.close();
   }
 
-  openBtn?.addEventListener("click", () => open());
-  closeBtn?.addEventListener("click", () => close());
+  openBtn?.addEventListener("click", () => open(), listenOpts);
+  closeBtn?.addEventListener("click", () => close(), listenOpts);
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
       close();
     }
-  });
+  }, listenOpts);
 
   input?.addEventListener("input", () => {
     activeIndex = 0;
     renderResults(input.value);
-  });
+  }, listenOpts);
 
   input?.addEventListener("keydown", (event) => {
     if (event.key === "ArrowDown") {
@@ -103,21 +115,17 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
         pickFile(chosen.path, currentTargetLine);
       }
     }
-  });
+  }, listenOpts);
 
-  window.addEventListener("keydown", (event) => {
-    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey && event.key.toLowerCase() === "p") {
-      if (keyboardRouter.shouldBlockGlobalShortcuts("quick-open-dialog")) {
-        return;
-      }
-      event.preventDefault();
-      if (dialog?.open) {
-        close();
-      } else {
-        open();
-      }
+  const handleShortcutToggle = () => {
+    if (dialog?.open) {
+      close();
+    } else {
+      open();
     }
-  });
+  };
+  keyboardRouter.registerGlobalShortcut("ctrl+p", handleShortcutToggle);
+  keyboardRouter.registerGlobalShortcut("meta+p", handleShortcutToggle);
 
   function pickFile(path, targetLine = currentTargetLine) {
     close();
@@ -208,15 +216,11 @@ export function initQuickOpenModal({ getFiles, getActiveFile, onSelectFile }) {
 
   return {
     open,
-    close
+    close,
+    destroy() {
+      controller?.abort();
+      keyboardRouter.unregisterGlobalShortcut("ctrl+p");
+      keyboardRouter.unregisterGlobalShortcut("meta+p");
+    }
   };
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

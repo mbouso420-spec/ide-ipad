@@ -6,6 +6,8 @@
   "description": "Suite de QA automatizada de Studio IDE (no forma parte de la app publicada).",
   "scripts": {
     "test": "node --test --expose-gc --test-reporter=spec ./*.test.js",
+    "test:lint": "node --test --test-reporter=spec ./lint.test.js",
+    "test:unit": "node --input-type=module -e \"import { readdirSync } from 'node:fs'; import { spawnSync } from 'node:child_process'; const files = readdirSync('.').filter((f) => f.endsWith('.test.js') && f !== 'lint.test.js').sort(); const res = spawnSync(process.execPath, ['--expose-gc', '--test', '--test-reporter=spec', ...files], { stdio: 'inherit' }); process.exit(res.status ?? 1);\"",
     "test:e2e": "node --test --test-reporter=spec ./browser.e2e.mjs",
     "test:e2e:webkit": "node --test --test-reporter=spec ./webkit.e2e.mjs"
   },

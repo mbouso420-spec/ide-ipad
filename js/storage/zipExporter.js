@@ -26,6 +26,8 @@ export function computeCrc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
+export const MAX_SAFE_ZIP_BYTES = 250 * 1024 * 1024; // 250 MB para prevenir picos OOM en el navegador
+
 /**
  * Convierte un objeto Date en la representación de fecha y hora MS-DOS usada en PKZIP.
  * @param {Date} [date=new Date()]
@@ -33,7 +35,8 @@ export function computeCrc32(bytes) {
  */
 export function getDosDateTime(date = new Date()) {
   const d = date instanceof Date && !isNaN(date.getTime()) ? date : new Date();
-  const year = Math.max(1980, d.getFullYear());
+  // El formato MS-DOS almacena (año - 1980) en 7 bits (0..127 -> 1980..2107).
+  const year = Math.min(2107, Math.max(1980, d.getFullYear()));
   const month = d.getMonth() + 1;
   const day = d.getDate();
   const hours = d.getHours();
@@ -45,26 +48,29 @@ export function getDosDateTime(date = new Date()) {
   return { dosDate, dosTime };
 }
 
-/**
- * Construye un archivo .zip válido en memoria a partir de una lista de entradas de archivo.
- * @param {Array<{ path: string, content: string | Uint8Array }>} files
- * @param {{ date?: Date }} [options={}]
- * @returns {Uint8Array}
- */
-export function buildZipArchive(files, options = {}) {
+function sanitizeZipDownloadFilename(filename) {
+  const clean = String(filename || "")
+    .replace(/[\x00-\x1f\x7f]/g, "")
+    .replace(/[\/\\:*?"<>|]/g, "_")
+    .replace(/^\.+/, "")
+    .trim();
+  const base = clean || "proyecto.zip";
+  return base.toLowerCase().endsWith(".zip") ? base : `${base}.zip`;
+}
+
+function buildZipParts(files, options = {}) {
   const encoder = new TextEncoder();
   const { dosDate, dosTime } = getDosDateTime(options.date || new Date());
 
-  // Preparar metadatos y convertir contenidos a Uint8Array evitando rutas duplicadas
   const MAX_ZIP_UINT16 = 0xffff;
   const MAX_ZIP_UINT32 = 0xffffffff;
   const entriesByPath = new Map();
 
-  for (const file of files) {
-    if (!file || !file.path) continue;
+  for (const file of files || []) {
+    if (!file || file.isFolder || !file.path) continue;
     const rawPath = String(file.path).trim().replace(/\\/g, "/");
-    if (/[\x00-\x1f\x7f]/.test(rawPath)) {
-      throw new Error(`Ruta ZIP inválida (caracteres de control no permitidos): ${file.path}`);
+    if (/[\x00-\x1f\x7f]/.test(rawPath) || rawPath.includes(":")) {
+      throw new Error(`Ruta ZIP inválida (caracteres no permitidos): ${file.path}`);
     }
     const cleanSegments = [];
     for (const seg of rawPath.replace(/^\/+/, "").split("/")) {
@@ -122,6 +128,9 @@ export function buildZipArchive(files, options = {}) {
 
   const eocdSize = 22;
   const totalBufferSize = totalLocalSize + totalCentralDirSize + eocdSize;
+  if (totalBufferSize > MAX_SAFE_ZIP_BYTES) {
+    throw new Error("El archivo ZIP supera el límite seguro de 250 MB en memoria.");
+  }
   if (
     totalLocalSize > MAX_ZIP_UINT32 ||
     totalCentralDirSize > MAX_ZIP_UINT32 ||
@@ -130,125 +139,125 @@ export function buildZipArchive(files, options = {}) {
     throw new Error("El archivo ZIP supera el límite máximo de 4 GB para formato PKZIP 2.0.");
   }
 
-  const buffer = new Uint8Array(totalBufferSize);
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
+  const parts = [];
   let currentLocalOffset = 0;
   const localHeaderOffsets = [];
 
-  // 1. Escribir Local File Headers + File Data
+  // 1. Emitir Local File Headers + File Data como fragmentos independientes (evita doble copia contigua al generar Blob).
   for (const entry of entries) {
     localHeaderOffsets.push(currentLocalOffset);
+    const localHeader = new Uint8Array(30);
+    const view = new DataView(localHeader.buffer);
 
-    // Firma Local Header: 0x04034b50
-    view.setUint32(currentLocalOffset + 0, 0x04034b50, true);
-    // Versión necesaria para extraer: 20 (2.0)
-    view.setUint16(currentLocalOffset + 4, 20, true);
-    // Flags: 0x0800 (bit 11 indica nombre codificado en UTF-8)
-    view.setUint16(currentLocalOffset + 6, 0x0800, true);
-    // Método de compresión: 0 (STORE)
-    view.setUint16(currentLocalOffset + 8, 0, true);
-    // Hora y fecha MS-DOS
-    view.setUint16(currentLocalOffset + 10, dosTime, true);
-    view.setUint16(currentLocalOffset + 12, dosDate, true);
-    // CRC-32
-    view.setUint32(currentLocalOffset + 14, entry.crc, true);
-    // Tamaño comprimido y sin comprimir (iguales en STORE)
-    view.setUint32(currentLocalOffset + 18, entry.dataBytes.length, true);
-    view.setUint32(currentLocalOffset + 22, entry.dataBytes.length, true);
-    // Longitud del nombre del archivo
-    view.setUint16(currentLocalOffset + 26, entry.nameBytes.length, true);
-    // Longitud de campos extra: 0
-    view.setUint16(currentLocalOffset + 28, 0, true);
+    view.setUint32(0, 0x04034b50, true);
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 0x0800, true);
+    view.setUint16(8, 0, true);
+    view.setUint16(10, dosTime, true);
+    view.setUint16(12, dosDate, true);
+    view.setUint32(14, entry.crc, true);
+    view.setUint32(18, entry.dataBytes.length, true);
+    view.setUint32(22, entry.dataBytes.length, true);
+    view.setUint16(26, entry.nameBytes.length, true);
+    view.setUint16(28, 0, true);
 
-    // Escribir nombre de archivo
-    buffer.set(entry.nameBytes, currentLocalOffset + 30);
-    // Escribir datos
-    buffer.set(entry.dataBytes, currentLocalOffset + 30 + entry.nameBytes.length);
+    parts.push(localHeader, entry.nameBytes);
+    if (entry.dataBytes.length > 0) {
+      parts.push(entry.dataBytes);
+    }
 
     currentLocalOffset += entry.localSize;
   }
 
-  // 2. Escribir Central Directory Headers
+  // 2. Escribir Central Directory Headers + EOCD en un único buffer de metadatos.
   const centralDirStartOffset = currentLocalOffset;
-  let currentCentralOffset = centralDirStartOffset;
+  const tailBuffer = new Uint8Array(totalCentralDirSize + eocdSize);
+  const tailView = new DataView(tailBuffer.buffer);
+  let currentCentralOffset = 0;
 
   for (let i = 0; i < entries.length; i += 1) {
     const entry = entries[i];
     const localOffset = localHeaderOffsets[i];
 
-    // Firma Central Directory Header: 0x02014b50
-    view.setUint32(currentCentralOffset + 0, 0x02014b50, true);
-    // Versión creada por: 0x0314 (UNIX = 3, PKZIP 2.0 = 20) alineada con atributos externos POSIX
-    view.setUint16(currentCentralOffset + 4, 0x0314, true);
-    // Versión necesaria para extraer: 20
-    view.setUint16(currentCentralOffset + 6, 20, true);
-    // Flags: 0x0800 (UTF-8)
-    view.setUint16(currentCentralOffset + 8, 0x0800, true);
-    // Método de compresión: 0 (STORE)
-    view.setUint16(currentCentralOffset + 10, 0, true);
-    // Hora y fecha MS-DOS
-    view.setUint16(currentCentralOffset + 12, dosTime, true);
-    view.setUint16(currentCentralOffset + 14, dosDate, true);
-    // CRC-32
-    view.setUint32(currentCentralOffset + 16, entry.crc, true);
-    // Tamaño comprimido y sin comprimir
-    view.setUint32(currentCentralOffset + 20, entry.dataBytes.length, true);
-    view.setUint32(currentCentralOffset + 24, entry.dataBytes.length, true);
-    // Longitud del nombre
-    view.setUint16(currentCentralOffset + 28, entry.nameBytes.length, true);
-    // Longitud extra: 0
-    view.setUint16(currentCentralOffset + 30, 0, true);
-    // Longitud comentario: 0
-    view.setUint16(currentCentralOffset + 32, 0, true);
-    // Número de disco de inicio: 0
-    view.setUint16(currentCentralOffset + 34, 0, true);
-    // Atributos internos: 0
-    view.setUint16(currentCentralOffset + 36, 0, true);
-    // Atributos externos: 0644 (archivo regular estándar en POSIX)
-    view.setUint32(currentCentralOffset + 38, 0x81a40000, true);
-    // Offset relativo del Local Header
-    view.setUint32(currentCentralOffset + 42, localOffset, true);
+    tailView.setUint32(currentCentralOffset + 0, 0x02014b50, true);
+    tailView.setUint16(currentCentralOffset + 4, 0x0314, true);
+    tailView.setUint16(currentCentralOffset + 6, 20, true);
+    tailView.setUint16(currentCentralOffset + 8, 0x0800, true);
+    tailView.setUint16(currentCentralOffset + 10, 0, true);
+    tailView.setUint16(currentCentralOffset + 12, dosTime, true);
+    tailView.setUint16(currentCentralOffset + 14, dosDate, true);
+    tailView.setUint32(currentCentralOffset + 16, entry.crc, true);
+    tailView.setUint32(currentCentralOffset + 20, entry.dataBytes.length, true);
+    tailView.setUint32(currentCentralOffset + 24, entry.dataBytes.length, true);
+    tailView.setUint16(currentCentralOffset + 28, entry.nameBytes.length, true);
+    tailView.setUint16(currentCentralOffset + 30, 0, true);
+    tailView.setUint16(currentCentralOffset + 32, 0, true);
+    tailView.setUint16(currentCentralOffset + 34, 0, true);
+    tailView.setUint16(currentCentralOffset + 36, 0, true);
+    tailView.setUint32(currentCentralOffset + 38, 0x81a40000, true);
+    tailView.setUint32(currentCentralOffset + 42, localOffset, true);
 
-    // Escribir nombre del archivo
-    buffer.set(entry.nameBytes, currentCentralOffset + 46);
-
+    tailBuffer.set(entry.nameBytes, currentCentralOffset + 46);
     currentCentralOffset += entry.centralSize;
   }
 
   // 3. Escribir End of Central Directory (EOCD)
   const eocdOffset = currentCentralOffset;
-  // Firma EOCD: 0x06054b50
-  view.setUint32(eocdOffset + 0, 0x06054b50, true);
-  // Número de disco: 0
-  view.setUint16(eocdOffset + 4, 0, true);
-  // Disco donde inicia Central Directory: 0
-  view.setUint16(eocdOffset + 6, 0, true);
-  // Total de entradas en este disco
-  view.setUint16(eocdOffset + 8, entries.length, true);
-  // Total de entradas en el Central Directory
-  view.setUint16(eocdOffset + 10, entries.length, true);
-  // Tamaño del Central Directory
-  view.setUint32(eocdOffset + 12, totalCentralDirSize, true);
-  // Offset donde inicia el Central Directory
-  view.setUint32(eocdOffset + 16, centralDirStartOffset, true);
-  // Longitud comentario: 0
-  view.setUint16(eocdOffset + 20, 0, true);
+  tailView.setUint32(eocdOffset + 0, 0x06054b50, true);
+  tailView.setUint16(eocdOffset + 4, 0, true);
+  tailView.setUint16(eocdOffset + 6, 0, true);
+  tailView.setUint16(eocdOffset + 8, entries.length, true);
+  tailView.setUint16(eocdOffset + 10, entries.length, true);
+  tailView.setUint32(eocdOffset + 12, totalCentralDirSize, true);
+  tailView.setUint32(eocdOffset + 16, centralDirStartOffset, true);
+  tailView.setUint16(eocdOffset + 20, 0, true);
 
+  parts.push(tailBuffer);
+  return { parts, totalBufferSize };
+}
+
+/**
+ * Construye un Blob .zip ensamblado por partes para evitar la doble copia contigua en RAM.
+ * @param {Array<{ path: string, content: string | Uint8Array, isFolder?: boolean }>} files
+ * @param {{ date?: Date }} [options={}]
+ * @returns {Blob}
+ */
+export function buildZipBlob(files, options = {}) {
+  const { parts } = buildZipParts(files, options);
+  return new Blob(parts, { type: "application/zip" });
+}
+
+/**
+ * Construye un archivo .zip válido en memoria a partir de una lista de entradas de archivo.
+ * @param {Array<{ path: string, content: string | Uint8Array, isFolder?: boolean }>} files
+ * @param {{ date?: Date }} [options={}]
+ * @returns {Uint8Array}
+ */
+export function buildZipArchive(files, options = {}) {
+  const { parts, totalBufferSize } = buildZipParts(files, options);
+  const buffer = new Uint8Array(totalBufferSize);
+  let offset = 0;
+  for (const part of parts) {
+    buffer.set(part, offset);
+    offset += part.length;
+  }
   return buffer;
 }
 
 /**
- * Dispara la descarga de un buffer ZIP como archivo descargable en el navegador.
- * @param {Uint8Array} zipBytes
+ * Dispara la descarga de un buffer o Blob ZIP como archivo descargable en el navegador.
+ * @param {Uint8Array | Blob} zipBytesOrBlob
  * @param {string} [filename="proyecto.zip"]
  */
-export function downloadZip(zipBytes, filename = "proyecto.zip") {
-  const blob = new Blob([zipBytes], { type: "application/zip" });
+export function downloadZip(zipBytesOrBlob, filename = "proyecto.zip") {
+  const blob =
+    typeof Blob !== "undefined" && zipBytesOrBlob instanceof Blob
+      ? zipBytesOrBlob
+      : new Blob([zipBytesOrBlob], { type: "application/zip" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = filename.endsWith(".zip") ? filename : `${filename}.zip`;
+  link.download = sanitizeZipDownloadFilename(filename);
   document.body.appendChild(link);
   link.click();
   link.remove();

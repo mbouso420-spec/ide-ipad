@@ -2,6 +2,7 @@ import { icon } from "./icons.js";
 import { inferFileMeta, validateUserPath } from "../storage/workspaceDb.js";
 import { decodeImportedFile, MAX_IMPORT_FILE_BYTES } from "../storage/fileImport.js";
 import { getStorageQuotaEstimate } from "../storage/storageQuota.js";
+import { escapeHtml } from "../utils/dom.js";
 
 /**
  * Genera una ruta única para un duplicado insertando ".copia" antes de la extensión.
@@ -86,16 +87,24 @@ export function initExplorerController({
 
   void refreshStorageIndicator();
 
+  const controller = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = controller ? { signal: controller.signal } : undefined;
+  const passiveOpts = controller ? { passive: true, signal: controller.signal } : { passive: true };
+  const captureOpts = controller ? { capture: true, signal: controller.signal } : { capture: true };
+
   /** @type {Set<string>} */
   const collapsedFolders = new Set();
   let selectedFolderPath = "";
   let pendingDeletePath = null;
   let pendingProjectDelete = false;
+  let pendingProjectDeleteTimer = null;
   let renamingTarget = null; // { path, isFolder }
   let currentEntries = [];
   let currentActiveFileId = null;
   let contextMenuEl = null;
   let cancelActiveLongPress = null;
+  let lastStructureSignature = null;
+  const rowRefsByPath = new Map();
 
   const explorerPanelBody =
     treeContainer?.closest?.(".panel-body") ||
@@ -108,8 +117,8 @@ export function initExplorerController({
     closeContextMenu();
   }
 
-  explorerPanelBody?.addEventListener?.("scroll", handleTreeContainerScroll, { passive: true });
-  treeContainer?.addEventListener?.("scroll", handleTreeContainerScroll, { passive: true });
+  explorerPanelBody?.addEventListener?.("scroll", handleTreeContainerScroll, passiveOpts);
+  treeContainer?.addEventListener?.("scroll", handleTreeContainerScroll, passiveOpts);
 
   treeContainer?.addEventListener?.("keydown", (event) => {
     if (event.key !== "Escape") return;
@@ -125,7 +134,7 @@ export function initExplorerController({
       pendingDeletePath = null;
       renderTree(currentEntries, currentActiveFileId);
     }
-  });
+  }, listenOpts);
 
   function closeContextMenu() {
     if (contextMenuEl) {
@@ -145,7 +154,7 @@ export function initExplorerController({
       if (contextMenuEl && !contextMenuEl.hidden && !contextMenuEl.contains(event.target)) {
         closeContextMenu();
       }
-    });
+    }, listenOpts);
 
     window.addEventListener(
       "keydown",
@@ -156,11 +165,11 @@ export function initExplorerController({
           closeContextMenu();
         }
       },
-      { capture: true }
+      captureOpts
     );
 
-    window.addEventListener("scroll", handleTreeContainerScroll, { passive: true });
-    window.addEventListener("blur", closeContextMenu);
+    window.addEventListener("scroll", handleTreeContainerScroll, passiveOpts);
+    window.addEventListener("blur", closeContextMenu, listenOpts);
 
     return contextMenuEl;
   }
@@ -230,7 +239,7 @@ export function initExplorerController({
     pendingProjectDelete = false;
     syncProjectDeleteButton();
     onSwitchProject(projectSelect.value);
-  });
+  }, listenOpts);
 
   btnNewProject?.addEventListener("click", () => {
     openInlineCreator({
@@ -244,13 +253,15 @@ export function initExplorerController({
         }
       }
     });
-  });
+  }, listenOpts);
 
   btnDeleteProject?.addEventListener("click", async () => {
     if (!pendingProjectDelete) {
       pendingProjectDelete = true;
       syncProjectDeleteButton();
-      window.setTimeout(() => {
+      clearTimeout(pendingProjectDeleteTimer);
+      pendingProjectDeleteTimer = window.setTimeout(() => {
+        pendingProjectDeleteTimer = null;
         if (pendingProjectDelete) {
           pendingProjectDelete = false;
           syncProjectDeleteButton();
@@ -258,10 +269,12 @@ export function initExplorerController({
       }, 3500);
       return;
     }
+    clearTimeout(pendingProjectDeleteTimer);
+    pendingProjectDeleteTimer = null;
     pendingProjectDelete = false;
     syncProjectDeleteButton();
     await onDeleteCurrentProject();
-  });
+  }, listenOpts);
 
   function syncProjectDeleteButton() {
     if (!btnDeleteProject) return;
@@ -285,7 +298,7 @@ export function initExplorerController({
         await onCreateEntry(clean, false);
       }
     });
-  });
+  }, listenOpts);
 
   btnNewFolder?.addEventListener("click", () => {
     const prefix = selectedFolderPath ? `${selectedFolderPath}/` : "";
@@ -300,11 +313,11 @@ export function initExplorerController({
         await onCreateEntry(clean, true);
       }
     });
-  });
+  }, listenOpts);
 
   btnImport?.addEventListener("click", () => {
     importInput?.click();
-  });
+  }, listenOpts);
 
   importInput?.addEventListener("change", async () => {
     const fileList = importInput.files ? [...importInput.files] : [];
@@ -360,7 +373,7 @@ export function initExplorerController({
       await onImportFiles(imported);
       if (rejectedMsg) setAutosaveStatus(rejectedMsg);
     }, rejectedMsg);
-  });
+  }, listenOpts);
 
   function openImportOverwriteConfirm(conflictPaths, onConfirm, rejectedMsg) {
     if (!inlineSlot) return;
@@ -424,19 +437,19 @@ export function initExplorerController({
 
   btnExport?.addEventListener("click", () => {
     onDownloadActiveFile();
-  });
+  }, listenOpts);
 
   btnExportZip?.addEventListener("click", () => {
     onExportProjectZip?.();
-  });
+  }, listenOpts);
 
   btnCloudBackup?.addEventListener("click", () => {
     onCloudBackupProject?.();
-  });
+  }, listenOpts);
 
   btnOfflineRepo?.addEventListener("click", () => {
     onSaveRepoOffline?.();
-  });
+  }, listenOpts);
 
   function openInlineCreator({ placeholder, initialValue, ariaLabel, onSubmit }) {
     if (!inlineSlot) return;
@@ -587,24 +600,200 @@ export function initExplorerController({
     }
   }
 
+  let activeLongPressTimer = null;
+  let activeLongPressTriggered = false;
+  let activeLongPressResetTimer = null;
+  let touchStartX = 0;
+  let touchStartY = 0;
+
+  const clearLongPress = () => {
+    if (activeLongPressTimer) {
+      clearTimeout(activeLongPressTimer);
+      activeLongPressTimer = null;
+    }
+    if (cancelActiveLongPress === clearLongPress) {
+      cancelActiveLongPress = null;
+    }
+  };
+
+  if (treeContainer) {
+    treeContainer.addEventListener("contextmenu", (event) => {
+      const row = event.target?.closest?.(".tree-row");
+      const entry = row ? rowRefsByPath.get(row.dataset.path) : null;
+      if (!entry) return;
+      event.preventDefault();
+      event.stopPropagation();
+      openContextMenu(entry.node, event.clientX, event.clientY);
+    }, listenOpts);
+
+    treeContainer.addEventListener("pointerdown", (event) => {
+      if (event.pointerType !== "touch" || event.isPrimary === false) return;
+      const row = event.target?.closest?.(".tree-row");
+      const entry = row ? rowRefsByPath.get(row.dataset.path) : null;
+      if (!entry || event.target?.closest?.(".tree-node-actions, .tree-confirm-bar, form, input")) {
+        clearLongPress();
+        return;
+      }
+      touchStartX = event.clientX;
+      touchStartY = event.clientY;
+      activeLongPressTriggered = false;
+      cancelActiveLongPress?.();
+      cancelActiveLongPress = clearLongPress;
+      activeLongPressTimer = window.setTimeout(() => {
+        activeLongPressTimer = null;
+        if (cancelActiveLongPress === clearLongPress) {
+          cancelActiveLongPress = null;
+        }
+        activeLongPressTriggered = true;
+        openContextMenu(entry.node, touchStartX, touchStartY);
+      }, 500);
+    }, listenOpts);
+
+    treeContainer.addEventListener("pointermove", (event) => {
+      if (activeLongPressTimer && event.pointerType === "touch") {
+        const dist = Math.hypot(event.clientX - touchStartX, event.clientY - touchStartY);
+        if (dist > 8) {
+          clearLongPress();
+        }
+      }
+    }, listenOpts);
+
+    treeContainer.addEventListener("pointerup", (event) => {
+      clearLongPress();
+      if (activeLongPressTriggered) {
+        event.preventDefault();
+        event.stopPropagation();
+        clearTimeout(activeLongPressResetTimer);
+        activeLongPressResetTimer = window.setTimeout(() => {
+          activeLongPressTriggered = false;
+          activeLongPressResetTimer = null;
+        }, 350);
+      }
+    }, listenOpts);
+
+    treeContainer.addEventListener("pointercancel", () => {
+      clearLongPress();
+      activeLongPressTriggered = false;
+    }, listenOpts);
+
+    treeContainer.addEventListener("click", async (event) => {
+      const actionEl = event.target?.closest?.("[data-tree-action]");
+      const row = event.target?.closest?.(".tree-row");
+      const entry = row ? rowRefsByPath.get(row.dataset.path) : null;
+      if (!actionEl || !entry) return;
+
+      const action = actionEl.dataset.treeAction;
+      const node = entry.node;
+
+      if (activeLongPressTriggered && (action === "toggle-folder" || action === "select-file")) {
+        activeLongPressTriggered = false;
+        return;
+      }
+
+      if (action === "toggle-folder") {
+        if (collapsedFolders.has(node.path)) {
+          collapsedFolders.delete(node.path);
+        } else {
+          collapsedFolders.add(node.path);
+        }
+        selectedFolderPath = selectedFolderPath === node.path ? "" : node.path;
+        renderTree(currentEntries, currentActiveFileId);
+        return;
+      }
+
+      if (action === "select-file") {
+        const idx = node.path.lastIndexOf("/");
+        selectedFolderPath = idx > 0 ? node.path.slice(0, idx) : "";
+        updateSelection(node.path);
+        onSelectFile(node.path);
+        return;
+      }
+
+      if (action === "confirm-delete") {
+        pendingDeletePath = null;
+        if (selectedFolderPath === node.path) {
+          selectedFolderPath = "";
+        }
+        await onDeleteEntry(node.path, node.isFolder);
+        return;
+      }
+
+      if (action === "cancel-delete") {
+        pendingDeletePath = null;
+        renderTree(currentEntries, currentActiveFileId);
+        return;
+      }
+
+      if (action === "rename") {
+        renamingTarget = { path: node.path, isFolder: node.isFolder };
+        renderTree(currentEntries, currentActiveFileId);
+        return;
+      }
+
+      if (action === "delete") {
+        pendingDeletePath = node.path;
+        renderTree(currentEntries, currentActiveFileId);
+      }
+    }, listenOpts);
+  }
+
+  function updateSelection(activeFileId) {
+    currentActiveFileId = activeFileId;
+    for (const ref of rowRefsByPath.values()) {
+      const { node, rowEl, mainBtnEl } = ref;
+      const isActiveFile = !node.isFolder && node.path === activeFileId;
+      const isSelectedFolder = node.isFolder && node.path === selectedFolderPath;
+      rowEl.classList.toggle("is-active", isActiveFile);
+      rowEl.classList.toggle("is-selected-folder", isSelectedFolder);
+      if (isActiveFile) {
+        mainBtnEl.setAttribute("aria-current", "page");
+      } else {
+        mainBtnEl.removeAttribute("aria-current");
+      }
+    }
+  }
+
   function renderTree(entries, activeFileId) {
     currentEntries = entries;
     currentActiveFileId = activeFileId;
     closeContextMenu();
 
     if (!treeContainer) return;
-    const prevScrollTop = treeContainer.scrollTop;
-    treeContainer.innerHTML = "";
 
     const hierarchy = buildHierarchy(entries);
     const flatRows = flattenVisibleTree(hierarchy, 0, collapsedFolders);
+
+    const canIncrementallyUpdate = !renamingTarget && !pendingDeletePath;
+    const structureSignature = canIncrementallyUpdate
+      ? flatRows
+          .map((n) => `${n.isFolder ? (collapsedFolders.has(n.path) ? "C" : "O") : "F"}:${n.depth}:${n.path}`)
+          .join("\n")
+      : null;
+
+    if (
+      canIncrementallyUpdate &&
+      lastStructureSignature !== null &&
+      structureSignature === lastStructureSignature &&
+      rowRefsByPath.size === flatRows.length &&
+      treeContainer.childElementCount === flatRows.length
+    ) {
+      updateSelection(activeFileId);
+      return;
+    }
+
+    const prevScrollTop = treeContainer.scrollTop;
+    treeContainer.innerHTML = "";
+    rowRefsByPath.clear();
+    lastStructureSignature = structureSignature;
+
+    const fragment = document.createDocumentFragment();
 
     for (const node of flatRows) {
       const li = document.createElement("li");
 
       if (renamingTarget && renamingTarget.path === node.path) {
         li.appendChild(buildInlineRenameRow(node));
-        treeContainer.appendChild(li);
+        fragment.appendChild(li);
         continue;
       }
 
@@ -613,6 +802,7 @@ export function initExplorerController({
       const isSelectedFolder = node.isFolder && node.path === selectedFolderPath;
 
       const row = document.createElement("div");
+      row.dataset.path = node.path;
       row.className = [
         "tree-row",
         depthClass,
@@ -621,76 +811,6 @@ export function initExplorerController({
       ]
         .filter(Boolean)
         .join(" ");
-
-      let touchStartX = 0;
-      let touchStartY = 0;
-      let longPressTimer = null;
-      let longPressTriggered = false;
-
-      const clearLongPress = () => {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-        if (cancelActiveLongPress === clearLongPress) {
-          cancelActiveLongPress = null;
-        }
-      };
-
-      row.addEventListener("contextmenu", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        openContextMenu(node, event.clientX, event.clientY);
-      });
-
-      row.addEventListener("pointerdown", (event) => {
-        if (event.pointerType !== "touch" || event.isPrimary === false) return;
-        if (event.target?.closest?.(".tree-node-actions, .tree-confirm-bar, form, input")) {
-          clearLongPress();
-          return;
-        }
-        touchStartX = event.clientX;
-        touchStartY = event.clientY;
-        longPressTriggered = false;
-        cancelActiveLongPress?.();
-        cancelActiveLongPress = clearLongPress;
-        longPressTimer = window.setTimeout(() => {
-          longPressTimer = null;
-          if (cancelActiveLongPress === clearLongPress) {
-            cancelActiveLongPress = null;
-          }
-          longPressTriggered = true;
-          openContextMenu(node, touchStartX, touchStartY);
-        }, 500);
-      });
-
-      row.addEventListener("pointermove", (event) => {
-        if (longPressTimer && event.pointerType === "touch") {
-          const dist = Math.hypot(event.clientX - touchStartX, event.clientY - touchStartY);
-          if (dist > 8) {
-            clearLongPress();
-          }
-        }
-      });
-
-      row.addEventListener("pointerup", (event) => {
-        clearLongPress();
-        if (longPressTriggered) {
-          event.preventDefault();
-          event.stopPropagation();
-          window.setTimeout(() => {
-            longPressTriggered = false;
-          }, 350);
-        }
-      });
-
-      row.addEventListener("pointercancel", () => {
-        clearLongPress();
-        longPressTriggered = false;
-      });
-      row.addEventListener("pointerleave", () => {
-        clearLongPress();
-      });
 
       const mainBtn = document.createElement("button");
       mainBtn.type = "button";
@@ -701,41 +821,21 @@ export function initExplorerController({
 
       if (node.isFolder) {
         const isCollapsed = collapsedFolders.has(node.path);
+        mainBtn.dataset.treeAction = "toggle-folder";
         mainBtn.setAttribute("aria-expanded", String(!isCollapsed));
         mainBtn.innerHTML = `
           ${icon(isCollapsed ? "chevronRight" : "chevronDown")}
           ${icon(isCollapsed ? "folder" : "folderOpen")}
           <span class="file-tree-name">${escapeHtml(node.name)}</span>
         `;
-        mainBtn.addEventListener("click", () => {
-          if (longPressTriggered) {
-            longPressTriggered = false;
-            return;
-          }
-          if (collapsedFolders.has(node.path)) {
-            collapsedFolders.delete(node.path);
-          } else {
-            collapsedFolders.add(node.path);
-          }
-          selectedFolderPath = selectedFolderPath === node.path ? "" : node.path;
-          renderTree(currentEntries, currentActiveFileId);
-        });
       } else {
         const meta = inferFileMeta(node.path);
+        mainBtn.dataset.treeAction = "select-file";
         mainBtn.innerHTML = `
           ${icon(meta.icon)}
           <span class="file-tree-name">${escapeHtml(node.name)}</span>
           <span class="file-tree-lang">${escapeHtml(meta.badge)}</span>
         `;
-        mainBtn.addEventListener("click", () => {
-          if (longPressTriggered) {
-            longPressTriggered = false;
-            return;
-          }
-          const idx = node.path.lastIndexOf("/");
-          selectedFolderPath = idx > 0 ? node.path.slice(0, idx) : "";
-          onSelectFile(node.path);
-        });
       }
 
       row.appendChild(mainBtn);
@@ -747,24 +847,15 @@ export function initExplorerController({
         const yesBtn = document.createElement("button");
         yesBtn.type = "button";
         yesBtn.className = "tree-confirm-delete";
+        yesBtn.dataset.treeAction = "confirm-delete";
         yesBtn.textContent = "Borrar";
-        yesBtn.addEventListener("click", async () => {
-          pendingDeletePath = null;
-          if (selectedFolderPath === node.path) {
-            selectedFolderPath = "";
-          }
-          await onDeleteEntry(node.path, node.isFolder);
-        });
 
         const noBtn = document.createElement("button");
         noBtn.type = "button";
         noBtn.className = "tree-icon-btn";
+        noBtn.dataset.treeAction = "cancel-delete";
         noBtn.setAttribute("aria-label", "Cancelar borrado");
         noBtn.innerHTML = icon("x");
-        noBtn.addEventListener("click", () => {
-          pendingDeletePath = null;
-          renderTree(currentEntries, currentActiveFileId);
-        });
 
         confirmBar.append(yesBtn, noBtn);
         row.appendChild(confirmBar);
@@ -775,32 +866,29 @@ export function initExplorerController({
         const renameBtn = document.createElement("button");
         renameBtn.type = "button";
         renameBtn.className = "tree-icon-btn";
+        renameBtn.dataset.treeAction = "rename";
         renameBtn.setAttribute("aria-label", `Renombrar ${node.name}`);
         renameBtn.title = "Renombrar";
         renameBtn.innerHTML = icon("edit");
-        renameBtn.addEventListener("click", () => {
-          renamingTarget = { path: node.path, isFolder: node.isFolder };
-          renderTree(currentEntries, currentActiveFileId);
-        });
 
         const delBtn = document.createElement("button");
         delBtn.type = "button";
         delBtn.className = "tree-icon-btn";
+        delBtn.dataset.treeAction = "delete";
         delBtn.setAttribute("aria-label", `Eliminar ${node.name}`);
         delBtn.title = "Eliminar";
         delBtn.innerHTML = icon("trash");
-        delBtn.addEventListener("click", () => {
-          pendingDeletePath = node.path;
-          renderTree(currentEntries, currentActiveFileId);
-        });
 
         actions.append(renameBtn, delBtn);
         row.appendChild(actions);
       }
 
+      rowRefsByPath.set(node.path, { node, rowEl: row, mainBtnEl: mainBtn });
       li.appendChild(row);
-      treeContainer.appendChild(li);
+      fragment.appendChild(li);
     }
+
+    treeContainer.appendChild(fragment);
 
     if (prevScrollTop > 0) {
       treeContainer.scrollTop = prevScrollTop;
@@ -928,9 +1016,22 @@ export function initExplorerController({
   return {
     renderProjects,
     renderTree,
+    updateSelection,
     setAutosaveStatus,
     setOfflineRepoState,
-    refreshStorageIndicator
+    refreshStorageIndicator,
+    destroy() {
+      clearLongPress();
+      clearTimeout(activeLongPressResetTimer);
+      clearTimeout(pendingProjectDeleteTimer);
+      controller?.abort();
+      if (contextMenuEl) {
+        contextMenuEl.remove();
+        contextMenuEl = null;
+      }
+      rowRefsByPath.clear();
+      lastStructureSignature = null;
+    }
   };
 }
 
@@ -989,13 +1090,4 @@ export function flattenVisibleTree(node, depth, collapsedFolders) {
     }
   }
   return result;
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }

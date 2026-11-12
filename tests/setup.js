@@ -46,6 +46,124 @@ if (!globalThis.MouseEvent) {
   globalThis.MouseEvent = class MouseEvent extends globalThis.Event {};
 }
 
+function splitSelectorOutsideBrackets(sel, sepChar) {
+  const parts = [];
+  let inBracket = false;
+  let quote = "";
+  let start = 0;
+  for (let i = 0; i < sel.length; i += 1) {
+    const ch = sel[i];
+    if (quote) {
+      if (ch === quote && sel[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === "[") {
+      inBracket = true;
+    } else if (ch === "]") {
+      inBracket = false;
+    } else if (!inBracket && ch === sepChar) {
+      parts.push(sel.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(sel.slice(start));
+  return parts;
+}
+
+function tokenizeComplexSelector(complexSel) {
+  const tokens = [];
+  let inBracket = false;
+  let quote = "";
+  let buf = "";
+
+  const flushBuf = () => {
+    const trimmed = buf.trim();
+    if (trimmed) tokens.push(trimmed);
+    buf = "";
+  };
+
+  for (let i = 0; i < complexSel.length; i += 1) {
+    const ch = complexSel[i];
+    if (quote) {
+      buf += ch;
+      if (ch === quote && complexSel[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      buf += ch;
+    } else if (ch === "[") {
+      inBracket = true;
+      buf += ch;
+    } else if (ch === "]") {
+      inBracket = false;
+      buf += ch;
+    } else if (!inBracket && ch === ">") {
+      flushBuf();
+      if (tokens[tokens.length - 1] === " ") tokens.pop();
+      tokens.push(">");
+    } else if (!inBracket && /\s/.test(ch)) {
+      flushBuf();
+      const prev = tokens[tokens.length - 1];
+      if (prev && prev !== ">" && prev !== " ") {
+        tokens.push(" ");
+      }
+    } else {
+      buf += ch;
+    }
+  }
+  flushBuf();
+  if (tokens[tokens.length - 1] === " ") tokens.pop();
+  return tokens;
+}
+
+function matchesCompoundSelector(el, compound) {
+  if (!el || !compound) return false;
+  if (compound === "*") return true;
+  const parts = compound.match(/(\.[^.#[\]]+|#[^.#[\]]+|\[[^\]]+\]|^[^.#[\]]+)/g) || [compound];
+  for (const part of parts) {
+    if (part.startsWith(".")) {
+      if (!el.classList.contains(part.slice(1))) return false;
+    } else if (part.startsWith("#")) {
+      if (el.id !== part.slice(1)) return false;
+    } else if (part.startsWith("[") && part.endsWith("]")) {
+      const inner = part.slice(1, -1);
+      const eqIdx = inner.indexOf("=");
+      if (eqIdx === -1) {
+        if (!el.attributes.has(inner.trim())) return false;
+      } else {
+        const attr = inner.slice(0, eqIdx).trim();
+        const val = inner.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, "");
+        if (el.getAttribute(attr) !== val) return false;
+      }
+    } else if (part !== "*") {
+      if (el.tagName.toLowerCase() !== part.toLowerCase()) return false;
+    }
+  }
+  return true;
+}
+
+function matchesTokenChain(el, tokens, idx) {
+  if (!el || idx < 0) return false;
+  if (!matchesCompoundSelector(el, tokens[idx])) return false;
+  if (idx === 0) return true;
+  const combinator = tokens[idx - 1];
+  if (combinator === ">") {
+    return matchesTokenChain(el.parentElement, tokens, idx - 2);
+  }
+  if (combinator === " ") {
+    let anc = el.parentElement;
+    while (anc) {
+      if (matchesTokenChain(anc, tokens, idx - 2)) return true;
+      anc = anc.parentElement;
+    }
+    return false;
+  }
+  return false;
+}
+
 class MockElement {
   constructor(tagName = "div") {
     this.tagName = tagName.toUpperCase();
@@ -55,8 +173,16 @@ class MockElement {
     this.dataset = {};
     this.classList = {
       _classes: new Set(),
-      add: (c) => this.classList._classes.add(c),
-      remove: (c) => this.classList._classes.delete(c),
+      add: (...classes) => {
+        for (const c of classes) {
+          if (c) this.classList._classes.add(String(c));
+        }
+      },
+      remove: (...classes) => {
+        for (const c of classes) {
+          if (c) this.classList._classes.delete(String(c));
+        }
+      },
       contains: (c) => this.classList._classes.has(c),
       toggle: (c, val) => {
         if (val === undefined) val = !this.classList.contains(c);
@@ -87,7 +213,12 @@ class MockElement {
   get innerHTML() { return this._innerHTML; }
   set innerHTML(v) {
     this._innerHTML = String(v);
-    if (v === "") this.children = [];
+    for (const ch of this.children) {
+      if (ch && ch.parentElement === this) {
+        ch.parentElement = null;
+      }
+    }
+    this.children = [];
   }
   get firstElementChild() { return this.children[0] || null; }
   get lastElementChild() { return this.children[this.children.length - 1] || null; }
@@ -123,18 +254,52 @@ class MockElement {
     }
   }
   dispatchEvent(event) {
-    if (event) {
+    if (!event) return true;
+    let propagationStopped = false;
+    let immediateStopped = false;
+    const origStop = typeof event.stopPropagation === "function" ? event.stopPropagation.bind(event) : null;
+    const origStopImm =
+      typeof event.stopImmediatePropagation === "function" ? event.stopImmediatePropagation.bind(event) : null;
+
+    try {
+      Object.defineProperty(event, "target", { value: this, configurable: true });
+    } catch (_) {}
+    try {
+      Object.defineProperty(event, "stopPropagation", {
+        value: () => {
+          propagationStopped = true;
+          origStop?.();
+        },
+        configurable: true
+      });
+      Object.defineProperty(event, "stopImmediatePropagation", {
+        value: () => {
+          propagationStopped = true;
+          immediateStopped = true;
+          origStopImm?.();
+        },
+        configurable: true
+      });
+    } catch (_) {}
+
+    let current = this;
+    while (current) {
       try {
-        Object.defineProperty(event, "target", { value: this, configurable: true });
+        Object.defineProperty(event, "currentTarget", { value: current, configurable: true });
       } catch (_) {}
-    }
-    const list = this._listeners.get(event?.type || "");
-    if (list) {
-      for (const fn of list) {
-        fn.call(this, event);
+      const list = current._listeners?.get(event.type || "");
+      if (list && list.length > 0) {
+        for (const fn of [...list]) {
+          fn.call(current, event);
+          if (immediateStopped) break;
+        }
       }
+      if (propagationStopped || !event.bubbles) {
+        break;
+      }
+      current = current.parentElement || null;
     }
-    return true;
+    return !event.defaultPrevented;
   }
   click() {
     this.dispatchEvent({ type: "click", bubbles: true, target: this, stopPropagation: () => {} });
@@ -146,6 +311,16 @@ class MockElement {
       this.dataset[camel] = String(v);
     }
   }
+  removeAttribute(k) {
+    this.attributes.delete(k);
+    if (k.startsWith("data-")) {
+      const camel = k.slice(5).replace(/-([a-z])/g, (_, g) => g.toUpperCase());
+      delete this.dataset[camel];
+    }
+  }
+  hasAttribute(k) {
+    return this.attributes.has(k);
+  }
   getAttribute(k) { return this.attributes.get(k) || null; }
   setRangeText(text, start, end) {
     const s = start !== undefined ? start : (this.selectionStart || 0);
@@ -155,28 +330,27 @@ class MockElement {
   setSelectionRange(s, e) { this.selectionStart = s; this.selectionEnd = e; }
   focus() {}
   matches(sel) {
-    if (!sel) return false;
-    const parts = sel.match(/(\.[^.#[\]]+|#[^.#[\]]+|\[[^\]]+\]|^[^.#[\]]+)/g) || [sel];
-    for (const part of parts) {
-      if (part.startsWith(".")) {
-        if (!this.classList.contains(part.slice(1))) return false;
-      } else if (part.startsWith("#")) {
-        if (this.id !== part.slice(1)) return false;
-      } else if (part.startsWith("[") && part.endsWith("]")) {
-        const inner = part.slice(1, -1);
-        const eqIdx = inner.indexOf("=");
-        if (eqIdx === -1) {
-          if (!this.attributes.has(inner)) return false;
-        } else {
-          const attr = inner.slice(0, eqIdx).trim();
-          const val = inner.slice(eqIdx + 1).replace(/^["']|["']$/g, "").trim();
-          if (this.getAttribute(attr) !== val) return false;
-        }
-      } else {
-        if (this.tagName.toLowerCase() !== part.toLowerCase()) return false;
+    if (!sel || typeof sel !== "string") return false;
+    const branches = splitSelectorOutsideBrackets(sel, ",");
+    for (const branch of branches) {
+      const trimmed = branch.trim();
+      if (!trimmed) continue;
+      const tokens = tokenizeComplexSelector(trimmed);
+      if (tokens.length > 0 && matchesTokenChain(this, tokens, tokens.length - 1)) {
+        return true;
       }
     }
-    return true;
+    return false;
+  }
+  closest(sel) {
+    let current = this;
+    while (current) {
+      if (typeof current.matches === "function" && current.matches(sel)) {
+        return current;
+      }
+      current = current.parentElement || null;
+    }
+    return null;
   }
   querySelector(sel) {
     for (const ch of this.children) {

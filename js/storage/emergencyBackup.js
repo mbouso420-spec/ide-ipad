@@ -94,6 +94,8 @@ function parseBackupItems(raw) {
   return parseBackupPayload(raw).items;
 }
 
+const MAX_EMERGENCY_BACKUP_CHARS = 2 * 1024 * 1024;
+
 /**
  * @param {Array<{ projectId: string, filePath: string, content: string }>} items
  * @param {Storage} [storage]
@@ -112,12 +114,25 @@ export function writeEmergencyBackup(items, storage = window.localStorage, proje
       storage.removeItem(targetKey);
       return true;
     }
+
+    // Evita serializar respaldos masivos en localStorage (~5 MB por origen); el autoguardado en IDB cubre archivos grandes.
+    let estimatedChars = 128;
+    for (const it of clean) {
+      estimatedChars += it.projectId.length + it.filePath.length + it.content.length + 64;
+      if (estimatedChars > MAX_EMERGENCY_BACKUP_CHARS) {
+        return false;
+      }
+    }
+
     const payloadStr = JSON.stringify({
       savedAt: Date.now(),
       projectId: projectId || null,
       instanceId: instanceId || null,
       items: clean.map(({ projectId: p, filePath, content }) => ({ projectId: p, filePath, content }))
     });
+    if (payloadStr.length > MAX_EMERGENCY_BACKUP_CHARS) {
+      return false;
+    }
     try {
       storage.setItem(targetKey, payloadStr);
       return true;
@@ -280,11 +295,24 @@ async function readInitialDbRecord(db, projectId, filePath, recordCache, project
   return record || null;
 }
 
+function hasRecordReader(db) {
+  return Boolean(
+    db &&
+      (typeof db.getEntryRecord === "function" ||
+        typeof db.getFileRecord === "function" ||
+        typeof db.getEntry === "function" ||
+        typeof db.getRecord === "function" ||
+        typeof db.getProjectEntries === "function")
+  );
+}
+
 async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache) {
   let restored = 0;
+  const canReadRecord = hasRecordReader(db);
   if (snap.items.length > 0) {
     for (const item of snap.items) {
-      if (await db.entryExists(item.projectId, item.filePath)) {
+      if (canReadRecord) {
+        // Una única lectura por snapshot/archivo: evita duplicar viajes a IndexedDB (entryExists + getEntryRecord).
         const record = await readInitialDbRecord(
           db,
           item.projectId,
@@ -292,17 +320,29 @@ async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEn
           recordCache,
           projectEntriesCache
         );
+        if (!record || record.deleted || record.isFolder) {
+          continue;
+        }
         if (
-          record &&
           snap.savedAt > 0 &&
           typeof record.updatedAt === "number" &&
           snap.savedAt < record.updatedAt
         ) {
           continue;
         }
-        await db.updateFileContent(item.projectId, item.filePath, item.content);
-        restored += 1;
+      } else if (typeof db.entryExists === "function") {
+        if (!(await db.entryExists(item.projectId, item.filePath))) {
+          continue;
+        }
+      } else {
+        continue;
       }
+
+      const updated = await db.updateFileContent(item.projectId, item.filePath, item.content);
+      if (updated === null || (updated && (updated.deleted || updated.isFolder))) {
+        continue;
+      }
+      restored += 1;
     }
   }
 

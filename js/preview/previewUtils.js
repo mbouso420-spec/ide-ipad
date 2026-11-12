@@ -4,6 +4,8 @@
 
 import { normalizePath } from "../storage/workspaceDb.js";
 
+export { normalizePath };
+
 export const HTML_EXTENSIONS = new Set(["html", "htm"]);
 export const JS_EXTENSIONS = new Set(["js", "mjs", "cjs"]);
 export const CSS_EXTENSIONS = new Set(["css"]);
@@ -65,13 +67,20 @@ export function resolveRelativePath(baseDir, relPath) {
   return stack.join("/");
 }
 
-export function escapeAttr(str) {
-  return String(str)
+/**
+ * Escapa texto para inserción segura en HTML y atributos (incluye comilla simple).
+ */
+export function escapeHtml(str) {
+  return String(str ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+export function escapeAttr(str) {
+  return escapeHtml(str ?? "");
 }
 
 export function escapeHtmlText(str) {
@@ -80,4 +89,24 @@ export function escapeHtmlText(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+/**
+ * Normaliza una referencia URL antes de evaluar esquemas peligrosos en previews.
+ * Elimina caracteres de control ASCII que podrían evadir regex simples en navegadores.
+ */
+export function normalizePreviewUrlRef(ref) {
+  return String(ref ?? "")
+    .replace(/[\u0000-\u001f\u007f]+/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+export function isBlockedPreviewUrlScheme(ref) {
+  const normalized = normalizePreviewUrlRef(ref);
+  return (
+    normalized.startsWith("javascript:") ||
+    normalized.startsWith("vbscript:") ||
+    normalized.startsWith("data:")
+  );
 }

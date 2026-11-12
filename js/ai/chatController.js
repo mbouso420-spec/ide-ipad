@@ -1,4 +1,6 @@
 import { icon } from "../ui/icons.js";
+import { escapeHtml } from "../preview/previewUtils.js";
+import { splitMarkdownCodeFences } from "../preview/markdownPreview.js";
 import {
   AI_PROVIDERS,
   PROVIDER_SHORT_NAMES,
@@ -11,10 +13,12 @@ import {
   setAiThinkingSpeed,
   getApiKey,
   getKeyStorageMode,
+  getProviderModels,
   getSavedModel,
   getSavedProviderId,
   hasStoredCredentials,
   importKeysBundle,
+  isAbortError,
   saveApiKey,
   saveModel,
   saveProviderId,
@@ -99,6 +103,9 @@ export function initChatController({
   let keyCheckTimer = 0;
   /** @type {AbortController | null} */
   let keyCheckController = null;
+  let activeRafId = 0;
+  let destroyed = false;
+  const streamDomState = new WeakMap();
 
   /** @type {Set<string>} */
   const attachedTabIds = new Set();
@@ -227,7 +234,6 @@ export function initChatController({
     try {
       const liveModels = await fetchLiveFreeModels(providerId, key);
       if (liveModels.length > 0) {
-        provider.models = liveModels;
         if (activeProviderId === providerId) {
           const stillValid = liveModels.some((m) => m.id === activeModelId);
           if (!stillValid) {
@@ -433,7 +439,6 @@ export function initChatController({
     try {
       const liveModels = await fetchLiveFreeModels(provider.id, getApiKey(provider.id));
       if (liveModels.length > 0) {
-        provider.models = liveModels;
         activeModelId = liveModels[0].id;
         saveModel(provider.id, activeModelId);
         syncSettingsForm();
@@ -546,6 +551,36 @@ export function initChatController({
     });
   });
 
+  function preflightAuthCheck() {
+    const lockState = checkAuthLockout(`ai:${activeProviderId}`);
+    if (lockState.locked) {
+      appendErrorBanner(
+        `Bloqueo temporal activo para ${AI_PROVIDERS[activeProviderId].name} por múltiples intentos fallidos. Esperá ${formatRemainingCooldown(lockState.remainingMs)}.`
+      );
+      return null;
+    }
+
+    const apiKey = getApiKey(activeProviderId);
+    if (!apiKey) {
+      toggleSettings(true);
+      apiKeyInput?.focus();
+      appendErrorBanner(
+        `Falta la API Key gratuita para ${AI_PROVIDERS[activeProviderId].name}. Pegala arriba (queda guardada en este navegador).`
+      );
+      return null;
+    }
+
+    const fmt = validateCredentialFormat(activeProviderId, apiKey);
+    if (!fmt.valid) {
+      toggleSettings(true);
+      apiKeyInput?.focus();
+      appendErrorBanner(fmt.reason);
+      return null;
+    }
+
+    return apiKey;
+  }
+
   regenerateBtn?.addEventListener("click", async () => {
     const running = activeStreams.get(conversationKey);
     if (running) return;
@@ -559,14 +594,10 @@ export function initChatController({
     }
     if (lastUserIdx === -1) return;
 
-    const userText = conversation[lastUserIdx].content;
-    const apiKey = getApiKey(activeProviderId);
-    if (!apiKey) {
-      toggleSettings(true);
-      apiKeyInput?.focus();
-      return;
-    }
+    const apiKey = preflightAuthCheck();
+    if (!apiKey) return;
 
+    const userText = conversation[lastUserIdx].content;
     conversation.splice(lastUserIdx);
     await sendPrompt(userText, apiKey);
   });
@@ -592,29 +623,8 @@ export function initChatController({
       return;
     }
 
-    const lockState = checkAuthLockout(`ai:${activeProviderId}`);
-    if (lockState.locked) {
-      appendErrorBanner(
-        `Bloqueo temporal activo para ${AI_PROVIDERS[activeProviderId].name} por múltiples intentos fallidos. Esperá ${formatRemainingCooldown(lockState.remainingMs)}.`
-      );
-      return;
-    }
-
-    const apiKey = getApiKey(activeProviderId);
+    const apiKey = preflightAuthCheck();
     if (!apiKey) {
-      toggleSettings(true);
-      apiKeyInput?.focus();
-      appendErrorBanner(
-        `Falta la API Key gratuita para ${AI_PROVIDERS[activeProviderId].name}. Pegala arriba (queda guardada en este navegador).`
-      );
-      return;
-    }
-
-    const fmt = validateCredentialFormat(activeProviderId, apiKey);
-    if (!fmt.valid) {
-      toggleSettings(true);
-      apiKeyInput?.focus();
-      appendErrorBanner(fmt.reason);
       return;
     }
 
@@ -662,11 +672,12 @@ export function initChatController({
 
     let rafPending = false;
     const scheduleRender = () => {
-      if (rafPending || !isVisible()) return;
+      if (destroyed || rafPending || !isVisible()) return;
       rafPending = true;
-      window.requestAnimationFrame(() => {
+      activeRafId = window.requestAnimationFrame(() => {
+        activeRafId = 0;
         rafPending = false;
-        if (!isVisible()) return;
+        if (destroyed || !isVisible()) return;
         updateLastAssistantMessage(assistantEntry.content, true);
         scrollToBottom();
       });
@@ -714,7 +725,7 @@ export function initChatController({
         updateLastAssistantMessage(assistantEntry.content || "Sin contenido devuelto por el modelo.", false);
       }
     } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
+      if (isAbortError(error)) {
         if (!stream.discarded) {
           assistantEntry.content += "\n\n*(Generación detenida)*";
           if (isVisible()) {
@@ -792,13 +803,14 @@ export function initChatController({
 
     if (modelSelect) {
       modelSelect.innerHTML = "";
-      for (const m of provider.models) {
+      const models = getProviderModels(provider.id);
+      for (const m of models) {
         const opt = document.createElement("option");
         opt.value = m.id;
         opt.textContent = m.label;
         modelSelect.appendChild(opt);
       }
-      const existsInPreset = provider.models.some((m) => m.id === activeModelId);
+      const existsInPreset = models.some((m) => m.id === activeModelId);
       if (!existsInPreset && activeModelId) {
         const customOpt = document.createElement("option");
         customOpt.value = activeModelId;
@@ -990,11 +1002,88 @@ export function initChatController({
     }
   }
 
+  function buildMultiFilePlanElement(multiFiles) {
+    const planEl = document.createElement("div");
+    planEl.className = "chat-multi-file-plan";
+
+    const planHeader = document.createElement("div");
+    planHeader.className = "chat-multi-file-plan-header";
+
+    const planBadge = document.createElement("span");
+    planBadge.className = "chat-multi-file-plan-badge";
+    planBadge.innerHTML = `${icon("sparkles")}<span>Plan multi-archivo detectado (${multiFiles.length} archivos)</span>`;
+
+    const btnApplyAll = document.createElement("button");
+    btnApplyAll.type = "button";
+    btnApplyAll.className = "btn btn-primary btn-sm chat-multi-apply-all-btn";
+    btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+    btnApplyAll.addEventListener("click", async () => {
+      btnApplyAll.disabled = true;
+      btnApplyAll.innerHTML = `${icon("refreshCw")}<span>Aplicando lote…</span>`;
+      if (typeof onApplyMultiFile === "function") {
+        try {
+          const applied = await onApplyMultiFile(multiFiles.map((m) => ({ path: m.filePath, code: m.code, lang: m.lang })));
+          if (applied === false) {
+            btnApplyAll.disabled = false;
+            btnApplyAll.innerHTML = `${icon("x")}<span>Sin cambios aplicados</span>`;
+            window.setTimeout(() => {
+              if (!btnApplyAll.isConnected) return;
+              btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+            }, 1500);
+          } else {
+            btnApplyAll.innerHTML = `${icon("check")}<span>¡${multiFiles.length} archivos aplicados!</span>`;
+          }
+        } catch {
+          btnApplyAll.disabled = false;
+          btnApplyAll.innerHTML = `${icon("x")}<span>Error al aplicar</span>`;
+          window.setTimeout(() => {
+            if (!btnApplyAll.isConnected) return;
+            btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+          }, 1500);
+        }
+      } else {
+        btnApplyAll.disabled = false;
+      }
+    });
+
+    planHeader.append(planBadge, btnApplyAll);
+
+    const chipsTrack = document.createElement("div");
+    chipsTrack.className = "chat-multi-file-chips";
+    for (const mf of multiFiles) {
+      const chip = document.createElement("span");
+      chip.className = "chat-multi-file-chip";
+      chip.innerHTML = `${icon("fileCode")}<span>${escapeHtml(mf.filePath)}</span>`;
+      chipsTrack.appendChild(chip);
+    }
+
+    planEl.append(planHeader, chipsTrack);
+    return planEl;
+  }
+
+  function appendSegmentNodes(targetParent, seg, contextHint, insertBeforeNode = null) {
+    if (seg.type === "prose") {
+      const wrapper = document.createElement("div");
+      wrapper.innerHTML = formatProseHtml(seg.content);
+      while (wrapper.firstChild) {
+        targetParent.insertBefore(wrapper.firstChild, insertBeforeNode);
+      }
+      return;
+    }
+    const block = buildCodeBlockElement(seg.lang, seg.code, seg.filePath, contextHint);
+    targetParent.insertBefore(block, insertBeforeNode);
+  }
+
+  /**
+   * Renderiza mensajes de asistente de forma incremental durante streaming (O(N) acumulado):
+   * congela en el DOM los nodos de segmentos ya cerrados y solo actualiza el último segmento abierto.
+   */
   function populateAssistantNode(container, markdownText, isStreaming) {
     const segments = parseMarkdownSegments(markdownText);
-    container.innerHTML = "";
 
     if (segments.length === 0 && isStreaming) {
+      streamDomState.delete(container);
+      container.innerHTML = "";
       const waiting = document.createElement("p");
       waiting.className = "chat-streaming-note";
       waiting.textContent = currentStreamStatus || "Generando respuesta…";
@@ -1002,62 +1091,105 @@ export function initChatController({
       return;
     }
 
-    const multiFiles = segments.filter((s) => s.type === "code" && s.filePath);
-    if (multiFiles.length >= 2 && !isStreaming) {
-      const planEl = document.createElement("div");
-      planEl.className = "chat-multi-file-plan";
-
-      const planHeader = document.createElement("div");
-      planHeader.className = "chat-multi-file-plan-header";
-
-      const planBadge = document.createElement("span");
-      planBadge.className = "chat-multi-file-plan-badge";
-      planBadge.innerHTML = `${icon("sparkles")}<span>Plan multi-archivo detectado (${multiFiles.length} archivos)</span>`;
-
-      const btnApplyAll = document.createElement("button");
-      btnApplyAll.type = "button";
-      btnApplyAll.className = "btn btn-primary btn-sm chat-multi-apply-all-btn";
-      btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
-      btnApplyAll.addEventListener("click", async () => {
-        btnApplyAll.disabled = true;
-        btnApplyAll.innerHTML = `${icon("refreshCw")}<span>Aplicando lote…</span>`;
-        if (typeof onApplyMultiFile === "function") {
-          try {
-            const applied = await onApplyMultiFile(multiFiles.map((m) => ({ path: m.filePath, code: m.code, lang: m.lang })));
-            if (applied === false) {
-              btnApplyAll.disabled = false;
-              btnApplyAll.innerHTML = `${icon("x")}<span>Sin cambios aplicados</span>`;
-              window.setTimeout(() => {
-                btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
-              }, 1500);
-            } else {
-              btnApplyAll.innerHTML = `${icon("check")}<span>¡${multiFiles.length} archivos aplicados!</span>`;
-            }
-          } catch {
-            btnApplyAll.disabled = false;
-            btnApplyAll.innerHTML = `${icon("x")}<span>Error al aplicar</span>`;
-            window.setTimeout(() => {
-              btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
-            }, 1500);
-          }
-        } else {
-          btnApplyAll.disabled = false;
-        }
-      });
-
-      planHeader.append(planBadge, btnApplyAll);
-
-      const chipsTrack = document.createElement("div");
-      chipsTrack.className = "chat-multi-file-chips";
-      for (const mf of multiFiles) {
-        const chip = document.createElement("span");
-        chip.className = "chat-multi-file-chip";
-        chip.innerHTML = `${icon("fileCode")}<span>${escapeHtml(mf.filePath)}</span>`;
-        chipsTrack.appendChild(chip);
+    let state = streamDomState.get(container);
+    if (isStreaming) {
+      if (!state || segments.length - 1 < state.closedCount || state.tailHost.parentNode !== container) {
+        container.innerHTML = "";
+        const tailHost = document.createElement("div");
+        tailHost.className = "chat-streaming-tail";
+        const indicator = document.createElement("span");
+        indicator.className = "chat-streaming-note";
+        indicator.textContent = "Escribiendo…";
+        container.append(tailHost, indicator);
+        state = {
+          closedCount: 0,
+          lastProseContent: "",
+          previousCodeBlock: "",
+          tailHost,
+          indicator,
+          lastTailKey: ""
+        };
+        streamDomState.set(container, state);
       }
 
-      planEl.append(planHeader, chipsTrack);
-      container.appendChild(planEl);
+      const newClosedCount = Math.max(0, segments.length - 1);
+      for (let i = state.closedCount; i < newClosedCount; i += 1) {
+        const seg = segments[i];
+        if (seg.type === "prose") {
+          state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
+          appendSegmentNodes(container, seg, null, state.tailHost);
+        } else {
+          const contextHint = {
+            precedingProse: state.lastProseContent,
+            previousCodeBlock: state.previousCodeBlock
+          };
+          appendSegmentNodes(container, seg, contextHint, state.tailHost);
+          state.previousCodeBlock = seg.code || "";
+          state.lastProseContent = "";
+        }
+      }
+      state.closedCount = newClosedCount;
+
+      const activeSeg = segments[segments.length - 1];
+      if (activeSeg) {
+        if (activeSeg.type === "code") {
+          const tailKey = `code:${newClosedCount}:${activeSeg.lang || ""}:${activeSeg.filePath || ""}`;
+          const existingCodeEl =
+            state.lastTailKey === tailKey ? state.tailHost.querySelector(".chat-code-pre code") : null;
+          if (existingCodeEl) {
+            existingCodeEl.textContent = activeSeg.code;
+          } else {
+            state.tailHost.innerHTML = "";
+            const contextHint = {
+              precedingProse: state.lastProseContent,
+              previousCodeBlock: state.previousCodeBlock
+            };
+            appendSegmentNodes(state.tailHost, activeSeg, contextHint, null);
+            state.lastTailKey = tailKey;
+          }
+        } else {
+          state.tailHost.innerHTML = "";
+          state.lastTailKey = `prose:${newClosedCount}`;
+          appendSegmentNodes(state.tailHost, activeSeg, null, null);
+        }
+      }
+      return;
+    }
+
+    // Render final (!isStreaming): si venía de streaming incremental, promocionar solo los pendientes sin reconstruir todo
+    if (state && state.tailHost.parentNode === container && segments.length >= state.closedCount) {
+      for (let i = state.closedCount; i < segments.length; i += 1) {
+        const seg = segments[i];
+        if (seg.type === "prose") {
+          state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
+          appendSegmentNodes(container, seg, null, state.tailHost);
+        } else {
+          const contextHint = {
+            precedingProse: state.lastProseContent,
+            previousCodeBlock: state.previousCodeBlock
+          };
+          appendSegmentNodes(container, seg, contextHint, state.tailHost);
+          state.previousCodeBlock = seg.code || "";
+          state.lastProseContent = "";
+        }
+      }
+      state.tailHost.remove();
+      state.indicator.remove();
+      streamDomState.delete(container);
+
+      const multiFiles = segments.filter((s) => s.type === "code" && s.filePath);
+      if (multiFiles.length >= 2) {
+        container.insertBefore(buildMultiFilePlanElement(multiFiles), container.firstChild);
+      }
+      return;
+    }
+
+    streamDomState.delete(container);
+    container.innerHTML = "";
+
+    const multiFiles = segments.filter((s) => s.type === "code" && s.filePath);
+    if (multiFiles.length >= 2) {
+      container.appendChild(buildMultiFilePlanElement(multiFiles));
     }
 
     let lastProseContent = "";
@@ -1065,27 +1197,16 @@ export function initChatController({
     for (const seg of segments) {
       if (seg.type === "prose") {
         lastProseContent += (lastProseContent ? "\n" : "") + (seg.content || "");
-        const wrapper = document.createElement("div");
-        wrapper.innerHTML = formatProseHtml(seg.content);
-        while (wrapper.firstChild) {
-          container.appendChild(wrapper.firstChild);
-        }
+        appendSegmentNodes(container, seg, null, null);
       } else {
         const contextHint = {
           precedingProse: lastProseContent,
           previousCodeBlock
         };
-        container.appendChild(buildCodeBlockElement(seg.lang, seg.code, seg.filePath, contextHint));
+        appendSegmentNodes(container, seg, contextHint, null);
         previousCodeBlock = seg.code || "";
         lastProseContent = "";
       }
-    }
-
-    if (isStreaming) {
-      const indicator = document.createElement("span");
-      indicator.className = "chat-streaming-note";
-      indicator.textContent = "Escribiendo…";
-      container.appendChild(indicator);
     }
   }
 
@@ -1127,6 +1248,7 @@ export function initChatController({
         ? `${icon("check")}<span>Insertado</span>`
         : `${icon("x")}<span>Sin archivo abierto</span>`;
       window.setTimeout(() => {
+        if (!btnInsert.isConnected) return;
         btnInsert.innerHTML = `${icon("arrowDownLeft")}<span>En cursor</span>`;
       }, inserted ? 1300 : 2200);
     });
@@ -1143,6 +1265,7 @@ export function initChatController({
         if (applied !== false) {
           btnReplace.innerHTML = `${icon("check")}<span>Reemplazado</span>`;
           window.setTimeout(() => {
+            if (!btnReplace.isConnected) return;
             btnReplace.innerHTML = `${icon("replace")}<span>Reemplazar código</span>`;
           }, 1300);
         }
@@ -1166,6 +1289,7 @@ export function initChatController({
           btnApplyAction.innerHTML = `${icon("x")}<span>Error</span>`;
         }
         window.setTimeout(() => {
+          if (!btnApplyAction.isConnected) return;
           btnApplyAction.disabled = false;
           btnApplyAction.innerHTML = `${icon("fileCheck")}<span>Aplicar a ${escapeHtml(baseName)}</span>`;
         }, 1500);
@@ -1182,6 +1306,7 @@ export function initChatController({
         ? `${icon("check")}<span>Copiado</span>`
         : `${icon("x")}<span>Sin acceso</span>`;
       window.setTimeout(() => {
+        if (!btnCopy.isConnected) return;
         btnCopy.innerHTML = `${icon("copy")}<span>Copiar</span>`;
       }, 1400);
     });
@@ -1357,6 +1482,24 @@ export function initChatController({
     },
     syncThinkingSpeed(speed) {
       syncThinkingSpeedUi(speed);
+    },
+    destroy() {
+      destroyed = true;
+      if (keyCheckTimer) {
+        window.clearTimeout(keyCheckTimer);
+        keyCheckTimer = 0;
+      }
+      keyCheckController?.abort();
+      keyCheckController = null;
+      if (activeRafId && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(activeRafId);
+        activeRafId = 0;
+      }
+      for (const stream of activeStreams.values()) {
+        stream.discarded = true;
+        stream.controller.abort();
+      }
+      activeStreams.clear();
     }
   };
 }
@@ -1406,20 +1549,47 @@ export function truncateCodeContent(content, maxChars = 16000) {
   return `${headSlice}\n\n// ... [${omittedLines} líneas omitidas por límite de contexto de la API gratuita] ...\n\n${tailSlice}`;
 }
 
+const FORBIDDEN_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+
+function sanitizeDetectedFilePath(rawCandidate) {
+  if (typeof rawCandidate !== "string") return null;
+  const trimmed = rawCandidate.trim();
+  if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed)) return null;
+  if (trimmed.startsWith("/") || trimmed.includes("\\") || trimmed.includes("://")) return null;
+  if (/^[a-zA-Z]:/.test(trimmed)) return null;
+
+  const rawParts = trimmed.split("/");
+  const cleanParts = [];
+  for (const part of rawParts) {
+    if (!part || part === ".") continue;
+    if (part === ".." || FORBIDDEN_PATH_SEGMENTS.has(part.toLowerCase())) {
+      return null;
+    }
+    cleanParts.push(part);
+  }
+  if (cleanParts.length === 0) return null;
+  const normalized = cleanParts.join("/");
+  return normalized.includes(".") ? normalized : null;
+}
+
 export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = "") {
   if (rawHeader) {
     if (rawHeader.includes(":")) {
       const parts = rawHeader.split(":");
       if (parts[1] && parts[1].trim()) {
-        const candidate = parts[1].trim().split(/\s+/)[0];
-        if (candidate.includes(".")) return candidate;
+        const candidate = sanitizeDetectedFilePath(parts[1].trim().split(/\s+/)[0]);
+        if (candidate) return candidate;
       }
     }
     const fileParamMatch = rawHeader.match(/(?:file|filepath|path)=["']?([^"'\s]+)["']?/i);
-    if (fileParamMatch) return fileParamMatch[1];
+    if (fileParamMatch) {
+      const candidate = sanitizeDetectedFilePath(fileParamMatch[1]);
+      if (candidate) return candidate;
+    }
     const headerParts = rawHeader.split(/\s+/);
-    if (headerParts.length > 1 && headerParts[1].includes(".")) {
-      return headerParts[1];
+    if (headerParts.length > 1) {
+      const candidate = sanitizeDetectedFilePath(headerParts[1]);
+      if (candidate) return candidate;
     }
   }
 
@@ -1427,8 +1597,9 @@ export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = 
   const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s]+)/i);
   if (commentMatch) {
     const cleaned = commentMatch[1].replace(/(?:\*\/|-->)+$/g, "");
-    if (cleaned) {
-      return cleaned;
+    const candidate = sanitizeDetectedFilePath(cleaned);
+    if (candidate) {
+      return candidate;
     }
   }
 
@@ -1437,7 +1608,10 @@ export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = 
     const lastProseLine = lines[lines.length - 1] || "";
     const proseMatch = lastProseLine.match(/(?:archivo|file|filepath):\s*[`*_]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`*_]?/i);
     if (proseMatch) {
-      return proseMatch[1];
+      const candidate = sanitizeDetectedFilePath(proseMatch[1]);
+      if (candidate) {
+        return candidate;
+      }
     }
   }
 
@@ -1455,80 +1629,30 @@ export function parseMarkdownSegments(raw) {
     return segments;
   }
 
-  const lines = source.split(/\r?\n/);
-  const proseLines = [];
-  let inFence = false;
-  let fenceLen = 0;
-  let rawHeader = "";
-  let codeLines = [];
+  const blocks = splitMarkdownCodeFences(source);
   let lastProseContent = "";
-
-  const flushProse = () => {
-    const prose = proseLines.join("\n").trim();
-    proseLines.length = 0;
-    if (prose) {
-      lastProseContent = prose;
-      segments.push({ type: "prose", content: prose });
-    } else if (segments.length > 0 && segments[segments.length - 1].type === "prose") {
-      lastProseContent = segments[segments.length - 1].content;
-    } else {
-      lastProseContent = "";
-    }
-  };
-
-  const pushCodeSegment = (unclosed) => {
-    let lang = (rawHeader.split(/\s+/)[0] || "").toLowerCase();
-    if (lang.includes(":")) {
-      lang = lang.split(":")[0];
-    }
-    let code = codeLines.join("\n");
-    if (unclosed) {
-      code = code.replace(/\n$/, "");
-    }
-    const filePath = detectFilePathFromCodeSegment(rawHeader, code, lastProseContent);
-    const segment = {
-      type: "code",
-      lang,
-      code
-    };
-    if (filePath) {
-      segment.filePath = filePath;
-    }
-    segments.push(segment);
-  };
-
-  for (const line of lines) {
-    if (!inFence) {
-      const openMatch = line.match(/^ {0,3}(`{3,})([^`]*)$/);
-      if (openMatch) {
-        flushProse();
-        inFence = true;
-        fenceLen = openMatch[1].length;
-        rawHeader = openMatch[2].trim();
-        codeLines = [];
-        continue;
+  for (const block of blocks) {
+    if (block.type === "prose") {
+      const prose = block.text.trim();
+      if (prose) {
+        lastProseContent = prose;
+        segments.push({ type: "prose", content: prose });
+      } else if (segments.length > 0 && segments[segments.length - 1].type === "prose") {
+        lastProseContent = segments[segments.length - 1].content;
+      } else {
+        lastProseContent = "";
       }
-      proseLines.push(line);
     } else {
-      const closeMatch = line.match(/^ {0,3}(`{3,})[ \t]*$/);
-      if (closeMatch && closeMatch[1].length >= fenceLen) {
-        pushCodeSegment(false);
-        inFence = false;
-        fenceLen = 0;
-        rawHeader = "";
-        codeLines = [];
-        continue;
+      const filePath = detectFilePathFromCodeSegment(block.rawHeader, block.code, lastProseContent);
+      const segment = {
+        type: "code",
+        lang: block.lang,
+        code: block.code
+      };
+      if (filePath) {
+        segment.filePath = filePath;
       }
-      codeLines.push(line);
-    }
-  }
-
-  if (inFence) {
-    pushCodeSegment(true);
-  } else {
-    const tail = proseLines.join("\n").trim();
-    if (tail) {
-      segments.push({ type: "prose", content: tail });
+      segments.push(segment);
     }
   }
 
@@ -1686,13 +1810,4 @@ async function copyToClipboardSafe(text) {
   } catch {
     return false;
   }
-}
-
-function escapeHtml(str) {
-  return String(str ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
 }
