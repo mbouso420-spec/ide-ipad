@@ -133,15 +133,15 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
     await page.waitForSelector(".editor-tab-item", { timeout: 20000 });
     await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
 
-    // Verificar sw.js accesible, versión v28 y API de Cache Storage activa en localhost
+    // Verificar sw.js accesible, versión v29 y API de Cache Storage activa en localhost
     const swAssetOk = await page.evaluate(async () => {
       if (!("serviceWorker" in navigator) || !("caches" in window)) return false;
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v28");
+      return text.includes("studio-ide-shell-v29");
     });
-    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v28");
+    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v29");
 
     // 2. Crear archivos E2E vía IndexedDB, recargar, abrir desde árbol, formatear y comprobar persistencia
     await page.evaluate(async () => {
@@ -229,6 +229,115 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
     await page.click("#btn-close-preview");
     await new Promise((r) => setTimeout(r, 300));
 
+    // 3b. Multi-archivo ES Modules (.ts/.json/.css) en Live Preview sin blob: ni errores CSP
+    await page.evaluate(async () => {
+      const dbMod = await import("./js/storage/workspaceDb.js");
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/cfg.json", {
+        isFolder: false,
+        content: '{"brand":"StudioWeb"}'
+      });
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/styles.css", {
+        isFolder: false,
+        content: ".e2e-banner { color: rgb(16, 185, 129); }"
+      });
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/util.ts", {
+        isFolder: false,
+        content: 'export const SCALE = 3;\nexport default function mkTag(s: string) { return "[" + s + "]"; }'
+      });
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/entry.ts", {
+        isFolder: false,
+        content:
+          'import mkTag, { SCALE } from "./util.js";\nimport cfg from "./cfg.json";\nimport "./styles.css";\nconst el = document.createElement("div");\nel.className = "e2e-banner";\nel.textContent = mkTag(cfg.brand) + ":" + (SCALE * 4);\ndocument.body.appendChild(el);\nconsole.log("MULTI_MOD_OK", el.textContent, getComputedStyle(el).color);'
+      });
+    });
+
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+
+    const modFolderPresent = await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll(".tree-node-btn")).find((el) =>
+        (el.textContent || "").includes("mod_e2e")
+      );
+      if (btn && btn.getAttribute("aria-expanded") === "false") {
+        btn.click();
+      }
+      return Boolean(btn);
+    });
+    assert.equal(modFolderPresent, true, "Carpeta mod_e2e debe aparecer en el Explorador");
+    await new Promise((r) => setTimeout(r, 300));
+
+    const clickedEntryTs = await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll(".tree-node-btn")).find((el) =>
+        (el.textContent || "").includes("entry.ts")
+      );
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    assert.equal(clickedEntryTs, true, "mod_e2e/entry.ts debe abrirse en el Explorador");
+    await new Promise((r) => setTimeout(r, 400));
+
+    await page.click("#btn-live-preview");
+    await page.waitForSelector("#preview-dialog[open]", { timeout: 10000 });
+    await page.waitForFunction(
+      () => (document.getElementById("preview-console-list")?.textContent || "").includes("MULTI_MOD_OK"),
+      { timeout: 12000 }
+    );
+    const multiConsoleText = await page.evaluate(
+      () => document.getElementById("preview-console-list")?.textContent || ""
+    );
+    assert.match(multiConsoleText, /MULTI_MOD_OK \[StudioWeb\]:12 rgb\(16, 185, 129\)/);
+    await page.click("#btn-close-preview");
+    await new Promise((r) => setTimeout(r, 300));
+
+    // Ahora agregar HTML con <script type="module" src="./dom_entry.ts"> en <head> y verificar disponibilidad DOM
+    await page.evaluate(async () => {
+      const dbMod = await import("./js/storage/workspaceDb.js");
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/app.html", {
+        isFolder: false,
+        content:
+          '<!DOCTYPE html><html><head><script type="module" src="./dom_entry.ts"></script></head><body><div id="mount-box">DOM_READY</div></body></html>'
+      });
+      await dbMod.upsertEntry("espacio-local", "mod_e2e/dom_entry.ts", {
+        isFolder: false,
+        content:
+          'import mkTag from "./util";\nconst txt = document.getElementById("mount-box")?.textContent || "MISS";\nconsole.log("HTML_MOD_OK", mkTag(txt));'
+      });
+    });
+
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+
+    const clickedAppHtml = await page.evaluate(() => {
+      const folderBtn = Array.from(document.querySelectorAll(".tree-node-btn")).find((el) =>
+        (el.textContent || "").includes("mod_e2e")
+      );
+      if (folderBtn && folderBtn.getAttribute("aria-expanded") === "false") {
+        folderBtn.click();
+      }
+      const btn = Array.from(document.querySelectorAll(".tree-node-btn")).find((el) =>
+        (el.textContent || "").includes("app.html")
+      );
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    assert.equal(clickedAppHtml, true, "mod_e2e/app.html debe abrirse en el Explorador");
+    await new Promise((r) => setTimeout(r, 400));
+
+    await page.click("#btn-live-preview");
+    await page.waitForSelector("#preview-dialog[open]", { timeout: 10000 });
+    await page.waitForFunction(
+      () => (document.getElementById("preview-console-list")?.textContent || "").includes("HTML_MOD_OK"),
+      { timeout: 12000 }
+    );
+    const htmlModConsole = await page.evaluate(
+      () => document.getElementById("preview-console-list")?.textContent || ""
+    );
+    assert.match(htmlModConsole, /HTML_MOD_OK \[DOM_READY\]/);
+    await page.click("#btn-close-preview");
+    await new Promise((r) => setTimeout(r, 300));
+
     // 4. Bóveda Cifrada AES-GCM 256 en el navegador real (Settings -> Almacenamiento)
     const vaultRoundTripOk = await page.evaluate(async () => {
       const providers = await import("./js/ai/providers.js");
@@ -266,8 +375,16 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
     // 5. Probar rotación responsive iPadOS (820x1180 <-> 1180x820) sin desbordes ni errores
     await page.setViewport({ width: 820, height: 1180 });
     await new Promise((r) => setTimeout(r, 250));
+    const portraitOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth
+    );
+    assert.equal(portraitOverflow, false, "No debe haber desborde horizontal en iPad vertical (820px)");
     await page.setViewport({ width: 1180, height: 820 });
     await new Promise((r) => setTimeout(r, 250));
+    const landscapeOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth > window.innerWidth
+    );
+    assert.equal(landscapeOverflow, false, "No debe haber desborde horizontal en iPad horizontal (1180px)");
 
     assert.deepEqual(pageErrors, [], `Se detectaron errores JS en navegador: ${pageErrors.join("; ")}`);
   });

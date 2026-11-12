@@ -9,6 +9,8 @@ import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
 import { computeSmartReplacement, createEditorManager } from "./editor/editorManager.js";
+import { createSplitEditorController } from "./editor/splitEditorController.js";
+import { createBinaryPreview } from "./ui/binaryPreview.js";
 import { formatCode } from "./editor/codeFormatter.js";
 import { initChatController } from "./ai/chatController.js";
 import { initGithubController } from "./github/githubController.js";
@@ -61,9 +63,7 @@ import {
 } from "./storage/emergencyBackup.js";
 import {
   base64ToUint8Array,
-  isBinaryFile,
-  isImageFile,
-  getImageMimeType
+  isBinaryFile
 } from "./storage/fileImport.js";
 
 async function initApp() {
@@ -142,12 +142,13 @@ async function initApp() {
   const splitTitleTextEl = document.getElementById("editor-split-title-text");
   const splitFileSelectEl = document.getElementById("editor-split-file-select");
   const btnCloseSplit = document.getElementById("btn-close-split");
-  const binaryPreviewEl = document.getElementById("editor-binary-preview");
+  const binaryPreview = createBinaryPreview({
+    binaryPreviewEl: document.getElementById("editor-binary-preview"),
+    onDownloadFile: downloadCurrentActiveFile
+  });
 
-  let isSplitOpen = false;
-  let splitActiveFileId = null;
-  /** @type {any} */
-  let editorSplit = null;
+  /** @type {ReturnType<typeof createSplitEditorController> | null} */
+  let splitController = null;
 
   const statusFilePathEl = document.getElementById("status-file-path");
   const statusFileLangEl = document.getElementById("status-file-lang");
@@ -194,7 +195,7 @@ async function initApp() {
       }
 
       scheduleAutosave(activeProject.id, filePath, newContent);
-      editorSplit?.syncDoc(filePath, newContent);
+      splitController?.syncDoc(filePath, newContent);
     },
     onSelectionChange(selection) {
       activeSelection = selection;
@@ -254,7 +255,7 @@ async function initApp() {
     editor,
     getContextSnapshot,
     onHardwareKeyboardChange(hardwareMode) {
-      editorSplit?.setHardwareKeyboardMode?.(hardwareMode);
+      splitController?.setHardwareKeyboardMode(hardwareMode);
     },
     onSelectProvider(providerId) {
       if (!layout.isRightPanelOpen()) {
@@ -352,13 +353,8 @@ async function initApp() {
       } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
         activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
       }
-      if (splitActiveFileId === oldPath) {
-        splitActiveFileId = newPath;
-      } else if (isFolder && splitActiveFileId && splitActiveFileId.startsWith(`${oldPath}/`)) {
-        splitActiveFileId = `${newPath}${splitActiveFileId.slice(oldPath.length)}`;
-      }
+      splitController?.handleEntryRenamed(oldPath, newPath, isFolder);
       editor.renameFileStates(oldPath, newPath, isFolder);
-      editorSplit?.renameFileStates?.(oldPath, newPath, isFolder);
 
       await persistTabsState();
       await reloadProjectEntries();
@@ -374,7 +370,7 @@ async function initApp() {
       );
       for (const rem of removedTabs) {
         editor.dropFileState(rem);
-        editorSplit?.dropFileState?.(rem);
+        splitController?.dropFileState(rem);
       }
 
       openTabIds = openTabIds.filter(
@@ -869,9 +865,7 @@ async function initApp() {
           if (activeFileId === existing.id) {
             editor.replaceEntireDocument(item.code);
           }
-          if (editorSplit && editorSplit.getActiveFileId() === existing.id) {
-            editorSplit.replaceEntireDocument(item.code);
-          }
+          splitController?.replaceIfActive(existing.id, item.code);
         } else {
           await upsertEntry(activeProject.id, norm, {
             content: item.code,
@@ -972,9 +966,9 @@ async function initApp() {
         // Invalida el estado cacheado en statesByFile y reabre limpiamente desde IndexedDB sin recargar toda la UI
         editor.dropFileState(event.path);
         if (isBinaryFile(updated)) {
-          renderBinaryPreview(updated);
+          binaryPreview.render(updated);
         } else {
-          hideBinaryPreview();
+          binaryPreview.hide();
           editor.openFile(updated);
         }
         renderTabs();
@@ -984,14 +978,7 @@ async function initApp() {
         renderTabs();
       }
 
-      if (editorSplit) {
-        if (splitActiveFileId === event.path && !isBinaryFile(updated)) {
-          editorSplit.dropFileState(event.path);
-          editorSplit.openFile(updated);
-        } else {
-          editorSplit.dropFileState(event.path);
-        }
-      }
+      splitController?.handleRemoteFileUpdated(event.path, updated);
       return;
     }
 
@@ -1026,143 +1013,27 @@ async function initApp() {
   syncToolbarState();
   preventFocusSteal([btnUndo, btnRedo, btnFontDown, btnFontUp, btnMinimap, btnEditorSplit, btnCloseSplit, btnToggleSymbols]);
 
-  async function initSplitEditorIfNeeded() {
-    if (editorSplit) return editorSplit;
-    editorSplit = await createEditorManager({
-      mountEl: splitBodyEl,
-      enableMinimap: false,
-      onDocChange(filePath, newContent) {
-        const target = filesOnly.find((f) => f.id === filePath);
-        if (!target) return;
-        const wasDirty = isFileDirtyForProject(target);
-        target.content = newContent;
-        const nowDirty = isFileDirtyForProject(target);
-        if (wasDirty !== nowDirty) {
-          renderTabs();
-        }
-        scheduleAutosave(activeProject.id, filePath, newContent);
-        editor.syncDoc(filePath, newContent);
-      },
-      onSelectionChange() {
-        // En editor secundario no sobreescribe la selección del principal
-      }
-    });
-    return editorSplit;
-  }
-
-  function populateSplitFileSelect() {
-    if (!splitFileSelectEl) return;
-    splitFileSelectEl.innerHTML = "";
-    for (const f of filesOnly) {
-      const opt = document.createElement("option");
-      opt.value = f.id;
-      opt.textContent = f.shortName;
-      if (f.id === splitActiveFileId) {
-        opt.selected = true;
-      }
-      splitFileSelectEl.appendChild(opt);
-    }
-  }
-
-  function openSplitFile(file) {
-    if (!file || !editorSplit || isBinaryFile(file)) return;
-    splitActiveFileId = file.id;
-    editorSplit.openFile(file);
-    if (splitTitleTextEl) splitTitleTextEl.textContent = file.shortName;
-    populateSplitFileSelect();
-  }
-
-  async function toggleEditorSplit(forceState) {
-    const nextState = typeof forceState === "boolean" ? forceState : !isSplitOpen;
-    if (nextState === isSplitOpen) return;
-    isSplitOpen = nextState;
-
-    if (btnEditorSplit) {
-      btnEditorSplit.setAttribute("aria-pressed", String(isSplitOpen));
-      btnEditorSplit.classList.toggle("is-active", isSplitOpen);
-    }
-
-    if (isSplitOpen) {
-      editorStageEl?.classList.add("is-split");
-      if (splitDividerEl) splitDividerEl.hidden = false;
-      if (splitMountEl) splitMountEl.hidden = false;
-      await initSplitEditorIfNeeded();
-
-      let targetFile = null;
-      if (openTabIds.length > 1) {
-        const otherId = openTabIds.find((id) => id !== activeFileId) || openTabIds[0];
-        targetFile = filesOnly.find((f) => f.id === otherId);
-      } else if (activeFileId) {
-        targetFile = filesOnly.find((f) => f.id === activeFileId);
-      }
-
-      if (targetFile) {
-        openSplitFile(targetFile);
-      }
-      populateSplitFileSelect();
-    } else {
-      editorStageEl?.classList.remove("is-split");
-      if (splitDividerEl) splitDividerEl.hidden = true;
-      if (splitMountEl) splitMountEl.hidden = true;
-      if (editorMountEl) {
-        editorMountEl.style.flex = "";
-        editorMountEl.style.width = "";
-      }
-      if (splitMountEl) {
-        splitMountEl.style.flex = "";
-        splitMountEl.style.width = "";
-      }
-      if (editorSplit) {
-        editorSplit.destroy?.();
-        editorSplit = null;
-      }
-      editor.focus();
-    }
-  }
-
-  btnEditorSplit?.addEventListener("click", () => void toggleEditorSplit());
-  btnCloseSplit?.addEventListener("click", () => void toggleEditorSplit(false));
-  splitFileSelectEl?.addEventListener("change", () => {
-    const chosen = filesOnly.find((f) => f.id === splitFileSelectEl.value);
-    if (chosen) openSplitFile(chosen);
+  splitController = createSplitEditorController({
+    btnEditorSplit,
+    btnCloseSplit,
+    editorStageEl,
+    editorMountEl,
+    splitMountEl,
+    splitDividerEl,
+    splitBodyEl,
+    splitTitleTextEl,
+    splitFileSelectEl,
+    keyboardRouter,
+    getActiveProject: () => activeProject,
+    getActiveFileId: () => activeFileId,
+    getFilesOnly: () => filesOnly,
+    getOpenTabIds: () => openTabIds,
+    isFileDirtyForProject,
+    renderTabs,
+    scheduleAutosave,
+    onSyncMainDoc: (filePath, newContent) => editor.syncDoc(filePath, newContent),
+    onFocusMain: () => editor.focus()
   });
-
-  if (splitDividerEl && editorStageEl) {
-    let startX = 0;
-    let startLeftWidth = 0;
-    let totalWidth = 0;
-    let isDragging = false;
-
-    const onPointerMove = (e) => {
-      if (!isDragging) return;
-      const delta = e.clientX - startX;
-      const newLeft = startLeftWidth + delta;
-      const leftPct = Math.max(20, Math.min(80, (newLeft / totalWidth) * 100));
-      if (editorMountEl) editorMountEl.style.flex = `0 0 ${leftPct}%`;
-      if (splitMountEl) splitMountEl.style.flex = `0 0 ${100 - leftPct}%`;
-    };
-
-    const onPointerUp = () => {
-      if (!isDragging) return;
-      isDragging = false;
-      splitDividerEl.classList.remove("is-dragging");
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-    };
-
-    splitDividerEl.addEventListener("pointerdown", (e) => {
-      isDragging = true;
-      startX = e.clientX;
-      startLeftWidth = editorMountEl ? editorMountEl.getBoundingClientRect().width : 0;
-      totalWidth = editorStageEl.getBoundingClientRect().width;
-      splitDividerEl.classList.add("is-dragging");
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-    });
-  }
-
-  keyboardRouter.registerGlobalShortcut("ctrl+\\", () => void toggleEditorSplit());
-  keyboardRouter.registerGlobalShortcut("meta+\\", () => void toggleEditorSplit());
 
   function formatActiveDocument() {
     if (!activeFileId) return;
@@ -1281,7 +1152,7 @@ async function initApp() {
 
     for (const f of filesOnly) {
       editor.dropFileState(f.id);
-      editorSplit?.dropFileState?.(f.id);
+      splitController?.dropFileState(f.id);
     }
 
     activeProject = nextProj;
@@ -1606,143 +1477,12 @@ async function initApp() {
 
     openTabIds.splice(idx, 1);
     editor.dropFileState(filePath);
-    editorSplit?.dropFileState?.(filePath);
+    splitController?.dropFileState(filePath);
     if (activeFileId === filePath) {
       activeFileId = openTabIds.length > 0 ? openTabIds[Math.min(idx, openTabIds.length - 1)] : null;
     }
     await persistTabsState();
     renderWorkspaceView();
-  }
-
-  function hideBinaryPreview() {
-    if (binaryPreviewEl) {
-      binaryPreviewEl.hidden = true;
-      binaryPreviewEl.innerHTML = "";
-    }
-  }
-
-  function renderBinaryPreview(file) {
-    if (!binaryPreviewEl) return;
-    binaryPreviewEl.hidden = false;
-    binaryPreviewEl.innerHTML = "";
-
-    const card = document.createElement("div");
-    card.className = "editor-binary-card";
-
-    const isImg = isImageFile(file);
-    const base64Data = file.base64 || (file.isBinary && typeof file.content === "string" ? file.content : null);
-    const ext = (file.path || "").split(".").pop().toLowerCase();
-
-    let sizeFormatted = "";
-    if (base64Data) {
-      const bytesLen = Math.floor((base64Data.length * 3) / 4);
-      if (bytesLen < 1024) {
-        sizeFormatted = `${bytesLen} B`;
-      } else if (bytesLen < 1024 * 1024) {
-        sizeFormatted = `${(bytesLen / 1024).toFixed(1)} KB`;
-      } else {
-        sizeFormatted = `${(bytesLen / (1024 * 1024)).toFixed(2)} MB`;
-      }
-    }
-
-    if (isImg && (base64Data || (ext === "svg" && typeof file.content === "string"))) {
-      const mime = getImageMimeType(file.path);
-      const imgSrc = base64Data
-        ? `data:${mime};base64,${base64Data}`
-        : `data:image/svg+xml;utf8,${encodeURIComponent(file.content)}`;
-
-      const imgContainer = document.createElement("div");
-      imgContainer.className = "editor-binary-image-container";
-
-      const img = document.createElement("img");
-      img.className = "editor-binary-image";
-      img.alt = file.shortName;
-      img.src = imgSrc;
-
-      imgContainer.appendChild(img);
-      card.appendChild(imgContainer);
-
-      const info = document.createElement("div");
-      info.className = "editor-binary-info";
-
-      const title = document.createElement("h2");
-      title.className = "editor-binary-title";
-      title.textContent = file.shortName;
-      info.appendChild(title);
-
-      const meta = document.createElement("div");
-      meta.className = "editor-binary-meta";
-
-      const badge = document.createElement("span");
-      badge.className = "editor-binary-badge";
-      badge.textContent = ext.toUpperCase();
-      meta.appendChild(badge);
-
-      const sizeSpan = document.createElement("span");
-      sizeSpan.textContent = sizeFormatted || "Imagen";
-      meta.appendChild(sizeSpan);
-
-      const dimSpan = document.createElement("span");
-      dimSpan.className = "editor-binary-dim";
-      img.addEventListener("load", () => {
-        dimSpan.textContent = `${img.naturalWidth} × ${img.naturalHeight} px`;
-      });
-      meta.appendChild(dimSpan);
-
-      info.appendChild(meta);
-      card.appendChild(info);
-    } else {
-      const mark = document.createElement("div");
-      mark.className = "editor-empty-mark";
-      mark.innerHTML = icon(file.icon || "fileText");
-      card.appendChild(mark);
-
-      const info = document.createElement("div");
-      info.className = "editor-binary-info";
-
-      const title = document.createElement("h2");
-      title.className = "editor-binary-title";
-      title.textContent = file.shortName;
-      info.appendChild(title);
-
-      const meta = document.createElement("div");
-      meta.className = "editor-binary-meta";
-
-      const badge = document.createElement("span");
-      badge.className = "editor-binary-badge";
-      badge.textContent = ext ? ext.toUpperCase() : "BIN";
-      meta.appendChild(badge);
-
-      if (sizeFormatted) {
-        const sizeSpan = document.createElement("span");
-        sizeSpan.textContent = sizeFormatted;
-        meta.appendChild(sizeSpan);
-      }
-
-      info.appendChild(meta);
-
-      const desc = document.createElement("p");
-      desc.className = "editor-binary-desc";
-      desc.textContent = "Este archivo contiene datos binarios que no pueden editarse en el editor de código para proteger su integridad.";
-      info.appendChild(desc);
-
-      card.appendChild(info);
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "editor-binary-actions";
-
-    const dlBtn = document.createElement("button");
-    dlBtn.type = "button";
-    dlBtn.className = "btn btn-secondary btn-sm";
-    dlBtn.innerHTML = `${icon("download")} <span>Descargar archivo</span>`;
-    dlBtn.addEventListener("click", () => {
-      void downloadCurrentActiveFile();
-    });
-    actions.appendChild(dlBtn);
-
-    card.appendChild(actions);
-    binaryPreviewEl.appendChild(card);
   }
 
   function renderWorkspaceView() {
@@ -1757,18 +1497,18 @@ async function initApp() {
       if (emptyStateEl) emptyStateEl.hidden = true;
       if (isBinaryFile(activeFile)) {
         if (editorMountEl) editorMountEl.hidden = true;
-        renderBinaryPreview(activeFile);
+        binaryPreview.render(activeFile);
         symbolBar.setLanguage(activeFile.lang);
         setEditorToolbarDisabled(false, true);
       } else {
-        hideBinaryPreview();
+        binaryPreview.hide();
         if (editorMountEl) editorMountEl.hidden = false;
         editor.openFile(activeFile);
         symbolBar.setLanguage(activeFile.lang);
         setEditorToolbarDisabled(false, false);
       }
     } else {
-      hideBinaryPreview();
+      binaryPreview.hide();
       editor.clearActiveFile();
       if (editorMountEl) editorMountEl.hidden = true;
       if (emptyStateEl) emptyStateEl.hidden = false;
@@ -1831,9 +1571,7 @@ async function initApp() {
     }
 
     revealActiveTab();
-    if (isSplitOpen) {
-      populateSplitFileSelect();
-    }
+    splitController?.refreshIfOpen();
   }
 
   /** En pantallas angostas desplaza la tira de pestañas hasta la activa (sin mover el resto de la página). */

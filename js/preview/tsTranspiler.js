@@ -675,6 +675,10 @@ function skipStatement(tokens, startIdx) {
         if (brace > 0) brace -= 1;
         if (brace === 0 && paren === 0 && bracket === 0) {
           const nxt = nextSigIndex(tokens, k + 1);
+          if (nxt < tokens.length && tokens[nxt].type === "ident" && tokens[nxt].value === "from") {
+            k += 1;
+            continue;
+          }
           if (nxt < tokens.length && tokens[nxt].type === "punct" && tokens[nxt].value === ";") {
             return nxt + 1;
           }
@@ -866,6 +870,9 @@ function stripTypeScriptFromTokens(tokens) {
     const prev = prevSigToken(tokens, i);
 
     if (tok.type === "ws" || tok.type === "comment") {
+      if (tok.type === "ws" && tok.value.includes("\n") && inImportExportClause && prev?.type === "string") {
+        inImportExportClause = false;
+      }
       out += tok.value;
       i += 1;
       continue;
@@ -906,7 +913,16 @@ function stripTypeScriptFromTokens(tokens) {
           }
         }
       }
-      if (n1 < tokens.length && tokens[n1].value === "{") {
+      const isStaticImport =
+        tok.value === "import" &&
+        n1 < tokens.length &&
+        tokens[n1].value !== "(" &&
+        tokens[n1].value !== ".";
+      const isExportClause =
+        tok.value === "export" &&
+        n1 < tokens.length &&
+        (tokens[n1].value === "{" || tokens[n1].value === "*");
+      if (isStaticImport || isExportClause) {
         inImportExportClause = true;
       }
     }
@@ -971,7 +987,11 @@ function stripTypeScriptFromTokens(tokens) {
       inVarInit = false;
     }
 
-    if (tok.type === "ident" && (tok.value === "case" || tok.value === "default")) {
+    if (
+      tok.type === "ident" &&
+      (tok.value === "case" ||
+        (tok.value === "default" && tokens[nextSigIndex(tokens, i + 1)]?.value === ":"))
+    ) {
       inCaseExpr = true;
     }
 
@@ -1262,4 +1282,23 @@ export function transpileTypeScriptAndJsx(source, options = {}) {
     code: finalCode,
     usedJsx: result.usedJsx
   };
+}
+
+/**
+ * Expone el tokenizador léxico con desplazamientos exactos `[start, end)` en el fuente original
+ * para análisis de módulos ES (import/export) sin interferir con strings, regex o comentarios.
+ *
+ * @param {string} source
+ * @returns {Array<{ type: string, value: string, start: number, end: number }>}
+ */
+export function tokenizeJsWithOffsets(source) {
+  const src = String(source ?? "");
+  const tokens = tokenize(src);
+  let pos = 0;
+  for (const tok of tokens) {
+    tok.start = pos;
+    pos += tok.value.length;
+    tok.end = pos;
+  }
+  return tokens;
 }

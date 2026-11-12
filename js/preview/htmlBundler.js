@@ -2,84 +2,71 @@ import { normalizePath } from "../storage/workspaceDb.js";
 import { getImageMimeType } from "../storage/fileImport.js";
 import { buildLoopGuardRuntime } from "./loopGuard.js";
 import { transpileTypeScriptAndJsx } from "./tsTranspiler.js";
+import {
+  HTML_EXTENSIONS,
+  JS_EXTENSIONS,
+  CSS_EXTENSIONS,
+  PYTHON_EXTENSIONS,
+  MARKDOWN_EXTENSIONS,
+  SQL_EXTENSIONS,
+  C_EXTENSIONS,
+  CPP_EXTENSIONS,
+  RUST_EXTENSIONS,
+  GO_EXTENSIONS,
+  JAVA_EXTENSIONS,
+  CSHARP_EXTENSIONS,
+  TS_EXTENSIONS,
+  MAX_PREVIEW_ASSET_BYTES,
+  MAX_TOTAL_INLINED_CSS,
+  IGNORED_PREVIEW_DIRS,
+  getFileExtension,
+  getParentFolder,
+  resolveRelativePath,
+  escapeAttr,
+  escapeHtmlText
+} from "./previewUtils.js";
+import {
+  buildExactModuleMap,
+  hasLocalModuleDependencies,
+  extractModuleDependencyPaths,
+  buildVirtualModuleBundle,
+  formatVirtualModuleExecution
+} from "./moduleBundler.js";
+import { buildStandalonePythonPreview } from "./pythonRunner.js";
+import {
+  buildMarkdownPreview,
+  renderMarkdownDocumentHtml,
+  formatMdInline
+} from "./markdownPreview.js";
 
-export const HTML_EXTENSIONS = new Set(["html", "htm"]);
-export const JS_EXTENSIONS = new Set(["js", "mjs", "cjs"]);
-export const CSS_EXTENSIONS = new Set(["css"]);
-export const PYTHON_EXTENSIONS = new Set(["py", "pyw"]);
-export const MARKDOWN_EXTENSIONS = new Set(["md", "markdown"]);
-export const SQL_EXTENSIONS = new Set(["sql"]);
-export const C_EXTENSIONS = new Set(["c", "h"]);
-export const CPP_EXTENSIONS = new Set(["cpp", "cxx", "cc", "hpp"]);
-export const RUST_EXTENSIONS = new Set(["rs"]);
-export const GO_EXTENSIONS = new Set(["go"]);
-export const JAVA_EXTENSIONS = new Set(["java"]);
-export const CSHARP_EXTENSIONS = new Set(["cs"]);
-export const TS_EXTENSIONS = new Set(["ts", "tsx"]);
-
-export const MAX_PREVIEW_ASSET_BYTES = 512 * 1024; // 512 KB por recurso individual
-export const MAX_TOTAL_INLINED_CSS = 2 * 1024 * 1024; // 2 MB presupuesto total acumulado de CSS
-
-export const IGNORED_PREVIEW_DIRS = new Set([
-  "node_modules",
-  ".git",
-  "dist",
-  "build",
-  ".next",
-  ".cache",
-  "venv",
-  ".venv",
-  "target",
-  "bin",
-  "obj",
-  ".turbo",
-  "out"
-]);
-
-export function getFileExtension(path) {
-  const base = String(path || "").split("/").pop() || "";
-  if (!base.includes(".")) return "";
-  return base.split(".").pop().toLowerCase();
-}
-
-export function getParentFolder(path) {
-  const clean = normalizePath(path);
-  return clean.includes("/") ? clean.slice(0, clean.lastIndexOf("/")) : "";
-}
-
-export function resolveRelativePath(baseDir, relPath) {
-  if (relPath.startsWith("/")) {
-    return normalizePath(relPath);
-  }
-  const stack = baseDir ? baseDir.split("/").filter(Boolean) : [];
-  const parts = relPath.split("/");
-  for (const part of parts) {
-    if (!part || part === ".") continue;
-    if (part === "..") {
-      stack.pop();
-    } else {
-      stack.push(part);
-    }
-  }
-  return stack.join("/");
-}
-
-export function escapeAttr(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-export function escapeHtmlText(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
+export {
+  HTML_EXTENSIONS,
+  JS_EXTENSIONS,
+  CSS_EXTENSIONS,
+  PYTHON_EXTENSIONS,
+  MARKDOWN_EXTENSIONS,
+  SQL_EXTENSIONS,
+  C_EXTENSIONS,
+  CPP_EXTENSIONS,
+  RUST_EXTENSIONS,
+  GO_EXTENSIONS,
+  JAVA_EXTENSIONS,
+  CSHARP_EXTENSIONS,
+  TS_EXTENSIONS,
+  MAX_PREVIEW_ASSET_BYTES,
+  MAX_TOTAL_INLINED_CSS,
+  IGNORED_PREVIEW_DIRS,
+  getFileExtension,
+  getParentFolder,
+  resolveRelativePath,
+  escapeAttr,
+  escapeHtmlText,
+  extractModuleDependencyPaths,
+  buildStandalonePythonPreview,
+  buildMarkdownPreview,
+  renderMarkdownDocumentHtml,
+  formatMdInline
+};
 
 /**
  * Filtra únicamente los archivos que pertenecen a la misma carpeta base (y subcarpetas relativas de ese conjunto),
@@ -713,6 +700,9 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
+  const exactModuleMap = buildExactModuleMap(fileMap);
+  let inlineScriptCounter = 0;
+
   function compileScriptContent(rawCode, sourcePath, explicitType = "", isModule = false) {
     const ext = getFileExtension(sourcePath || "");
     const t = String(explicitType || "").trim().toLowerCase();
@@ -731,7 +721,23 @@ export function bundleHtmlWithFolderAssets(
         fileName: sourcePath || "inline.tsx"
       }).code;
     }
-    return transformJs(executable, isModule).replace(/<\/script>/gi, "<\\/script>");
+    const rendered = typeof transformJs === "function" ? transformJs(executable, isModule) : executable;
+    return rendered.replace(/<\/script>/gi, "<\\/script>");
+  }
+
+  function tryBundleLocalModules(rawCode, sourcePath) {
+    if (!hasLocalModuleDependencies(rawCode, sourcePath, exactModuleMap, { allowParentTraversal })) {
+      return null;
+    }
+    const bundle = buildVirtualModuleBundle({
+      entryPath: sourcePath,
+      entryCode: rawCode,
+      exactMap: exactModuleMap,
+      transformJs,
+      transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
+      allowParentTraversal
+    });
+    return formatVirtualModuleExecution(bundle);
   }
 
   html = html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi, (fullTag, attrs, inlineCode) => {
@@ -751,7 +757,13 @@ export function bundleHtmlWithFolderAssets(
         type === "text/babel";
       if (!isJsOrTs || !inlineCode.trim()) return fullTag;
       const isMod = type === "module";
-      const safeInline = compileScriptContent(inlineCode, "inline.js", type, isMod);
+      const virtualPath = resolveRelativePath(dir, `__inline_${inlineScriptCounter++}.js`);
+      const bundledExec = tryBundleLocalModules(inlineCode, virtualPath);
+      if (bundledExec) {
+        const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
+        return `<script${modAttr}>\n${bundledExec.scriptCode}\n</script>`;
+      }
+      const safeInline = compileScriptContent(inlineCode, virtualPath, type, isMod);
       const outAttrs = type && type !== "module" ? attrs.replace(/\btype=["'][^"']*["']/i, "").trim() : attrs.trim();
       return `<script${outAttrs ? " " + outAttrs : ""}>${safeInline}</script>`;
     }
@@ -767,6 +779,17 @@ export function bundleHtmlWithFolderAssets(
 
     const isModule = /\btype=["']module["']/i.test(attrs);
     const hasDefer = /\bdefer\b/i.test(attrs);
+    const bundledExec = tryBundleLocalModules(asset.content, asset.path);
+    if (bundledExec) {
+      const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
+      const scriptTag = `<script${modAttr} data-source="${escapeAttr(asset.path)}">\n${bundledExec.scriptCode}\n</script>`;
+      if (isModule || hasDefer) {
+        deferredScripts.push(scriptTag);
+        return "";
+      }
+      return scriptTag;
+    }
+
     const safeJs = compileScriptContent(asset.content, asset.path, "", isModule);
 
     if (!isModule && hasDefer) {
@@ -778,8 +801,16 @@ export function bundleHtmlWithFolderAssets(
   });
 
   if (ensureJsFile && !inlinedActiveJs) {
-    const safeExtraJs = compileScriptContent(ensureJsFile.content, ensureJsFile.path, "", false);
-    deferredScripts.push(`<script data-source="${escapeAttr(ensureJsFile.path)}">\n${safeExtraJs}\n</script>`);
+    const bundledExtra = tryBundleLocalModules(ensureJsFile.content, ensureJsFile.path);
+    if (bundledExtra) {
+      const modAttr = bundledExtra.isModuleTag ? ' type="module"' : "";
+      deferredScripts.push(
+        `<script${modAttr} data-source="${escapeAttr(ensureJsFile.path)}">\n${bundledExtra.scriptCode}\n</script>`
+      );
+    } else {
+      const safeExtraJs = compileScriptContent(ensureJsFile.content, ensureJsFile.path, "", false);
+      deferredScripts.push(`<script data-source="${escapeAttr(ensureJsFile.path)}">\n${safeExtraJs}\n</script>`);
+    }
   }
 
   if (deferredScripts.length > 0) {
@@ -798,7 +829,17 @@ export function bundleHtmlWithFolderAssets(
   return `${bridge}\n${html}`;
 }
 
-export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code) {
+export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code, options = {}) {
+  const exactMap = buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
+  const allowParentTraversal = options?.allowParentTraversal !== false;
+  if (
+    exactMap.size > 0 &&
+    hasLocalModuleDependencies(tsFile?.content || "", tsFile?.path || "main.ts", exactMap, {
+      allowParentTraversal
+    })
+  ) {
+    return buildStandaloneJsPreview(tsFile, transformJs, options);
+  }
   const ext = getFileExtension(tsFile?.path || "");
   const isJsx = ext === "tsx" || ext === "jsx";
   const compiled = transpileTypeScriptAndJsx(tsFile?.content || "", {
@@ -810,18 +851,64 @@ export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code) {
       ...tsFile,
       content: compiled.code
     },
-    transformJs
+    transformJs,
+    options
   );
 }
 
-export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code) {
+export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, options = {}) {
   const bridge = buildConsoleBridgeScript(true);
-  const isModule = /\b(import|export|await)\b/.test(jsFile.content);
-  const safeJs = transformJs(jsFile.content, isModule).replace(/<\/script>/gi, "<\\/script>");
+  const exactMap = buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
+  const allowParentTraversal = options?.allowParentTraversal !== false;
+  const usesLocalModules =
+    exactMap.size > 0 &&
+    hasLocalModuleDependencies(jsFile.content, jsFile.path, exactMap, { allowParentTraversal });
+
+  const isModule = !usesLocalModules && /\b(import|export|await)\b/.test(jsFile.content);
   const safeName = escapeHtmlText(jsFile.path);
 
-  const scriptSnippet = isModule
-    ? `<script type="module">
+  let scriptSnippet = "";
+  if (usesLocalModules) {
+    const bundle = buildVirtualModuleBundle({
+      entryPath: jsFile.path,
+      entryCode: jsFile.content,
+      exactMap,
+      transformJs,
+      allowParentTraversal
+    });
+    const exec = formatVirtualModuleExecution(bundle);
+    const statusFooter = `
+      var st = document.getElementById("__js_status");
+      if (st && st.dataset.failed !== "1") {
+        st.textContent = "Ejecutado correctamente (Módulos ES)";
+      }
+      var out = document.getElementById("__js_screen_log");
+      if (out && out.children.length === 0) {
+        var note = document.createElement("div");
+        note.className = "js-empty";
+        note.textContent = "El grafo de módulos se ejecutó sin errores. Usá console.log(...) para mostrar resultados acá.";
+        out.appendChild(note);
+      }`;
+    const openTag = exec.isModuleTag ? '<script type="module">' : "<script>";
+    const preamble = exec.extImportPreamble ? `${exec.extImportPreamble}\n` : "";
+    scriptSnippet = `${openTag}
+${preamble}try {
+${exec.scriptBodyCode}
+${statusFooter}
+} catch (err) {
+  var stErr = document.getElementById("__js_status");
+  if (stErr) {
+    stErr.dataset.failed = "1";
+    stErr.style.color = "var(--err)";
+    stErr.textContent = "Error en ejecución: " + (err && err.message ? err.message : String(err));
+  }
+  console.error(err);
+}
+</script>`;
+  } else {
+    const safeJs = transformJs(jsFile.content, isModule).replace(/<\/script>/gi, "<\\/script>");
+    scriptSnippet = isModule
+      ? `<script type="module">
 ${safeJs}
 </script>
 <script type="module">
@@ -841,7 +928,7 @@ ${safeJs}
     }, 40);
   });
 </script>`
-    : `<script>
+      : `<script>
     try {
 ${safeJs}
       var st = document.getElementById("__js_status");
@@ -864,6 +951,7 @@ ${safeJs}
       }
     }
 </script>`;
+  }
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -953,864 +1041,4 @@ ${safeJs}
   ${scriptSnippet}
 </body>
 </html>`;
-}
-
-export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseFolder = "") {
-  const prefix = baseFolder ? `${baseFolder}/` : "";
-  const modules = [];
-  const modPrefixes = new Set();
-  const TEXT_OR_DATA_EXTENSIONS = new Set([
-    "json", "txt", "csv", "tsv", "sql", "xml", "yaml", "yml", "md"
-  ]);
-
-  for (const candidate of sameFolderFiles) {
-    const ext = getFileExtension(candidate.path);
-    const isPy = PYTHON_EXTENSIONS.has(ext);
-    const isData = TEXT_OR_DATA_EXTENSIONS.has(ext);
-    if (!isPy && !isData) continue;
-    const cleanPath = normalizePath(candidate.path);
-    if (cleanPath === normalizePath(pyFile.path)) continue;
-    const relPath = prefix && cleanPath.startsWith(prefix) ? cleanPath.slice(prefix.length) : cleanPath;
-    if (relPath && !relPath.startsWith("..")) {
-      modules.push({ path: relPath, content: candidate.content });
-      if (isPy) {
-        const topMod = relPath.split("/")[0].replace(/\.(py|pyw)$/i, "");
-        if (topMod) modPrefixes.add(topMod);
-      }
-    }
-  }
-
-  const pythonBootstrap = [
-    "import builtins, json, random, sys, traceback",
-    "if '.' not in sys.path:",
-    "    sys.path.insert(0, '.')",
-    "class _StudioPauseForInput(BaseException):",
-    "    def __init__(self, prompt_text):",
-    "        self.prompt_text = prompt_text",
-    "for _mod_prefix in json.loads(__studio_mod_prefixes_json):",
-    "    for _loaded in list(sys.modules.keys()):",
-    "        if _loaded == _mod_prefix or _loaded.startswith(_mod_prefix + '.'):",
-    "            sys.modules.pop(_loaded, None)",
-    "random.seed(int(__studio_seed))",
-    "_inputs = json.loads(__studio_inputs_json)",
-    "_idx = 0",
-    "def __studio_input(prompt=''):",
-    "    global _idx",
-    "    texto = str(prompt) if prompt is not None else ''",
-    "    if _idx < len(_inputs):",
-    "        item = _inputs[_idx]",
-    "        _idx += 1",
-    "        if item.get('cancelled'):",
-    "            print(f'{texto}(cancelado)')",
-    "            raise EOFError('Entrada cancelada por el usuario.')",
-    "        val = str(item.get('value', ''))",
-    "        print(f'{texto}{val}')",
-    "        return val",
-    "    raise _StudioPauseForInput(texto)",
-    "builtins.input = __studio_input",
-    "_result = {'status': 'ok'}",
-    "global _studio_repl_ns",
-    "_studio_repl_ns = {'__name__': '__main__', '__file__': __studio_entry_name}",
-    "try:",
-    "    exec(compile(__studio_entry_code, __studio_entry_name, 'exec'), _studio_repl_ns)",
-    "except _StudioPauseForInput as _pause:",
-    "    _result = {'status': 'need_input', 'prompt': _pause.prompt_text}",
-    "except SystemExit:",
-    "    pass",
-    "except Exception as _exc:",
-    "    _result = {'status': 'error'}",
-    "    _tb = traceback.extract_tb(_exc.__traceback__)",
-    "    _clean = [f for f in _tb if f.filename == __studio_entry_name or not f.filename.startswith('<')]",
-    "    _lines = ['Traceback (most recent call last):']",
-    "    for _f in _clean:",
-    "        _lines.append(f'  Archivo \"{_f.filename}\", línea {_f.lineno}, en {_f.name}')",
-    "    _lines.extend([l.rstrip('\\n') for l in traceback.format_exception_only(type(_exc), _exc)])",
-    "    print('\\n'.join(_lines), file=sys.stderr)",
-    "finally:",
-    "    sys.stdout.flush()",
-    "    sys.stderr.flush()",
-    "json.dumps(_result)"
-  ].join("\n");
-
-  const payloadJson = JSON.stringify({
-    entryName: pyFile.shortName,
-    entryPath: pyFile.path,
-    code: pyFile.content,
-    modules,
-    modPrefixes: [...modPrefixes],
-    bootstrap: pythonBootstrap
-  }).replace(/</g, "\\u003c");
-
-  const safePathLabel = escapeHtmlText(pyFile.path);
-
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <style>
-    :root {
-      --bg: oklch(15% 0.011 255);
-      --card: oklch(20.5% 0.014 255);
-      --surface-input: oklch(16.5% 0.012 255);
-      --border: oklch(33% 0.016 255 / 0.65);
-      --ink: oklch(94.5% 0.007 255);
-      --muted: oklch(67% 0.014 255);
-      --accent: oklch(74% 0.13 252);
-      --accent-solid: oklch(52% 0.165 252);
-      --accent-ink: oklch(98% 0.005 252);
-      --ok: oklch(66% 0.14 152);
-      --warn: oklch(74% 0.14 75);
-      --err: oklch(62% 0.18 25);
-      --font-ui: system-ui, -apple-system, sans-serif;
-      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 20px;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: var(--font-ui);
-    }
-    .py-runner-card {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--card);
-      overflow: hidden;
-    }
-    .py-runner-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--border);
-      font-size: 13px;
-    }
-    .py-runner-file {
-      font-family: var(--font-mono);
-      color: var(--accent);
-      font-weight: 500;
-    }
-    .py-runner-status {
-      color: var(--warn);
-      font-size: 12px;
-    }
-    .py-runner-output {
-      padding: 12px 14px;
-      font-family: var(--font-mono);
-      font-size: 13px;
-      line-height: 1.6;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .py-line {
-      white-space: pre-wrap;
-      word-break: break-word;
-      padding: 4px 8px;
-      border-radius: 4px;
-      background: var(--surface-input);
-    }
-    .py-line-error { color: var(--err); }
-    .py-empty { color: var(--muted); font-style: italic; }
-    .py-input-bar {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 14px;
-      border-top: 1px solid var(--border);
-      background: var(--surface-input);
-    }
-    .py-input-bar[hidden] { display: none; }
-    .py-input-prompt {
-      font-family: var(--font-mono);
-      font-size: 13px;
-      color: var(--accent);
-      font-weight: 500;
-    }
-    .py-input-field {
-      flex: 1;
-      min-width: 160px;
-      min-height: 36px;
-      padding: 6px 10px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--card);
-      color: var(--ink);
-      font-family: var(--font-mono);
-      font-size: 16px;
-    }
-    .py-input-field:focus {
-      outline: 2px solid var(--accent);
-      outline-offset: 1px;
-    }
-    .py-btn {
-      min-height: 36px;
-      padding: 6px 12px;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--card);
-      color: var(--ink);
-      font-family: var(--font-ui);
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-    }
-    .py-btn-primary {
-      background: var(--accent-solid);
-      border-color: var(--accent-solid);
-      color: var(--accent-ink);
-    }
-    .py-runner-controls {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .py-btn-stop {
-      min-height: 30px;
-      padding: 4px 12px;
-      border-color: var(--err);
-      color: var(--err);
-    }
-    .py-btn-stop[hidden] { display: none; }
-  </style>
-</head>
-<body>
-  <section class="py-runner-card">
-    <div class="py-runner-head">
-      <span class="py-runner-file">${safePathLabel}</span>
-      <span class="py-runner-controls">
-        <span id="__py_status" class="py-runner-status">Iniciando motor Python 3 (WebAssembly)…</span>
-        <button type="button" id="__py_stop" class="py-btn py-btn-stop" hidden>Detener</button>
-      </span>
-    </div>
-    <div id="__py_screen_log" class="py-runner-output"></div>
-    <form id="__py_input_form" class="py-input-bar" hidden>
-      <label id="__py_input_prompt" for="__py_input_field" class="py-input-prompt">input():</label>
-      <input id="__py_input_field" type="text" class="py-input-field" autocomplete="off" spellcheck="false" placeholder="Escribí un valor y tocá Enviar…">
-      <button type="submit" class="py-btn py-btn-primary">Enviar</button>
-      <button type="button" id="__py_input_cancel" class="py-btn">Cancelar</button>
-    </form>
-  </section>
-
-  <script id="__py_payload" type="application/json">${payloadJson}</script>
-  <script id="__py_runner_src" type="text/plain">
-    var PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.27.3/full/";
-    var pyodide = null;
-    var loading = null;
-    function send(msg) { self.postMessage(msg); }
-    function ensurePyodide() {
-      if (pyodide) return Promise.resolve(pyodide);
-      if (!loading) {
-        send({ type: "status", text: "loading" });
-        loading = (async function () {
-          await __loadScript(PYODIDE_URL + "pyodide.js");
-          var py = await loadPyodide({ indexURL: PYODIDE_URL });
-          py.setStdout({ batched: function (line) { send({ type: "out", level: "log", text: line }); } });
-          py.setStderr({ batched: function (line) { send({ type: "out", level: "error", text: line }); } });
-          pyodide = py;
-          return py;
-        })();
-      }
-      return loading;
-    }
-    function ensureParentDirs(FS, filePath) {
-      var parts = filePath.split("/");
-      var current = "";
-      for (var i = 0; i < parts.length - 1; i += 1) {
-        current = current ? current + "/" + parts[i] : parts[i];
-        try { FS.mkdir(current); } catch (_) {}
-      }
-    }
-    function writeFiles(py, job) {
-      ensureParentDirs(py.FS, job.entryName);
-      try { py.FS.writeFile(job.entryName, job.code, { encoding: "utf8" }); } catch (_) {}
-      if (job.entryPath && job.entryPath !== job.entryName) {
-        ensureParentDirs(py.FS, job.entryPath);
-        try { py.FS.writeFile(job.entryPath, job.code, { encoding: "utf8" }); } catch (_) {}
-      }
-      for (var i = 0; i < job.modules.length; i += 1) {
-        var mod = job.modules[i];
-        ensureParentDirs(py.FS, mod.path);
-        py.FS.writeFile(mod.path, mod.content, { encoding: "utf8" });
-      }
-    }
-    self.onmessage = async function (event) {
-      var job = event.data;
-      if (!job) return;
-      if (job.type === "eval") {
-        try {
-          var pyEval = await ensurePyodide();
-          pyEval.globals.set("__studio_eval_code", String(job.code || ""));
-          var evalScript = [
-            "import json, sys, traceback",
-            "_er = {'status': 'ok'}",
-            "try:",
-            "    _v = eval(compile(__studio_eval_code, '<repl>', 'eval'), _studio_repl_ns)",
-            "    if _v is not None:",
-            "        print(repr(_v))",
-            "except SyntaxError:",
-            "    try:",
-            "        exec(compile(__studio_eval_code, '<repl>', 'exec'), _studio_repl_ns)",
-            "    except Exception as _ex:",
-            "        _er = {'status': 'error'}",
-            "        print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
-            "except Exception as _ex:",
-            "    _er = {'status': 'error'}",
-            "    print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
-            "sys.stdout.flush()",
-            "sys.stderr.flush()",
-            "json.dumps(_er)"
-          ].join("\\n");
-          var evalRaw = await pyEval.runPythonAsync(evalScript);
-          send({ type: "eval_done", outcome: JSON.parse(String(evalRaw || '{"status":"ok"}')) });
-        } catch (err) {
-          send({ type: "out", level: "error", text: err && err.message ? String(err.message) : String(err) });
-          send({ type: "eval_done", outcome: { status: "error" } });
-        }
-        return;
-      }
-      if (job.type !== "run") return;
-      try {
-        var py = await ensurePyodide();
-        send({ type: "status", text: "running" });
-        writeFiles(py, job);
-        py.globals.set("__studio_entry_name", job.entryName);
-        py.globals.set("__studio_entry_code", job.code);
-        py.globals.set("__studio_seed", job.seed);
-        py.globals.set("__studio_inputs_json", JSON.stringify(job.inputs));
-        py.globals.set("__studio_mod_prefixes_json", JSON.stringify(job.modPrefixes));
-        var raw = await py.runPythonAsync(job.bootstrap);
-        send({ type: "result", outcome: JSON.parse(String(raw || '{"status":"ok"}')) });
-      } catch (err) {
-        send({ type: "fatal", message: err && err.message ? String(err.message) : String(err) });
-      }
-    };
-  </script>
-  <script>
-    (function () {
-      var statusEl = document.getElementById("__py_status");
-      var stopBtn = document.getElementById("__py_stop");
-      var screenBox = document.getElementById("__py_screen_log");
-      var inputForm = document.getElementById("__py_input_form");
-      var inputPromptEl = document.getElementById("__py_input_prompt");
-      var inputField = document.getElementById("__py_input_field");
-      var cancelBtn = document.getElementById("__py_input_cancel");
-      var payload = JSON.parse(document.getElementById("__py_payload").textContent);
-      var runnerSrc = document.getElementById("__py_runner_src").textContent;
-
-      var sessionSeed = Math.floor(Math.random() * 1000000000);
-      var submittedInputs = [];
-      var MAX_INPUT_STEPS = 200;
-      var runner = null;
-      var running = false;
-      var runStartedAt = 0;
-      var ticker = 0;
-      var sawWorkerMessage = false;
-
-      function clearOutputs() {
-        if (screenBox) screenBox.innerHTML = "";
-        try {
-          parent.postMessage({ source: "studio-ide-preview", action: "clear" }, "*");
-        } catch (_) {}
-      }
-
-      function emit(level, text) {
-        var msg = String(text == null ? "" : text);
-        try {
-          parent.postMessage({ source: "studio-ide-preview", level: level, text: msg }, "*");
-        } catch (_) {}
-        if (screenBox) {
-          var row = document.createElement("div");
-          row.className = level === "error" ? "py-line py-line-error" : "py-line";
-          row.textContent = msg;
-          screenBox.appendChild(row);
-        }
-      }
-
-      function setStatus(label, colorVar) {
-        if (!statusEl) return;
-        statusEl.textContent = label;
-        statusEl.style.color = colorVar;
-      }
-
-      function setRunning(next) {
-        running = next;
-        window.clearInterval(ticker);
-        if (stopBtn) stopBtn.hidden = !(next && runner && runner.canStop);
-        if (next) {
-          runStartedAt = Date.now();
-          ticker = window.setInterval(function () {
-            var secs = Math.floor((Date.now() - runStartedAt) / 1000);
-            if (secs >= 1) {
-              setStatus(
-                secs >= 5
-                  ? "Ejecutando… " + secs + " s (¿bucle infinito? Tocá Detener)"
-                  : "Ejecutando… " + secs + " s",
-                secs >= 5 ? "var(--warn)" : "var(--accent)"
-              );
-            }
-          }, 1000);
-        }
-      }
-
-      function loadScriptTag(url) {
-        return new Promise(function (resolve, reject) {
-          var s = document.createElement("script");
-          s.src = url;
-          s.onload = function () { resolve(); };
-          s.onerror = function () { reject(new Error("No se pudo descargar el motor Python 3 (Pyodide). Conectate a internet al menos una vez para almacenarlo en caché.")); };
-          document.head.appendChild(s);
-        });
-      }
-
-      function createMainThreadRunner() {
-        var fakeSelf = {
-          postMessage: function (msg) { window.setTimeout(function () { handle(msg); }, 0); },
-          onmessage: null
-        };
-        new Function("self", "__loadScript", runnerSrc)(fakeSelf, loadScriptTag);
-        return {
-          canStop: false,
-          post: function (msg) { fakeSelf.onmessage({ data: msg }); },
-          stop: function () {}
-        };
-      }
-
-      function createRunner() {
-        try {
-          var prefix = "var __loadScript = function (url) { importScripts(url); return Promise.resolve(); };\\n";
-          var blobUrl = URL.createObjectURL(new Blob([prefix + runnerSrc], { type: "text/javascript" }));
-          var worker = new Worker(blobUrl);
-          var revoked = false;
-          function revokeBlobUrl() {
-            if (!revoked) {
-              revoked = true;
-              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
-            }
-          }
-          var r = {
-            canStop: true,
-            post: function (msg) { worker.postMessage(msg); },
-            stop: function () {
-              window.removeEventListener("pagehide", onPageHide);
-              revokeBlobUrl();
-              worker.terminate();
-            }
-          };
-          function onPageHide() {
-            r.stop();
-          }
-          worker.onmessage = function (event) {
-            sawWorkerMessage = true;
-            revokeBlobUrl();
-            handle(event.data);
-          };
-          worker.onerror = function (event) {
-            if (event && event.preventDefault) event.preventDefault();
-            if (!sawWorkerMessage && runner === r) {
-              r.stop();
-              runner = createMainThreadRunner();
-              executePass();
-              return;
-            }
-            handle({ type: "fatal", message: event && event.message ? event.message : "Error en el motor Python." });
-          };
-          window.addEventListener("pagehide", onPageHide, { once: true });
-          return r;
-        } catch (_) {
-          return createMainThreadRunner();
-        }
-      }
-
-      function handle(msg) {
-        if (!msg) return;
-        if (msg.type === "out") {
-          emit(msg.level, msg.text);
-          return;
-        }
-        if (msg.type === "status") {
-          if (msg.text === "loading") setStatus("Iniciando motor Python 3 (WebAssembly)…", "var(--warn)");
-          if (msg.text === "running") setStatus("Ejecutando script…", "var(--accent)");
-          return;
-        }
-        if (msg.type === "fatal") {
-          setRunning(false);
-          setStatus("Error al iniciar Python", "var(--err)");
-          emit("error", msg.message);
-          return;
-        }
-        if (msg.type === "eval_done") {
-          return;
-        }
-        if (msg.type === "result") {
-          setRunning(false);
-          var outcome = msg.outcome || { status: "ok" };
-          if (outcome.status === "need_input") {
-            setStatus("Esperando entrada en consola…", "var(--warn)");
-            if (inputPromptEl) inputPromptEl.textContent = outcome.prompt || "Entrada (input):";
-            if (inputForm && inputField) {
-              inputField.value = "";
-              inputForm.hidden = false;
-              inputField.focus();
-            }
-            return;
-          }
-          if (outcome.status === "error") {
-            setStatus("Error en ejecución", "var(--err)");
-          } else {
-            setStatus("Ejecutado correctamente", "var(--ok)");
-            if (screenBox && screenBox.children.length === 0) {
-              var note = document.createElement("div");
-              note.className = "py-empty";
-              note.textContent = "El script Python finalizó sin errores. Usá print(...) para mostrar resultados acá.";
-              screenBox.appendChild(note);
-            }
-          }
-        }
-      }
-
-      function executePass() {
-        if (inputForm) inputForm.hidden = true;
-        if (submittedInputs.length > MAX_INPUT_STEPS) {
-          emit("error", "Se superó el límite de 200 lecturas input() consecutivas.");
-          setStatus("Detenido por límite de entradas", "var(--err)");
-          return;
-        }
-        if (!runner) runner = createRunner();
-        clearOutputs();
-        setRunning(true);
-        runner.post({
-          type: "run",
-          entryName: payload.entryName,
-          entryPath: payload.entryPath,
-          code: payload.code,
-          modules: payload.modules,
-          modPrefixes: payload.modPrefixes,
-          bootstrap: payload.bootstrap,
-          inputs: submittedInputs,
-          seed: sessionSeed
-        });
-      }
-
-      if (stopBtn) {
-        stopBtn.addEventListener("click", function () {
-          if (!running || !runner || !runner.canStop) return;
-          runner.stop();
-          runner = null;
-          setRunning(false);
-          if (inputForm) inputForm.hidden = true;
-          setStatus("Ejecución detenida", "var(--err)");
-          emit("error", "Ejecución detenida por el usuario. Tocá Recargar para volver a ejecutar.");
-        });
-      }
-
-      if (inputForm) {
-        inputForm.addEventListener("submit", function (ev) {
-          ev.preventDefault();
-          submittedInputs.push({ value: inputField ? inputField.value : "" });
-          executePass();
-        });
-      }
-
-      if (cancelBtn) {
-        cancelBtn.addEventListener("click", function () {
-          submittedInputs.push({ cancelled: true });
-          executePass();
-        });
-      }
-
-      window.addEventListener("message", function (ev) {
-        var d = ev.data;
-        if (!d || d.source !== "studio-ide-repl" || d.action !== "eval") return;
-        if (ev.source !== window.parent) return;
-        var code = String(d.code || "").trim();
-        if (!code) return;
-        emit("log", ">>> " + code);
-        if (running) {
-          emit("error", "Esperá a que termine la ejecución actual antes de evaluar en el REPL.");
-          return;
-        }
-        if (!runner) runner = createRunner();
-        runner.post({ type: "eval", code: code });
-      });
-
-      executePass();
-    })();
-  </script>
-</body>
-</html>`;
-}
-
-export function buildMarkdownPreview(mdFile) {
-  const renderedBody = renderMarkdownDocumentHtml(mdFile.content || "");
-  const safeTitle = escapeHtmlText(mdFile.shortName);
-
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>${safeTitle}</title>
-  <style>
-    :root {
-      --bg: oklch(15% 0.011 255);
-      --card: oklch(20.5% 0.014 255);
-      --code-bg: oklch(18% 0.013 255);
-      --border: oklch(33% 0.016 255 / 0.65);
-      --ink: oklch(94.5% 0.007 255);
-      --ink-2: oklch(83% 0.011 255);
-      --muted: oklch(67% 0.014 255);
-      --accent: oklch(74% 0.13 252);
-      --font-body: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
-      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 28px 24px 48px;
-      background: var(--bg);
-      color: var(--ink-2);
-      font-family: var(--font-body);
-      font-size: 15px;
-      line-height: 1.68;
-    }
-    .md-article {
-      max-width: 760px;
-      margin: 0 auto;
-    }
-    h1, h2, h3, h4, h5, h6 {
-      color: var(--ink);
-      margin: 1.4em 0 0.55em;
-      line-height: 1.3;
-      overflow-wrap: break-word;
-    }
-    h1 { font-size: 1.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.35em; margin-top: 0; }
-    h2 { font-size: 1.35rem; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
-    h3 { font-size: 1.12rem; }
-    p, ul, ol, blockquote, pre, table { margin: 0 0 1em; }
-    ul, ol { padding-left: 1.5em; }
-    li + li { margin-top: 0.28em; }
-    a { color: var(--accent); text-underline-offset: 0.18em; }
-    code {
-      font-family: var(--font-mono);
-      font-size: 0.86em;
-      padding: 0.15em 0.4em;
-      border-radius: 5px;
-      background: var(--card);
-      color: var(--ink);
-    }
-    pre {
-      padding: 14px 16px;
-      border-radius: 8px;
-      border: 1px solid var(--border);
-      background: var(--code-bg);
-      overflow-x: auto;
-    }
-    pre code {
-      padding: 0;
-      background: transparent;
-      font-size: 13px;
-      line-height: 1.6;
-    }
-    blockquote {
-      padding: 8px 14px;
-      border-left: 3px solid var(--accent);
-      background: var(--card);
-      border-radius: 0 6px 6px 0;
-      color: var(--ink-2);
-    }
-    hr {
-      border: 0;
-      border-top: 1px solid var(--border);
-      margin: 1.6em 0;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 14px;
-    }
-    th, td {
-      border: 1px solid var(--border);
-      padding: 8px 12px;
-      text-align: left;
-    }
-    th {
-      background: var(--card);
-      color: var(--ink);
-      font-weight: 600;
-    }
-    .md-empty {
-      color: var(--muted);
-      font-style: italic;
-    }
-  </style>
-</head>
-<body>
-  <article class="md-article">
-    ${renderedBody || '<p class="md-empty">Este archivo Markdown está vacío.</p>'}
-  </article>
-</body>
-</html>`;
-}
-
-export function renderMarkdownDocumentHtml(rawMd) {
-  const blocks = [];
-  const fenceRe = /```([^\r\n]*)\r?\n?([\s\S]*?)```/g;
-  let cursor = 0;
-  let m;
-
-  while ((m = fenceRe.exec(rawMd)) !== null) {
-    if (m.index > cursor) {
-      blocks.push({ type: "prose", text: rawMd.slice(cursor, m.index) });
-    }
-    const rawHeader = (m[1] || "").trim();
-    const lang = (rawHeader.split(/\s+/)[0] || "").toLowerCase();
-    blocks.push({ type: "code", lang, code: m[2].replace(/\n$/, "") });
-    cursor = fenceRe.lastIndex;
-  }
-  if (cursor < rawMd.length) {
-    blocks.push({ type: "prose", text: rawMd.slice(cursor) });
-  }
-
-  return blocks
-    .map((b) => {
-      if (b.type === "code") {
-        return `<pre><code>${escapeHtmlText(b.code)}</code></pre>`;
-      }
-      return renderMarkdownProseBlock(b.text);
-    })
-    .join("\n");
-}
-
-function renderMarkdownProseBlock(text) {
-  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n");
-  const out = [];
-  let para = [];
-  let listTag = null;
-  let listItems = [];
-  let tableRows = [];
-
-  const flushPara = () => {
-    if (para.length > 0) {
-      out.push(`<p>${para.map(formatMdInline).join("<br>")}</p>`);
-      para = [];
-    }
-  };
-  const flushList = () => {
-    if (listTag && listItems.length > 0) {
-      out.push(`<${listTag}>${listItems.join("")}</${listTag}>`);
-      listTag = null;
-      listItems = [];
-    }
-  };
-  const flushTable = () => {
-    if (tableRows.length === 0) return;
-    const parsed = tableRows.map((r) =>
-      r
-        .replace(/^\||\|$/g, "")
-        .split("|")
-        .map((c) => c.trim())
-    );
-    const hasSep = parsed.length >= 2 && parsed[1].every((c) => /^:?-{2,}:?$/.test(c));
-    const head = parsed[0];
-    const body = hasSep ? parsed.slice(2) : parsed.slice(1);
-    const thead = `<thead><tr>${head.map((h) => `<th>${formatMdInline(h)}</th>`).join("")}</tr></thead>`;
-    const tbody =
-      body.length > 0
-        ? `<tbody>${body.map((row) => `<tr>${row.map((c) => `<td>${formatMdInline(c)}</td>`).join("")}</tr>`).join("")}</tbody>`
-        : "";
-    out.push(`<table>${thead}${tbody}</table>`);
-    tableRows = [];
-  };
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      flushPara();
-      flushList();
-      flushTable();
-      continue;
-    }
-
-    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
-      flushPara();
-      flushList();
-      tableRows.push(trimmed);
-      continue;
-    }
-    flushTable();
-
-    if (/^(-{3,}|\*{3,}|_{3,})$/.test(trimmed)) {
-      flushPara();
-      flushList();
-      out.push("<hr>");
-      continue;
-    }
-
-    const hMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (hMatch) {
-      flushPara();
-      flushList();
-      const lvl = hMatch[1].length;
-      out.push(`<h${lvl}>${formatMdInline(hMatch[2])}</h${lvl}>`);
-      continue;
-    }
-
-    const qMatch = trimmed.match(/^>\s?(.*)$/);
-    if (qMatch) {
-      flushPara();
-      flushList();
-      out.push(`<blockquote>${formatMdInline(qMatch[1])}</blockquote>`);
-      continue;
-    }
-
-    const ulMatch = line.match(/^\s*[-*+]\s+(.+)$/);
-    if (ulMatch) {
-      flushPara();
-      if (listTag && listTag !== "ul") flushList();
-      listTag = "ul";
-      listItems.push(`<li>${formatMdInline(ulMatch[1])}</li>`);
-      continue;
-    }
-
-    const olMatch = line.match(/^\s*\d+\.\s+(.+)$/);
-    if (olMatch) {
-      flushPara();
-      if (listTag && listTag !== "ol") flushList();
-      listTag = "ol";
-      listItems.push(`<li>${formatMdInline(olMatch[1])}</li>`);
-      continue;
-    }
-
-    flushList();
-    para.push(line);
-  }
-
-  flushPara();
-  flushList();
-  flushTable();
-  return out.join("\n");
-}
-
-export function formatMdInline(str) {
-  const codes = [];
-  const cleanStr = String(str ?? "").replace(/\u0000/g, "");
-  const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
-    const i = codes.length;
-    codes.push(`<code>${escapeHtmlText(c)}</code>`);
-    return `\u0000C${i}\u0000`;
-  });
-
-  let safe = escapeHtmlText(masked);
-  safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
-  );
-  safe = safe.replace(/\[([^\]]+)\]\((#[a-zA-Z0-9_-]+)\)/g, '<a href="$2">$1</a>');
-  safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  safe = safe.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-  safe = safe.replace(/\u0000C(\d+)\u0000/g, (_, i) => codes[Number(i)] || "");
-  return safe;
 }

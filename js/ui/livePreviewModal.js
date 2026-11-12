@@ -54,6 +54,7 @@ import {
   buildWorkspaceAssetMap,
   extractReferencedAssetPaths,
   extractCssImportPaths,
+  extractModuleDependencyPaths,
   getSavedPreviewHtml,
   savePreviewHtml,
   findBestHtmlEntrypoint,
@@ -227,9 +228,11 @@ export function initLivePreviewModal({
       }
     }
 
+    const isUnloaded = (f) => Boolean(f && (f.contentLoaded === false || (f.content === "" && f.blobSha)));
+
     for (const refPath of referencedPaths) {
       const assetFile = filesByNormPath.get(normalizePath(refPath));
-      if (assetFile && (assetFile.contentLoaded === false || (assetFile.content === "" && assetFile.blobSha))) {
+      if (isUnloaded(assetFile)) {
         unloadedToFetch.push(assetFile);
       }
     }
@@ -239,16 +242,28 @@ export function initLivePreviewModal({
       await ensureFilesLoaded(unloadedToFetch);
     }
 
-    // 4. Revisar si entre los CSS descargados hay reglas @import url(...) que a su vez requieran descarga
+    // 4. Revisar dependencias secundarias (@import en CSS y módulos relativos en JS/TS)
     const secondaryUnloaded = [];
     for (const refPath of referencedPaths) {
       const assetFile = filesByNormPath.get(normalizePath(refPath));
-      if (assetFile && getFileExtension(assetFile.path) === "css" && typeof assetFile.content === "string") {
+      if (!assetFile || typeof assetFile.content !== "string") continue;
+      const assetExt = getFileExtension(assetFile.path);
+      if (assetExt === "css") {
         const cssImports = extractCssImportPaths(assetFile.path, assetFile.content);
         for (const impPath of cssImports) {
           const impFile = filesByNormPath.get(normalizePath(impPath));
-          if (impFile && (impFile.contentLoaded === false || (impFile.content === "" && impFile.blobSha))) {
+          if (isUnloaded(impFile)) {
             secondaryUnloaded.push(impFile);
+          }
+        }
+      } else if (JS_EXTENSIONS.has(assetExt) || TS_EXTENSIONS.has(assetExt) || assetExt === "jsx") {
+        const modDeps = extractModuleDependencyPaths(assetFile.path, assetFile.content, allFiles, {
+          allowParentTraversal: true
+        });
+        for (const depPath of modDeps) {
+          const depFile = filesByNormPath.get(normalizePath(depPath));
+          if (isUnloaded(depFile)) {
+            secondaryUnloaded.push(depFile);
           }
         }
       }
@@ -263,6 +278,18 @@ export function initLivePreviewModal({
       html: targetFile.content || "",
       assetMap
     };
+  }
+
+  async function ensureStandaloneDepsLoaded(activeFile, allFiles) {
+    const depPaths = extractModuleDependencyPaths(activeFile.path, activeFile.content || "", allFiles, {
+      allowParentTraversal: true
+    });
+    const unloaded = depPaths
+      .map((p) => allFiles.find((f) => normalizePath(f.path) === normalizePath(p)))
+      .filter((f) => f && f.isLoaded === false);
+    if (unloaded.length > 0 && typeof ensureFilesLoaded === "function") {
+      await ensureFilesLoaded(unloaded);
+    }
   }
 
   async function navigateToHtml(targetPath, pushHistory = true) {
@@ -718,7 +745,10 @@ export function initLivePreviewModal({
       if (activeFile.isLoaded === false && typeof ensureFileLoaded === "function") {
         await ensureFileLoaded(activeFile);
       }
-      const compiledJsHtml = buildStandaloneJsPreview(activeFile, guardJs);
+      await ensureStandaloneDepsLoaded(activeFile, files);
+      const compiledJsHtml = buildStandaloneJsPreview(activeFile, guardJs, {
+        assetMap: buildWorkspaceAssetMap(files)
+      });
       showRunnableIframe({
         headerTitle: "Vista previa de JS",
         badgeText: activeFile.path,
@@ -863,7 +893,10 @@ export function initLivePreviewModal({
         return;
       }
       hideWebNavigationControls();
-      const compiledTsHtml = buildStandaloneTsPreview(activeFile, guardJs);
+      await ensureStandaloneDepsLoaded(activeFile, files);
+      const compiledTsHtml = buildStandaloneTsPreview(activeFile, guardJs, {
+        assetMap: buildWorkspaceAssetMap(files)
+      });
       showRunnableIframe({
         headerTitle: ext === "tsx" ? "Vista previa de TSX (Offline)" : "Vista previa de TypeScript (Offline)",
         badgeText: activeFile.path,
