@@ -91,7 +91,7 @@
           <span class="topbar-label-collapsible">Asistente</span>
         </button>
 
-        <button type="button" id="btn-open-github" class="btn btn-primary" title="Sincronizar repositorios de GitHub y publicar commits">
+        <button type="button" id="btn-open-github" class="btn btn-ghost gh-topbar-btn" title="Sincronizar repositorios de GitHub y publicar commits">
           <span data-icon="gitBranch"></span>
           <span id="topbar-repo-label" class="topbar-label-collapsible">Repositorio</span>
         </button>
@@ -144,7 +144,7 @@
               <span id="explorer-autosave-status" class="explorer-autosave-note">Autoguardado en IndexedDB</span>
               <span id="explorer-storage-status" class="explorer-storage-note code-font" title="Almacenamiento del navegador"></span>
             </div>
-            <div class="panel-actions">
+            <div class="panel-actions explorer-io-actions">
               <button
                 type="button"
                 id="btn-cloud-backup"
@@ -318,6 +318,16 @@
             <span id="status-network-state" class="status-bar-net" aria-live="polite">En línea</span>
             <button
               type="button"
+              id="btn-toggle-zen"
+              class="btn-status-action"
+              aria-label="Alternar modo Zen / Enfoque total (Cmd/Ctrl + Alt + Z)"
+              aria-pressed="false"
+              title="Modo Zen (Cmd/Ctrl + Alt + Z)"
+            >
+              <span data-icon="maximize"></span>
+            </button>
+            <button
+              type="button"
               id="btn-open-settings"
               class="btn-status-action"
               aria-label="Configuración y atajos de teclado"
@@ -328,6 +338,18 @@
             </button>
           </div>
         </footer>
+
+        <button
+          type="button"
+          id="btn-exit-zen"
+          class="btn-exit-zen"
+          aria-label="Salir de modo Zen (Esc o Cmd/Ctrl + Alt + Z)"
+          title="Salir de modo Zen (Esc)"
+          hidden
+        >
+          <span data-icon="minimize"></span>
+          <span>Salir de Zen (Esc)</span>
+        </button>
       </main>
 
       <div

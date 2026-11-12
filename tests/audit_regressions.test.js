@@ -95,6 +95,8 @@ describe("Regresiones de Auditoría Integral", () => {
         "btn-toggle-right": makeMockNode("button", "btn-toggle-right"),
         "btn-close-left": makeMockNode("button", "btn-close-left"),
         "btn-close-right": makeMockNode("button", "btn-close-right"),
+        "btn-toggle-zen": makeMockNode("button", "btn-toggle-zen"),
+        "btn-exit-zen": makeMockNode("button", "btn-exit-zen"),
         "drawer-backdrop": makeMockNode("div", "drawer-backdrop"),
         "panel-explorer": makeMockNode("aside", "panel-explorer"),
         "panel-assistant": makeMockNode("aside", "panel-assistant"),
@@ -113,6 +115,8 @@ describe("Regresiones de Auditoría Integral", () => {
         assert.equal(typeof ctrl.isRightPanelOpen, "function");
         assert.equal(typeof ctrl.toggleLeftPanel, "function");
         assert.equal(typeof ctrl.toggleRightPanel, "function");
+        assert.equal(typeof ctrl.isZenMode, "function");
+        assert.equal(typeof ctrl.toggleZenMode, "function");
 
         // En compacto ambos paneles inician cerrados
         assert.equal(ctrl.isRightPanelOpen(), false);
@@ -125,6 +129,23 @@ describe("Regresiones de Auditoría Integral", () => {
         ctrl.toggleRightPanel();
         assert.equal(ctrl.isRightPanelOpen(), false);
         assert.equal(ids["panel-assistant"].inert, true);
+
+        // Modo Zen (Enfoque Total)
+        assert.equal(ctrl.isZenMode(), false);
+        assert.equal(document.body.dataset.zenMode, "false");
+        assert.equal(ids["btn-toggle-zen"].getAttribute("aria-pressed"), "false");
+
+        ctrl.toggleZenMode(true);
+        assert.equal(ctrl.isZenMode(), true);
+        assert.equal(document.body.dataset.zenMode, "true");
+        assert.equal(ids["btn-toggle-zen"].getAttribute("aria-pressed"), "true");
+        assert.equal(ids["btn-exit-zen"].hidden, false);
+
+        ctrl.toggleZenMode(false);
+        assert.equal(ctrl.isZenMode(), false);
+        assert.equal(document.body.dataset.zenMode, "false");
+        assert.equal(ids["btn-toggle-zen"].getAttribute("aria-pressed"), "false");
+        assert.equal(ids["btn-exit-zen"].hidden, true);
       } finally {
         document.getElementById = origGetById;
         window.matchMedia = origMatchMedia;

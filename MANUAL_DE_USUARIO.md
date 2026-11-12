@@ -62,6 +62,7 @@ La aplicación organiza el espacio de trabajo en **3 islas ergonómicas**:
 | `Ctrl + S` / `Cmd + S` | Fuerza el guardado inmediato en `IndexedDB` |
 | `Ctrl + B` / `Cmd + B` | Muestra u oculta el panel lateral del Explorador |
 | `Ctrl + J` / `Cmd + J` | Muestra u oculta el panel lateral del Asistente IA |
+| `Cmd/Ctrl + Alt + Z` | Activa o desactiva el Modo Zen (enfoque total a pantalla completa sin distracciones) |
 | `Ctrl + F` / `Cmd + F` | Abre el buscador y reemplazador dentro del editor |
 | `Ctrl + Z` / `Cmd + Z` | Deshacer en el archivo actual |
 | `Ctrl + Espacio` | Abre manualmente el menú de autocompletado inteligente |

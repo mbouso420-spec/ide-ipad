@@ -30,11 +30,14 @@ export function initLayoutController() {
   const panelRight = document.getElementById("panel-assistant");
   const resizerLeft = document.getElementById("resizer-left");
   const resizerRight = document.getElementById("resizer-right");
+  const btnToggleZen = document.getElementById("btn-toggle-zen");
+  const btnExitZen = document.getElementById("btn-exit-zen");
 
   const isCompact = () => mqCompact.matches;
 
   let leftOpen = readStoredBool(STORAGE_KEYS.leftOpen, !isCompact());
   let rightOpen = readStoredBool(STORAGE_KEYS.rightOpen, !isCompact());
+  let isZenActive = false;
 
   // En modo compacto inicial evitamos abrir ambos drawers superpuestos a la vez
   if (isCompact() && leftOpen && rightOpen) {
@@ -46,9 +49,16 @@ export function initLayoutController() {
 
   function applyState() {
     const compact = isCompact();
-    document.body.dataset.leftOpen = String(leftOpen);
-    document.body.dataset.rightOpen = String(rightOpen);
-    document.body.dataset.drawerBackdrop = String(compact && (leftOpen || rightOpen));
+    if (document.body) {
+      document.body.dataset.leftOpen = String(leftOpen);
+      document.body.dataset.rightOpen = String(rightOpen);
+      document.body.dataset.drawerBackdrop = String(compact && (leftOpen || rightOpen));
+      document.body.dataset.zenMode = String(isZenActive);
+    }
+
+    if (btnToggleZen) {
+      btnToggleZen.setAttribute("aria-pressed", String(isZenActive));
+    }
 
     if (panelLeft) {
       panelLeft.inert = compact && !leftOpen;
@@ -99,10 +109,32 @@ export function initLayoutController() {
     applyState();
   }
 
+  function toggleZenMode(force) {
+    isZenActive = typeof force === "boolean" ? force : !isZenActive;
+    if (document.body) {
+      document.body.dataset.zenMode = String(isZenActive);
+    }
+    if (btnToggleZen) {
+      btnToggleZen.setAttribute("aria-pressed", String(isZenActive));
+      btnToggleZen.title = isZenActive
+        ? "Salir de Modo Zen (Esc o Cmd/Ctrl + Alt + Z)"
+        : "Modo Zen / Enfoque total (Cmd/Ctrl + Alt + Z)";
+    }
+    if (btnExitZen) {
+      btnExitZen.hidden = !isZenActive;
+    }
+    if (!isZenActive) {
+      applyState();
+    }
+    return isZenActive;
+  }
+
   btnLeft?.addEventListener("click", () => setLeftOpen(!leftOpen), listenOpts);
   btnRight?.addEventListener("click", () => setRightOpen(!rightOpen), listenOpts);
   btnCloseLeft?.addEventListener("click", () => setLeftOpen(false), listenOpts);
   btnCloseRight?.addEventListener("click", () => setRightOpen(false), listenOpts);
+  btnToggleZen?.addEventListener("click", () => toggleZenMode(), listenOpts);
+  btnExitZen?.addEventListener("click", () => toggleZenMode(false), listenOpts);
   backdrop?.addEventListener("click", () => {
     setLeftOpen(false);
     setRightOpen(false);
@@ -132,20 +164,23 @@ export function initLayoutController() {
     screen.orientation.addEventListener("change", scheduleRestoreWidths, listenOpts);
   }
 
-  // Atajos globales enrutados por KeyboardRouter (Cmd/Ctrl + B Explorador, Cmd/Ctrl + J Asistente)
+  // Atajos globales enrutados por KeyboardRouter (Cmd/Ctrl + B Explorador, Cmd/Ctrl + J Asistente, Cmd/Ctrl + Alt + Z Modo Zen)
   const toggleLeftShortcut = () => setLeftOpen(!leftOpen);
   const toggleRightShortcut = () => setRightOpen(!rightOpen);
+  const toggleZenShortcut = () => toggleZenMode();
   keyboardRouter.registerGlobalShortcut("ctrl+b", toggleLeftShortcut);
   keyboardRouter.registerGlobalShortcut("meta+b", toggleLeftShortcut);
   keyboardRouter.registerGlobalShortcut("ctrl+j", toggleRightShortcut);
   keyboardRouter.registerGlobalShortcut("meta+j", toggleRightShortcut);
+  keyboardRouter.registerGlobalShortcut("ctrl+alt+z", toggleZenShortcut);
+  keyboardRouter.registerGlobalShortcut("meta+alt+z", toggleZenShortcut);
 
   // Escape para cerrar drawers en modo compacto cuando no hay modales ni edición en línea
   window.addEventListener("keydown", (event) => {
     if (keyboardRouter.shouldBlockGlobalShortcuts()) {
       return;
     }
-    if (event.key === "Escape" && isCompact() && (leftOpen || rightOpen)) {
+    if (event.key === "Escape") {
       if (event.defaultPrevented) {
         return;
       }
@@ -159,8 +194,15 @@ export function initLayoutController() {
       if (hasOpenDialog || hasOpenContextMenu || hasActiveRename) {
         return;
       }
-      setLeftOpen(false);
-      setRightOpen(false);
+      if (isZenActive) {
+        event.preventDefault();
+        toggleZenMode(false);
+        return;
+      }
+      if (isCompact() && (leftOpen || rightOpen)) {
+        setLeftOpen(false);
+        setRightOpen(false);
+      }
     }
   }, listenOpts);
 
@@ -200,6 +242,8 @@ export function initLayoutController() {
     toggleRightPanel: () => setRightOpen(!rightOpen),
     setLeftOpen,
     setRightOpen,
+    isZenMode: () => isZenActive,
+    toggleZenMode: (force) => toggleZenMode(force),
     closeLeftOnCompactSelect() {
       if (isCompact() && leftOpen) {
         setLeftOpen(false);
@@ -220,6 +264,8 @@ export function initLayoutController() {
       keyboardRouter.unregisterGlobalShortcut("meta+b");
       keyboardRouter.unregisterGlobalShortcut("ctrl+j");
       keyboardRouter.unregisterGlobalShortcut("meta+j");
+      keyboardRouter.unregisterGlobalShortcut("ctrl+alt+z");
+      keyboardRouter.unregisterGlobalShortcut("meta+alt+z");
     }
   };
 }

@@ -530,3 +530,68 @@ body[data-symbols-visible="false"] .symbol-bar {
     display: none;
   }
 }
+
+/* ==========================================================================
+   Modo Zen / Enfoque Total (Sin distracciones, 100% pantalla para el código)
+   ========================================================================== */
+body[data-zen-mode="true"] .ide-topbar {
+  display: none !important;
+}
+
+body[data-zen-mode="true"] .ide-panel-left,
+body[data-zen-mode="true"] .ide-panel-right,
+body[data-zen-mode="true"] .ide-resizer {
+  display: none !important;
+}
+
+body[data-zen-mode="true"] .ide-workspace {
+  padding: 0 !important;
+}
+
+body[data-zen-mode="true"] .ide-panel-center {
+  border-radius: 0;
+  border: none;
+}
+
+.btn-exit-zen {
+  display: none;
+}
+
+body[data-zen-mode="true"] .btn-exit-zen {
+  position: fixed;
+  top: max(var(--space-sm), var(--safe-top));
+  right: max(var(--space-sm), var(--safe-right));
+  z-index: var(--z-sticky-nav);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-height: var(--control-height-sm);
+  padding-block: var(--space-3xs);
+  padding-inline: var(--space-sm);
+  border-radius: var(--radius-pill);
+  border: var(--rule-hair) solid var(--color-rule-strong);
+  background: var(--color-glass-bar);
+  color: var(--color-ink-2);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: var(--shadow-card);
+  backdrop-filter: blur(var(--blur-glass));
+  -webkit-backdrop-filter: blur(var(--blur-glass));
+  opacity: 0.75;
+  transition: opacity var(--dur-micro) var(--ease-out), transform var(--dur-micro) var(--ease-out);
+}
+
+body[data-zen-mode="true"] .btn-exit-zen:hover,
+body[data-zen-mode="true"] .btn-exit-zen:focus-visible {
+  opacity: 1;
+  color: var(--color-ink);
+  transform: scale(1.02);
+}
+
+/* Botón contextual de GitHub en Topbar */
+.gh-topbar-btn.has-pending-commits {
+  background: var(--color-accent) !important;
+  border-color: var(--color-accent) !important;
+  color: var(--color-accent-ink) !important;
+}

@@ -1286,6 +1286,7 @@ export function initGithubController({
     const project = getActiveProject();
     if (!project || project.kind !== "github") {
       topbarRepoLabel.textContent = "Repositorio";
+      openDialogBtn?.classList.remove("has-pending-commits");
       return;
     }
     const count =
@@ -1294,6 +1295,11 @@ export function initGithubController({
         : await countPendingGithubChanges(project.id);
 
     topbarRepoLabel.textContent = count > 0 ? `Commit (${count})` : "Repositorio";
+    if (count > 0) {
+      openDialogBtn?.classList.add("has-pending-commits");
+    } else {
+      openDialogBtn?.classList.remove("has-pending-commits");
+    }
   }
 
   async function syncExplorerReposInBackground() {
