@@ -21,6 +21,7 @@ for (let i = 0; i < 256; i += 1) {
  * @returns {number}
  */
 export function computeCrc32(bytes) {
+  if (!bytes || typeof bytes.length !== "number") return 0;
   let crc = 0xffffffff;
   for (let i = 0; i < bytes.length; i += 1) {
     crc = (crc >>> 8) ^ CRC_TABLE[(crc ^ bytes[i]) & 0xff];
@@ -61,12 +62,15 @@ function sanitizeZipDownloadFilename(filename) {
 }
 
 function buildZipParts(files, options = {}) {
+  const safeOptions = options && typeof options === "object" ? options : {};
   const encoder = new TextEncoder();
-  const { dosDate, dosTime } = getDosDateTime(options.date || new Date());
+  const { dosDate, dosTime } = getDosDateTime(safeOptions.date || new Date());
 
   const MAX_ZIP_UINT16 = 0xffff;
   const MAX_ZIP_UINT32 = 0xffffffff;
+  const eocdSize = 22;
   const entriesByPath = new Map();
+  let runningTotalBytes = eocdSize;
 
   for (const file of files || []) {
     if (!file || file.isFolder || !file.path) continue;
@@ -103,9 +107,18 @@ function buildZipParts(files, options = {}) {
       throw new Error(`Archivo demasiado grande para PKZIP (> 4 GB): ${cleanPath}`);
     }
 
-    const crc = computeCrc32(dataBytes);
     const localSize = 30 + nameBytes.length + dataBytes.length;
     const centralSize = 46 + nameBytes.length;
+    const prevEntry = entriesByPath.get(cleanPath);
+    const nextTotalBytes =
+      runningTotalBytes - (prevEntry ? prevEntry.localSize + prevEntry.centralSize : 0) + localSize + centralSize;
+
+    if (nextTotalBytes > MAX_SAFE_ZIP_BYTES) {
+      throw new Error("El archivo ZIP supera el límite seguro de 250 MB en memoria.");
+    }
+
+    const crc = computeCrc32(dataBytes);
+    runningTotalBytes = nextTotalBytes;
 
     entriesByPath.set(cleanPath, {
       nameBytes,
@@ -128,11 +141,7 @@ function buildZipParts(files, options = {}) {
     totalCentralDirSize += entry.centralSize;
   }
 
-  const eocdSize = 22;
   const totalBufferSize = totalLocalSize + totalCentralDirSize + eocdSize;
-  if (totalBufferSize > MAX_SAFE_ZIP_BYTES) {
-    throw new Error("El archivo ZIP supera el límite seguro de 250 MB en memoria.");
-  }
   if (
     totalLocalSize > MAX_ZIP_UINT32 ||
     totalCentralDirSize > MAX_ZIP_UINT32 ||
@@ -256,5 +265,5 @@ export function downloadZip(zipBytesOrBlob, filename = "proyecto.zip") {
     typeof Blob !== "undefined" && zipBytesOrBlob instanceof Blob
       ? zipBytesOrBlob
       : new Blob([zipBytesOrBlob], { type: "application/zip" });
-  return downloadBlob(blob, sanitizeZipDownloadFilename(filename), { revokeDelayMs: 1000 });
+  return downloadBlob(blob, sanitizeZipDownloadFilename(filename), { revokeDelayMs: 1500 });
 }

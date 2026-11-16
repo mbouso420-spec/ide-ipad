@@ -5,6 +5,9 @@ import {
   MAX_IMPORT_FILE_BYTES
 } from "../storage/fileImport.js";
 import { formatStorageBytes } from "../storage/storageQuota.js";
+import { sanitizeSvgMarkup, safeEncodeURIComponent } from "../preview/previewUtils.js";
+
+export { sanitizeSvgMarkup };
 
 const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
@@ -15,29 +18,6 @@ function sanitizeBase64Payload(raw) {
     return null;
   }
   return compact;
-}
-
-/**
- * Sanea SVG antes de pasarlo a `data:image/svg+xml` para neutralizar scripts embebidos,
- * `foreignObject`, manejadores de eventos `on*` y URIs `javascript:` / `vbscript:` / `data:text/html`.
- * @param {string} svgMarkup
- * @returns {string|null}
- */
-export function sanitizeSvgMarkup(svgMarkup) {
-  if (typeof svgMarkup !== "string" || !svgMarkup.trim()) return null;
-  let cleaned = svgMarkup
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<script\b[^>]*\/?>/gi, "")
-    .replace(/<foreignObject\b[^>]*>[\s\S]*?<\/foreignObject\s*>/gi, "")
-    .replace(/<foreignObject\b[^>]*\/?>/gi, "")
-    .replace(/<(iframe|object|embed|applet|meta|base|set|animate)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-    .replace(/<(iframe|object|embed|applet|meta|base|set|animate)\b[^>]*\/?>/gi, "")
-    .replace(/[\s/]+on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, " ")
-    .replace(/(href|xlink:href|src|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data\s*:\s*(?:text\/html|image\/svg\+xml))[^"]*"|'\s*(?:javascript|vbscript|data\s*:\s*(?:text\/html|image\/svg\+xml))[^']*'|[^\s>]*(?:javascript|vbscript):[^\s>]*)/gi, '$1="#"');
-  if (!/<svg[\s>/]/i.test(cleaned)) {
-    return null;
-  }
-  return cleaned;
 }
 
 /**
@@ -85,9 +65,11 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
       return;
     }
     const ext = (file.path || "").split(".").pop().toLowerCase();
+    const targetFileId = file.id;
     if (ext === "svg") {
       const reader = new FileReader();
       reader.onload = () => {
+        if (currentActiveFile && currentActiveFile.id !== targetFileId) return;
         const text = String(reader.result || "");
         if (/^\s*(?:<!doctype\s+html\b|<html\b)/i.test(text)) {
           showInlineUploadError("El archivo contiene marcado HTML disfrazado de SVG y fue rechazado.");
@@ -100,10 +82,14 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
         }
         void onUpdateFileContent(file, { text: safeSvg });
       };
+      reader.onerror = () => {
+        showInlineUploadError("No se pudo leer el archivo SVG seleccionado.");
+      };
       reader.readAsText(selectedFileBlob, "utf-8");
     } else {
       const reader = new FileReader();
       reader.onload = () => {
+        if (currentActiveFile && currentActiveFile.id !== targetFileId) return;
         const res = String(reader.result || "");
         const commaIdx = res.indexOf(",");
         const base64 = commaIdx !== -1 ? res.slice(commaIdx + 1) : res;
@@ -131,6 +117,9 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
           // Si atob falla sobre el prefijo parcial, delegamos al guardado normal
         }
         void onUpdateFileContent(file, { base64: cleanB64 });
+      };
+      reader.onerror = () => {
+        showInlineUploadError("No se pudo leer la imagen seleccionada.");
       };
       reader.readAsDataURL(selectedFileBlob);
     }
@@ -187,7 +176,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     });
 
     card.addEventListener("dragleave", (event) => {
-      if (event.target === card || !card.contains(event.relatedTarget)) {
+      if (!card.contains(event.relatedTarget)) {
         card.classList.remove("is-drag-over");
       }
     });
@@ -218,7 +207,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
       const mime = getImageMimeType(file.path);
       const imgSrc = safeBase64
         ? `data:${mime};base64,${safeBase64}`
-        : `data:image/svg+xml;utf8,${encodeURIComponent(safeSvg)}`;
+        : `data:image/svg+xml;utf8,${safeEncodeURIComponent(safeSvg)}`;
 
       const imgContainer = document.createElement("div");
       imgContainer.className = "editor-binary-image-container";

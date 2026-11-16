@@ -10,6 +10,7 @@ import {
   normalizePath,
   escapeHtml
 } from "./previewUtils.js";
+import { hydrateIcons } from "../ui/icons.js";
 
 const mountedRunnerInstances = new WeakMap();
 
@@ -438,11 +439,13 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
 
   const codes = [];
   const extraSourceFiles = [];
+  const seenCompanionPaths = new Set([cleanActivePath]);
 
   for (const comp of effectiveCompanions) {
     if (!comp || !comp.path) continue;
     const compClean = normalizePath(comp.path);
-    if (compClean === cleanActivePath) continue;
+    if (!compClean || seenCompanionPaths.has(compClean)) continue;
+    seenCompanionPaths.add(compClean);
 
     const compExt = getFileExtension(comp.path);
 
@@ -471,7 +474,7 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
     // Obtener ruta relativa respecto al archivo principal y sanitizar contra inyección de flags/opciones
     const rawRelName = prefix && compClean.startsWith(prefix)
       ? compClean.slice(prefix.length)
-      : comp.shortName || compClean.split("/").pop();
+      : compClean;
     let relName = String(rawRelName || "companion.c")
       .replace(/[\r\n\x00-\x1f\x7f]/g, "")
       .replace(/\\/g, "/")
@@ -592,6 +595,7 @@ export async function compileAndRunWandbox(
       throw new Error(`Error en servidor de compilación (HTTP ${res.status}): ${res.statusText}`);
     }
     const jsonPromise = res.json();
+    jsonPromise.catch(() => {});
     if (controller && controller.signal) {
       let onRaceAbort = null;
       try {
@@ -641,9 +645,13 @@ export async function compileAndRunWandbox(
     }
   }
 
+  if (!data || typeof data !== "object") {
+    throw new Error("Respuesta inválida o vacía del compilador remoto (Wandbox).");
+  }
   const rawCompilerErr = String(data.compiler_error || "");
   const hasRealCompileError = /(?:^|:|\s)(?:fatal error|error(?:\s*\[[^\]]+\]|\s+[A-Z]{1,6}\d{1,6})?):/i.test(rawCompilerErr);
-  const statusCode = Number(data.status ?? (hasRealCompileError ? 1 : 0));
+  const hasExplicitStatus = data.status !== undefined && data.status !== null && String(data.status).trim() !== "";
+  const statusCode = hasExplicitStatus ? Number(data.status) : (hasRealCompileError ? 1 : 0);
 
   return {
     status: statusCode,
@@ -672,12 +680,13 @@ export function parseGccErrors(output) {
   };
 
   // GCC / Clang / Go / TypeScript pretty (`file:line:col - error TSxxxx: msg`)
-  const regex = /(?:^|\n)(?:[^\s:(]+):(\d+)(?::(\d+))?(?::\s*|\s+-\s+)(?:(fatal error|error|warning)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*)?([^\r\n]+)/gi;
+  const regex = /(?:^|\n)(?:[^\s:(]+):(\d+)(?::(\d+))?(?::\s*|\s+-\s+)(?:(fatal error|error|warning|note)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*)?([^\r\n]+)/gi;
   let match;
   while ((match = regex.exec(output)) !== null) {
     const line = parseInt(match[1], 10);
     const column = match[2] ? parseInt(match[2], 10) : 1;
     const severity = (match[3] || "error").toLowerCase();
+    if (severity === "note") continue;
     const diagCode = match[4] ? `${match[4]}: ` : "";
     const rawMessage = `${diagCode}${match[5].trim()}`
       .replace(/__studio_scanf\b/g, "scanf")
@@ -696,11 +705,12 @@ export function parseGccErrors(output) {
   }
 
   // TypeScript (tsc) & C# (csc / Roslyn / MSBuild): `archivo(linea,columna): error TSxxxx/CSxxxx: mensaje`
-  const parenRegex = /(?:^|\n)[^\r\n(\n]{0,260}\((\d+)(?:,\s*(\d+))?\)\s*:\s*(fatal error|error|warning)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*([^\r\n]+)/gi;
+  const parenRegex = /(?:^|\n)[^\r\n(\n]{0,260}\((\d+)(?:,\s*(\d+))?\)\s*:\s*(fatal error|error|warning|note)(?:\s+([A-Z]{1,6}\d{1,6}))?:\s*([^\r\n]+)/gi;
   while ((match = parenRegex.exec(output)) !== null) {
     const line = parseInt(match[1], 10);
     const column = match[2] ? parseInt(match[2], 10) : 1;
     const severity = (match[3] || "error").toLowerCase();
+    if (severity === "note") continue;
     const diagCode = match[4] ? `${match[4]}: ` : "";
     const rawMessage = `${diagCode}${match[5].trim()}`;
     if (!isNaN(line)) {
@@ -905,6 +915,7 @@ export function mountCRunnerView(containerEl, {
 
   shell.append(header, termCard, stdinDetails);
   containerEl.appendChild(shell);
+  hydrateIcons(shell);
 
   const terminalHistory = createTerminalHistory();
   let sessionInputs = [];
@@ -915,10 +926,12 @@ export function mountCRunnerView(containerEl, {
   let activeRequestController = null;
 
   async function executeStep(userInput = null) {
-    if (isCompiling) return;
+    if (isDestroyed || isCompiling) return;
 
+    let pushedInput = false;
     if (userInput !== null) {
       sessionInputs.push(String(userInput));
+      pushedInput = true;
     }
 
     isCompiling = true;
@@ -963,7 +976,7 @@ export function mountCRunnerView(containerEl, {
         ? rawStdoutWithMarker.split(WAIT_INPUT_MARKER).join("")
         : rawStdoutWithMarker;
 
-      const compilerErrors = parseGccErrors(`${res.compilerErr}\n${res.compilerOut}\n${res.stderr}`);
+      const compilerErrors = parseGccErrors(`${res.compilerErr}\n${res.compilerOut}`);
       const blockingErrors = compilerErrors.filter((e) => e.severity !== "warning");
 
       if (blockingErrors.length > 0 || !res.success) {
@@ -1005,13 +1018,13 @@ export function mountCRunnerView(containerEl, {
                 evt.stopPropagation();
                 onGoToLine(matched.line);
               };
-              errLineEl.addEventListener("click", jump);
+              errLineEl.addEventListener("click", jump, listenerOpts);
               errLineEl.addEventListener("keydown", (evt) => {
                 if (evt.key === "Enter" || evt.key === " ") {
                   evt.preventDefault();
                   jump(evt);
                 }
-              });
+              }, listenerOpts);
               compBlock.appendChild(errLineEl);
             } else {
               const normalLine = document.createElement("div");
@@ -1024,6 +1037,12 @@ export function mountCRunnerView(containerEl, {
           compBlock.textContent = rawErrText || "Error de compilación desconocido";
         }
 
+        if (cleanResStdout.trim()) {
+          const outDiv = document.createElement("div");
+          outDiv.className = "c-term-stdout";
+          outDiv.textContent = sanitizeLoopOutput(cleanResStdout);
+          termBody.appendChild(outDiv);
+        }
         termBody.appendChild(compBlock);
         onCompilerResult({ success: false, errors: compilerErrors });
         return;
@@ -1124,6 +1143,9 @@ export function mountCRunnerView(containerEl, {
         scheduleFocus();
       }
     } catch (err) {
+      if (pushedInput && sessionInputs.length > 0) {
+        sessionInputs.pop();
+      }
       if (isDestroyed) return;
       termStatus.className = "c-term-status is-err";
       termStatus.textContent = "Error de red / API";
@@ -1244,8 +1266,12 @@ export function mountCRunnerView(containerEl, {
       if (mountedRunnerInstances.get(containerEl) === instance) {
         mountedRunnerInstances.delete(containerEl);
       }
+      containerEl.innerHTML = "";
     },
-    run: () => executeStep(null)
+    run: () => {
+      if (isDestroyed) return;
+      return executeStep(null);
+    }
   };
   mountedRunnerInstances.set(containerEl, instance);
   return instance;

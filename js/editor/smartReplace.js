@@ -166,6 +166,8 @@ function findBalancedBraceBlockEnd(lines, startIdx) {
 
 export function computeSmartReplacement(docText, newSnippet, options = {}) {
   const rawDoc = String(docText ?? "");
+  const hasCrlf = rawDoc.includes("\r\n");
+  const eol = hasCrlf ? "\r\n" : "\n";
   const rawSnippet = String(newSnippet ?? "").replace(/\r\n/g, "\n").replace(/\n$/, "");
   const {
     cursorLine = 1,
@@ -176,12 +178,13 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
 
   // 1. Si hay selección activa en el editor, reemplazar exclusivamente ese rango
   if (selectionFrom < selectionTo && selectionFrom >= 0 && selectionTo <= rawDoc.length) {
-    const updated = rawDoc.slice(0, selectionFrom) + rawSnippet + rawDoc.slice(selectionTo);
+    const insertedSel = hasCrlf ? rawSnippet.replace(/\n/g, "\r\n") : rawSnippet;
+    const updated = rawDoc.slice(0, selectionFrom) + insertedSel + rawDoc.slice(selectionTo);
     return {
       text: updated,
       from: selectionFrom,
       to: selectionTo,
-      insertedText: rawSnippet,
+      insertedText: insertedSel,
       mode: "selection"
     };
   }
@@ -191,11 +194,12 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
 
   // 2. Documento vacío o de 1 sola línea: reemplazo directo
   if (!rawDoc.trim() || docLines.length <= 1) {
+    const fullInserted = hasCrlf ? rawSnippet.replace(/\n/g, "\r\n") : rawSnippet;
     return {
-      text: rawSnippet,
+      text: fullInserted,
       from: 0,
       to: rawDoc.length,
-      insertedText: rawSnippet,
+      insertedText: fullInserted,
       mode: "full"
     };
   }
@@ -213,16 +217,18 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     return { from: fromOffset, to: toOffset };
   };
 
-  // Helper para preservar la indentación base cuando la IA envía un fragmento sin sangría
+  // Helper para preservar la indentación base y salto de línea del documento (CRLF vs LF)
   const applyBaseIndentation = (targetLineStr, linesToInsert) => {
     const baseIndent = (targetLineStr.match(/^[ \t]*/) || [""])[0];
     if (!baseIndent || /^[ \t]/.test(linesToInsert[0])) {
-      return linesToInsert.join("\n");
+      return linesToInsert.join(eol);
     }
     return linesToInsert
       .map((line) => (line.trim() ? baseIndent + line : line))
-      .join("\n");
+      .join(eol);
   };
+
+  const safeCursorIdx = Math.min(Math.max(0, (Number(cursorLine) || 1) - 1), docLines.length - 1);
 
   // 3. Pistas explícitas del mensaje de la IA (bloque "antes" o código inline `...` o número de línea)
   if (contextHint && typeof contextHint === "object") {
@@ -230,6 +236,8 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     if (prevBlock && prevBlock.length < rawDoc.length) {
       const prevLines = prevBlock.split("\n").map((l) => l.trim()).filter(Boolean);
       if (prevLines.length > 0 && prevLines.length < docLines.length) {
+        let bestPrevMatchIdx = -1;
+        let bestPrevDist = Infinity;
         for (let i = 0; i <= docLines.length - prevLines.length; i++) {
           let allMatch = true;
           for (let j = 0; j < prevLines.length; j++) {
@@ -239,40 +247,57 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
             }
           }
           if (allMatch) {
-            const endIdx = i + prevLines.length - 1;
-            const { from, to } = lineRangeToOffsets(i, endIdx);
-            const inserted = applyBaseIndentation(docLines[i], snippetLines);
-            const updated = rawDoc.slice(0, from) + inserted + rawDoc.slice(to);
-            return {
-              text: updated,
-              from,
-              to,
-              insertedText: inserted,
-              targetLineNumber: i + 1,
-              mode: snippetLines.length === 1 ? "single-line" : "block"
-            };
+            const dist = Math.abs(i - safeCursorIdx);
+            if (dist < bestPrevDist) {
+              bestPrevDist = dist;
+              bestPrevMatchIdx = i;
+            }
           }
         }
-      }
-    }
-
-    const prose = String(contextHint.precedingProse || "");
-    if (prose && snippetLines.length <= 3) {
-      // Buscar fragmentos entre backticks `...` en la explicación previa que coincidan exactamente con una línea del archivo
-      const inlineMatches = [...prose.matchAll(/`([^`\n]{3,140})`/g)].map((m) => m[1].trim());
-      for (const candidate of inlineMatches) {
-        if (candidate === rawSnippet.trim()) continue;
-        const foundIdx = docLines.findIndex((l) => l.trim() === candidate);
-        if (foundIdx !== -1) {
-          const { from, to } = lineRangeToOffsets(foundIdx, foundIdx);
-          const inserted = applyBaseIndentation(docLines[foundIdx], snippetLines);
+        if (bestPrevMatchIdx !== -1) {
+          const endIdx = bestPrevMatchIdx + prevLines.length - 1;
+          const { from, to } = lineRangeToOffsets(bestPrevMatchIdx, endIdx);
+          const inserted = applyBaseIndentation(docLines[bestPrevMatchIdx], snippetLines);
           const updated = rawDoc.slice(0, from) + inserted + rawDoc.slice(to);
           return {
             text: updated,
             from,
             to,
             insertedText: inserted,
-            targetLineNumber: foundIdx + 1,
+            targetLineNumber: bestPrevMatchIdx + 1,
+            mode: snippetLines.length === 1 ? "single-line" : "block"
+          };
+        }
+      }
+    }
+
+    const prose = String(contextHint.precedingProse || "");
+    if (prose && snippetLines.length <= 3) {
+      // Buscar fragmentos entre backticks `...` en la explicación previa que coincidan exactamente con una línea del archivo (desempate por cercanía al cursor)
+      const inlineMatches = [...prose.matchAll(/`([^`\n]{3,140})`/g)].map((m) => m[1].trim());
+      for (const candidate of inlineMatches) {
+        if (candidate === rawSnippet.trim()) continue;
+        let bestInlineIdx = -1;
+        let bestInlineDist = Infinity;
+        for (let li = 0; li < docLines.length; li++) {
+          if (docLines[li].trim() === candidate) {
+            const dist = Math.abs(li - safeCursorIdx);
+            if (dist < bestInlineDist) {
+              bestInlineDist = dist;
+              bestInlineIdx = li;
+            }
+          }
+        }
+        if (bestInlineIdx !== -1) {
+          const { from, to } = lineRangeToOffsets(bestInlineIdx, bestInlineIdx);
+          const inserted = applyBaseIndentation(docLines[bestInlineIdx], snippetLines);
+          const updated = rawDoc.slice(0, from) + inserted + rawDoc.slice(to);
+          return {
+            text: updated,
+            from,
+            to,
+            insertedText: inserted,
+            targetLineNumber: bestInlineIdx + 1,
             mode: "single-line"
           };
         }
@@ -291,8 +316,6 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
       }
     }
   }
-
-  const safeCursorIdx = Math.min(Math.max(0, (Number(cursorLine) || 1) - 1), docLines.length - 1);
 
   // Acotar el análisis léxico en archivos masivos para mantener tiempos interactivos
   if (docLines.length > MAX_PREPARED_DOC_LINES) {
@@ -331,11 +354,74 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
       };
     }
 
+    if (snippetLines.length < docLines.length * 0.45) {
+      const preparedWindow = new Map();
+      const getWindowPrep = (idx) => {
+        if (!preparedWindow.has(idx)) {
+          preparedWindow.set(idx, prepareLineForSimilarity(docLines[idx]));
+        }
+        return preparedWindow.get(idx);
+      };
+      const firstLine = snippetLines.find((l) => l.trim().length > 0) || snippetLines[0];
+      const prepFirst = prepareLineForSimilarity(firstLine);
+      let bestAnchor = -1;
+      let bestAnchorScore = 0;
+      for (let i = scanStart; i <= scanEnd; i++) {
+        const s = scorePreparedLines(getWindowPrep(i), prepFirst);
+        if (s > bestAnchorScore) {
+          bestAnchorScore = s;
+          bestAnchor = i;
+        }
+      }
+      if (bestAnchor !== -1 && bestAnchorScore >= 0.58) {
+        const endLine = Math.min(docLines.length - 1, bestAnchor + snippetLines.length - 1);
+        const { from, to } = lineRangeToOffsets(bestAnchor, endLine);
+        const inserted = applyBaseIndentation(docLines[bestAnchor], snippetLines);
+        return {
+          text: rawDoc.slice(0, from) + inserted + rawDoc.slice(to),
+          from,
+          to,
+          insertedText: inserted,
+          targetLineNumber: bestAnchor + 1,
+          mode: "block"
+        };
+      }
+      const winLen = Math.min(snippetLines.length, scanEnd - scanStart + 1);
+      if (winLen > 0) {
+        let bestWinIdx = safeCursorIdx;
+        let bestWinScore = -1;
+        for (let i = scanStart; i <= scanEnd - winLen + 1; i++) {
+          let sum = 0;
+          for (let j = 0; j < winLen; j++) {
+            sum += scorePreparedLines(getWindowPrep(i + j), snippetPrep[j]);
+          }
+          const avg = sum / winLen;
+          if (avg > bestWinScore) {
+            bestWinScore = avg;
+            bestWinIdx = i;
+          }
+        }
+        const startIdx = bestWinScore >= 0.32 ? bestWinIdx : safeCursorIdx;
+        const endIdx = bestWinScore >= 0.32 ? Math.min(docLines.length - 1, startIdx + winLen - 1) : startIdx;
+        const { from, to } = lineRangeToOffsets(startIdx, endIdx);
+        const inserted = applyBaseIndentation(docLines[startIdx], snippetLines);
+        return {
+          text: rawDoc.slice(0, from) + inserted + rawDoc.slice(to),
+          from,
+          to,
+          insertedText: inserted,
+          targetLineNumber: startIdx + 1,
+          mode: "block"
+        };
+      }
+    }
+
+    const fullLargeInserted = hasCrlf ? rawSnippet.replace(/\n/g, "\r\n") : rawSnippet;
     return {
-      text: rawSnippet,
+      text: fullLargeInserted,
       from: 0,
       to: rawDoc.length,
-      insertedText: rawSnippet,
+      insertedText: fullLargeInserted,
       mode: "full"
     };
   }
@@ -533,11 +619,12 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
   }
 
   // 6. El bloque devuelto por la IA representa el archivo completo
+  const fullFallbackInserted = hasCrlf ? rawSnippet.replace(/\n/g, "\r\n") : rawSnippet;
   return {
-    text: rawSnippet,
+    text: fullFallbackInserted,
     from: 0,
     to: rawDoc.length,
-    insertedText: rawSnippet,
+    insertedText: fullFallbackInserted,
     mode: "full"
   };
 }

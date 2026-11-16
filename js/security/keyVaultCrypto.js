@@ -8,8 +8,8 @@ import { base64ToBytes, bytesToBase64 } from "../utils/encoding.js";
 export const VAULT_FORMAT = "studio-ide-key-vault";
 export const VAULT_VERSION = 1;
 export const DEFAULT_PBKDF2_ITERATIONS = 210_000;
-export const MIN_PBKDF2_ITERATIONS = 10_000;
-export const MAX_PBKDF2_ITERATIONS = 2_000_000;
+const MIN_PBKDF2_ITERATIONS = 10_000;
+const MAX_PBKDF2_ITERATIONS = 2_000_000;
 export const MIN_PASSPHRASE_LENGTH = 6;
 export const MAX_PASSPHRASE_LENGTH = 512;
 export const MAX_VAULT_JSON_BYTES = 1024 * 1024; // 1 MB límite seguro antes de JSON.parse
@@ -17,7 +17,12 @@ const SALT_BYTES = 16;
 const IV_BYTES = 12;
 
 function getWebCrypto() {
-  const api = typeof window !== "undefined" && window.crypto ? window.crypto : crypto;
+  const api =
+    typeof window !== "undefined" && window.crypto
+      ? window.crypto
+      : typeof crypto !== "undefined"
+        ? crypto
+        : null;
   if (!api?.subtle || typeof api.getRandomValues !== "function") {
     throw new Error("Web Crypto API (AES-GCM / PBKDF2) no está disponible en este entorno.");
   }
@@ -36,6 +41,9 @@ function validatePassphrase(passphrase) {
     throw new Error(
       `La contraseña maestra debe tener al menos ${MIN_PASSPHRASE_LENGTH} caracteres.`
     );
+  }
+  if (!passphrase.trim()) {
+    throw new Error("La contraseña maestra no puede consistir solo en espacios.");
   }
   if (passphrase.length > MAX_PASSPHRASE_LENGTH) {
     throw new Error(
@@ -197,7 +205,7 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
 
   const iterations = Number(parsed.iterations);
   if (
-    !Number.isFinite(iterations) ||
+    !Number.isInteger(iterations) ||
     iterations < MIN_PBKDF2_ITERATIONS ||
     iterations > MAX_PBKDF2_ITERATIONS
   ) {

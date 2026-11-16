@@ -73,6 +73,7 @@ export function showConfirmDialog({
   };
 
   const onDialogClose = () => {
+    if (dialog.open) return;
     cleanup();
   };
 
@@ -82,11 +83,19 @@ export function showConfirmDialog({
   dialog.addEventListener("close", onDialogClose, listenOpts);
 
   dialog.showModal();
+  cancelBtn?.focus?.();
   keyboardRouter.pushModal({
     id: "confirm-dialog",
     blockGlobalShortcuts: true,
     onEscape: () => onCancel(),
-    onEnter: () => {
+    onEnter: (event) => {
+      const activeEl = typeof document !== "undefined" ? document.activeElement : null;
+      if (
+        (cancelBtn && (activeEl === cancelBtn || event?.target === cancelBtn)) ||
+        (closeBtn && (activeEl === closeBtn || event?.target === closeBtn))
+      ) {
+        return false;
+      }
       onProceed();
       return true;
     }

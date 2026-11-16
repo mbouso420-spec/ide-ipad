@@ -1,4 +1,14 @@
 import { isBinaryFile } from "../storage/fileImport.js";
+import { validateUserPath } from "../storage/workspaceDb.js";
+
+function sanitizeBroadcastPath(rawPath) {
+  if (typeof rawPath !== "string" || !rawPath) return "";
+  try {
+    return validateUserPath(rawPath);
+  } catch {
+    return "";
+  }
+}
 
 /**
  * Conecta la sincronización multi-pestaña vía BroadcastChannel para actualizaciones de archivos,
@@ -27,35 +37,70 @@ export function initBroadcastSync({
   github,
   onKeyStorageModeBroadcast
 }) {
-  const unsubscribe = onWorkspaceBroadcast(async (event) => {
-    if (!event) return;
+  let destroyed = false;
+  let eventQueue = Promise.resolve();
+
+  async function processWorkspaceEvent(event) {
+    if (destroyed || !event || typeof event !== "object" || typeof event.type !== "string") return;
 
     if (event.type === "KEY_STORAGE_MODE_CHANGED" && (event.mode === "session" || event.mode === "local")) {
       onKeyStorageModeBroadcast?.(event.mode);
       return;
     }
 
+    if (typeof event.projectId !== "string" || !event.projectId) return;
     const activeProject = getActiveProject();
     if (!activeProject || event.projectId !== activeProject.id) return;
     const splitController = getSplitController?.();
 
-    // Actualización de contenido de archivo emitida por otra pestaña (contrato FILE_UPDATED)
-    if (event.type === "FILE_UPDATED" && event.path) {
-      if (autosaveManager.hasPendingTimer(activeProject.id, event.path)) {
+    const safeEventPath = sanitizeBroadcastPath(event.path);
+    const safeOldPath = sanitizeBroadcastPath(event.oldPath);
+    const safeNewPath = sanitizeBroadcastPath(event.newPath);
+
+    if (event.type === "ENTRY_UPSERTED") {
+      if (safeEventPath && !event.isFolder && autosaveManager.hasPendingTimer(activeProject.id, safeEventPath)) {
         return;
       }
 
       await reloadProjectEntries();
       const currentProject = getActiveProject();
-      if (!currentProject || event.projectId !== currentProject.id || autosaveManager.hasPendingTimer(currentProject.id, event.path)) {
+      if (destroyed || !currentProject || event.projectId !== currentProject.id) {
         return;
       }
 
-      const updated = getFilesOnly().find((f) => f.id === event.path);
+      if (!event.isFolder && safeEventPath) {
+        if (autosaveManager.hasPendingTimer(currentProject.id, safeEventPath)) {
+          return;
+        }
+        const upserted = getFilesOnly().find((f) => f.id === safeEventPath);
+        editor.dropFileState(safeEventPath);
+        if (upserted) {
+          splitController?.handleRemoteFileUpdated?.(safeEventPath, upserted);
+        }
+      }
+
+      renderWorkspaceView();
+      await github.refreshTopbarBadge();
+      return;
+    }
+
+    // Actualización de contenido de archivo emitida por otra pestaña (contrato FILE_UPDATED)
+    if (event.type === "FILE_UPDATED" && safeEventPath) {
+      if (autosaveManager.hasPendingTimer(activeProject.id, safeEventPath)) {
+        return;
+      }
+
+      await reloadProjectEntries();
+      const currentProject = getActiveProject();
+      if (destroyed || !currentProject || event.projectId !== currentProject.id || autosaveManager.hasPendingTimer(currentProject.id, safeEventPath)) {
+        return;
+      }
+
+      const updated = getFilesOnly().find((f) => f.id === safeEventPath);
       if (!updated) return;
 
-      if (event.path === getActiveFileId()) {
-        editor.dropFileState(event.path);
+      if (safeEventPath === getActiveFileId()) {
+        editor.dropFileState(safeEventPath);
         if (isBinaryFile(updated)) {
           if (editorMountEl) editorMountEl.hidden = true;
           binaryPreview.render(updated);
@@ -71,21 +116,21 @@ export function initBroadcastSync({
         tabManager.renderTabs();
         statusBar.updateStatusBar();
       } else {
-        editor.dropFileState(event.path);
+        editor.dropFileState(safeEventPath);
         tabManager.renderTabs();
       }
 
-      splitController?.handleRemoteFileUpdated(event.path, updated);
+      splitController?.handleRemoteFileUpdated?.(safeEventPath, updated);
       await github.refreshTopbarBadge();
       return;
     }
 
     let tabsChanged = false;
 
-    if (event.type === "ENTRY_DELETED" && event.path && activeProject) {
-      const deletedPrefix = `${event.path}/`;
+    if (event.type === "ENTRY_DELETED" && safeEventPath) {
+      const deletedPrefix = `${safeEventPath}/`;
       const isDeletedTarget = (p) =>
-        p === event.path || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(deletedPrefix));
+        p === safeEventPath || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(deletedPrefix));
 
       autosaveManager.clearTimersForProject(activeProject.id, isDeletedTarget);
 
@@ -101,24 +146,24 @@ export function initBroadcastSync({
       if (tabsChanged) {
         setOpenTabIds(nextTabs);
       }
-      splitController?.dropFileState(event.path, Boolean(event.isFolder));
+      splitController?.dropFileState?.(safeEventPath, Boolean(event.isFolder));
       if (isDeletedTarget(getActiveFileId())) {
         setActiveFileId(getOpenTabIds()[0] || null);
         tabsChanged = true;
       }
-    } else if (event.type === "ENTRY_RENAMED" && event.oldPath && activeProject) {
-      const oldPrefix = `${event.oldPath}/`;
+    } else if (event.type === "ENTRY_RENAMED" && safeOldPath) {
+      const oldPrefix = `${safeOldPath}/`;
       const matchesOld = (p) =>
-        p === event.oldPath || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(oldPrefix));
+        p === safeOldPath || (Boolean(event.isFolder) && Boolean(p) && p.startsWith(oldPrefix));
 
       autosaveManager.clearTimersForProject(activeProject.id, matchesOld);
 
-      if (event.newPath) {
+      if (safeNewPath) {
         const remapPath = (p) => {
           if (!p) return p;
-          if (p === event.oldPath) return event.newPath;
+          if (p === safeOldPath) return safeNewPath;
           if (event.isFolder && p.startsWith(oldPrefix)) {
-            return `${event.newPath}${p.slice(event.oldPath.length)}`;
+            return `${safeNewPath}${p.slice(safeOldPath.length)}`;
           }
           return p;
         };
@@ -142,29 +187,50 @@ export function initBroadcastSync({
           }
         }
 
-        editor.renameFileStates(event.oldPath, event.newPath, Boolean(event.isFolder));
-        splitController?.handleEntryRenamed(event.oldPath, event.newPath, Boolean(event.isFolder));
+        editor.renameFileStates(safeOldPath, safeNewPath, Boolean(event.isFolder));
+        splitController?.handleEntryRenamed?.(safeOldPath, safeNewPath, Boolean(event.isFolder));
       }
+    } else {
+      return;
     }
 
     await autosaveManager.flushPendingSaves();
     await reloadProjectEntries();
-    if (tabsChanged) {
-      const validIds = new Set(getFilesOnly().map((f) => f.id));
-      const filteredTabs = getOpenTabIds().filter((id) => validIds.has(id));
+    if (destroyed || getActiveProject()?.id !== activeProject.id) return;
+    const validIds = new Set(getFilesOnly().map((f) => f.id));
+    const currentTabs = getOpenTabIds();
+    const filteredTabs = currentTabs.filter((id) => validIds.has(id));
+    if (filteredTabs.length !== currentTabs.length) {
       setOpenTabIds(filteredTabs);
-      const currentActive = getActiveFileId();
-      if (currentActive && !validIds.has(currentActive)) {
-        setActiveFileId(filteredTabs[0] || null);
-      }
+      tabsChanged = true;
+    }
+    const currentActive = getActiveFileId();
+    if (currentActive && !validIds.has(currentActive)) {
+      setActiveFileId(filteredTabs[0] || null);
+      tabsChanged = true;
+    } else if (!currentActive && filteredTabs.length > 0) {
+      setActiveFileId(filteredTabs[0]);
+      tabsChanged = true;
+    }
+    if (tabsChanged) {
       await persistTabsState();
     }
+    if (destroyed) return;
     renderWorkspaceView();
     await github.refreshTopbarBadge();
+  }
+
+  const unsubscribe = onWorkspaceBroadcast((event) => {
+    eventQueue = eventQueue
+      .then(() => processWorkspaceEvent(event))
+      .catch((err) => {
+        console.warn("[BroadcastSync] Error sincronizando evento de pestaña:", err?.message || err);
+      });
   });
 
   return {
     destroy() {
+      destroyed = true;
       if (typeof unsubscribe === "function") {
         unsubscribe();
       }

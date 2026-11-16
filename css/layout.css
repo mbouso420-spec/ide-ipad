@@ -227,13 +227,13 @@ body[data-right-open="false"] #panel-assistant .panel-title {
   display: none !important;
 }
 
-@container panel-left (max-width: 250px) {
+@container panel-left (max-width: 210px) {
   .panel-title {
     display: none !important;
   }
 }
 
-@container panel-right (max-width: 250px) {
+@container panel-right (max-width: 220px) {
   .panel-title {
     display: none !important;
   }

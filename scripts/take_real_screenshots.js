@@ -113,22 +113,35 @@ try {
       return;
     }
 
-    let stat = fs.statSync(filePath);
-    if (stat.isDirectory()) {
-      filePath = path.join(filePath, "index.html");
-      if (!filePath.startsWith(ROOT_PREFIX) || !fs.existsSync(filePath)) {
-        res.writeHead(404);
-        res.end("Not found");
-        return;
-      }
-      stat = fs.statSync(filePath);
+    let realFilePath;
+    try {
+      realFilePath = fs.realpathSync(filePath);
+    } catch {
+      res.writeHead(404);
+      res.end("Not found");
+      return;
     }
-
-    const realFilePath = fs.realpathSync(filePath);
     if (realFilePath !== REAL_ROOT_DIR && !realFilePath.startsWith(ROOT_PREFIX)) {
       res.writeHead(403);
       res.end("Forbidden");
       return;
+    }
+
+    let stat = fs.statSync(realFilePath);
+    if (stat.isDirectory()) {
+      const indexPath = path.join(realFilePath, "index.html");
+      if (!fs.existsSync(indexPath)) {
+        res.writeHead(404);
+        res.end("Not found");
+        return;
+      }
+      realFilePath = fs.realpathSync(indexPath);
+      if (!realFilePath.startsWith(ROOT_PREFIX)) {
+        res.writeHead(403);
+        res.end("Forbidden");
+        return;
+      }
+      stat = fs.statSync(realFilePath);
     }
 
     if (!stat.isFile()) {
@@ -149,9 +162,12 @@ try {
 
   await new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(8088, "127.0.0.1", resolve);
+    server.listen(0, "127.0.0.1", resolve);
   });
-  console.log("Local HTTP server running at http://127.0.0.1:8088");
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 8088;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  console.log(`Local HTTP server running at ${baseUrl}`);
 
   const executablePath = findBrowserExecutable();
   console.log("Launching browser from:", executablePath);
@@ -176,7 +192,7 @@ try {
   await page.setViewport({ width: 1280, height: 820, deviceScaleFactor: 2 });
 
   console.log("Navigating to Studio IDE...");
-  await page.goto("http://127.0.0.1:8088/index.html", { waitUntil: "networkidle0", timeout: 15000 });
+  await page.goto(`${baseUrl}/index.html`, { waitUntil: "networkidle0", timeout: 15000 });
 
   await page.waitForSelector(".ide-workspace", { timeout: 10000 });
   await new Promise((r) => setTimeout(r, 2500));

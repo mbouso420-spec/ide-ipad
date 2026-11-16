@@ -17,27 +17,25 @@ import {
   getApiKey,
   getSavedModel,
   getSavedProviderId,
-  getModelContextWindow,
-  getAiTemperature,
-  setAiTemperature,
-  setAiContextBudget,
-  getAiThinkingSpeed,
-  setAiThinkingSpeed
+  getModelContextWindow
 } from "../ai/providers.js";
 
 const THEME_STORAGE_KEY = "studio_theme";
+const MAX_VAULT_FILE_BYTES = 1024 * 1024;
 
 export const KEYBOARD_SHORTCUTS = [
   { combo: "Cmd/Ctrl + P", desc: "Apertura rápida de archivo y salto directo a línea (ej. app.js:145)", category: "Navegación" },
+  { combo: "Cmd/Ctrl + K", desc: "Abrir Paleta de comandos y acciones rápidas (> )", category: "Navegación" },
   { combo: "Cmd/Ctrl + Shift + F", desc: "Búsqueda global de texto y expresiones regulares en todo el proyecto", category: "Búsqueda" },
   { combo: "Cmd/Ctrl + S", desc: "Forzar guardado inmediato en almacenamiento local IndexedDB", category: "Archivo" },
   { combo: "Cmd/Ctrl + \\", desc: "Alternar vista dividida del editor (Split View)", category: "Editor" },
   { combo: "Shift + Alt + F", desc: "Formatear e indentar el archivo activo (100% offline)", category: "Editor" },
   { combo: "Cmd/Ctrl + W / Alt + W", desc: "Cerrar pestaña activa (Alt+W prioritario en iPad Safari PWA)", category: "Editor" },
+  { combo: "Cmd/Ctrl + Alt + Z", desc: "Alternar Modo Zen / enfoque total", category: "Paneles" },
   { combo: "Cmd/Ctrl + B", desc: "Alternar visibilidad del panel lateral del Explorador", category: "Paneles" },
   { combo: "Cmd/Ctrl + J", desc: "Alternar visibilidad del panel lateral del Asistente IA", category: "Paneles" },
   { combo: "Cmd/Ctrl + ,", desc: "Abrir ventana de Configuración y Atajos de Teclado", category: "General" },
-  { combo: "Escape", desc: "Cerrar diálogo activo o cancelar acción", category: "General" },
+  { combo: "Escape", desc: "Cerrar diálogo activo, menú o Modo Zen", category: "General" },
   { combo: "Enter", desc: "Confirmar acción en modales y ejecutar búsquedas", category: "General" }
 ];
 
@@ -64,13 +62,13 @@ export function initSettingsModal({
   onHardwareKeyboardChange,
   onWordWrapChange,
   onMinimapChange,
-  onThinkingSpeedChange,
   onKeyStorageModeChange,
   getContextSnapshot,
   onSelectProvider
 }) {
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = controller ? { signal: controller.signal } : undefined;
+  let modelsRenderController = null;
   const dialog = document.getElementById("settings-dialog");
   const openBtn = document.getElementById("btn-open-settings");
   const closeBtn = document.getElementById("btn-close-settings");
@@ -81,9 +79,6 @@ export function initSettingsModal({
   const chkHardwareKeyboard = document.getElementById("setting-hardware-keyboard");
   const selectKeyStorage = document.getElementById("setting-key-storage");
   const selectAutosave = document.getElementById("setting-autosave-delay");
-  const selectAiTemp = document.getElementById("setting-ai-temperature");
-  const selectAiBudget = document.getElementById("setting-ai-budget");
-  const selectAiThinkingSpeed = document.getElementById("setting-ai-thinking-speed");
   const modelsListEl = document.getElementById("settings-active-models-list");
   const quotaTextEl = document.getElementById("setting-quota-text");
   const vaultPassphraseInput = document.getElementById("vault-passphrase-input");
@@ -101,6 +96,7 @@ export function initSettingsModal({
     if (!dialog) return;
     syncControlsWithState();
     refreshStorageInfo();
+    if (shortcutsFilter) shortcutsFilter.value = "";
     renderShortcutsList("");
     if (vaultPassphraseInput) vaultPassphraseInput.value = "";
     setVaultStatus("", "neutral");
@@ -185,7 +181,7 @@ export function initSettingsModal({
         : 100;
 
       if (pctEl) {
-        pctEl.textContent = `${availablePct}% disponible (${connectedProviders.length}/4 conectados · ${provider.name.split(" ")[0]})`;
+        pctEl.textContent = `${availablePct}% disponible (${connectedProviders.length}/${allProviders.length} conectados · ${provider.name.split(" ")[0]})`;
         pctEl.className = "models-tokens-badge";
       }
       if (fillEl) {
@@ -265,7 +261,7 @@ export function initSettingsModal({
           </div>
 
           <div class="models-provider-meter">
-            <div class="models-meter-track" role="progressbar" aria-valuenow="${progressPct}" aria-valuemin="0" aria-valuemax="100">
+            <div class="models-meter-track" role="progressbar" aria-label="Contexto disponible en ${escapeHtml(p.name)}" aria-valuenow="${progressPct}" aria-valuemin="0" aria-valuemax="100">
               <div class="models-meter-fill" style="--progress-val: ${progressPct};" data-state="${meterState}"></div>
             </div>
             <div class="models-provider-meter-legend">
@@ -278,6 +274,10 @@ export function initSettingsModal({
       })
       .join("");
 
+    modelsRenderController?.abort();
+    modelsRenderController = typeof AbortController === "function" ? new AbortController() : null;
+    const renderOpts = modelsRenderController ? { signal: modelsRenderController.signal } : undefined;
+
     const buttons = modelsListEl.querySelectorAll(".btn-provider-action");
     if (buttons && buttons.length > 0) {
       buttons.forEach((btn) => {
@@ -287,7 +287,7 @@ export function initSettingsModal({
             close();
             onSelectProvider?.(pid);
           }
-        });
+        }, renderOpts);
       });
     } else {
       for (const p of providers) {
@@ -296,7 +296,7 @@ export function initSettingsModal({
         btn.addEventListener("click", () => {
           close();
           onSelectProvider?.(p.id);
-        });
+        }, renderOpts);
         modelsListEl.appendChild(btn);
       }
     }
@@ -335,23 +335,6 @@ export function initSettingsModal({
       } catch (_) {
         selectAutosave.value = "240";
       }
-    }
-
-    if (selectAiTemp) {
-      selectAiTemp.value = String(getAiTemperature());
-    }
-
-    if (selectAiBudget) {
-      try {
-        const stored = localStorage.getItem("studio_ai_budget") || "standard";
-        selectAiBudget.value = stored;
-      } catch (_) {
-        selectAiBudget.value = "standard";
-      }
-    }
-
-    if (selectAiThinkingSpeed) {
-      selectAiThinkingSpeed.value = getAiThinkingSpeed();
     }
 
     refreshTokensMeter();
@@ -423,7 +406,7 @@ export function initSettingsModal({
     const isInitiallyActive =
       btn.classList?.contains?.("is-active") || btn.getAttribute?.("aria-selected") === "true";
     btn.setAttribute?.("tabindex", isInitiallyActive ? "0" : "-1");
-    btn.addEventListener("click", () => activateTab(btn));
+    btn.addEventListener("click", () => activateTab(btn), listenOpts);
     btn.addEventListener("keydown", (event) => {
       const list = Array.from(tabButtons);
       if (!list.length) return;
@@ -441,7 +424,7 @@ export function initSettingsModal({
       }
       event.preventDefault();
       activateTab(list[nextIdx], { moveFocus: true });
-    });
+    }, listenOpts);
   });
 
   // Control Events
@@ -542,34 +525,6 @@ export function initSettingsModal({
     } catch (_) {}
   }, listenOpts);
 
-  selectAiTemp?.addEventListener("change", (e) => {
-    const val = parseFloat((e?.target ? e.target.value : selectAiTemp?.value) || "0.7");
-    setAiTemperature(val);
-  }, listenOpts);
-
-  selectAiBudget?.addEventListener("change", (e) => {
-    const val = (e?.target ? e.target.value : selectAiBudget?.value) || "standard";
-    setAiContextBudget(val);
-    refreshTokensMeter();
-  }, listenOpts);
-
-  selectAiThinkingSpeed?.addEventListener("change", (e) => {
-    const val = (e?.target ? e.target.value : selectAiThinkingSpeed?.value) || "media";
-    if (val === "baja" || val === "media" || val === "alta") {
-      setAiThinkingSpeed(val);
-      if (typeof onThinkingSpeedChange === "function") {
-        onThinkingSpeedChange(val);
-      } else {
-        const chatBtns = document.querySelectorAll(".chat-thinking-btn");
-        chatBtns?.forEach((btn) => {
-          const active = (btn.dataset?.speed || btn.getAttribute?.("data-speed")) === val;
-          btn.classList.toggle("is-active", active);
-          btn.setAttribute("aria-checked", String(active));
-        });
-      }
-    }
-  }, listenOpts);
-
   function setVaultStatus(message, type = "neutral") {
     if (!vaultStatusEl) return;
     vaultStatusEl.hidden = !message;
@@ -588,6 +543,9 @@ export function initSettingsModal({
   }
 
   async function readSelectedFileText(file) {
+    if (typeof file?.size === "number" && file.size > MAX_VAULT_FILE_BYTES) {
+      throw new Error("El archivo de bóveda supera el límite seguro de 1 MB.");
+    }
     if (file && typeof file.text === "function") {
       return file.text();
     }
@@ -618,9 +576,12 @@ export function initSettingsModal({
     } finally {
       if (btnExportVault) btnExportVault.disabled = false;
     }
-  });
+  }, listenOpts);
 
   async function importVaultText(rawText, passphrase) {
+    if (typeof rawText === "string" && rawText.length > MAX_VAULT_FILE_BYTES) {
+      throw new Error("El archivo de bóveda supera el límite seguro de 1 MB.");
+    }
     let payloadJson = rawText;
     if (isEncryptedKeyVault(rawText)) {
       payloadJson = await decryptKeysPayload(rawText, passphrase);
@@ -655,7 +616,7 @@ export function initSettingsModal({
       vaultFileInput.value = "";
       vaultFileInput.click();
     }
-  });
+  }, listenOpts);
 
   vaultFileInput?.addEventListener("change", async () => {
     const file = vaultFileInput.files?.[0];
@@ -672,7 +633,7 @@ export function initSettingsModal({
       vaultFileInput.value = "";
       if (btnImportVault) btnImportVault.disabled = false;
     }
-  });
+  }, listenOpts);
 
   shortcutsFilter?.addEventListener("input", (e) => {
     renderShortcutsList((e?.target ? e.target.value : shortcutsFilter?.value) || "");
@@ -683,6 +644,7 @@ export function initSettingsModal({
     close,
     syncControls: syncControlsWithState,
     destroy() {
+      modelsRenderController?.abort();
       controller?.abort();
     }
   };

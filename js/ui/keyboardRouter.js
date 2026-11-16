@@ -3,10 +3,43 @@
  * Evita colisiones de atajos globales y garantiza que 'Escape' o 'Enter' solo afecten al modal superior activo.
  */
 
+function mapCodeToShortcutKey(code) {
+  if (typeof code !== "string" || !code) return "";
+  if (code.startsWith("Key") && code.length === 4) {
+    return code.slice(3).toLowerCase();
+  }
+  if (code.startsWith("Digit") && code.length === 6) {
+    return code.slice(5);
+  }
+  switch (code) {
+    case "Slash":
+      return "/";
+    case "Backquote":
+      return "`";
+    case "Comma":
+      return ",";
+    case "Period":
+      return ".";
+    case "BracketLeft":
+      return "[";
+    case "BracketRight":
+      return "]";
+    case "Minus":
+      return "-";
+    case "Equal":
+      return "=";
+    case "Backslash":
+      return "\\";
+    default:
+      return "";
+  }
+}
+
 export class KeyboardRouter {
   constructor() {
     this.modalStack = [];
     this.globalShortcuts = new Map();
+    this.hookedDialogs = new Map();
     this.boundListener = this.handleKeyDown.bind(this);
     this.attached = false;
   }
@@ -34,10 +67,14 @@ export class KeyboardRouter {
       const resolvedModalId = dialog.id || `dialog_${Math.random().toString(36).slice(2, 7)}`;
       dialog.__kr_modalId = resolvedModalId;
 
-      dialog.addEventListener("close", () => {
-        this.popModal(dialog.__kr_modalId);
-      });
+      const onClose = () => {
+        if (!dialog.open) {
+          this.popModal(dialog.__kr_modalId);
+        }
+      };
+      dialog.addEventListener("close", onClose);
 
+      const hasOwnShowModal = Object.prototype.hasOwnProperty.call(dialog, "showModal");
       const originalShowModal = dialog.showModal;
       if (typeof originalShowModal === "function") {
         dialog.showModal = (...args) => {
@@ -56,6 +93,7 @@ export class KeyboardRouter {
           return res;
         };
       }
+      this.hookedDialogs.set(dialog, { onClose, originalShowModal, hasOwnShowModal });
     });
   }
 
@@ -143,7 +181,7 @@ export class KeyboardRouter {
    * @param {KeyboardEvent} event
    */
   handleKeyDown(event) {
-    if (!event || typeof event.key !== "string") return;
+    if (!event || typeof event.key !== "string" || event.isComposing || event.keyCode === 229) return;
 
     // 1. Si hay modales en la pila, el modal superior tiene máxima prioridad
     const activeModal = this.getActiveModal();
@@ -189,10 +227,15 @@ export class KeyboardRouter {
     if (event.metaKey) modParts.push("meta");
     if (event.altKey) modParts.push("alt");
     if (event.shiftKey) modParts.push("shift");
-    modParts.push(event.key.toLowerCase());
-    const combo = modParts.join("+");
+    const primaryCombo = [...modParts, event.key.toLowerCase()].join("+");
 
-    const shortcut = this.globalShortcuts.get(combo);
+    let shortcut = this.globalShortcuts.get(primaryCombo);
+    if (typeof shortcut !== "function" && event.altKey && event.code) {
+      const codeKey = mapCodeToShortcutKey(event.code);
+      if (codeKey) {
+        shortcut = this.globalShortcuts.get([...modParts, codeKey].join("+"));
+      }
+    }
     if (typeof shortcut === "function") {
       event.preventDefault();
       shortcut(event);
@@ -201,6 +244,21 @@ export class KeyboardRouter {
 
   destroy() {
     this.detach();
+    for (const [dialog, meta] of this.hookedDialogs.entries()) {
+      try {
+        dialog.removeEventListener("close", meta.onClose);
+        if (meta.hasOwnShowModal) {
+          dialog.showModal = meta.originalShowModal;
+        } else {
+          delete dialog.showModal;
+        }
+        delete dialog.__kr_hooked;
+        delete dialog.__kr_modalId;
+      } catch (_) {
+        /* elemento ya recolectado o desconectado */
+      }
+    }
+    this.hookedDialogs.clear();
     this.modalStack = [];
     this.globalShortcuts.clear();
   }

@@ -31,6 +31,8 @@ export function createSplitEditorController({
   let isSplitOpen = false;
   let splitActiveFileId = null;
   let openRequestSeq = 0;
+  let initSplitPromise = null;
+  let isDestroyed = false;
   /** @type {any} */
   let editorSplit = null;
   const listenerController = typeof AbortController === "function" ? new AbortController() : null;
@@ -39,32 +41,45 @@ export function createSplitEditorController({
 
   async function initSplitEditorIfNeeded() {
     if (editorSplit) return editorSplit;
-    editorSplit = await createEditorManager({
-      mountEl: splitBodyEl,
-      enableMinimap: false,
-      isSplitInstance: true,
-      enableGlobalRuler: false,
-      enableAutocomplete: false,
-      onDocChange(filePath, newContent) {
-        applyDocumentEdit({
-          filePath,
-          newContent,
-          getFilesOnly,
-          isFileDirtyForProject,
-          renderTabs,
-          onDirtyChange,
-          getActiveProject,
-          scheduleAutosave,
-          onAfterEdit: (editedPath, editedContent) => {
-            onSyncMainDoc?.(editedPath, editedContent);
-          }
-        });
-      },
-      onSelectionChange() {
-        // En editor secundario no sobreescribe la selección del principal
+    if (initSplitPromise) return initSplitPromise;
+    initSplitPromise = (async () => {
+      const instance = await createEditorManager({
+        mountEl: splitBodyEl,
+        enableMinimap: false,
+        isSplitInstance: true,
+        enableGlobalRuler: false,
+        enableAutocomplete: false,
+        onDocChange(filePath, newContent) {
+          applyDocumentEdit({
+            filePath,
+            newContent,
+            getFilesOnly,
+            isFileDirtyForProject,
+            renderTabs,
+            onDirtyChange,
+            getActiveProject,
+            scheduleAutosave,
+            onAfterEdit: (editedPath, editedContent) => {
+              onSyncMainDoc?.(editedPath, editedContent);
+            }
+          });
+        },
+        onSelectionChange() {
+          // En editor secundario no sobreescribe la selección del principal
+        }
+      });
+      if (isDestroyed || !isSplitOpen) {
+        instance.destroy?.();
+        return null;
       }
-    });
-    return editorSplit;
+      editorSplit = instance;
+      return editorSplit;
+    })();
+    try {
+      return await initSplitPromise;
+    } finally {
+      initSplitPromise = null;
+    }
   }
 
   function populateSelect() {
@@ -164,6 +179,8 @@ export function createSplitEditorController({
       }
     } else {
       openRequestSeq += 1;
+      activeDragCleanup?.();
+      activeDragCleanup = null;
       splitActiveFileId = null;
       if (splitTitleTextEl) splitTitleTextEl.textContent = "Sin archivo";
       editorStageEl?.classList.remove("is-split");
@@ -201,6 +218,7 @@ export function createSplitEditorController({
 
     const onPointerMove = (e) => {
       if (!isDragging || totalWidth <= 0) return;
+      if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
       const delta = e.clientX - startX;
       const newLeft = startLeftWidth + delta;
       const leftPct = Math.max(20, Math.min(80, (newLeft / totalWidth) * 100));
@@ -208,8 +226,9 @@ export function createSplitEditorController({
       if (splitMountEl) splitMountEl.style.flex = `0 0 ${100 - leftPct}%`;
     };
 
-    const onPointerUp = () => {
+    const onPointerUp = (e) => {
       if (!isDragging) return;
+      if (e && activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
       isDragging = false;
       if (activePointerId !== null) {
         try {
@@ -226,6 +245,7 @@ export function createSplitEditorController({
       activeDragCleanup = null;
     };
 
+    splitDividerEl.addEventListener("lostpointercapture", onPointerUp, listenerOpts);
     splitDividerEl.addEventListener("pointerdown", (e) => {
       isDragging = true;
       activePointerId = e.pointerId ?? null;
@@ -333,6 +353,7 @@ export function createSplitEditorController({
       }
     },
     destroy() {
+      isDestroyed = true;
       openRequestSeq += 1;
       activeDragCleanup?.();
       activeDragCleanup = null;

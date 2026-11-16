@@ -286,11 +286,36 @@ function tokenize(source) {
     }
 
     if (/[0-9]/.test(ch) || (ch === "." && /[0-9]/.test(next))) {
-      let j = i + 1;
-      while (j < len && /[0-9a-fA-FxXoObBn._eE]/.test(source[j])) {
-        if ((source[j] === "e" || source[j] === "E") && (source[j + 1] === "+" || source[j + 1] === "-")) {
-          j += 2;
-        } else {
+      let j = i;
+      if (ch === "0" && (next === "x" || next === "X")) {
+        j += 2;
+        while (j < len && /[0-9a-fA-F_]/.test(source[j])) j += 1;
+        if (source[j] === "n") j += 1;
+      } else if (ch === "0" && (next === "b" || next === "B")) {
+        j += 2;
+        while (j < len && /[01_]/.test(source[j])) j += 1;
+        if (source[j] === "n") j += 1;
+      } else if (ch === "0" && (next === "o" || next === "O")) {
+        j += 2;
+        while (j < len && /[0-7_]/.test(source[j])) j += 1;
+        if (source[j] === "n") j += 1;
+      } else {
+        let sawDot = ch === ".";
+        let sawExp = false;
+        j += 1;
+        while (j < len && /[0-9_]/.test(source[j])) j += 1;
+        if (!sawDot && source[j] === "." && !/[A-Za-z_$]/.test(source[j + 1] || "")) {
+          sawDot = true;
+          j += 1;
+          while (j < len && /[0-9_]/.test(source[j])) j += 1;
+        }
+        if ((source[j] === "e" || source[j] === "E") && /[0-9+-]/.test(source[j + 1] || "")) {
+          sawExp = true;
+          j += 1;
+          if (source[j] === "+" || source[j] === "-") j += 1;
+          while (j < len && /[0-9_]/.test(source[j])) j += 1;
+        }
+        if (!sawDot && !sawExp && source[j] === "n") {
           j += 1;
         }
       }
@@ -736,7 +761,8 @@ function expandJsxInSource(source, fileName) {
           const inner = exprRes.inner.trim();
           p = exprRes.endIdx;
           if (inner.startsWith("...")) {
-            propParts.push(inner);
+            const transformedSpread = transpileCore(inner.slice(3), false, fileName).code.trim();
+            propParts.push(`...${transformedSpread}`);
           }
           continue;
         }
@@ -758,7 +784,10 @@ function expandJsxInSource(source, fileName) {
                 break;
               } else endQ += 1;
             }
-            const strVal = src.slice(p, endQ);
+            const rawStrVal = src.slice(p, endQ);
+            const strVal = rawStrVal.includes("\n") || rawStrVal.includes("\r")
+              ? `${q}${rawStrVal.slice(1, -1).replace(/\r\n?/g, "\\n").replace(/\n/g, "\\n")}${q}`
+              : rawStrVal;
             propParts.push(`${JSON.stringify(attrName)}: ${strVal}`);
             p = endQ;
           } else if (src[p] === "{") {
@@ -836,7 +865,7 @@ function expandJsxInSource(source, fileName) {
     usedJsx = true;
     const typeArg = isFragment
       ? "__studioFragment"
-      : /^[a-z]/.test(tagName)
+      : !tagName.includes(".") && /^[a-z]/.test(tagName)
         ? JSON.stringify(tagName)
         : tagName;
     const propsArg = propParts.length > 0 ? `{ ${propParts.join(", ")} }` : "null";
@@ -960,6 +989,17 @@ function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
     }
     if (t.type === "punct") {
       const v = t.value;
+      if (v === "{" && stopPuncts.has("{") && angle === 0 && paren === 0 && brace === 0 && bracket === 0) {
+        const prevSig = prevSigToken(tokens, k);
+        const isInlineObjTypeStart =
+          k === startIdx ||
+          (prevSig &&
+            (prevSig.value === ":" || prevSig.value === "|" || prevSig.value === "&" || prevSig.value === "=>"));
+        if (isInlineObjTypeStart) {
+          k = skipBalancedPair(tokens, k, "{", "}");
+          continue;
+        }
+      }
       if (angle === 0 && paren === 0 && brace === 0 && bracket === 0 && stopPuncts.has(v)) {
         return k;
       }
@@ -999,19 +1039,27 @@ function skipStatement(tokens, startIdx) {
   let brace = 0;
   let paren = 0;
   let bracket = 0;
+  let angle = 0;
   while (k < tokens.length) {
     const t = tokens[k];
     if (t.type === "punct") {
       if (t.value === "{") brace += 1;
       else if (t.value === "}") {
         if (brace > 0) brace -= 1;
-        if (brace === 0 && paren === 0 && bracket === 0) {
+        if (brace === 0 && paren === 0 && bracket === 0 && angle === 0) {
           const nxt = nextSigIndex(tokens, k + 1);
-          if (nxt < tokens.length && tokens[nxt].type === "ident" && tokens[nxt].value === "from") {
+          const nxtTok = nxt < tokens.length ? tokens[nxt] : null;
+          if (
+            nxtTok &&
+            ((nxtTok.type === "ident" && (nxtTok.value === "from" || nxtTok.value === "extends" || nxtTok.value === "implements")) ||
+              nxtTok.value === "|" ||
+              nxtTok.value === "&" ||
+              nxtTok.value === "[")
+          ) {
             k += 1;
             continue;
           }
-          if (nxt < tokens.length && tokens[nxt].type === "punct" && tokens[nxt].value === ";") {
+          if (nxtTok && nxtTok.value === ";") {
             return nxt + 1;
           }
           return k + 1;
@@ -1020,7 +1068,10 @@ function skipStatement(tokens, startIdx) {
       else if (t.value === ")" && paren > 0) paren -= 1;
       else if (t.value === "[") bracket += 1;
       else if (t.value === "]" && bracket > 0) bracket -= 1;
-      else if (t.value === ";" && brace === 0 && paren === 0 && bracket === 0) {
+      else if (brace === 0 && paren === 0 && bracket === 0 && t.value === "<") angle += 1;
+      else if (brace === 0 && paren === 0 && bracket === 0 && angleCloseCount(t) > 0 && angle > 0) {
+        angle = Math.max(0, angle - angleCloseCount(t));
+      } else if (t.value === ";" && brace === 0 && paren === 0 && bracket === 0 && angle === 0) {
         return k + 1;
       }
     } else if (
@@ -1028,14 +1079,15 @@ function skipStatement(tokens, startIdx) {
       t.value.includes("\n") &&
       brace === 0 &&
       paren === 0 &&
-      bracket === 0
+      bracket === 0 &&
+      angle === 0
     ) {
       const prev = prevSigToken(tokens, k);
       const nxtIdx = nextSigIndex(tokens, k + 1);
       const nxt = nxtIdx < tokens.length ? tokens[nxtIdx] : null;
       const continues =
-        (prev && prev.type === "punct" && (prev.value === "=" || prev.value === "|" || prev.value === "&")) ||
-        (nxt && nxt.type === "punct" && (nxt.value === "|" || nxt.value === "&" || nxt.value === "{"));
+        (prev && prev.type === "punct" && (prev.value === "=" || prev.value === "|" || prev.value === "&" || prev.value === "<")) ||
+        (nxt && nxt.type === "punct" && (nxt.value === "|" || nxt.value === "&" || nxt.value === "{" || nxt.value === ">"));
       if (!continues) return k;
     }
     k += 1;
@@ -1051,6 +1103,9 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
   if (openBraceIdx >= tokens.length || tokens[openBraceIdx].value !== "{") return null;
   const endIdx = skipBalancedPair(tokens, openBraceIdx, "{", "}");
   const props = [];
+  const entries = [];
+  const priorNames = new Set();
+  let usesSelfRef = false;
   let autoNum = 0;
 
   let k = openBraceIdx + 1;
@@ -1064,6 +1119,7 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
     }
     const keyName = keyTok.value;
     let nextIdx = nextSigIndex(tokens, k + 1);
+    let exprStr = String(autoNum);
     if (nextIdx < endIdx - 1 && tokens[nextIdx].value === "=") {
       const valStart = nextSigIndex(tokens, nextIdx + 1);
       let valEnd = valStart;
@@ -1084,6 +1140,9 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
           else if (vt.value === "{") cDepth += 1;
           else if (vt.value === "}") cDepth = Math.max(0, cDepth - 1);
         }
+        if (vt.type === "ident" && priorNames.has(vt.value) && tokens[prevSigIndex(tokens, valEnd)]?.value !== ".") {
+          usesSelfRef = true;
+        }
         if (vt.type !== "comment") {
           valStr += vt.type === "ws" ? " " : vt.value;
         }
@@ -1094,13 +1153,30 @@ function compileEnumDeclaration(tokens, enumKwIdx) {
       if (trimmedVal !== "" && Number.isInteger(numVal)) {
         autoNum = numVal + 1;
       }
-      props.push(`${keyName}: ${trimmedVal || "undefined"}`);
+      exprStr = trimmedVal || "undefined";
+      props.push(`${keyName}: ${exprStr}`);
       k = valEnd + 1;
     } else {
       props.push(`${keyName}: ${autoNum}`);
       autoNum += 1;
       k = nextIdx + (tokens[nextIdx]?.value === "," ? 1 : 0);
     }
+    entries.push({ keyName, exprStr });
+    if (keyTok.type === "ident") {
+      priorNames.add(keyName);
+    }
+  }
+
+  if (usesSelfRef) {
+    const bodyStmts = entries
+      .map((e) => (e.keyName.startsWith('"') || e.keyName.startsWith("'")
+        ? `__e[${e.keyName}] = ${e.exprStr};`
+        : `const ${e.keyName} = (__e[${JSON.stringify(e.keyName)}] = ${e.exprStr});`))
+      .join(" ");
+    return {
+      js: `const ${enumName} = (() => { const __e = {}; ${bodyStmts} return __e; })();`,
+      nextIdx: endIdx
+    };
   }
 
   return {
@@ -1209,33 +1285,44 @@ function looksLikeCallGeneric(tokens, ltIdx) {
     return false;
   }
   let depth = 0;
+  let innerParens = 0;
+  let innerBraces = 0;
   let k = ltIdx;
   while (k < tokens.length) {
     const t = tokens[k];
-    if (t.type === "punct" && t.value === "<") {
-      depth += 1;
-    } else {
-      const closeCount = angleCloseCount(t);
-      if (closeCount > 0) {
-        depth -= closeCount;
-        if (depth === 0) {
-          const after = nextSigIndex(tokens, k + 1);
-          return (
-            after < tokens.length &&
-            tokens[after].type === "punct" &&
-            (tokens[after].value === "(" || tokens[after].value === "=>")
-          );
-        }
-        if (depth < 0) {
+    if (t.type === "punct") {
+      if (t.value === "<") {
+        depth += 1;
+      } else {
+        const closeCount = angleCloseCount(t);
+        if (closeCount > 0) {
+          depth -= closeCount;
+          if (depth === 0 && innerParens === 0 && innerBraces === 0) {
+            const after = nextSigIndex(tokens, k + 1);
+            return (
+              after < tokens.length &&
+              tokens[after].type === "punct" &&
+              (tokens[after].value === "(" || tokens[after].value === "=>")
+            );
+          }
+          if (depth < 0) {
+            return false;
+          }
+        } else if (t.value === "(" || t.value === "[") {
+          innerParens += 1;
+        } else if (t.value === ")" || t.value === "]") {
+          if (innerParens === 0) return false;
+          innerParens -= 1;
+        } else if (t.value === "{") {
+          innerBraces += 1;
+        } else if (t.value === "}") {
+          if (innerBraces === 0) return false;
+          innerBraces -= 1;
+        } else if (t.value === ";") {
+          if (innerParens === 0 && innerBraces === 0) return false;
+        } else if (depth === 1 && innerParens === 0 && innerBraces === 0 && DISALLOW_ARROW_GENERIC_OPS.has(t.value)) {
           return false;
         }
-      } else if (
-        t.type === "punct" &&
-        (t.value === ";" || t.value === "&&" || t.value === "||")
-      ) {
-        return false;
-      } else if (t.type === "ws" && t.value.includes("\n")) {
-        return false;
       }
     }
     k += 1;
@@ -1253,6 +1340,7 @@ function stripTypeScriptFromTokens(tokens) {
   let inCaseExpr = false;
   let pendingClassBody = false;
   let pendingConstructorParams = null;
+  let constructorParenDepth = -1;
   let injectConstructorThis = null;
   let waitingForSuperEnd = false;
   let superBodyDepth = -1;
@@ -1491,6 +1579,13 @@ function stripTypeScriptFromTokens(tokens) {
           i = skipStatement(tokens, i);
           continue;
         }
+        if (tok.value === "export" && tokens[n1].value === "default") {
+          const n2 = nextSigIndex(tokens, n1 + 1);
+          if (n2 < tokens.length && tokens[n2].type === "ident" && tokens[n2].value === "interface") {
+            i = skipStatement(tokens, i);
+            continue;
+          }
+        }
         if (tok.value === "export" && tokens[n1].value === "enum") {
           const compiled = compileEnumDeclaration(tokens, n1);
           if (compiled) {
@@ -1638,6 +1733,7 @@ function stripTypeScriptFromTokens(tokens) {
       ) {
         if (
           paren?.isParams &&
+          stack.length - 1 === constructorParenDepth &&
           pendingConstructorParams !== null &&
           nextTok.type === "ident" &&
           !MODIFIER_KEYWORDS.has(nextTok.value)
@@ -1651,17 +1747,27 @@ function stripTypeScriptFromTokens(tokens) {
 
     if (tok.type === "ident" && tok.value === "constructor" && currentBrace()?.inClass) {
       pendingConstructorParams = [];
+      constructorParenDepth = stack.length;
     }
 
-    // as Type / satisfies Type (fuera de import/export y accesos a propiedad `obj.as`)
+    // as Type / satisfies Type (fuera de import/export, llamadas `as(...)` y accesos `obj.as`)
+    const prevCanEndExpr =
+      prev &&
+      ((prev.type === "ident" && !EXPR_START_KEYWORDS.has(prev.value)) ||
+        prev.type === "number" ||
+        prev.type === "string" ||
+        prev.type === "regex" ||
+        prev.type === "template_full" ||
+        prev.type === "template_tail" ||
+        prev.value === ")" ||
+        prev.value === "]");
     if (
       tok.type === "ident" &&
       (tok.value === "as" || tok.value === "satisfies") &&
       !inImportExportClause &&
-      prev &&
+      prevCanEndExpr &&
       prev.value !== "." &&
-      prev.value !== "?." &&
-      !(prev.type === "ident" && (prev.value === "const" || prev.value === "let" || prev.value === "var" || prev.value === "function"))
+      prev.value !== "?."
     ) {
       const n1 = nextSigIndex(tokens, i + 1);
       const nTok = n1 < tokens.length ? tokens[n1] : null;
@@ -1677,7 +1783,13 @@ function stripTypeScriptFromTokens(tokens) {
         const afterType = skipTypeAnnotation(
           tokens,
           i + 1,
-          new Set([";", ",", ")", "]", "}", ":", "?", "&&", "||", "??", "=", "==", "===", "!=", "!==", "+", "-", "*", "/"])
+          new Set([
+            ";", ",", ")", "]", "}", ":", "?",
+            "&&", "||", "??",
+            "=", "==", "===", "!=", "!==", "<=", ">=",
+            "+", "-", "*", "/", "%", "**",
+            "instanceof", "in"
+          ])
         );
         i = afterType;
         continue;
@@ -1840,9 +1952,18 @@ function stripTypeScriptFromTokens(tokens) {
       if (stack.length > 0 && stack[stack.length - 1].kind === "paren") {
         const closed = stack.pop();
         lastClosedParen = { token: tok, isMethodOrFunc: closed.isMethodOrFunc };
-        if (closed.isParams && pendingConstructorParams && pendingConstructorParams.length > 0) {
+        if (
+          closed.isParams &&
+          stack.length === constructorParenDepth &&
+          pendingConstructorParams &&
+          pendingConstructorParams.length > 0
+        ) {
           injectConstructorThis = pendingConstructorParams;
           pendingConstructorParams = null;
+          constructorParenDepth = -1;
+        } else if (stack.length === constructorParenDepth) {
+          pendingConstructorParams = null;
+          constructorParenDepth = -1;
         }
       }
       if (waitingForSuperEnd && stack.length === superBodyDepth) {
@@ -1924,6 +2045,16 @@ function stripTypeScriptFromTokens(tokens) {
     if (tok.type === "punct" && tok.value === "=") {
       if (inVarDecl && !currentParen()) {
         inVarInit = true;
+      }
+    }
+
+    if (tok.type === "punct" && tok.value === ",") {
+      if (inVarDecl) {
+        const top = stack[stack.length - 1];
+        const inDeclaratorList = !top || (top.kind === "brace" && !top.isObject && !top.isPattern && !top.inClass);
+        if (inDeclaratorList) {
+          inVarInit = false;
+        }
       }
     }
 

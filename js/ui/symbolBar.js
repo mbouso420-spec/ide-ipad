@@ -35,12 +35,12 @@ export const LANGUAGE_SYMBOLS = {
       { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
-      { label: "fn", insert: "fn () {\n    \n}", cursorBack: 7 },
+      { label: "fn", insert: "fn () {\n    \n}", cursorBack: 11 },
       { label: "let mut", insert: "let mut ", cursorBack: 0 },
       { label: "->", insert: " -> ", cursorBack: 0 },
       { label: "::", insert: "::", cursorBack: 0 },
       { label: "pub", insert: "pub ", cursorBack: 0 },
-      { label: "struct", insert: "struct {\n    \n}", cursorBack: 7 },
+      { label: "struct", insert: "struct  {\n    \n}", cursorBack: 9 },
       { label: "&", insert: "&", cursorBack: 0 },
       { label: ";", insert: ";", cursorBack: 0 },
       { label: "!=", insert: " != ", cursorBack: 0 },
@@ -55,10 +55,10 @@ export const LANGUAGE_SYMBOLS = {
       { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "{ }", insert: "{}", cursorBack: 1 },
       { label: "( )", insert: "()", cursorBack: 1 },
-      { label: "func", insert: "func () {\n    \n}", cursorBack: 7 },
+      { label: "func", insert: "func () {\n    \n}", cursorBack: 11 },
       { label: ":=", insert: " := ", cursorBack: 0 },
       { label: "package", insert: "package main\n\n", cursorBack: 0 },
-      { label: "import", insert: "import (\n\t\"\"\n)", cursorBack: 4 },
+      { label: "import", insert: "import (\n\t\"\"\n)", cursorBack: 3 },
       { label: "err != nil", insert: "if err != nil {\n    return \n}", cursorBack: 2 },
       { label: "return", insert: "return ", cursorBack: 0 },
       { label: "fmt.Println", insert: "fmt.Println()", cursorBack: 1 },
@@ -73,7 +73,7 @@ export const LANGUAGE_SYMBOLS = {
       { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "public", insert: "public ", cursorBack: 0 },
-      { label: "class", insert: "class  {\n    \n}", cursorBack: 7 },
+      { label: "class", insert: "class  {\n    \n}", cursorBack: 9 },
       { label: "void", insert: "void ", cursorBack: 0 },
       { label: "static", insert: "static ", cursorBack: 0 },
       { label: "sout", insert: "System.out.println();", cursorBack: 2 },
@@ -92,8 +92,8 @@ export const LANGUAGE_SYMBOLS = {
       { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "\\n", insert: "\\n", cursorBack: 0 },
       { label: "using", insert: "using System;\n", cursorBack: 0 },
-      { label: "namespace", insert: "namespace \n{\n    \n}", cursorBack: 6 },
-      { label: "class", insert: "class  {\n    \n}", cursorBack: 7 },
+      { label: "namespace", insert: "namespace \n{\n    \n}", cursorBack: 9 },
+      { label: "class", insert: "class  {\n    \n}", cursorBack: 9 },
       { label: "public", insert: "public ", cursorBack: 0 },
       { label: "cw", insert: "Console.WriteLine();", cursorBack: 2 },
       { label: "{ }", insert: "{\n    \n}", cursorBack: 2 },
@@ -110,8 +110,8 @@ export const LANGUAGE_SYMBOLS = {
       { label: "Tab", insert: "  ", cursorBack: 0 },
       { label: "\\", insert: "\\", cursorBack: 0 },
       { label: "\\n", insert: "\\n", cursorBack: 0 },
-      { label: "interface", insert: "interface  {\n  \n}", cursorBack: 5 },
-      { label: "type", insert: "type  = ;\n", cursorBack: 4 },
+      { label: "interface", insert: "interface  {\n  \n}", cursorBack: 7 },
+      { label: "type", insert: "type  = ;\n", cursorBack: 5 },
       { label: ": string", insert: ": string", cursorBack: 0 },
       { label: ": number", insert: ": number", cursorBack: 0 },
       { label: "=>", insert: " => ", cursorBack: 0 },
@@ -254,6 +254,10 @@ export const LANGUAGE_SYMBOLS = {
       { label: "/", insert: "/", cursorBack: 0 },
       { label: "_", insert: "_", cursorBack: 0 }
     ]
+  },
+  image: {
+    label: "Imagen",
+    keys: []
   }
 };
 
@@ -268,6 +272,7 @@ export function initSymbolBar({ onInsert, onToggle }) {
 
   const listenerController = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
+  let currentKeys = [];
 
   const defaultVisible = readDefaultVisibility();
   let visible = readStoredBool(SYMBOL_STORAGE_KEY, defaultVisible);
@@ -276,6 +281,22 @@ export function initSymbolBar({ onInsert, onToggle }) {
 
   toggleBtn?.addEventListener("click", () => {
     setVisible(!visible);
+  }, listenOpts);
+
+  track?.addEventListener("pointerdown", (event) => {
+    if (event.target?.closest?.(".symbol-key")) {
+      event.preventDefault();
+    }
+  }, listenOpts);
+
+  track?.addEventListener("click", (event) => {
+    const btn = event.target?.closest?.(".symbol-key");
+    if (!btn) return;
+    const idx = Number(btn.dataset.symbolIndex);
+    const item = Number.isInteger(idx) ? currentKeys[idx] : null;
+    if (item) {
+      onInsert(item.insert, item.cursorBack);
+    }
   }, listenOpts);
 
   function setVisible(nextState) {
@@ -313,23 +334,22 @@ export function initSymbolBar({ onInsert, onToggle }) {
       return;
     }
 
+    currentKeys = config.keys;
     track.innerHTML = "";
-    for (const item of config.keys) {
+    const frag = typeof document.createDocumentFragment === "function"
+      ? document.createDocumentFragment()
+      : null;
+    config.keys.forEach((item, idx) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "symbol-key";
+      btn.dataset.symbolIndex = String(idx);
       btn.textContent = item.label;
       btn.setAttribute("aria-label", `Insertar ${item.label}`);
-
-      btn.addEventListener("pointerdown", (event) => {
-        event.preventDefault();
-      });
-
-      btn.addEventListener("click", () => {
-        onInsert(item.insert, item.cursorBack);
-      });
-
-      track.appendChild(btn);
+      (frag || track).appendChild(btn);
+    });
+    if (frag) {
+      track.appendChild(frag);
     }
   }
 

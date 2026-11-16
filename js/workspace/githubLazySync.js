@@ -45,6 +45,23 @@ export function createGithubLazySync({
   markProjectOfflineCached,
   listProjects
 }) {
+  const inFlightFileFetches = new Map();
+
+  function isWebScriptOrMarkupFile(file) {
+    if (!file) return false;
+    if (file.lang === "html" || file.lang === "js" || file.lang === "ts" || file.lang === "tsx" || file.lang === "css") {
+      return true;
+    }
+    const lowerPath = String(file.path || "").toLowerCase();
+    return (
+      lowerPath.endsWith(".tsx") ||
+      lowerPath.endsWith(".ts") ||
+      lowerPath.endsWith(".jsx") ||
+      lowerPath.endsWith(".mjs") ||
+      lowerPath.endsWith(".cjs")
+    );
+  }
+
   function syncOfflineButtonState() {
     const activeProject = getActiveProject();
     if (!activeProject || activeProject.kind !== "github") {
@@ -80,6 +97,7 @@ export function createGithubLazySync({
         if (activeFileId && deletedIds.has(activeFileId)) {
           setActiveFileId(nextOpenTabs[0] || null);
           await persistTabsState();
+          if (getActiveProject()?.id !== sourceProjectId) return;
           renderWorkspaceView();
         } else {
           renderTabs();
@@ -95,14 +113,17 @@ export function createGithubLazySync({
     for (const fileObj of loadedFiles) {
       if (fileObj && !fileObj.deleted) {
         editor.dropFileState(fileObj.id);
+        splitController?.dropFileState?.(fileObj.id);
       }
     }
 
     const currentFiles = getFilesOnly();
     if (currentFiles.length > 0 && currentFiles.every((f) => f.contentLoaded !== false)) {
-      activeProject.offlineCached = true;
       await markProjectOfflineCached(activeProject.id, true);
+      if (getActiveProject()?.id !== sourceProjectId) return;
+      activeProject.offlineCached = true;
       const nextProjects = await listProjects();
+      if (getActiveProject()?.id !== sourceProjectId) return;
       setProjects(nextProjects);
       explorer.renderProjects(nextProjects, activeProject.id);
     }
@@ -124,65 +145,124 @@ export function createGithubLazySync({
 
     // Fijar el proyecto ANTES de esperar a la red para no contaminar otro proyecto si el usuario cambia
     const sourceProjectId = activeProject.id;
-    const blobPayload = await fetchSingleRepoBlob({
-      token: getGithubToken(),
-      owner: activeProject.github.owner,
-      repo: activeProject.github.repo,
-      blobSha: fileObj.blobSha,
-      path: fileObj.path,
-      isBinary: Boolean(fileObj.isBinary)
-    });
-    const { deleted } = await cacheAndSyncGithubFileFn({
-      projectId: sourceProjectId,
-      fileObj,
-      remotePayload: blobPayload ?? "",
-      blobSha: fileObj.blobSha
-    });
-    await finalizeLoadedProjectFiles(sourceProjectId, [fileObj], deleted);
+    const fetchKey = `${sourceProjectId}::${fileObj.path}`;
+    const existingFetch = inFlightFileFetches.get(fetchKey);
+    if (existingFetch) {
+      return existingFetch;
+    }
+
+    const promise = (async () => {
+      const blobPayload = await fetchSingleRepoBlob({
+        token: getGithubToken(),
+        owner: activeProject.github.owner,
+        repo: activeProject.github.repo,
+        blobSha: fileObj.blobSha,
+        path: fileObj.path,
+        isBinary: Boolean(fileObj.isBinary)
+      });
+      const { deleted } = await cacheAndSyncGithubFileFn({
+        projectId: sourceProjectId,
+        fileObj,
+        remotePayload: blobPayload ?? "",
+        blobSha: fileObj.blobSha
+      });
+      if (getActiveProject()?.id !== sourceProjectId) {
+        return;
+      }
+      await finalizeLoadedProjectFiles(sourceProjectId, [fileObj], deleted);
+    })();
+
+    inFlightFileFetches.set(fetchKey, promise);
+    try {
+      await promise;
+    } finally {
+      if (inFlightFileFetches.get(fetchKey) === promise) {
+        inFlightFileFetches.delete(fetchKey);
+      }
+    }
   }
 
   async function ensureFilesLoaded(fileList, onProgress) {
     const activeProject = getActiveProject();
-    const unloaded = fileList.filter((f) => f && f.contentLoaded === false && f.blobSha);
-    if (unloaded.length === 0 || !activeProject || activeProject.kind !== "github" || !activeProject.github) {
+    const candidates = (Array.isArray(fileList) ? fileList : []).filter(
+      (f) => f && f.contentLoaded === false && f.blobSha
+    );
+    if (candidates.length === 0 || !activeProject || activeProject.kind !== "github" || !activeProject.github) {
       return;
     }
 
     const sourceProjectId = activeProject.id;
-    const loadedItems = await downloadBatchBlobs({
-      token: getGithubToken(),
-      owner: activeProject.github.owner,
-      repo: activeProject.github.repo,
-      items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha, isBinary: Boolean(f.isBinary) })),
-      onProgress
-    });
-
-    const byPath = new Map(loadedItems.map((item) => [item.path, item]));
-    const syncedFiles = [];
-    let hasDeleted = false;
-    for (const fileObj of unloaded) {
-      const hit = byPath.get(fileObj.path);
-      if (!hit) continue;
-      const { deleted } = await cacheAndSyncGithubFileFn({
-        projectId: sourceProjectId,
-        fileObj,
-        remotePayload: hit,
-        blobSha: hit.blobSha || fileObj.blobSha
-      });
-      if (deleted) {
-        hasDeleted = true;
+    const alreadyInFlight = [];
+    const unloaded = [];
+    for (const f of candidates) {
+      const key = `${sourceProjectId}::${f.path}`;
+      const existing = inFlightFileFetches.get(key);
+      if (existing) {
+        alreadyInFlight.push(existing);
+      } else {
+        unloaded.push(f);
       }
-      syncedFiles.push(fileObj);
     }
 
-    await finalizeLoadedProjectFiles(sourceProjectId, syncedFiles, hasDeleted);
+    if (unloaded.length === 0) {
+      await Promise.all(alreadyInFlight);
+      return;
+    }
+
+    const batchPromise = (async () => {
+      const loadedItems = await downloadBatchBlobs({
+        token: getGithubToken(),
+        owner: activeProject.github.owner,
+        repo: activeProject.github.repo,
+        items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha, isBinary: Boolean(f.isBinary) })),
+        onProgress
+      });
+
+      const byPath = new Map((Array.isArray(loadedItems) ? loadedItems : []).map((item) => [item.path, item]));
+      const syncedFiles = [];
+      let hasDeleted = false;
+      for (const fileObj of unloaded) {
+        const hit = byPath.get(fileObj.path);
+        if (!hit) continue;
+        const { deleted } = await cacheAndSyncGithubFileFn({
+          projectId: sourceProjectId,
+          fileObj,
+          remotePayload: hit,
+          blobSha: hit.blobSha || fileObj.blobSha
+        });
+        if (deleted) {
+          hasDeleted = true;
+        }
+        syncedFiles.push(fileObj);
+      }
+
+      if (getActiveProject()?.id !== sourceProjectId) {
+        return;
+      }
+      await finalizeLoadedProjectFiles(sourceProjectId, syncedFiles, hasDeleted);
+    })();
+
+    for (const f of unloaded) {
+      inFlightFileFetches.set(`${sourceProjectId}::${f.path}`, batchPromise);
+    }
+    try {
+      await Promise.all([batchPromise, ...alreadyInFlight]);
+    } finally {
+      for (const f of unloaded) {
+        const key = `${sourceProjectId}::${f.path}`;
+        if (inFlightFileFetches.get(key) === batchPromise) {
+          inFlightFileFetches.delete(key);
+        }
+      }
+    }
   }
 
   async function preloadForPreview(activeFile) {
     const activeProject = getActiveProject();
     if (!activeProject || activeProject.kind !== "github" || !activeFile) return;
+    const sourceProjectId = activeProject.id;
     const activeIsImage = isImageFile(activeFile);
-    if (!activeIsImage && !PREVIEWABLE_LANGS.has(activeFile.lang)) return;
+    if (!activeIsImage && !PREVIEWABLE_LANGS.has(activeFile.lang) && !isWebScriptOrMarkupFile(activeFile)) return;
 
     if (activeIsImage || activeFile.lang === "markdown") {
       if (activeFile.contentLoaded === false && activeFile.blobSha) {
@@ -192,19 +272,14 @@ export function createGithubLazySync({
           // Se muestra con el estado actual en memoria
         }
       }
-      if (activeIsImage) {
+      if (activeIsImage || getActiveProject()?.id !== sourceProjectId) {
         return;
       }
     }
 
     const lastSlash = activeFile.path.lastIndexOf("/");
     const folderPrefix = lastSlash === -1 ? "" : `${activeFile.path.slice(0, lastSlash + 1)}`;
-    const isWeb =
-      activeFile.lang === "html" ||
-      activeFile.lang === "js" ||
-      activeFile.lang === "ts" ||
-      activeFile.lang === "tsx" ||
-      activeFile.lang === "css";
+    const isWeb = isWebScriptOrMarkupFile(activeFile);
 
     const needed = getFilesOnly().filter((f) => {
       if (f.contentLoaded !== false || !f.blobSha) return false;
@@ -228,24 +303,20 @@ export function createGithubLazySync({
       if (activeFile.lang === "sql") {
         return f.lang === "sql";
       }
-      return (
-        f.lang === "html" ||
-        f.lang === "js" ||
-        f.lang === "ts" ||
-        f.lang === "tsx" ||
-        f.lang === "css" ||
-        f.path.endsWith(".json") ||
-        isImageFile(f)
-      );
+      return isWebScriptOrMarkupFile(f) || f.path.toLowerCase().endsWith(".json") || isImageFile(f);
     });
 
     if (needed.length > 0) {
       explorer.setAutosaveStatus(`Cargando ${needed.length} archivo(s) para la vista previa…`);
       try {
         await ensureFilesLoaded(needed);
-        explorer.setAutosaveStatus("Vista previa lista");
+        if (getActiveProject()?.id === sourceProjectId) {
+          explorer.setAutosaveStatus("Vista previa lista");
+        }
       } catch {
-        // Si falla la red, abre con los archivos ya disponibles en memoria
+        if (getActiveProject()?.id === sourceProjectId) {
+          explorer.setAutosaveStatus("Vista previa parcial (sin red)");
+        }
       }
     }
   }

@@ -143,6 +143,7 @@ export function initGithubController({
   let isSwitchingBranch = false;
   let branchesRequestSeq = 0;
   let syncPanelRequestSeq = 0;
+  let badgeRequestSeq = 0;
 
   function applyConnectedSessionUi(login, repos) {
     const cleanLogin = String(login || "").trim();
@@ -223,11 +224,31 @@ export function initGithubController({
   }
 
   let lockoutUiTimer = 0;
+  let isOpeningDialog = false;
+
+  function isSyncBusy() {
+    return isPulling || isPushing || isSwitchingBranch;
+  }
+
+  function syncCredentialsBackupFromGithub() {
+    try {
+      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
+        void saveCredentialsBackup("");
+      } else {
+        void saveCredentialsBackup(exportKeysBundle());
+      }
+    } catch {
+      /* ignorar error al respaldar credenciales */
+    }
+  }
 
   function cleanupDialogTransientState() {
     if (tokenInput) tokenInput.value = "";
     window.clearTimeout(lockoutUiTimer);
     lockoutUiTimer = 0;
+    if (newBranchBox) newBranchBox.hidden = true;
+    if (newBranchInput) newBranchInput.value = "";
+    if (branchStatusEl) branchStatusEl.hidden = true;
     resetPullConfirm();
     resetOpenConfirm();
     hideConflictBox();
@@ -260,46 +281,53 @@ export function initGithubController({
   }
 
   openDialogBtn?.addEventListener("click", async () => {
-    if (!dialog) return;
-    resetPullConfirm();
-    resetOpenConfirm();
-    hideConflictBox();
-    hidePublishRepoBox();
-    await onFlushPendingSaves?.();
-    const storedToken = getGithubToken();
-    syncTokenPlaceholder(storedToken);
-    await refreshSyncPanel();
-    dialog.showModal();
-    if (syncLockoutUi()) return;
-    if (storedToken) {
-      if (!isSessionConnected || reposCache.length === 0) {
-        await connectAndLoadRepos(storedToken);
-      } else {
-        applyConnectedSessionUi(connectedUserLogin, reposCache);
+    if (!dialog || isOpeningDialog) return;
+    isOpeningDialog = true;
+    try {
+      resetPullConfirm();
+      resetOpenConfirm();
+      hideConflictBox();
+      hidePublishRepoBox();
+      await onFlushPendingSaves?.();
+      const storedToken = getGithubToken();
+      syncTokenPlaceholder(storedToken);
+      await refreshSyncPanel();
+      if (!dialog.open) {
+        dialog.showModal();
       }
+      if (syncLockoutUi()) return;
+      if (storedToken) {
+        if (!isSessionConnected || reposCache.length === 0) {
+          await connectAndLoadRepos(storedToken);
+        } else {
+          applyConnectedSessionUi(connectedUserLogin, reposCache);
+        }
+      }
+    } finally {
+      isOpeningDialog = false;
     }
-  });
+  }, listenOpts);
 
-  dialog?.addEventListener("close", cleanupDialogTransientState);
+  dialog?.addEventListener("close", cleanupDialogTransientState, listenOpts);
 
   closeDialogBtn?.addEventListener("click", () => {
     cleanupDialogTransientState();
     dialog?.close();
-  });
+  }, listenOpts);
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
       cleanupDialogTransientState();
       dialog.close();
     }
-  });
+  }, listenOpts);
 
   tokenInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       connectBtn?.click();
     }
-  });
+  }, listenOpts);
 
   connectBtn?.addEventListener("click", async () => {
     if (syncLockoutUi()) return;
@@ -314,51 +342,42 @@ export function initGithubController({
     // Se verifica ANTES de guardar: un token inválido no debe quedar guardado.
     connectBtn.disabled = true;
     setStatus(authMsgEl, "Verificando el token con GitHub…", "neutral");
-    const check = await verifyGithubToken(token);
-    connectBtn.disabled = false;
-
-    if (check.status === "locked") {
-      if (tokenInput) tokenInput.value = "";
-      syncLockoutUi();
-      return;
-    }
-
-    if (check.status === "invalid") {
-      setStatus(authMsgEl, redactSensitiveTokens(check.message, [token]), "error");
-      syncLockoutUi();
-      return;
-    }
-
-    saveGithubToken(token);
-    syncTokenPlaceholder(token);
-    hideTokenWarning();
     try {
-      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
-        void saveCredentialsBackup("");
-      } else {
-        void saveCredentialsBackup(exportKeysBundle());
-      }
-    } catch {}
+      const check = await verifyGithubToken(token);
 
-    if (check.status !== "valid") {
-      // Sin internet o GitHub sin responder: se guarda para usarlo cuando vuelva la conexión.
-      setStatus(authMsgEl, `${redactSensitiveTokens(check.message, [token])} El token quedó guardado.`, "error");
-      return;
+      if (check.status === "locked") {
+        if (tokenInput) tokenInput.value = "";
+        syncLockoutUi();
+        return;
+      }
+
+      if (check.status === "invalid") {
+        setStatus(authMsgEl, redactSensitiveTokens(check.message, [token]), "error");
+        syncLockoutUi();
+        return;
+      }
+
+      saveGithubToken(token);
+      syncTokenPlaceholder(token);
+      hideTokenWarning();
+      syncCredentialsBackupFromGithub();
+
+      if (check.status !== "valid") {
+        // Sin internet o GitHub sin responder: se guarda para usarlo cuando vuelva la conexión.
+        setStatus(authMsgEl, `${redactSensitiveTokens(check.message, [token])} El token quedó guardado.`, "error");
+        return;
+      }
+      await connectAndLoadRepos(token);
+    } finally {
+      connectBtn.disabled = checkAuthLockout("github").locked;
     }
-    await connectAndLoadRepos(token);
-  });
+  }, listenOpts);
 
   clearTokenBtn?.addEventListener("click", () => {
     clearGithubToken();
     hideTokenWarning();
     cleanupDialogTransientState();
-    try {
-      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
-        void saveCredentialsBackup("");
-      } else {
-        void saveCredentialsBackup(exportKeysBundle());
-      }
-    } catch {}
+    syncCredentialsBackupFromGithub();
     reposCache = [];
     connectedUserLogin = "";
     isSessionConnected = false;
@@ -367,7 +386,8 @@ export function initGithubController({
     if (userStatusEl) userStatusEl.textContent = "Sin sesión";
     if (repoSelect) repoSelect.innerHTML = '<option value="">Conectá tu token para listar repositorios</option>';
     setStatus(authMsgEl, "Token eliminado de este navegador.", "neutral");
-  });
+    void localBackupPanel.refresh(getActiveProject());
+  }, listenOpts);
 
   repoSelect?.addEventListener("change", async () => {
     resetOpenConfirm();
@@ -378,14 +398,14 @@ export function initGithubController({
     if (fullName) {
       await loadBranchesForRepo(fullName);
     }
-  });
+  }, listenOpts);
 
   manualRepoInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
       manualRepoInput.dispatchEvent(new Event("change"));
     }
-  });
+  }, listenOpts);
 
   manualRepoInput?.addEventListener("change", async () => {
     resetOpenConfirm();
@@ -393,11 +413,11 @@ export function initGithubController({
     if (parseRepoFullName(fullName)) {
       await loadBranchesForRepo(fullName);
     }
-  });
+  }, listenOpts);
 
   branchSelect?.addEventListener("change", () => {
     resetOpenConfirm();
-  });
+  }, listenOpts);
 
   async function guardOverwritePendingChanges(owner, repo, branch, kind, triggerBtn) {
     const targetId = makeGithubProjectId(owner, repo, branch);
@@ -483,9 +503,11 @@ export function initGithubController({
       }
       await onProjectClonedOrSynced(project.id);
       await refreshSyncPanel();
-      dialog?.close();
+      if (!index.isTruncated) {
+        dialog?.close();
+      }
     });
-  });
+  }, listenOpts);
 
   cloneBtn?.addEventListener("click", () => {
     void handleOpenOrClone("clone", cloneBtn, "No se pudo descargar el repositorio.", async ({ token, owner, repo, branch }) => {
@@ -520,10 +542,10 @@ export function initGithubController({
       await onProjectClonedOrSynced(project.id);
       await refreshSyncPanel();
     });
-  });
+  }, listenOpts);
 
   pullBtn?.addEventListener("click", async () => {
-    if (isPulling) return;
+    if (isSyncBusy()) return;
     const project = getActiveProject();
     if (!project || project.kind !== "github" || !project.github) return;
 
@@ -572,6 +594,7 @@ export function initGithubController({
           entries: index.entries
         });
       }
+      hideConflictBox();
       await onProjectClonedOrSynced(updated.id);
       await refreshSyncPanel();
       if (wasTruncated) {
@@ -585,10 +608,10 @@ export function initGithubController({
       isPulling = false;
       pullBtn.disabled = false;
     }
-  });
+  }, listenOpts);
 
   async function executePush(force = false) {
-    if (isPushing) return;
+    if (isSyncBusy()) return;
     const project = getActiveProject();
     if (!project || project.kind !== "github" || !project.github) return;
 
@@ -637,6 +660,7 @@ export function initGithubController({
       // Solo se consolida lo que viajó en este commit: lo editado mientras tanto sigue pendiente.
       await markProjectSynced(project.id, commitSha, changes);
       if (commitMsgInput) commitMsgInput.value = "";
+      isPushing = false;
       await onProjectClonedOrSynced(project.id);
       await refreshSyncPanel();
       setStatus(pushStatusEl, `Commit publicado con éxito (${commitSha.slice(0, 7)}).`, "ok");
@@ -650,7 +674,9 @@ export function initGithubController({
             await onProjectClonedOrSynced(project.id);
             await refreshSyncPanel();
           }
-        } catch {}
+        } catch {
+          /* ignorar fallo secundario al sincronizar estado parcial */
+        }
       }
       if (error instanceof RemoteAheadError) {
         showConflictBox(error, project);
@@ -693,51 +719,57 @@ export function initGithubController({
   }
 
   async function openRemoteVsLocalDiff(file) {
-    if (!activeConflict) return;
+    const conflictSnapshot = activeConflict;
+    if (!conflictSnapshot?.project?.github) return;
+    const { id: projectId, github: ghMeta } = conflictSnapshot.project;
     const token = getGithubToken();
-    const allEntries = await getProjectEntries(activeConflict.project.id);
-    const localFile = allEntries.find((f) => f.path === file.path);
-    let remoteContent = "";
-    if (file.blobSha) {
-      try {
-        const fetched = await fetchSingleRepoBlob({
-          token,
-          owner: activeConflict.project.github.owner,
-          repo: activeConflict.project.github.repo,
-          blobSha: file.blobSha,
-          path: file.path
-        });
-        remoteContent = formatFetchedForDiff(fetched);
-      } catch {
-        remoteContent = "(No se pudo descargar el archivo remoto)";
-      }
-    }
-    let localContent = "(Archivo no existe localmente)";
-    if (localFile) {
-      if (localFile.isBinary) {
-        localContent = `[Archivo binario local (${(localFile.base64 || "").length} caracteres Base64)]`;
-      } else if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
-        localContent = localFile.content;
-      } else if (localFile.blobSha) {
+    try {
+      const allEntries = await getProjectEntries(projectId);
+      const localFile = allEntries.find((f) => f.path === file.path);
+      let remoteContent = "";
+      if (file.blobSha) {
         try {
-          const fetchedLocal = await fetchSingleRepoBlob({
+          const fetched = await fetchSingleRepoBlob({
             token,
-            owner: activeConflict.project.github.owner,
-            repo: activeConflict.project.github.repo,
-            blobSha: localFile.blobSha,
-            path: localFile.path
+            owner: ghMeta.owner,
+            repo: ghMeta.repo,
+            blobSha: file.blobSha,
+            path: file.path
           });
-          localContent = formatFetchedForDiff(fetchedLocal);
+          remoteContent = formatFetchedForDiff(fetched);
         } catch {
-          localContent = "(No se pudo descargar el archivo local)";
+          remoteContent = "(No se pudo descargar el archivo remoto)";
         }
       }
+      let localContent = "(Archivo no existe localmente)";
+      if (localFile) {
+        if (localFile.isBinary) {
+          localContent = `[Archivo binario local (${(localFile.base64 || "").length} caracteres Base64)]`;
+        } else if (localFile.contentLoaded !== false && typeof localFile.content === "string") {
+          localContent = localFile.content;
+        } else if (localFile.blobSha) {
+          try {
+            const fetchedLocal = await fetchSingleRepoBlob({
+              token,
+              owner: ghMeta.owner,
+              repo: ghMeta.repo,
+              blobSha: localFile.blobSha,
+              path: localFile.path
+            });
+            localContent = formatFetchedForDiff(fetchedLocal);
+          } catch {
+            localContent = "(No se pudo descargar el archivo local)";
+          }
+        }
+      }
+      onOpenDiff?.({
+        title: `Remoto (${file.path}) vs Local`,
+        oldCode: remoteContent,
+        newCode: localContent
+      });
+    } catch (err) {
+      setStatus(pushStatusEl, formatSafeErrorMessage(err, [token], "No se pudo abrir la comparación."), "error");
     }
-    onOpenDiff?.({
-      title: `Remoto (${file.path}) vs Local`,
-      oldCode: remoteContent,
-      newCode: localContent
-    });
   }
 
   function createDiffPreviewButton(file) {
@@ -752,18 +784,18 @@ export function initGithubController({
   commitMsgInput?.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
-      if (isPushing) return;
+      if (isSyncBusy()) return;
       void executePush(false);
     }
-  });
+  }, listenOpts);
 
   pushBtn?.addEventListener("click", () => {
-    if (!isPushing) void executePush(false);
-  });
+    if (!isSyncBusy()) void executePush(false);
+  }, listenOpts);
 
   conflictForceBtn?.addEventListener("click", () => {
-    if (!isPushing) void executePush(true);
-  });
+    if (!isSyncBusy()) void executePush(true);
+  }, listenOpts);
 
   conflictViewBtn?.addEventListener("click", async () => {
     if (!activeConflict || !conflictList) return;
@@ -819,7 +851,7 @@ export function initGithubController({
     } finally {
       conflictViewBtn.disabled = false;
     }
-  });
+  }, listenOpts);
 
   conflictMergeBtn?.addEventListener("click", async () => {
     if (!activeConflict || !conflictList) return;
@@ -929,15 +961,16 @@ export function initGithubController({
     } finally {
       conflictMergeBtn.disabled = false;
     }
-  });
+  }, listenOpts);
 
   conflictApplyBtn?.addEventListener("click", async () => {
-    if (!activeConflict || !activeMergeClassification) return;
+    if (!activeConflict || !activeMergeClassification || isSyncBusy()) return;
     const targetToken = getGithubToken();
     if (!targetToken) {
       setStatus(pushStatusEl, "Conectá tu Personal Access Token arriba para aplicar la integración.", "error");
       return;
     }
+    isPulling = true;
     conflictApplyBtn.disabled = true;
     setStatus(pushStatusEl, "Aplicando integración segura en el workspace…", "neutral");
     try {
@@ -962,6 +995,7 @@ export function initGithubController({
 
       const result = await applyRemotePullPlan(targetProject.id, plan);
       hideConflictBox();
+      isPulling = false;
       await onProjectClonedOrSynced?.(result?.project?.id || targetProject.id);
       await refreshSyncPanel();
       setStatus(
@@ -972,16 +1006,17 @@ export function initGithubController({
     } catch (err) {
       setStatus(pushStatusEl, formatSafeErrorMessage(err, [targetToken], "Error al aplicar la integración."), "error");
     } finally {
+      isPulling = false;
       conflictApplyBtn.disabled = false;
     }
-  });
+  }, listenOpts);
 
   btnNewBranch?.addEventListener("click", () => {
     if (newBranchBox) {
       newBranchBox.hidden = false;
       newBranchInput?.focus();
     }
-  });
+  }, listenOpts);
 
   btnCancelBranch?.addEventListener("click", () => {
     if (newBranchBox) {
@@ -989,7 +1024,7 @@ export function initGithubController({
       if (newBranchInput) newBranchInput.value = "";
     }
     if (branchStatusEl) branchStatusEl.hidden = true;
-  });
+  }, listenOpts);
 
   newBranchInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -999,16 +1034,24 @@ export function initGithubController({
       event.preventDefault();
       btnCancelBranch?.click();
     }
-  });
+  }, listenOpts);
 
   btnCreateBranch?.addEventListener("click", async () => {
+    if (isSyncBusy()) return;
     const project = getActiveProject();
     if (!project || !project.github) return;
-    const branchName = String(newBranchInput?.value || "").trim();
+    const branchName = String(newBranchInput?.value || "").trim().replace(/^refs\/heads\//, "");
     if (!branchName) {
       if (branchStatusEl) {
         branchStatusEl.hidden = false;
         branchStatusEl.textContent = "Escribí un nombre para la nueva rama.";
+      }
+      return;
+    }
+    if (!project.github.commitSha) {
+      if (branchStatusEl) {
+        branchStatusEl.hidden = false;
+        branchStatusEl.textContent = "El repositorio aún no tiene commits base; hacé un primer Commit antes de crear ramas.";
       }
       return;
     }
@@ -1036,19 +1079,21 @@ export function initGithubController({
         branchName,
         fromSha: project.github.commitSha
       });
+      const cleanBranchName = createdBranch?.name || branchName;
       const migrated = await migrateGithubProjectBranch(
         project.id,
-        branchName,
+        cleanBranchName,
         createdBranch?.commitSha || project.github.commitSha || null
       );
       if (newBranchBox) {
         newBranchBox.hidden = true;
         if (newBranchInput) newBranchInput.value = "";
       }
+      hideConflictBox();
       await onProjectClonedOrSynced?.(migrated.id);
       if (branchStatusEl) {
         branchStatusEl.hidden = false;
-        branchStatusEl.textContent = `Rama "${branchName}" creada y activa.`;
+        branchStatusEl.textContent = `Rama "${cleanBranchName}" creada y activa.`;
       }
       await refreshSyncPanel();
     } catch (err) {
@@ -1059,12 +1104,15 @@ export function initGithubController({
     } finally {
       if (btnCreateBranch) btnCreateBranch.disabled = false;
     }
-  });
+  }, listenOpts);
 
   syncBranchSelect?.addEventListener("change", async () => {
-    if (isSwitchingBranch) return;
     const project = getActiveProject();
     if (!project || !project.github) return;
+    if (isSyncBusy()) {
+      syncBranchSelect.value = project.github.branch;
+      return;
+    }
     const prevBranch = project.github.branch;
     const chosen = syncBranchSelect.value;
     if (!chosen || chosen === prevBranch) return;
@@ -1104,6 +1152,7 @@ export function initGithubController({
                 entries: idx.entries
               })
             ))();
+      hideConflictBox();
       await onProjectClonedOrSynced?.(updated.id);
       await refreshSyncPanel();
       setStatus(pushStatusEl, `Rama activa cambiada a "${chosen}".`, "ok");
@@ -1114,16 +1163,14 @@ export function initGithubController({
       isSwitchingBranch = false;
       syncBranchSelect.disabled = false;
     }
-  });
+  }, listenOpts);
 
   async function connectAndLoadRepos(token) {
     if (connectBtn) connectBtn.disabled = true;
     setStatus(authMsgEl, "Verificando cuenta y repositorios en GitHub…", "neutral");
     try {
-      const [user, repos] = await Promise.all([
-        fetchGithubUser(token),
-        fetchUserRepositories(token)
-      ]);
+      const user = await fetchGithubUser(token);
+      const repos = await fetchUserRepositories(token);
       reposCache = Array.isArray(repos) ? repos : [];
       connectedUserLogin = user?.login || connectedUserLogin || "";
       isSessionConnected = true;
@@ -1143,7 +1190,7 @@ export function initGithubController({
         setStatus(authMsgEl, formatSafeErrorMessage(error, [token], "Token inválido o sin permisos."), "error");
       }
     } finally {
-      if (connectBtn) connectBtn.disabled = false;
+      if (connectBtn) connectBtn.disabled = checkAuthLockout("github").locked;
     }
   }
 
@@ -1152,6 +1199,8 @@ export function initGithubController({
     if (!parsed || !branchSelect) return;
 
     const seq = ++branchesRequestSeq;
+    branchSelect.disabled = true;
+    branchSelect.innerHTML = '<option value="">Cargando ramas…</option>';
     const token = getGithubToken();
     try {
       const branches = await fetchRepositoryBranches(token, parsed.owner, parsed.repo);
@@ -1169,6 +1218,10 @@ export function initGithubController({
     } catch {
       if (seq !== branchesRequestSeq) return;
       branchSelect.innerHTML = '<option value="main">main</option><option value="master">master</option>';
+    } finally {
+      if (seq === branchesRequestSeq) {
+        branchSelect.disabled = false;
+      }
     }
   }
 
@@ -1286,6 +1339,7 @@ export function initGithubController({
 
   async function refreshTopbarBadge(precomputedCount) {
     if (!topbarRepoLabel) return;
+    const seq = ++badgeRequestSeq;
     const project = getActiveProject();
     if (!project || project.kind !== "github") {
       topbarRepoLabel.textContent = "Repositorio";
@@ -1296,6 +1350,7 @@ export function initGithubController({
       typeof precomputedCount === "number"
         ? precomputedCount
         : await countPendingGithubChanges(project.id);
+    if (seq !== badgeRequestSeq) return;
 
     topbarRepoLabel.textContent = count > 0 ? `Commit (${count})` : "Repositorio";
     if (count > 0) {
@@ -1325,10 +1380,10 @@ export function initGithubController({
     }
 
     try {
-      const [liveUser, liveRepos] = await Promise.all([
-        fetchGithubUser(token),
-        fetchUserRepositories(token)
-      ]);
+      const liveUser = await fetchGithubUser(token);
+      if (getGithubToken() !== token) return;
+      const liveRepos = await fetchUserRepositories(token);
+      if (getGithubToken() !== token) return;
       if (liveUser?.login) {
         connectedUserLogin = liveUser.login;
         isSessionConnected = true;
@@ -1340,7 +1395,9 @@ export function initGithubController({
       applyConnectedSessionUi(connectedUserLogin, reposCache);
       hideTokenWarning();
     } catch (error) {
+      if (getGithubToken() !== token) return;
       if (error?.status === 401 || error?.credentialRejected) {
+        isSessionConnected = false;
         // El token guardado dejó de funcionar: avisar ahora y no recién al intentar el push.
         showTokenWarning("Tu token de GitHub venció o fue revocado. Conectá uno nuevo para ver tus repos y hacer push.");
       }
@@ -1354,6 +1411,9 @@ export function initGithubController({
     destroy() {
       window.clearTimeout(pullConfirmTimer);
       window.clearTimeout(openConfirmTimer);
+      window.clearTimeout(lockoutUiTimer);
+      lockoutUiTimer = 0;
+      localBackupPanel?.destroy?.();
       listenerController?.abort();
     }
   };

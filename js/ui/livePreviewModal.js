@@ -12,9 +12,12 @@ let acornLoading = null;
 /** Carga (una sola vez) el analizador de JS usado para proteger los bucles. Sin red, la vista previa sigue sin protección. */
 function loadAcorn() {
   if (!acornLoading) {
+    let timeoutId = null;
     acornLoading = Promise.race([
       import(ACORN_URL),
-      new Promise((_, reject) => window.setTimeout(() => reject(new Error("timeout")), 5000))
+      new Promise((_, reject) => {
+        timeoutId = window.setTimeout(() => reject(new Error("timeout")), 5000);
+      })
     ])
       .then((mod) => {
         acornModule = mod && typeof mod.parse === "function" ? mod : null;
@@ -23,6 +26,12 @@ function loadAcorn() {
       .catch(() => {
         acornLoading = null; // reintentar la próxima vez que se abra la vista previa
         return null;
+      })
+      .finally(() => {
+        if (timeoutId !== null) {
+          window.clearTimeout(timeoutId);
+          timeoutId = null;
+        }
       });
   }
   return acornLoading;
@@ -114,6 +123,7 @@ export function initLivePreviewModal({
   const backBtn = document.getElementById("btn-preview-back");
   const forwardBtn = document.getElementById("btn-preview-forward");
   const navControls = dialog?.querySelector(".preview-nav-controls");
+  const deviceSwitcher = dialog?.querySelector(".preview-device-switcher");
 
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = controller ? { signal: controller.signal } : undefined;
@@ -125,6 +135,7 @@ export function initLivePreviewModal({
   let idleAcornUsesIdleApi = false;
   let previewRunSeq = 0;
   let renderSeq = 0;
+  let destroyed = false;
   let currentPreviewPath = null;
   let activePreviewExt = "";
   /** @type {"auto" | "standalone" | "folder"} */
@@ -331,10 +342,12 @@ export function initLivePreviewModal({
     // 1. Si el HTML está pendiente de descarga bajo demanda (lazy en GitHub), descargarlo primero
     if (isFileContentUnloaded(targetFile) && typeof ensureFileLoaded === "function") {
       await ensureFileLoaded(targetFile);
+      if (destroyed) return { html: "", assetMap: new Map() };
     }
 
     // 2. Descargar transitivamente todas las dependencias locales (HTML -> CSS -> @import / JS/TS)
     await loadTransitiveDependencies([targetFile], allFiles);
+    if (destroyed) return { html: "", assetMap: new Map() };
 
     // 3. Construir mapa de assets del proyecto completo
     const assetMap = buildWorkspaceAssetMap(allFiles);
@@ -345,14 +358,16 @@ export function initLivePreviewModal({
   }
 
   async function ensureStandaloneDepsLoaded(activeFile, allFiles) {
-    if (!activeFile) return;
+    if (!activeFile || destroyed) return;
     if (isFileContentUnloaded(activeFile) && typeof ensureFileLoaded === "function") {
       await ensureFileLoaded(activeFile);
+      if (destroyed) return;
     }
     await loadTransitiveDependencies([activeFile], allFiles);
   }
 
   async function navigateToHtml(targetPath, pushHistory = true) {
+    if (destroyed) return;
     const seq = ++renderSeq;
     const { files, projectId } = getWorkspaceSnapshot();
     const targetFile = files.find((f) => normalizePath(f.path) === normalizePath(targetPath));
@@ -372,7 +387,7 @@ export function initLivePreviewModal({
     syncPageSelect(files, targetFile.path);
 
     const { html, assetMap } = await prepareHtmlForPreview(targetFile, files);
-    if (seq !== renderSeq) return;
+    if (destroyed || seq !== renderSeq) return;
     const compiledHtml = bundleHtmlWithFolderAssets(targetFile.path, html, assetMap, null, guardJs, null, true);
 
     showRunnableIframe({
@@ -411,10 +426,7 @@ export function initLivePreviewModal({
   }
 
   openBtn?.addEventListener("click", async () => {
-    jsRunOverride = "auto";
-    tsRunOverride = "auto";
-    imageRunOverride = "auto";
-    await loadAcorn();
+    if (destroyed) return;
     await openPreview();
   }, listenOpts);
 
@@ -425,6 +437,7 @@ export function initLivePreviewModal({
   }, listenOpts);
 
   dialog?.addEventListener("close", () => {
+    if (dialog.open) return;
     renderSeq += 1;
     stopIframe();
   }, listenOpts);
@@ -438,6 +451,7 @@ export function initLivePreviewModal({
   }, listenOpts);
 
   jsModeBtn?.addEventListener("click", () => {
+    if (destroyed) return;
     if (TS_EXTENSIONS.has(activePreviewExt)) {
       tsRunOverride = tsRunOverride === "compiler" ? "browser" : "compiler";
     } else if (IMAGE_EXTENSIONS.has(activePreviewExt)) {
@@ -481,6 +495,18 @@ export function initLivePreviewModal({
   }, listenOpts);
 
   reloadBtn?.addEventListener("click", () => {
+    if (destroyed) return;
+    const { activeFileId } = getWorkspaceSnapshot();
+    const navigatedHtml =
+      currentPreviewPath &&
+      HTML_EXTENSIONS.has(getFileExtension(currentPreviewPath)) &&
+      (historyStack.length > 1 ||
+        (HTML_EXTENSIONS.has(activePreviewExt) &&
+          normalizePath(currentPreviewPath) !== normalizePath(activeFileId || "")));
+    if (navigatedHtml) {
+      void navigateToHtml(currentPreviewPath, false);
+      return;
+    }
     void renderActiveTabPreview();
   }, listenOpts);
 
@@ -567,11 +593,20 @@ export function initLivePreviewModal({
     while (consoleList.children.length >= MAX_CONSOLE_LINES && consoleList.firstElementChild) {
       consoleList.removeChild(consoleList.firstElementChild);
     }
-    const rawStr = redactSensitiveTokens(String(text ?? ""));
+    const rawStr = String(text ?? "");
+    const preSlice = rawStr.length > MAX_CONSOLE_LINE_CHARS + 512
+      ? rawStr.slice(0, MAX_CONSOLE_LINE_CHARS + 512)
+      : rawStr;
+    let redacted = preSlice;
+    try {
+      redacted = redactSensitiveTokens(preSlice);
+    } catch (_) {
+      redacted = preSlice;
+    }
     const safeText =
-      rawStr.length > MAX_CONSOLE_LINE_CHARS
-        ? `${rawStr.slice(0, MAX_CONSOLE_LINE_CHARS)}… [truncado]`
-        : rawStr;
+      rawStr.length > MAX_CONSOLE_LINE_CHARS || redacted.length > MAX_CONSOLE_LINE_CHARS
+        ? `${redacted.slice(0, MAX_CONSOLE_LINE_CHARS)}… [truncado]`
+        : redacted;
     const item = document.createElement("div");
     item.className =
       level === "error"
@@ -585,12 +620,18 @@ export function initLivePreviewModal({
   }
 
   async function openPreview() {
-    if (!dialog) return;
-    await loadAcorn();
+    if (!dialog || destroyed) return;
+    jsRunOverride = "auto";
+    tsRunOverride = "auto";
+    imageRunOverride = "auto";
+    void loadAcorn();
     if (typeof onBeforePreview === "function") {
       try {
         await onBeforePreview();
-      } catch (_) {}
+      } catch (_) {
+        /* guardado previo opcional antes de previsualizar */
+      }
+      if (destroyed) return;
     }
     if (!dialog.open) {
       dialog.showModal();
@@ -602,6 +643,7 @@ export function initLivePreviewModal({
     stopIframe();
     clearConsoleOutput();
     hideWebNavigationControls();
+    if (deviceSwitcher) deviceSwitcher.hidden = true;
 
     if (titleEl) titleEl.textContent = headerTitle;
     if (fileBadgeEl) {
@@ -636,6 +678,7 @@ export function initLivePreviewModal({
     clearConsoleOutput();
     if (cRunnerContainer) cRunnerContainer.hidden = true;
     if (iframeWrapper) iframeWrapper.hidden = false;
+    if (deviceSwitcher) deviceSwitcher.hidden = false;
 
     if (titleEl) titleEl.textContent = headerTitle;
     if (consoleTitleEl) consoleTitleEl.textContent = consoleTitle;
@@ -684,6 +727,7 @@ export function initLivePreviewModal({
     stopIframe();
     clearConsoleOutput();
     hideWebNavigationControls();
+    if (deviceSwitcher) deviceSwitcher.hidden = true;
 
     const ext = getFileExtension(activeFile.path);
     const isC = C_EXTENSIONS.has(ext);
@@ -760,7 +804,7 @@ export function initLivePreviewModal({
 
   async function renderActiveTabPreview() {
     const seq = ++renderSeq;
-    const isStale = () => seq !== renderSeq;
+    const isStale = () => destroyed || seq !== renderSeq;
     const { files, activeFileId, projectId } = getWorkspaceSnapshot();
     const activeFile = activeFileId
       ? files.find((f) => normalizePath(f.path) === normalizePath(activeFileId)) || null
@@ -947,7 +991,7 @@ export function initLivePreviewModal({
     // 6. Pestaña SQL (.sql): base de datos SQLite interactiva en WebAssembly
     if (SQL_EXTENSIONS.has(ext)) {
       hideWebNavigationControls();
-      const compiledSqlHtml = buildSqlRunnerPreview(activeFile, sameFolderFiles);
+      const compiledSqlHtml = buildSqlRunnerPreview(activeFile);
       showRunnableIframe({
         headerTitle: "Vista previa de SQL (SQLite)",
         badgeText: activeFile.path,
@@ -1095,6 +1139,7 @@ export function initLivePreviewModal({
   return {
     openPreview,
     destroy() {
+      destroyed = true;
       renderSeq += 1;
       if (idleAcornHandle !== null && typeof window !== "undefined") {
         if (idleAcornUsesIdleApi && typeof window.cancelIdleCallback === "function") {

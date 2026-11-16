@@ -13,6 +13,7 @@ export function createTabManager({
   getActiveFileId,
   getActiveProject,
   saveProjectState,
+  saveProjectTabsState,
   isFileDirtyForProject,
   onOpenFile,
   onRequestCloseTab,
@@ -20,13 +21,28 @@ export function createTabManager({
 }) {
   /** @type {Map<string, { wrapper: HTMLElement, selectBtn: HTMLButtonElement }>} */
   const tabElementsById = new Map();
+  let persistChain = Promise.resolve();
 
-  async function persistTabsState() {
+  function persistTabsState() {
     const activeProject = getActiveProject?.();
-    if (!activeProject) return;
-    activeProject.openTabIds = [...(getOpenTabIds?.() || [])];
-    activeProject.activeFileId = getActiveFileId?.() ?? null;
-    await saveProjectState(activeProject);
+    if (!activeProject) return Promise.resolve();
+    const projectId = activeProject.id;
+    const nextTabs = [...(getOpenTabIds?.() || [])];
+    const nextActive = getActiveFileId?.() ?? null;
+    activeProject.openTabIds = nextTabs;
+    activeProject.activeFileId = nextActive;
+
+    const task = async () => {
+      if (typeof saveProjectTabsState === "function") {
+        await saveProjectTabsState(projectId, nextTabs, nextActive);
+        return;
+      }
+      await saveProjectState?.(activeProject);
+    };
+
+    const run = persistChain.then(task, task);
+    persistChain = run.catch(() => {});
+    return run;
   }
 
   function revealActiveTab() {

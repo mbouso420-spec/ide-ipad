@@ -7,7 +7,11 @@ import { normalizePath } from "../storage/workspaceDb.js";
 import { getFileExtension, escapeHtmlText, PYTHON_EXTENSIONS } from "./previewUtils.js";
 
 export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseFolder = "") {
-  const prefix = baseFolder ? `${baseFolder}/` : "";
+  const pyPath = String(pyFile?.path || "main.py");
+  const pyShortName = String(pyFile?.shortName || pyPath.split("/").pop() || "main.py");
+  const pyCode = String(pyFile?.content || "");
+  const cleanBaseFolder = normalizePath(baseFolder);
+  const prefix = cleanBaseFolder ? `${cleanBaseFolder}/` : "";
   const modules = [];
   const modPrefixes = new Set();
   const TEXT_OR_DATA_EXTENSIONS = new Set([
@@ -15,12 +19,13 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
   ]);
 
   for (const candidate of sameFolderFiles) {
+    if (!candidate || !candidate.path) continue;
     const ext = getFileExtension(candidate.path);
     const isPy = PYTHON_EXTENSIONS.has(ext);
     const isData = TEXT_OR_DATA_EXTENSIONS.has(ext);
     if (!isPy && !isData) continue;
     const cleanPath = normalizePath(candidate.path);
-    if (cleanPath === normalizePath(pyFile.path)) continue;
+    if (cleanPath === normalizePath(pyPath)) continue;
     const relPath = prefix && cleanPath.startsWith(prefix) ? cleanPath.slice(prefix.length) : cleanPath;
     if (relPath && !relPath.startsWith("..")) {
       modules.push({ path: relPath, content: candidate.content });
@@ -38,6 +43,8 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "class _StudioPauseForInput(BaseException):",
     "    def __init__(self, prompt_text):",
     "        self.prompt_text = prompt_text",
+    "class _StudioTimeoutError(BaseException):",
+    "    pass",
     "for _mod_prefix in json.loads(__studio_mod_prefixes_json):",
     "    for _loaded in list(sys.modules.keys()):",
     "        if _loaded == _mod_prefix or _loaded.startswith(_mod_prefix + '.'):",
@@ -72,7 +79,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "        if _studio_trace_n >= 2000:",
     "            _studio_trace_n = 0",
     "            if time.monotonic() - _studio_start_t > _studio_limit_sec:",
-    "                raise TimeoutError(f'Ejecución detenida: se superó el límite de {_studio_limit_sec:.0f} s en hilo principal (posible bucle infinito).')",
+    "                raise _StudioTimeoutError(f'Ejecución detenida: se superó el límite de {_studio_limit_sec:.0f} s en hilo principal (posible bucle infinito).')",
     "    return _studio_trace_guard",
     "try:",
     "    if _studio_limit_sec > 0:",
@@ -80,6 +87,9 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "    exec(compile(__studio_entry_code, __studio_entry_name, 'exec'), _studio_repl_ns)",
     "except _StudioPauseForInput as _pause:",
     "    _result = {'status': 'need_input', 'prompt': _pause.prompt_text}",
+    "except _StudioTimeoutError as _texc:",
+    "    _result = {'status': 'error'}",
+    "    print(str(_texc), file=sys.stderr)",
     "except SystemExit:",
     "    pass",
     "except Exception as _exc:",
@@ -100,15 +110,15 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
   ].join("\n");
 
   const payloadJson = JSON.stringify({
-    entryName: pyFile.shortName,
-    entryPath: pyFile.path,
-    code: pyFile.content,
+    entryName: pyShortName,
+    entryPath: pyPath,
+    code: pyCode,
     modules,
     modPrefixes: [...modPrefixes],
     bootstrap: pythonBootstrap
   }).replace(/</g, "\\u003c");
 
-  const safePathLabel = escapeHtmlText(pyFile.path);
+  const safePathLabel = escapeHtmlText(pyPath);
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -179,6 +189,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       border-radius: 4px;
       background: var(--surface-input);
     }
+    .py-line-warn { color: var(--warn); }
     .py-line-error { color: var(--err); }
     .py-empty { color: var(--muted); font-style: italic; }
     .py-input-bar {
@@ -257,7 +268,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     <form id="__py_input_form" class="py-input-bar" hidden>
       <label id="__py_input_prompt" for="__py_input_field" class="py-input-prompt">input():</label>
       <input id="__py_input_field" type="text" class="py-input-field" autocomplete="off" spellcheck="false" placeholder="Escribí un valor y tocá Enviar…">
-      <button type="submit" class="py-btn py-btn-primary">Enviar</button>
+      <button type="button" id="__py_input_submit" class="py-btn py-btn-primary">Enviar</button>
       <button type="button" id="__py_input_cancel" class="py-btn">Cancelar</button>
     </form>
   </section>
@@ -342,6 +353,8 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             "_repl_limit_sec = float(globals().get('__studio_exec_limit_sec', 0) or 0)",
             "_repl_trace_n = 0",
             "_repl_start_t = time.monotonic()",
+            "class _ReplTimeoutError(BaseException):",
+            "    pass",
             "def _repl_trace_guard(frame, event, arg):",
             "    global _repl_trace_n",
             "    if event == 'line':",
@@ -349,7 +362,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             "        if _repl_trace_n >= 2000:",
             "            _repl_trace_n = 0",
             "            if time.monotonic() - _repl_start_t > _repl_limit_sec:",
-            "                raise TimeoutError(f'REPL detenido: se superó el límite de {_repl_limit_sec:.0f} s en hilo principal.')",
+            "                raise _ReplTimeoutError(f'REPL detenido: se superó el límite de {_repl_limit_sec:.0f} s en hilo principal.')",
             "    return _repl_trace_guard",
             "try:",
             "    if _repl_limit_sec > 0:",
@@ -357,9 +370,19 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             "    _v = eval(compile(__studio_eval_code, '<repl>', 'eval'), _studio_repl_ns)",
             "    if _v is not None:",
             "        print(repr(_v))",
+            "except _ReplTimeoutError as _texc:",
+            "    _er = {'status': 'error'}",
+            "    print(str(_texc), file=sys.stderr)",
+            "except SystemExit:",
+            "    pass",
             "except SyntaxError:",
             "    try:",
             "        exec(compile(__studio_eval_code, '<repl>', 'exec'), _studio_repl_ns)",
+            "    except _ReplTimeoutError as _texc:",
+            "        _er = {'status': 'error'}",
+            "        print(str(_texc), file=sys.stderr)",
+            "    except SystemExit:",
+            "        pass",
             "    except Exception as _ex:",
             "        _er = {'status': 'error'}",
             "        print(''.join(traceback.format_exception_only(type(_ex), _ex)).rstrip(), file=sys.stderr)",
@@ -410,6 +433,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       var inputForm = document.getElementById("__py_input_form");
       var inputPromptEl = document.getElementById("__py_input_prompt");
       var inputField = document.getElementById("__py_input_field");
+      var submitBtn = document.getElementById("__py_input_submit");
       var cancelBtn = document.getElementById("__py_input_cancel");
       var payload = JSON.parse(document.getElementById("__py_payload").textContent);
       var runnerSrc = document.getElementById("__py_runner_src").textContent;
@@ -434,16 +458,26 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         } catch (_) {}
       }
 
+      var MAX_SCREEN_LINES = 2000;
       function emit(level, text) {
         var msg = String(text == null ? "" : text);
         try {
           parent.postMessage({ source: "studio-ide-preview", level: level, text: msg }, "*");
-        } catch (_) {}
+        } catch (_) {
+          /* iframe sin parent accesible */
+        }
         if (screenBox) {
           var row = document.createElement("div");
-          row.className = level === "error" ? "py-line py-line-error" : "py-line";
+          row.className = level === "error"
+            ? "py-line py-line-error"
+            : level === "warn"
+              ? "py-line py-line-warn"
+              : "py-line";
           row.textContent = msg;
           screenBox.appendChild(row);
+          while (screenBox.children.length > MAX_SCREEN_LINES) {
+            screenBox.removeChild(screenBox.firstChild);
+          }
         }
       }
 
@@ -479,11 +513,22 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
 
       function loadScriptTag(url) {
+        if (typeof self.loadPyodide === "function") {
+          return Promise.resolve();
+        }
         return new Promise(function (resolve, reject) {
+          var prev = document.querySelector('script[data-py-loader="1"]');
+          if (prev) {
+            try { prev.remove(); } catch (_) {}
+          }
           var s = document.createElement("script");
+          s.dataset.pyLoader = "1";
           s.src = url;
           s.onload = function () { resolve(); };
-          s.onerror = function () { reject(new Error("No se pudo descargar el motor Python 3 (Pyodide). Conectate a internet al menos una vez para almacenarlo en caché.")); };
+          s.onerror = function () {
+            try { s.remove(); } catch (_) { /* nodo ya removido */ }
+            reject(new Error("No se pudo descargar el motor Python 3 (Pyodide). Conectate a internet al menos una vez para almacenarlo en caché."));
+          };
           document.head.appendChild(s);
         });
       }
@@ -527,17 +572,18 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
 
       function createRunner() {
+        var blobUrl = null;
+        var revoked = false;
+        function revokeBlobUrl() {
+          if (!revoked && blobUrl) {
+            revoked = true;
+            try { URL.revokeObjectURL(blobUrl); } catch (_) { /* noop */ }
+          }
+        }
         try {
           var prefix = "var __loadScript = function (url) { importScripts(url); return Promise.resolve(); };\\n";
-          var blobUrl = URL.createObjectURL(new Blob([prefix + runnerSrc], { type: "text/javascript" }));
+          blobUrl = URL.createObjectURL(new Blob([prefix + runnerSrc], { type: "text/javascript" }));
           var worker = new Worker(blobUrl);
-          var revoked = false;
-          function revokeBlobUrl() {
-            if (!revoked) {
-              revoked = true;
-              try { URL.revokeObjectURL(blobUrl); } catch (_) {}
-            }
-          }
           var r = {
             canStop: true,
             post: function (msg) { worker.postMessage(msg); },
@@ -567,11 +613,16 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
               }
               return;
             }
+            if (runner === r) {
+              r.stop();
+              runner = null;
+            }
             handle({ type: "fatal", message: event && event.message ? event.message : "Error en el motor Python." });
           };
           window.addEventListener("pagehide", onPageHide, { once: true });
           return r;
         } catch (_) {
+          revokeBlobUrl();
           return createMainThreadRunner();
         }
       }
@@ -672,16 +723,37 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         });
       }
 
+      function submitUserInput() {
+        if (running) return;
+        submittedInputs.push({ value: inputField ? inputField.value : "" });
+        executePass();
+      }
+
       if (inputForm) {
         inputForm.addEventListener("submit", function (ev) {
           ev.preventDefault();
-          submittedInputs.push({ value: inputField ? inputField.value : "" });
-          executePass();
+          submitUserInput();
+        });
+      }
+
+      if (submitBtn) {
+        submitBtn.addEventListener("click", function () {
+          submitUserInput();
+        });
+      }
+
+      if (inputField) {
+        inputField.addEventListener("keydown", function (ev) {
+          if (ev.key === "Enter") {
+            ev.preventDefault();
+            submitUserInput();
+          }
         });
       }
 
       if (cancelBtn) {
         cancelBtn.addEventListener("click", function () {
+          if (running) return;
           submittedInputs.push({ cancelled: true });
           executePass();
         });

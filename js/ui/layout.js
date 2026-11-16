@@ -8,7 +8,7 @@ const STORAGE_KEYS = {
   rightWidth: "ide.layout.rightWidth"
 };
 
-const COMPACT_MEDIA = "(max-width: 74rem)";
+const COMPACT_MEDIA = "(max-width: 73.99rem)";
 
 /**
  * Inicializa el sistema de layout híbrido de 3 paneles (islas acopladas en ancho / drawers flotantes en Stage Manager o vertical),
@@ -52,7 +52,7 @@ export function initLayoutController() {
     if (document.body) {
       document.body.dataset.leftOpen = String(leftOpen);
       document.body.dataset.rightOpen = String(rightOpen);
-      document.body.dataset.drawerBackdrop = String(compact && (leftOpen || rightOpen));
+      document.body.dataset.drawerBackdrop = String(!isZenActive && compact && (leftOpen || rightOpen));
       document.body.dataset.zenMode = String(isZenActive);
     }
 
@@ -111,9 +111,6 @@ export function initLayoutController() {
 
   function toggleZenMode(force) {
     isZenActive = typeof force === "boolean" ? force : !isZenActive;
-    if (document.body) {
-      document.body.dataset.zenMode = String(isZenActive);
-    }
     if (btnToggleZen) {
       btnToggleZen.setAttribute("aria-pressed", String(isZenActive));
       btnToggleZen.title = isZenActive
@@ -123,9 +120,7 @@ export function initLayoutController() {
     if (btnExitZen) {
       btnExitZen.hidden = !isZenActive;
     }
-    if (!isZenActive) {
-      applyState();
-    }
+    applyState();
     return isZenActive;
   }
 
@@ -336,7 +331,11 @@ function bindSplitter(handle, side, callbacks = {}) {
 
   handle.addEventListener("pointerdown", (event) => {
     activePointerId = event.pointerId;
-    handle.setPointerCapture(event.pointerId);
+    try {
+      handle.setPointerCapture?.(event.pointerId);
+    } catch (_) {
+      /* setPointerCapture no disponible */
+    }
     handle.classList.add("is-dragging");
     event.preventDefault();
   }, listenOpts);
@@ -381,6 +380,7 @@ function bindSplitter(handle, side, callbacks = {}) {
 
   handle.addEventListener("pointerup", endDrag, listenOpts);
   handle.addEventListener("pointercancel", endDrag, listenOpts);
+  handle.addEventListener("lostpointercapture", endDrag, listenOpts);
 }
 
 function bindSwipeToClose(panel, direction, onClose, signal) {

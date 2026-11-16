@@ -24,15 +24,16 @@ export function isNetworkFailure(error) {
   ) {
     return true;
   }
-  return NETWORK_MESSAGE_RE.test(message) && !(/** @type {any} */ (error).httpStatus);
+  return NETWORK_MESSAGE_RE.test(message) && !(/** @type {any} */ (error).httpStatus || /** @type {any} */ (error).status);
 }
 
 /**
  * @param {unknown} error
  * @param {string} serviceLabel p. ej. "GitHub" o "Google Gemini"
+ * @param {Array<string>} [extraKnownSecrets=[]]
  * @returns {unknown} un Error en español si fue un fallo de red; si no, el error original
  */
-export function toFriendlyNetworkError(error, serviceLabel) {
+export function toFriendlyNetworkError(error, serviceLabel, extraKnownSecrets = []) {
   if (!isNetworkFailure(error)) {
     return error;
   }
@@ -42,7 +43,7 @@ export function toFriendlyNetworkError(error, serviceLabel) {
       ? `Estás sin conexión a internet: no se pudo contactar a ${serviceLabel}. Conectate y volvé a intentar.`
       : `Sin conexión con ${serviceLabel}. Revisá tu internet e intentá de nuevo.`
   );
-  /** @type {any} */ (friendly).cause = sanitizeErrorCause(error);
+  /** @type {any} */ (friendly).cause = sanitizeErrorCause(error, extraKnownSecrets);
   /** @type {any} */ (friendly).isNetworkFailure = true;
   return friendly;
 }

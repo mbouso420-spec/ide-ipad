@@ -17,18 +17,59 @@ function extractBaseAndExtension(filePathOrName) {
  * @param {Uint8Array} view
  * @returns {boolean}
  */
+function stripLeadingPrologue(text) {
+  let cursor = String(text || "").replace(/^\uFEFF|^\xEF\xBB\xBF/, "");
+  let idx = 0;
+  const len = cursor.length;
+  while (idx < len) {
+    const ch = cursor.charCodeAt(idx);
+    if (ch === 0 || ch <= 32 || ch === 0xfeff) {
+      idx += 1;
+      continue;
+    }
+    if (cursor.startsWith("<!--", idx)) {
+      const endComment = cursor.indexOf("-->", idx + 4);
+      if (endComment === -1) break;
+      idx = endComment + 3;
+      continue;
+    }
+    break;
+  }
+  return cursor.slice(idx);
+}
+
 function hasDisguisedActiveMarkup(view) {
   const probeLen = Math.min(view.length, 1024);
-  if (probeLen === 0 || hasNullBytes(view, probeLen)) return false;
+  if (probeLen === 0) return false;
+  const activeMarkupRe =
+    /^(?:<!doctype\s+html\b|<html\b|<head\b|<body\b|<script\b|<svg\b|<iframe\b)|^<\?xml\b[\s\S]{0,512}<(?:svg|script|html|xhtml)\b/i;
+
+  // Comprobar UTF-16 LE / BE (con o sin BOM, incluso con espacios iniciales)
+  const looksUtf16Le =
+    (probeLen >= 2 && view[0] === 0xff && view[1] === 0xfe) ||
+    (probeLen >= 4 && view[1] === 0x00 && view[3] === 0x00 && view[0] !== 0x00);
+  const looksUtf16Be =
+    (probeLen >= 2 && view[0] === 0xfe && view[1] === 0xff) ||
+    (probeLen >= 4 && view[0] === 0x00 && view[2] === 0x00 && view[1] !== 0x00);
+  if (looksUtf16Le || looksUtf16Be) {
+    try {
+      const dec = new TextDecoder(looksUtf16Le ? "utf-16le" : "utf-16be");
+      const text16 = stripLeadingPrologue(dec.decode(view.subarray(0, probeLen - (probeLen % 2))));
+      if (activeMarkupRe.test(text16)) return true;
+    } catch {
+      /* ignorar fallo de decodificación UTF-16 */
+    }
+  }
+
   let head = "";
   for (let i = 0; i < probeLen; i += 1) {
     head += String.fromCharCode(view[i]);
   }
-  const normalized = head.replace(/^\uFEFF|^\xEF\xBB\xBF/, "").trimStart();
-  return (
-    /^(?:<!doctype\s+html\b|<html\b|<script\b|<svg\b)/i.test(normalized) ||
-    /^<\?xml\b[\s\S]{0,256}<(?:svg|script)\b/i.test(normalized)
-  );
+  const normalized = stripLeadingPrologue(head);
+  if (activeMarkupRe.test(normalized)) return true;
+
+  if (hasNullBytes(view, probeLen)) return false;
+  return /<(?:script|svg|iframe)\b[^>]*>/i.test(head) && /<!doctype\s+html|<html\b/i.test(head);
 }
 export const BINARY_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "webp", "avif", "ico", "bmp", "tif", "tiff", "heic", "psd",
@@ -130,6 +171,9 @@ export function decodeImportedFile(bytes, fileName, options = {}) {
   } else if (ArrayBuffer.isView(bytes)) {
     view = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   } else if (Array.isArray(bytes)) {
+    if (bytes.length > MAX_IMPORT_FILE_BYTES) {
+      return { ok: false, reason: "supera el límite de 5 MB por archivo" };
+    }
     view = new Uint8Array(bytes);
   } else {
     return { ok: false, reason: "contenido de archivo inválido" };

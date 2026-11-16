@@ -90,14 +90,14 @@ export function buildContentAttributes(hardwareKeyboard = true) {
  * @param {boolean} hardwareKeyboard
  * @param {HTMLElement|null} [targetEl]
  */
-export function applyHardwareKeyboardAttributes(hardwareKeyboard, targetEl = null) {
+export function applyHardwareKeyboardAttributes(hardwareKeyboard, targetEl = null, includeGlobal = true) {
   const attrs = buildContentAttributes(hardwareKeyboard);
   if (targetEl && typeof targetEl.setAttribute === "function") {
     for (const [k, v] of Object.entries(attrs)) {
       targetEl.setAttribute(k, v);
     }
   }
-  if (typeof document !== "undefined" && document.body) {
+  if (includeGlobal && typeof document !== "undefined" && document.body) {
     if (document.body.dataset) {
       document.body.dataset.hardwareKeyboard = String(Boolean(hardwareKeyboard));
     }
@@ -328,7 +328,8 @@ export async function createEditorManager({
                 const deco = errorLineDeco(errorMessage);
                 if (deco) {
                   markers = markers.update({
-                    add: [deco.range(lineObj.from)]
+                    add: [deco.range(lineObj.from)],
+                    sort: true
                   });
                 }
               } else if (effect.is(clearErrorEffect)) {
@@ -403,6 +404,7 @@ export async function createEditorManager({
   );
 
   let view = null;
+  let scrollHandler = null;
   let isSyncingExternal = false;
   let activeLang = "js";
 
@@ -431,6 +433,7 @@ export async function createEditorManager({
   let docVocabWords = [];
   let docVocabDocRef = null;
   let docVocabTimer = null;
+  let docVocabHasComputed = false;
 
   function computeDocWordsNow(doc) {
     if (!doc) return [];
@@ -444,7 +447,7 @@ export async function createEditorManager({
     if (docVocabFileId === activeFileId && docVocabDocRef === doc) {
       return docVocabWords;
     }
-    if (immediate || docVocabFileId !== activeFileId || docVocabWords.length === 0) {
+    if (immediate || docVocabFileId !== activeFileId || !docVocabHasComputed) {
       if (docVocabTimer) {
         clearTimeout(docVocabTimer);
         docVocabTimer = null;
@@ -452,6 +455,7 @@ export async function createEditorManager({
       docVocabFileId = activeFileId;
       docVocabDocRef = doc;
       docVocabWords = computeDocWordsNow(doc);
+      docVocabHasComputed = true;
       return docVocabWords;
     }
     // Reutilizar vocabulario reciente mientras el usuario teclea y refrescar tras breve pausa
@@ -463,6 +467,7 @@ export async function createEditorManager({
           docVocabFileId = activeFileId;
           docVocabDocRef = currentDoc;
           docVocabWords = computeDocWordsNow(currentDoc);
+          docVocabHasComputed = true;
         }
       }, 180);
     }
@@ -698,16 +703,17 @@ export async function createEditorManager({
         parent: mountEl
       });
       if (view.scrollDOM) {
-        view.scrollDOM.addEventListener("scroll", () => {
+        scrollHandler = () => {
           minimap?.updateSlider();
-        }, { passive: true });
+        };
+        view.scrollDOM.addEventListener("scroll", scrollHandler, { passive: true });
       }
     } else {
       view.setState(nextState);
     }
 
     if (view?.contentDOM) {
-      applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM);
+      applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM, !isSplitInstance);
     }
 
     syncErrorRuler(view?.state?.doc?.lines || 1);
@@ -725,15 +731,27 @@ export async function createEditorManager({
     } catch (_) {
       try {
         view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "" } });
-      } catch (_) {}
+      } catch (_) {
+        /* fallback al destruir */
+      }
     }
   }
 
   function clearActiveFile() {
-    activeFileId = null;
     autocompleteBar.hide();
     clearErrorMarkers();
+    activeFileId = null;
+    if (docVocabTimer) {
+      clearTimeout(docVocabTimer);
+      docVocabTimer = null;
+    }
+    docVocabFileId = null;
+    docVocabWords = [];
+    docVocabDocRef = null;
+    docVocabHasComputed = false;
     purgeViewDocument();
+    minimap?.render();
+    minimap?.updateSlider();
     onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
   }
 
@@ -741,14 +759,22 @@ export async function createEditorManager({
     statesByFile.delete(fileId);
     errorMarkers.dropFile(fileId);
     if (docVocabFileId === fileId) {
+      if (docVocabTimer) {
+        clearTimeout(docVocabTimer);
+        docVocabTimer = null;
+      }
       docVocabFileId = null;
       docVocabWords = [];
       docVocabDocRef = null;
+      docVocabHasComputed = false;
     }
     if (activeFileId === fileId) {
-      activeFileId = null;
+      autocompleteBar.hide();
       clearErrorMarkers();
+      activeFileId = null;
       purgeViewDocument();
+      minimap?.render();
+      minimap?.updateSlider();
       onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     }
   }
@@ -963,7 +989,7 @@ export async function createEditorManager({
   function toggleWordWrap() {
     wordWrap = !wordWrap;
     saveStoredValue(PREF_KEYS.wordWrap, String(wordWrap));
-    if (view) {
+    if (view && activeFileId) {
       view.dispatch({
         effects: wrapCompartment.reconfigure(wordWrap ? EditorView.lineWrapping : [])
       });
@@ -985,8 +1011,8 @@ export async function createEditorManager({
   function setHardwareKeyboardMode(nextState) {
     hardwareKeyboard = Boolean(nextState);
     saveStoredValue(PREF_KEYS.hardwareKeyboard, String(hardwareKeyboard));
-    applyHardwareKeyboardAttributes(hardwareKeyboard, view?.contentDOM || null);
-    if (view) {
+    applyHardwareKeyboardAttributes(hardwareKeyboard, view?.contentDOM || null, !isSplitInstance);
+    if (view && activeFileId) {
       try {
         view.dispatch({
           effects: contentAttrsCompartment.reconfigure(buildCmContentAttrsExtension(hardwareKeyboard))
@@ -994,7 +1020,7 @@ export async function createEditorManager({
         stateCompartmentPrefs.set(view.state, { wordWrap, hardwareKeyboard });
       } catch (_) {}
       if (view.contentDOM) {
-        applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM);
+        applyHardwareKeyboardAttributes(hardwareKeyboard, view.contentDOM, !isSplitInstance);
       }
     }
     return hardwareKeyboard;
@@ -1061,7 +1087,7 @@ export async function createEditorManager({
       const query = prefix !== undefined
         ? prefix
         : (view ? extractPrefixWordFromDoc(view.state.doc, view.state.selection.main.head).word : "");
-      const words = view ? getCachedDocWords(view.state.doc, { immediate: true }) : "";
+      const words = view ? getCachedDocWords(view.state.doc, { immediate: true }) : [];
       return getLanguageCompletions(activeLang, query, words);
     },
     acceptTopCompletion: () => autocompleteBar.acceptCurrent(),
@@ -1075,18 +1101,27 @@ export async function createEditorManager({
       docVocabWords = [];
       docVocabDocRef = null;
       docVocabFileId = null;
+      docVocabHasComputed = false;
       errorMarkers.destroy();
       if (view && clearErrorEffect) {
         try {
           view.dispatch({ effects: clearErrorEffect.of(null) });
-        } catch (_) {}
+        } catch (_) {
+          /* vista ya cerrada */
+        }
       }
       autocompleteBar.destroy();
       minimap?.destroy?.();
       if (view) {
+        if (view.scrollDOM && scrollHandler && typeof view.scrollDOM.removeEventListener === "function") {
+          view.scrollDOM.removeEventListener("scroll", scrollHandler);
+          scrollHandler = null;
+        }
         try {
           view.destroy();
-        } catch (_) {}
+        } catch (_) {
+          /* vista ya destruida */
+        }
         view = null;
       }
       statesByFile.clear();
@@ -1096,23 +1131,8 @@ export async function createEditorManager({
 }
 
 async function loadCodeMirrorModules() {
-  const [
-    stateMod,
-    viewMod,
-    langMod,
-    cmdMod,
-    searchMod,
-    autoMod,
-    hiMod,
-    cppMod,
-    htmlMod,
-    cssMod,
-    jsMod,
-    pyMod,
-    mdMod,
-    jsonMod,
-    sqlMod
-  ] = await Promise.all([
+  let timeoutId = null;
+  const loadPromise = Promise.all([
     import("@codemirror/state"),
     import("@codemirror/view"),
     import("@codemirror/language"),
@@ -1129,6 +1149,34 @@ async function loadCodeMirrorModules() {
     import("@codemirror/lang-json").catch(() => null),
     import("@codemirror/lang-sql")
   ]);
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error("Tiempo de espera agotado al cargar módulos CodeMirror 6."));
+    }, 8000);
+  });
+
+  const [
+    stateMod,
+    viewMod,
+    langMod,
+    cmdMod,
+    searchMod,
+    autoMod,
+    hiMod,
+    cppMod,
+    htmlMod,
+    cssMod,
+    jsMod,
+    pyMod,
+    mdMod,
+    jsonMod,
+    sqlMod
+  ] = await Promise.race([loadPromise, timeoutPromise]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  });
 
   return {
     EditorState: stateMod.EditorState,

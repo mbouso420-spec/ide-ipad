@@ -1,5 +1,5 @@
 import { icon } from "../ui/icons.js";
-import { escapeHtml } from "../preview/previewUtils.js";
+import { escapeHtml } from "../utils/dom.js";
 import { splitMarkdownCodeFences } from "../preview/markdownPreview.js";
 import {
   AI_PROVIDERS,
@@ -34,7 +34,7 @@ import {
   redactSensitiveTokens,
   validateCredentialFormat
 } from "../security/credentialGuard.js";
-import { saveCredentialsBackup } from "../storage/workspaceDb.js";
+import { broadcastWorkspaceChange, saveCredentialsBackup } from "../storage/workspaceDb.js";
 
 /**
  * Controlador del Asistente IA estilo Antigravity (depurado 100% para APIs gratuitas):
@@ -103,8 +103,12 @@ export function initChatController({
   let keyCheckTimer = 0;
   /** @type {AbortController | null} */
   let keyCheckController = null;
+  /** @type {AbortController | null} */
+  let liveModelsController = null;
   let activeRafId = 0;
   let destroyed = false;
+  const listenerAbort = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
   const streamDomState = new WeakMap();
 
   /** @type {Set<string>} */
@@ -210,8 +214,8 @@ export function initChatController({
       keyChecks.set(providerId, { key, ...result });
       updateModelStrip();
       if (result.status === "valid") {
-        // Limpiar el texto del input tras validar para no dejar el secreto expuesto en el DOM
-        if (providerId === activeProviderId) {
+        // Limpiar el texto del input tras validar solo si el usuario no sigue editándolo ni inspeccionándolo
+        if (providerId === activeProviderId && document.activeElement !== apiKeyInput) {
           syncApiKeyMaskPlaceholder(providerId);
         }
         void syncLiveModelsSilently(providerId);
@@ -223,6 +227,7 @@ export function initChatController({
   }
 
   async function syncLiveModelsSilently(providerId) {
+    if (destroyed) return;
     const provider = AI_PROVIDERS[providerId];
     if (!provider || !provider.supportsLiveModels) {
       return;
@@ -231,8 +236,12 @@ export function initChatController({
     if (!key && providerId !== "openrouter") {
       return;
     }
+    liveModelsController?.abort();
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    liveModelsController = ctrl;
     try {
-      const liveModels = await fetchLiveFreeModels(providerId, key);
+      const liveModels = await fetchLiveFreeModels(providerId, key, ctrl?.signal);
+      if (destroyed) return;
       if (liveModels.length > 0) {
         if (activeProviderId === providerId) {
           const stillValid = liveModels.some((m) => m.id === activeModelId);
@@ -245,6 +254,10 @@ export function initChatController({
       }
     } catch {
       // Silencioso en segundo plano
+    } finally {
+      if (liveModelsController === ctrl) {
+        liveModelsController = null;
+      }
     }
   }
 
@@ -261,8 +274,8 @@ export function initChatController({
     }
   }
 
-  settingsBtn?.addEventListener("click", () => toggleSettings());
-  keyStatusBtn?.addEventListener("click", () => toggleSettings());
+  settingsBtn?.addEventListener("click", () => toggleSettings(), listenOpts);
+  keyStatusBtn?.addEventListener("click", () => toggleSettings(), listenOpts);
 
   clearChatBtn?.addEventListener("click", () => {
     const running = activeStreams.get(conversationKey);
@@ -271,11 +284,13 @@ export function initChatController({
       running.discarded = true;
       running.controller.abort();
     }
+    currentStreamStatus = "";
     conversation = [];
     renderConversation();
     setStreamingUiState(false);
+    updateTokenEstimate();
     onConversationChange?.([], conversationKey);
-  });
+  }, listenOpts);
 
   providerSelect?.addEventListener("change", () => {
     activeProviderId = providerSelect.value;
@@ -283,7 +298,7 @@ export function initChatController({
     activeModelId = getSavedModel(activeProviderId);
     syncSettingsForm();
     scheduleKeyValidation(activeProviderId, 0, false);
-  });
+  }, listenOpts);
 
   modelSelect?.addEventListener("change", () => {
     activeModelId = modelSelect.value;
@@ -292,16 +307,26 @@ export function initChatController({
     }
     saveModel(activeProviderId, activeModelId);
     updateModelStrip();
-  });
+  }, listenOpts);
 
   customModelInput?.addEventListener("input", () => {
     const val = customModelInput.value.trim();
     if (val) {
       activeModelId = val;
       saveModel(activeProviderId, activeModelId);
+      if (modelSelect) {
+        const hasOpt = Array.from(modelSelect.options || []).some((o) => o.value === val);
+        if (!hasOpt) {
+          const customOpt = document.createElement("option");
+          customOpt.value = val;
+          customOpt.textContent = `${val} (Personalizado)`;
+          modelSelect.appendChild(customOpt);
+        }
+        modelSelect.value = val;
+      }
       updateModelStrip();
     }
-  });
+  }, listenOpts);
 
   function syncCredentialsBackup() {
     try {
@@ -323,13 +348,20 @@ export function initChatController({
     saveApiKey(activeProviderId, rawVal);
     syncCredentialsBackup();
     scheduleKeyValidation(activeProviderId, 700, true);
-  });
+  }, listenOpts);
 
-  apiKeyInput?.addEventListener("blur", () => {
+  apiKeyInput?.addEventListener("blur", (event) => {
+    if (event?.relatedTarget === toggleKeyVisBtn) {
+      return;
+    }
     if (getApiKey(activeProviderId)) {
       syncApiKeyMaskPlaceholder(activeProviderId);
     }
-  });
+  }, listenOpts);
+
+  toggleKeyVisBtn?.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+  }, listenOpts);
 
   toggleKeyVisBtn?.addEventListener("click", () => {
     keyVisible = !keyVisible;
@@ -337,28 +369,28 @@ export function initChatController({
       apiKeyInput.type = keyVisible ? "text" : "password";
     }
     syncKeyVisibilityButton(keyVisible);
-  });
+  }, listenOpts);
 
   clearKeyBtn?.addEventListener("click", () => {
     clearApiKey(activeProviderId);
     syncCredentialsBackup();
     syncApiKeyMaskPlaceholder(activeProviderId);
     scheduleKeyValidation(activeProviderId, 0, false);
-  });
+  }, listenOpts);
 
   modeLocalBtn?.addEventListener("click", () => {
     setKeyStorageMode("local");
     syncStorageModeButtons();
     syncCredentialsBackup();
-  });
+    broadcastWorkspaceChange({ type: "KEY_STORAGE_MODE_CHANGED", mode: "local" });
+  }, listenOpts);
 
   modeSessionBtn?.addEventListener("click", () => {
     setKeyStorageMode("session");
     syncStorageModeButtons();
-    try {
-      void saveCredentialsBackup("");
-    } catch {}
-  });
+    syncCredentialsBackup();
+    broadcastWorkspaceChange({ type: "KEY_STORAGE_MODE_CHANGED", mode: "session" });
+  }, listenOpts);
 
   exportKeysBtn?.addEventListener("click", async () => {
     const bundle = exportKeysBundle();
@@ -368,7 +400,7 @@ export function initChatController({
         ? "Pack de claves copiado al portapapeles. Podés mandártelo al iPad y tocar Importar pack."
         : "No se pudo acceder al portapapeles automáticamente.";
     }
-  });
+  }, listenOpts);
 
   importKeysBtn?.addEventListener("click", () => {
     if (!importKeysSlot) return;
@@ -429,31 +461,39 @@ export function initChatController({
     form.append(input, okBtn, closeBtn);
     importKeysSlot.appendChild(form);
     input.focus();
-  });
+  }, listenOpts);
 
   fetchModelsBtn?.addEventListener("click", async () => {
     const provider = AI_PROVIDERS[activeProviderId];
     if (!provider) return;
+    const targetProviderId = provider.id;
 
     fetchModelsBtn.disabled = true;
+    liveModelsController?.abort();
+    const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+    liveModelsController = ctrl;
     try {
-      const liveModels = await fetchLiveFreeModels(provider.id, getApiKey(provider.id));
+      const liveModels = await fetchLiveFreeModels(targetProviderId, getApiKey(targetProviderId), ctrl?.signal);
+      if (destroyed || activeProviderId !== targetProviderId) return;
       if (liveModels.length > 0) {
         activeModelId = liveModels[0].id;
-        saveModel(provider.id, activeModelId);
+        saveModel(targetProviderId, activeModelId);
         syncSettingsForm();
         if (providerHelpEl) {
           providerHelpEl.textContent = `Lista actualizada (${liveModels.length} modelos gratuitos disponibles).`;
         }
       }
     } catch (error) {
-      if (providerHelpEl) {
+      if (!destroyed && !isAbortError(error) && providerHelpEl && activeProviderId === targetProviderId) {
         providerHelpEl.textContent = error instanceof Error ? error.message : "Error al actualizar modelos.";
       }
     } finally {
+      if (liveModelsController === ctrl) {
+        liveModelsController = null;
+      }
       fetchModelsBtn.disabled = false;
     }
-  });
+  }, listenOpts);
 
   function updateTokenEstimate() {
     if (!tokenCounterEl) return;
@@ -495,7 +535,7 @@ export function initChatController({
     regenerateBtn.hidden = !hasAssistantResponse || isStreaming;
   }
 
-  promptInput?.addEventListener("input", updateTokenEstimate);
+  promptInput?.addEventListener("input", updateTokenEstimate, listenOpts);
 
   const toggleToolsBtn = document.getElementById("btn-toggle-composer-tools");
   const toolsDrawer = document.getElementById("chat-tools-drawer");
@@ -506,7 +546,7 @@ export function initChatController({
     toolsDrawer.hidden = !willShow;
     toggleToolsBtn.setAttribute("aria-expanded", String(willShow));
     toggleToolsBtn.classList.toggle("is-active", willShow);
-  });
+  }, listenOpts);
 
   const actionChips = composerForm?.querySelectorAll(".chat-action-chip");
   actionChips?.forEach((btn) => {
@@ -524,7 +564,7 @@ export function initChatController({
       }
       promptInput.focus();
       updateTokenEstimate();
-    });
+    }, listenOpts);
   });
 
   const thinkingButtons = composerForm?.querySelectorAll(".chat-thinking-btn");
@@ -543,12 +583,8 @@ export function initChatController({
       if (chosen === "baja" || chosen === "media" || chosen === "alta") {
         setAiThinkingSpeed(chosen);
         syncThinkingSpeedUi(chosen);
-        const settingSpeed = document.getElementById("setting-ai-thinking-speed");
-        if (settingSpeed) {
-          settingSpeed.value = chosen;
-        }
       }
-    });
+    }, listenOpts);
   });
 
   function preflightAuthCheck() {
@@ -600,14 +636,14 @@ export function initChatController({
     const userText = conversation[lastUserIdx].content;
     conversation.splice(lastUserIdx);
     await sendPrompt(userText, apiKey);
-  });
+  }, listenOpts);
 
   promptInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       composerForm?.requestSubmit();
     }
-  });
+  }, listenOpts);
 
   composerForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -633,7 +669,7 @@ export function initChatController({
     }
 
     await sendPrompt(userText, apiKey);
-  });
+  }, listenOpts);
 
   async function sendPrompt(userText, apiKey) {
     const snapshot = getContextSnapshot();
@@ -671,13 +707,22 @@ export function initChatController({
     setStreamingUiState(true);
 
     let rafPending = false;
+    let streamSettled = false;
+    const cancelQueuedRender = () => {
+      streamSettled = true;
+      rafPending = false;
+      if (activeRafId && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(activeRafId);
+        activeRafId = 0;
+      }
+    };
     const scheduleRender = () => {
-      if (destroyed || rafPending || !isVisible()) return;
+      if (destroyed || streamSettled || rafPending || !isVisible()) return;
       rafPending = true;
       activeRafId = window.requestAnimationFrame(() => {
         activeRafId = 0;
         rafPending = false;
-        if (destroyed || !isVisible()) return;
+        if (destroyed || streamSettled || !isVisible()) return;
         updateLastAssistantMessage(assistantEntry.content, true);
         scrollToBottom();
       });
@@ -705,14 +750,16 @@ export function initChatController({
           }
         },
         onFallbackNotice(noticeText) {
-          if (!isVisible()) return;
-          currentStreamStatus = noticeText;
+          if (streamSettled || !isVisible()) return;
+          const safeNotice = redactSensitiveTokens(noticeText, [apiKey]);
+          currentStreamStatus = safeNotice;
           if (providerHelpEl && activeProviderId === streamProviderId) {
-            providerHelpEl.textContent = noticeText;
+            providerHelpEl.textContent = safeNotice;
           }
           scheduleRender();
         },
         onChunk(delta) {
+          if (streamSettled) return;
           if (isVisible()) {
             currentStreamStatus = "";
           }
@@ -721,10 +768,12 @@ export function initChatController({
         }
       });
 
+      cancelQueuedRender();
       if (isVisible()) {
         updateLastAssistantMessage(assistantEntry.content || "Sin contenido devuelto por el modelo.", false);
       }
     } catch (error) {
+      cancelQueuedRender();
       if (isAbortError(error)) {
         if (!stream.discarded) {
           assistantEntry.content += "\n\n*(Generación detenida)*";
@@ -771,6 +820,7 @@ export function initChatController({
       if (isVisible()) {
         currentStreamStatus = "";
         setStreamingUiState(false);
+        updateTokenEstimate();
         scrollToBottom();
       }
       if (!stream.discarded) {
@@ -940,6 +990,7 @@ export function initChatController({
           attachedTabIds.add(file.id);
         }
         renderExtraTabChips();
+        updateTokenEstimate();
       });
       extraTabsBar.appendChild(chip);
     }
@@ -1074,6 +1125,25 @@ export function initChatController({
     targetParent.insertBefore(block, insertBeforeNode);
   }
 
+  function appendClosedSegmentsUpTo(container, state, segments, targetCount) {
+    for (let i = state.closedCount; i < targetCount; i += 1) {
+      const seg = segments[i];
+      if (seg.type === "prose") {
+        state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
+        appendSegmentNodes(container, seg, null, state.tailHost);
+      } else {
+        const contextHint = {
+          precedingProse: state.lastProseContent,
+          previousCodeBlock: state.previousCodeBlock
+        };
+        appendSegmentNodes(container, seg, contextHint, state.tailHost);
+        state.previousCodeBlock = seg.code || "";
+        state.lastProseContent = "";
+      }
+    }
+    state.closedCount = targetCount;
+  }
+
   /**
    * Renderiza mensajes de asistente de forma incremental durante streaming (O(N) acumulado):
    * congela en el DOM los nodos de segmentos ya cerrados y solo actualiza el último segmento abierto.
@@ -1113,22 +1183,7 @@ export function initChatController({
       }
 
       const newClosedCount = Math.max(0, segments.length - 1);
-      for (let i = state.closedCount; i < newClosedCount; i += 1) {
-        const seg = segments[i];
-        if (seg.type === "prose") {
-          state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
-          appendSegmentNodes(container, seg, null, state.tailHost);
-        } else {
-          const contextHint = {
-            precedingProse: state.lastProseContent,
-            previousCodeBlock: state.previousCodeBlock
-          };
-          appendSegmentNodes(container, seg, contextHint, state.tailHost);
-          state.previousCodeBlock = seg.code || "";
-          state.lastProseContent = "";
-        }
-      }
-      state.closedCount = newClosedCount;
+      appendClosedSegmentsUpTo(container, state, segments, newClosedCount);
 
       const activeSeg = segments[segments.length - 1];
       if (activeSeg) {
@@ -1158,21 +1213,7 @@ export function initChatController({
 
     // Render final (!isStreaming): si venía de streaming incremental, promocionar solo los pendientes sin reconstruir todo
     if (state && state.tailHost.parentNode === container && segments.length >= state.closedCount) {
-      for (let i = state.closedCount; i < segments.length; i += 1) {
-        const seg = segments[i];
-        if (seg.type === "prose") {
-          state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
-          appendSegmentNodes(container, seg, null, state.tailHost);
-        } else {
-          const contextHint = {
-            precedingProse: state.lastProseContent,
-            previousCodeBlock: state.previousCodeBlock
-          };
-          appendSegmentNodes(container, seg, contextHint, state.tailHost);
-          state.previousCodeBlock = seg.code || "";
-          state.lastProseContent = "";
-        }
-      }
+      appendClosedSegmentsUpTo(container, state, segments, segments.length);
       state.tailHost.remove();
       state.indicator.remove();
       streamDomState.delete(container);
@@ -1238,11 +1279,14 @@ export function initChatController({
     actions.className = "chat-code-actions-wrap";
 
     const btnInsert = createCodeActionButton("arrowDownLeft", "En cursor", "Insertar en la posición del cursor", async () => {
+      btnInsert.disabled = true;
       let inserted = false;
       try {
         inserted = (await onInsertAtCursor(code, lang)) !== false;
       } catch {
         inserted = false;
+      } finally {
+        btnInsert.disabled = false;
       }
       btnInsert.innerHTML = inserted
         ? `${icon("check")}<span>Insertado</span>`
@@ -1261,14 +1305,23 @@ export function initChatController({
         ? "Reemplazar las líneas seleccionadas"
         : "Reemplazar línea o bloque correspondiente en el editor",
       async () => {
-        const applied = await onReplaceSelection(code, contextHint);
-        if (applied !== false) {
-          btnReplace.innerHTML = `${icon("check")}<span>Reemplazado</span>`;
-          window.setTimeout(() => {
-            if (!btnReplace.isConnected) return;
-            btnReplace.innerHTML = `${icon("replace")}<span>Reemplazar código</span>`;
-          }, 1300);
+        if (typeof onReplaceSelection !== "function") return;
+        btnReplace.disabled = true;
+        let applied = false;
+        try {
+          applied = (await onReplaceSelection(code, contextHint)) !== false;
+        } catch {
+          applied = false;
+        } finally {
+          btnReplace.disabled = false;
         }
+        btnReplace.innerHTML = applied
+          ? `${icon("check")}<span>Reemplazado</span>`
+          : `${icon("x")}<span>No aplicado</span>`;
+        window.setTimeout(() => {
+          if (!btnReplace.isConnected) return;
+          btnReplace.innerHTML = `${icon("replace")}<span>Reemplazar código</span>`;
+        }, applied ? 1300 : 2000);
       }
     );
     btnReplace.dataset.action = "replace-selection";
@@ -1432,6 +1485,18 @@ export function initChatController({
     }
   }
 
+  window?.addEventListener?.(
+    "studio-credentials-updated",
+    () => {
+      if (destroyed) return;
+      keyChecks.clear();
+      syncSettingsForm();
+      scheduleKeyValidation(activeProviderId, 0, false);
+      updateTokenEstimate();
+    },
+    listenOpts
+  );
+
   return {
     notifyWorkspaceChanged() {
       renderExtraTabChips();
@@ -1491,6 +1556,8 @@ export function initChatController({
       }
       keyCheckController?.abort();
       keyCheckController = null;
+      liveModelsController?.abort();
+      liveModelsController = null;
       if (activeRafId && typeof window.cancelAnimationFrame === "function") {
         window.cancelAnimationFrame(activeRafId);
         activeRafId = 0;
@@ -1500,6 +1567,7 @@ export function initChatController({
         stream.controller.abort();
       }
       activeStreams.clear();
+      listenerAbort?.abort();
     }
   };
 }
@@ -1514,10 +1582,16 @@ export function cleanHistoryForAi(rawConvo) {
   return rawConvo
     .map((m) => {
       let content = String(m?.content || "");
-      content = content
-        .replace(/\n\n\*\((?:Generación detenida|Respuesta interrumpida:[^)]*)\)\*/g, "")
-        .trim();
-      return { role: m.role, content };
+      content = content.split("\n\n*(Generación detenida)*").join("");
+      const marker = "\n\n*(Respuesta interrumpida:";
+      let idx = content.indexOf(marker);
+      while (idx !== -1) {
+        const closeIdx = content.indexOf(")*", idx + marker.length);
+        if (closeIdx === -1) break;
+        content = content.slice(0, idx) + content.slice(closeIdx + 2);
+        idx = content.indexOf(marker, idx);
+      }
+      return { role: m.role, content: content.trim() };
     })
     .filter((m) => Boolean(m.content));
 }

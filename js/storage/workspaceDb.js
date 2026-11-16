@@ -1,4 +1,5 @@
 import { slugifyName } from "../utils/encoding.js";
+import { readStoredValue, saveStoredValue } from "../utils/storage.js";
 
 const DB_NAME = "studio_ide_db";
 const DB_VERSION = 1;
@@ -153,14 +154,20 @@ export function validateUserPath(rawPath) {
   if (!raw) {
     throw new Error("Escribí un nombre válido.");
   }
-  if (raw.includes("//") || raw.includes("\\\\")) {
-    throw new Error('El nombre no puede contener barras consecutivas "//".');
+  if (raw.includes("::") || /[/\\]{2,}/.test(raw)) {
+    throw new Error('El nombre no puede contener barras consecutivas "//" ni "::".');
   }
   const rawSegments = raw.split(/[/\\]/);
   for (const seg of rawSegments) {
     const trimmedSeg = seg.trim();
+    if (seg !== "" && !trimmedSeg) {
+      throw new Error("El nombre no puede contener carpetas o segmentos vacíos.");
+    }
     if (trimmedSeg === "." || trimmedSeg === "..") {
       throw new Error('El nombre no puede contener referencias relativas "." o "..".');
+    }
+    if (trimmedSeg === "__proto__" || trimmedSeg === "constructor" || trimmedSeg === "prototype") {
+      throw new Error(`El nombre reservado "${trimmedSeg}" no está permitido.`);
     }
     if (seg.length > 255) {
       throw new Error("El nombre de archivo o carpeta no puede superar los 255 caracteres.");
@@ -325,19 +332,11 @@ export async function ensureInitialWorkspace() {
 }
 
 export function getSavedActiveProjectId() {
-  try {
-    return window.localStorage.getItem(ACTIVE_PROJECT_KEY) || SEED_PROJECT_ID;
-  } catch {
-    return SEED_PROJECT_ID;
-  }
+  return readStoredValue(ACTIVE_PROJECT_KEY, SEED_PROJECT_ID) || SEED_PROJECT_ID;
 }
 
 export function setSavedActiveProjectId(projectId) {
-  try {
-    window.localStorage.setItem(ACTIVE_PROJECT_KEY, projectId);
-  } catch {
-    // Ignorar
-  }
+  saveStoredValue(ACTIVE_PROJECT_KEY, projectId);
 }
 
 export async function listProjects() {
@@ -351,6 +350,8 @@ export async function listProjects() {
       resolve(list);
     };
     req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción listProjects se canceló."));
   });
 }
 
@@ -361,6 +362,8 @@ export async function getProject(projectId) {
     const req = tx.objectStore(STORE_PROJECTS).get(projectId);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción getProject se canceló."));
   });
 }
 
@@ -418,35 +421,81 @@ export async function saveProjectState(project) {
   await putRecord(STORE_PROJECTS, project);
 }
 
+export async function saveProjectTabsState(projectId, openTabIds, activeFileId) {
+  if (!projectId) return;
+  await updateProjectRecord(projectId, (project) => {
+    project.openTabIds = Array.isArray(openTabIds) ? [...openTabIds] : [];
+    project.activeFileId = activeFileId ?? null;
+    project.updatedAt = Date.now();
+  });
+}
+
+export async function saveProjectGistId(projectId, gistId) {
+  if (!projectId) return;
+  await updateProjectRecord(projectId, (project) => {
+    project.gistId = gistId || null;
+    project.updatedAt = Date.now();
+  });
+}
+
+async function updateProjectRecord(projectId, mutatorFn) {
+  const db = await openDb();
+  let txErr = null;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_PROJECTS, "readwrite");
+    const store = tx.objectStore(STORE_PROJECTS);
+    const req = store.get(projectId);
+    req.onsuccess = () => {
+      const project = req.result;
+      if (!project) return;
+      try {
+        mutatorFn(project);
+        store.put(project);
+      } catch (err) {
+        txErr = err;
+        try { tx.abort(); } catch (_) {}
+      }
+    };
+    req.onerror = () => reject(req.error || new Error("Error leyendo el registro del proyecto."));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error || new Error("Error guardando el registro del proyecto."));
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción sobre el proyecto se canceló."));
+  });
+}
+
 /**
  * Guarda el historial reciente de conversación del asistente IA asociado al proyecto activo.
  */
 export async function saveProjectChatHistory(projectId, history) {
-  const project = await getProject(projectId);
-  if (!project) return;
   const sanitized = Array.isArray(history)
     ? history
         .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim())
         .slice(-MAX_STORED_CHAT_TURNS)
         .map((m) => ({ role: m.role, content: m.content }))
     : [];
-  project.chatHistory = sanitized;
-  await putRecord(STORE_PROJECTS, project);
+  await updateProjectRecord(projectId, (project) => {
+    project.chatHistory = sanitized;
+  });
 }
 
 export async function deleteProject(projectId) {
-  const entries = await getAllRawProjectEntries(projectId);
   const db = await openDb();
 
   await new Promise((resolve, reject) => {
     const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
     tx.objectStore(STORE_PROJECTS).delete(projectId);
-    const fileStore = tx.objectStore(STORE_FILES);
-    for (const entry of entries) {
-      fileStore.delete(entry.key);
-    }
+    const fileIdx = tx.objectStore(STORE_FILES).index("byProject");
+    const req = fileIdx.openCursor(projectId);
+    req.onsuccess = () => {
+      const cursor = req.result;
+      if (!cursor) return;
+      cursor.delete();
+      cursor.continue();
+    };
+    req.onerror = () => reject(req.error);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("No se pudo eliminar el proyecto."));
   });
 }
 
@@ -463,6 +512,8 @@ export async function getAllRawProjectEntries(projectId) {
     const req = idx.getAll(projectId);
     req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
     req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción getAllRawProjectEntries se canceló."));
   });
 }
 
@@ -546,7 +597,7 @@ export async function upsertEntry(
     contentLoaded = true,
     mode = null,
     isBinary = false,
-    base64 = null,
+    base64 = undefined,
     baseBase64 = undefined,
     skipIfDeleted = false,
     silent = false
@@ -574,33 +625,36 @@ export async function upsertEntry(
     };
 
     const writeTarget = (latestExisting) => {
-      const resolvedBase =
-        baseContent !== null
-          ? baseContent
-          : fromGithub
-            ? content
-            : latestExisting && typeof latestExisting.baseContent === "string"
-              ? latestExisting.baseContent
-              : "";
+      const resolvedIsBinary = !isFolder && Boolean(isBinary);
+      const resolvedBase = resolvedIsBinary
+        ? (typeof baseContent === "string" ? baseContent : "")
+        : (baseContent !== null
+            ? baseContent
+            : fromGithub
+              ? content
+              : latestExisting && !latestExisting.isBinary && typeof latestExisting.baseContent === "string"
+                ? latestExisting.baseContent
+                : "");
 
       const recreatedOverUnloaded = Boolean(
         !isFolder &&
           !fromGithub &&
           latestExisting &&
           latestExisting.trackedInGithub &&
-          latestExisting.contentLoaded === false
+          (latestExisting.contentLoaded === false || Boolean(latestExisting.isBinary) !== resolvedIsBinary)
       );
 
-      const resolvedIsBinary = !isFolder && Boolean(isBinary);
       const resolvedBase64 = resolvedIsBinary
-        ? (base64 ?? (latestExisting && !latestExisting.deleted ? latestExisting.base64 : null) ?? null)
+        ? (base64 !== undefined
+            ? base64
+            : (latestExisting && !latestExisting.deleted ? latestExisting.base64 : null) ?? null)
         : null;
-      const resolvedBaseBase64 = isFolder
+      const resolvedBaseBase64 = isFolder || !resolvedIsBinary
         ? null
         : baseBase64 !== undefined
           ? baseBase64
           : fromGithub
-            ? (resolvedIsBinary ? resolvedBase64 : null)
+            ? resolvedBase64
             : resolveEntryBaselineBase64(latestExisting);
 
       writtenRecord = {
@@ -795,6 +849,7 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
 
   const db = await openDb();
   let didRename = false;
+  let resolvedIsFolder = Boolean(isFolder);
   let txErr = null;
 
   await new Promise((resolve, reject) => {
@@ -808,11 +863,20 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
     const req = store.index("byProject").getAll(projectId);
     req.onsuccess = () => {
       const all = Array.isArray(req.result) ? req.result : [];
+      const targetEntry = all.find((e) => !e.deleted && e.path === fromPath);
+      if (!targetEntry) {
+        return;
+      }
+      resolvedIsFolder = Boolean(targetEntry.isFolder);
+      if (resolvedIsFolder && toPath.startsWith(`${fromPath}/`)) {
+        abortWith("No se puede mover una carpeta dentro de sí misma.");
+        return;
+      }
       const targetConflict = all.find(
         (e) =>
           !e.deleted &&
           e.path !== fromPath &&
-          !(isFolder && e.path.startsWith(`${fromPath}/`)) &&
+          !(resolvedIsFolder && e.path.startsWith(`${fromPath}/`)) &&
           (e.path === toPath || e.path.startsWith(`${toPath}/`) || (!e.isFolder && toPath.startsWith(`${e.path}/`)))
       );
       if (targetConflict) {
@@ -822,7 +886,7 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
 
       const rawByPath = new Map(all.map((e) => [e.path, e]));
       const affected = all.filter(
-        (e) => !e.deleted && (e.path === fromPath || (isFolder && e.path.startsWith(`${fromPath}/`)))
+        (e) => !e.deleted && (e.path === fromPath || (resolvedIsFolder && e.path.startsWith(`${fromPath}/`)))
       );
 
       if (affected.length === 0) {
@@ -931,7 +995,7 @@ export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) 
   });
 
   if (didRename) {
-    broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder });
+    broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder: resolvedIsFolder });
   }
 }
 
@@ -941,6 +1005,7 @@ export async function deleteProjectEntry(projectId, targetPath, isFolder) {
 
   const db = await openDb();
   let deletedAny = false;
+  let resolvedIsFolder = Boolean(isFolder);
 
   await new Promise((resolve, reject) => {
     const tx = db.transaction(STORE_FILES, "readwrite");
@@ -949,8 +1014,10 @@ export async function deleteProjectEntry(projectId, targetPath, isFolder) {
     const req = idx.getAll(projectId);
     req.onsuccess = () => {
       const all = Array.isArray(req.result) ? req.result : [];
+      const targetEntry = all.find((e) => !e.deleted && e.path === cleanPath);
+      resolvedIsFolder = targetEntry ? Boolean(targetEntry.isFolder) : Boolean(isFolder);
       const affected = all.filter(
-        (e) => !e.deleted && (e.path === cleanPath || (isFolder && e.path.startsWith(`${cleanPath}/`)))
+        (e) => !e.deleted && (e.path === cleanPath || (resolvedIsFolder && e.path.startsWith(`${cleanPath}/`)))
       );
       if (affected.length === 0) return;
 
@@ -968,14 +1035,14 @@ export async function deleteProjectEntry(projectId, targetPath, isFolder) {
         }
       }
     };
-    req.onerror = () => reject(req.error);
+    req.onerror = () => reject(req.error || new Error("Error leyendo entradas para borrar."));
     tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
+    tx.onerror = () => reject(tx.error || new Error("Error borrando entrada."));
     tx.onabort = () => reject(tx.error || new Error("La transacción de borrado se canceló."));
   });
 
   if (deletedAny) {
-    broadcastWorkspaceChange({ type: "ENTRY_DELETED", projectId, path: cleanPath, isFolder });
+    broadcastWorkspaceChange({ type: "ENTRY_DELETED", projectId, path: cleanPath, isFolder: resolvedIsFolder });
   }
 }
 
@@ -1206,11 +1273,10 @@ export async function cacheSingleGithubFileContent(projectId, path, contentOrBlo
 }
 
 export async function markProjectOfflineCached(projectId, isCached = true) {
-  const project = await getProject(projectId);
-  if (!project) return;
-  project.offlineCached = Boolean(isCached);
-  project.updatedAt = Date.now();
-  await putRecord(STORE_PROJECTS, project);
+  await updateProjectRecord(projectId, (project) => {
+    project.offlineCached = Boolean(isCached);
+    project.updatedAt = Date.now();
+  });
 }
 
 /**
@@ -1239,15 +1305,18 @@ export async function hydrateGithubProject({ owner, repo, branch, commitSha, fil
     })
   );
 
+  const filePathSet = new Set(files.map((f) => normalizePath(f.path)));
   const firstPaths = files.slice(0, 3).map((f) => normalizePath(f.path));
+  const preservedTabs = existingProject?.openTabIds?.filter((p) => filePathSet.has(p));
+  const openTabIds = preservedTabs && preservedTabs.length > 0 ? preservedTabs : firstPaths;
   const project = {
     id: projectId,
     name: `${owner}/${repo} (${branch})`,
     kind: "github",
     github: { owner, repo, branch, commitSha },
     offlineCached: true,
-    openTabIds: existingProject?.openTabIds?.filter((p) => files.some((f) => normalizePath(f.path) === p)) || firstPaths,
-    activeFileId: firstPaths[0] || null,
+    openTabIds,
+    activeFileId: existingProject?.activeFileId || openTabIds[0] || null,
     chatHistory: Array.isArray(existingProject?.chatHistory) ? existingProject.chatHistory : [],
     updatedAt: Date.now()
   };
@@ -1305,6 +1374,8 @@ export async function countPendingGithubChanges(projectId) {
       cursor.continue();
     };
     req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción countPendingGithubChanges se canceló."));
   });
 }
 
@@ -1335,7 +1406,7 @@ export async function getPendingGithubChanges(projectId) {
         baseContent: "",
         mode: item.mode || null,
         isBinary: Boolean(item.isBinary),
-        base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
+        base64: item.isBinary ? (item.base64 ?? null) : null
       });
     } else {
       changes.push({
@@ -1345,7 +1416,7 @@ export async function getPendingGithubChanges(projectId) {
         baseContent: item.baseContent || "",
         mode: item.mode || null,
         isBinary: Boolean(item.isBinary),
-        base64: item.isBinary ? (item.base64 ?? item.content ?? null) : null
+        base64: item.isBinary ? (item.base64 ?? null) : null
       });
     }
   }
@@ -1706,6 +1777,8 @@ function getRecord(storeName, key) {
         const req = tx.objectStore(storeName).get(key);
         req.onsuccess = () => resolve(req.result || null);
         req.onerror = () => reject(req.error);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error("La transacción getRecord se canceló."));
       })
   );
 }
@@ -1717,8 +1790,31 @@ function putRecord(storeName, value) {
         const tx = db.transaction(storeName, "readwrite");
         tx.objectStore(storeName).put(value);
         tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error);
+        tx.onerror = () => reject(tx.error || new Error("La transacción putRecord falló."));
+        tx.onabort = () => reject(tx.error || new Error("La transacción putRecord se canceló."));
       })
+  );
+}
+
+function deleteRecord(storeName, key) {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(storeName, "readwrite");
+        tx.objectStore(storeName).delete(key);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error("La transacción deleteRecord falló."));
+        tx.onabort = () => reject(tx.error || new Error("La transacción deleteRecord se canceló."));
+      })
+  );
+}
+
+function isValidBase64String(raw) {
+  if (typeof raw !== "string") return false;
+  const compact = raw.replace(/\s+/g, "");
+  return (
+    compact.length % 4 === 0 &&
+    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)
   );
 }
 
@@ -1730,12 +1826,16 @@ function putRecord(storeName, value) {
 export async function saveCredentialsBackup(rawJson) {
   try {
     const key = makeFileKey("__system__", "credentials");
+    if (!rawJson) {
+      await deleteRecord(STORE_FILES, key);
+      return;
+    }
     await putRecord(STORE_FILES, {
       key,
       projectId: "__system__",
       path: "credentials",
       isFolder: false,
-      content: rawJson || "",
+      content: rawJson,
       baseContent: "",
       deleted: false,
       updatedAt: Date.now()
@@ -1782,10 +1882,17 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
     }
 
     const isBinary = Boolean(e.isBinary);
+    let cleanBase64 = null;
     if (isBinary) {
       if (e.base64 !== undefined && e.base64 !== null && typeof e.base64 !== "string") continue;
-      if (typeof e.base64 === "string" && e.base64.length > Math.ceil((MAX_GIST_RESTORE_ENTRY_BYTES * 4) / 3) + 16) {
-        continue;
+      if (typeof e.base64 === "string") {
+        if (e.base64.length > Math.ceil((MAX_GIST_RESTORE_ENTRY_BYTES * 4) / 3) + 16) {
+          continue;
+        }
+        if (!isValidBase64String(e.base64)) {
+          continue;
+        }
+        cleanBase64 = e.base64.replace(/\s+/g, "");
       }
     } else {
       if (e.content !== undefined && e.content !== null && typeof e.content !== "string") continue;
@@ -1798,24 +1905,13 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
       path: validPath,
       isBinary,
       content: isBinary ? "" : (typeof e.content === "string" ? e.content : ""),
-      base64: isBinary ? (typeof e.base64 === "string" ? e.base64 : null) : null,
+      base64: isBinary ? cleanBase64 : null,
       mode: typeof e.mode === "string" ? e.mode : null
     });
   }
-  const firstFile = fileEntries[0]?.path || "main.cpp";
-
-  const project = {
-    id,
-    name: cleanName,
-    kind: "local",
-    github: null,
-    openTabIds: [firstFile],
-    activeFileId: firstFile,
-    chatHistory: [],
-    updatedAt: now
-  };
 
   const records = new Map();
+  let firstStoredFilePath = null;
   for (const entry of fileEntries) {
     const cleanPath = entry.path;
     if (!cleanPath) continue;
@@ -1851,6 +1947,9 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
     const existingTarget = records.get(cleanPath);
     if (existingTarget && existingTarget.isFolder) continue;
 
+    if (!firstStoredFilePath) {
+      firstStoredFilePath = cleanPath;
+    }
     records.set(cleanPath, {
       key: makeFileKey(id, cleanPath),
       projectId: id,
@@ -1869,6 +1968,19 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
       updatedAt: now
     });
   }
+
+  const firstFile = firstStoredFilePath || null;
+
+  const project = {
+    id,
+    name: cleanName,
+    kind: "local",
+    github: null,
+    openTabIds: firstFile ? [firstFile] : [],
+    activeFileId: firstFile,
+    chatHistory: [],
+    updatedAt: now
+  };
 
   const db = await openDb();
   await new Promise((resolve, reject) => {

@@ -95,6 +95,9 @@ export function resolveLocalModuleEntry(specifier, fromPath, exactMap, options =
   const cleanRef = String(specifier).trim().split("?")[0].split("#")[0].replace(/\\/g, "/");
   if (!cleanRef) return null;
   if (!allowParentTraversal) {
+    if (cleanRef.startsWith("/")) {
+      return null;
+    }
     let depth = 0;
     for (const seg of cleanRef.split("/")) {
       if (!seg || seg === ".") continue;
@@ -2225,7 +2228,12 @@ export function buildVirtualModuleRuntimeScript() {
     var module = { exports: Object.create(null) };
     module.exports.__esModule = true;
     window.__studioCache[id] = module;
-    factory(window.__studioRequire, module, module.exports);
+    try {
+      factory(window.__studioRequire, module, module.exports);
+    } catch (err) {
+      delete window.__studioCache[id];
+      throw err;
+    }
     notifyModule(module.exports);
     return module.exports;
   };
@@ -2328,6 +2336,11 @@ export function buildVirtualModuleBundle({
       continue;
     }
 
+    if (node.ext && !CODE_SOURCE_EXTS.has(node.ext)) {
+      graphNodes.push({ ...node, kind: "text" });
+      continue;
+    }
+
     let jsCode = node.content;
     if (node.isEntry && typeof precompiledEntryCode === "string") {
       jsCode = precompiledEntryCode;
@@ -2336,8 +2349,6 @@ export function buildVirtualModuleBundle({
         jsx: node.ext === "tsx" || node.ext === "jsx",
         fileName: node.id
       }).code;
-    } else if (!CODE_SOURCE_EXTS.has(node.ext) && node.ext) {
-      jsCode = transpileTypeScriptAndJsx(jsCode, { jsx: false, fileName: node.id }).code;
     }
 
     const usage =
@@ -2388,6 +2399,16 @@ export function buildVirtualModuleBundle({
           `  __st.textContent = ${cssLit};\n` +
           `  (document.head || document.documentElement).appendChild(__st);\n` +
           `  exports.default = "";\n` +
+          `});`
+      );
+      continue;
+    }
+
+    if (node.kind === "text") {
+      const textLit = JSON.stringify(String(node.content ?? "")).replace(/</g, "\\u003c");
+      compiledModules.push(
+        `__studioDefine(${idLit}, function (__studioRequire, module, exports) {\n` +
+          `  exports.default = ${textLit};\n` +
           `});`
       );
       continue;

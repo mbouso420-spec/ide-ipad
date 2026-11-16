@@ -2,19 +2,27 @@
  * Renderizador seguro 100% offline de documentos Markdown (.md / README.md) para Vista Previa.
  */
 
-import { escapeHtml, isBlockedPreviewUrlScheme, normalizePreviewUrlRef, resolveRelativePath } from "./previewUtils.js";
+import {
+  escapeHtml,
+  isBlockedPreviewUrlScheme,
+  normalizePreviewUrlRef,
+  resolveRelativePath,
+  sanitizeSvgMarkup,
+  safeEncodeURIComponent
+} from "./previewUtils.js";
 import { normalizePath } from "../storage/workspaceDb.js";
 import { getImageMimeType } from "../storage/fileImport.js";
 
 export function buildMarkdownPreview(mdFile, assetMap = null) {
   const baseDir = mdFile?.path ? mdFile.path.split("/").slice(0, -1).join("/") : "";
-  const renderedBody = renderMarkdownDocumentHtml(mdFile.content || "", { assetMap, baseDir });
-  const safeTitle = escapeHtml(mdFile.shortName);
+  const renderedBody = renderMarkdownDocumentHtml(mdFile?.content || "", { assetMap, baseDir });
+  const safeTitle = escapeHtml(mdFile?.shortName || mdFile?.path || "Documento");
 
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;">
   <title>${safeTitle}</title>
   <style>
     :root {
@@ -331,7 +339,7 @@ export function formatMdInline(str, options = {}) {
   const baseDir = typeof options?.baseDir === "string" ? options.baseDir : "";
 
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
-  const masked = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
+  let working = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
     codes.push(`<code>${escapeHtml(c)}</code>`);
     return `\u0000C${i}\u0000`;
@@ -342,13 +350,11 @@ export function formatMdInline(str, options = {}) {
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
 
-  let safe = escapeHtml(masked);
-
-  // Imágenes Markdown: ![alt](url "title")
-  safe = safe.replace(
-    /!\[([^\]]*)\]\(([^)\s]+)(?:\s+(?:"([^"]*)"|'([^']*)'|&quot;((?:(?!&quot;).)*)&quot;|&#39;((?:(?!&#39;).)*)&#39;))?\)/g,
-    (_, alt, rawUrl, t1, t2, t3, t4) => {
-      const title = t1 || t2 || t3 || t4 || "";
+  // Imágenes Markdown: ![alt](url "title") — evaluar antes de escapeHtml para no alterar '&' o '\'' en rutas locales
+  working = working.replace(
+    /!\[([^\]]*)\]\(([^)\s\u0000]+)(?:\s+(?:"([^"]*)"|'([^']*)'))?\)/g,
+    (_, alt, rawUrl, t1, t2) => {
+      const title = t1 || t2 || "";
       let resolvedSrc = rawUrl;
       if (assetMap) {
         const cleanRef = rawUrl.trim().split("?")[0].split("#")[0];
@@ -368,10 +374,17 @@ export function formatMdInline(str, options = {}) {
             const mime = getImageMimeType(entry.path || cleanRef);
             resolvedSrc = `data:${mime};base64,${b64}`;
           } else if (ext === "svg" && typeof entry.content === "string") {
-            const encodedSvg = encodeURIComponent(entry.content)
-              .replace(/'/g, "%27")
-              .replace(/"/g, "%22");
-            resolvedSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+            const sanitizedSvg = sanitizeSvgMarkup(entry.content);
+            if (sanitizedSvg) {
+              try {
+                const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
+                  .replace(/'/g, "%27")
+                  .replace(/"/g, "%22");
+                resolvedSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+              } catch {
+                /* ignorar fallo de codificación */
+              }
+            }
           }
         }
       }
@@ -379,33 +392,38 @@ export function formatMdInline(str, options = {}) {
       const isSafeDataImage = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|ico|svg\+xml)[;,]/i.test(normCandidate);
       if (isBlockedPreviewUrlScheme(normCandidate) && !isSafeDataImage) {
         const safeLabel = escapeHtml(alt || "imagen bloqueada");
-        return `<span class="md-blocked-img">[${safeLabel}]</span>`;
+        const i = images.length;
+        images.push(`<span class="md-blocked-img">[${safeLabel}]</span>`);
+        return `\u0000I${i}\u0000`;
       }
-      const safeSrc = resolvedSrc;
-      const safeTitle = title ? ` title="${title}"` : "";
+      const safeTitleAttr = title ? ` title="${escapeHtml(title)}"` : "";
       const i = images.length;
-      images.push(`<img src="${safeSrc}" alt="${alt}"${safeTitle} class="md-image">`);
+      images.push(`<img src="${escapeHtml(resolvedSrc)}" alt="${escapeHtml(alt)}"${safeTitleAttr} class="md-image">`);
       return `\u0000I${i}\u0000`;
     }
   );
 
-  safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
-    (_, label, url) => {
+  working = working.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^\s\u0000()]+(?:\([^\s\u0000()]*\)[^\s\u0000()]*)*)\)/g,
+    (fullMatch, label, url) => {
+      if (isBlockedPreviewUrlScheme(url)) {
+        return escapeHtml(fullMatch);
+      }
       const i = links.length;
-      links.push(`<a href="${url}" target="_blank" rel="noopener noreferrer">${applyEmphasis(label)}</a>`);
+      links.push(`<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">${applyEmphasis(escapeHtml(label))}</a>`);
       return `\u0000L${i}\u0000`;
     }
   );
-  safe = safe.replace(
+  working = working.replace(
     /\[([^\]]+)\]\((#[a-zA-Z0-9_-]+)\)/g,
     (_, label, hash) => {
       const i = links.length;
-      links.push(`<a href="${hash}">${applyEmphasis(label)}</a>`);
+      links.push(`<a href="${escapeHtml(hash)}">${applyEmphasis(escapeHtml(label))}</a>`);
       return `\u0000L${i}\u0000`;
     }
   );
-  safe = applyEmphasis(safe);
+
+  let safe = applyEmphasis(escapeHtml(working));
   safe = safe.replace(/\u0000L(\d+)\u0000/g, (_, i) => links[Number(i)] || "");
   safe = safe.replace(/\u0000I(\d+)\u0000/g, (_, i) => images[Number(i)] || "");
   safe = safe.replace(/\u0000C(\d+)\u0000/g, (_, i) => codes[Number(i)] || "");

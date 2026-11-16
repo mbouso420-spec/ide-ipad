@@ -6,7 +6,7 @@
 
 export const LOCKOUT_THRESHOLD = 4;
 export const LOCKOUT_DURATIONS_MS = [30_000, 120_000, 300_000]; // 30s -> 2m -> 5m
-export const LOCKOUT_STALE_RESET_MS = 3_600_000; // 1 hora sin incidentes reinicia historial viejo
+const LOCKOUT_STALE_RESET_MS = 3_600_000; // 1 hora sin incidentes reinicia historial viejo
 const LOCKOUT_STORAGE_PREFIX = "ide.security.lockout.";
 const MAX_REJECTED_HASHES_PER_SCOPE = 500;
 
@@ -295,7 +295,7 @@ export function validateCredentialFormat(kindOrProvider, rawToken) {
   }
 
   // Detectar caracteres de control o saltos de línea incluso en los bordes (inyección CRLF en cabeceras HTTP)
-  if (/[\x00-\x1f\x7f]/.test(rawToken)) {
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(rawToken)) {
     return {
       valid: false,
       reason: "La credencial contiene caracteres de control o saltos de línea no permitidos.",
@@ -466,7 +466,8 @@ export function redactSensitiveTokens(input, extraKnownSecrets = []) {
     .replace(/\bAIza[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_AI_KEY]")
     .replace(/\b(?:sk-or-v1-|sk-or-|sk-ant-|sk-proj-|sk-|gsk_)[A-Za-z0-9_-]{8,}\b/gi, "[REDACTED_AI_KEY]")
     .replace(/((?:Bearer|token|Basic)\s+)[A-Za-z0-9._~+/=-]{6,}/gi, "$1[REDACTED]")
-    .replace(/((?:x-goog-api-key|x-api-key)\s*[:=]\s*)[^\s"'<>]+/gi, "$1[REDACTED]")
+    .replace(/((?:["']?(?:x-goog-api-key|x-api-key|x-auth-token)["']?\s*[:=]\s*["']?))([^\s"',<>}]+)/gi, "$1[REDACTED]")
+    .replace(/((?:["']?authorization["']?\s*[:=]\s*["']?))(?:(?:Bearer|token|Basic)\s+)?[A-Za-z0-9._~+/=-]{6,}/gi, "$1[REDACTED]")
     .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"'<>]+/gi, "$1[REDACTED]");
 
   if (Array.isArray(extraKnownSecrets)) {
@@ -493,23 +494,59 @@ const SENSITIVE_HEADER_KEYS = new Set([
 
 function scrubSensitiveHeaders(headers, extraKnownSecrets = []) {
   if (!headers || typeof headers !== "object") return headers;
+  if (Array.isArray(headers)) {
+    const cleanArr = [];
+    for (const entry of headers) {
+      if (Array.isArray(entry) && entry.length >= 2) {
+        const k = String(entry[0]);
+        if (SENSITIVE_HEADER_KEYS.has(k.toLowerCase())) continue;
+        cleanArr.push([
+          k,
+          typeof entry[1] === "string" ? redactSensitiveTokens(entry[1], extraKnownSecrets) : entry[1]
+        ]);
+      }
+    }
+    return cleanArr;
+  }
   if (typeof Headers !== "undefined" && headers instanceof Headers) {
-    const clean = {};
+    const clean = Object.create(null);
     headers.forEach((value, key) => {
-      if (!SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
+      const lower = String(key).toLowerCase();
+      if (!SENSITIVE_HEADER_KEYS.has(lower) && key !== "__proto__") {
         clean[key] = redactSensitiveTokens(value, extraKnownSecrets);
       }
     });
     return clean;
   }
-  const clean = {};
+  const clean = Object.create(null);
   for (const [key, value] of Object.entries(headers)) {
-    if (SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
+    if (key === "__proto__" || SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
       continue;
     }
     clean[key] = typeof value === "string" ? redactSensitiveTokens(value, extraKnownSecrets) : value;
   }
   return clean;
+}
+
+function scrubRequestOrConfig(obj, extraKnownSecrets, depth, seen) {
+  const copy = Object.create(null);
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === "__proto__") continue;
+    if (k === "headers") {
+      copy.headers = scrubSensitiveHeaders(v, extraKnownSecrets);
+    } else if (k === "auth" || k === "password" || k === "token" || k === "apiKey") {
+      copy[k] = "[REDACTED]";
+    } else if (k === "url" && typeof v === "string") {
+      copy.url = redactSensitiveTokens(v, extraKnownSecrets);
+    } else if (typeof v === "string") {
+      copy[k] = redactSensitiveTokens(v, extraKnownSecrets);
+    } else if (v && typeof v === "object") {
+      copy[k] = sanitizeErrorCause(v, extraKnownSecrets, depth + 1, seen);
+    } else {
+      copy[k] = v;
+    }
+  }
+  return copy;
 }
 
 /**
@@ -530,11 +567,16 @@ export function sanitizeErrorCause(error, extraKnownSecrets = [], depth = 0, see
   }
   seen.add(error);
 
+  if (Array.isArray(error)) {
+    return error.map((item) => sanitizeErrorCause(item, extraKnownSecrets, depth + 1, seen));
+  }
+
   if (error instanceof Error) {
     const safeMsg = redactSensitiveTokens(error.message || "", extraKnownSecrets);
     const safeErr = new Error(safeMsg);
     safeErr.name = error.name || "Error";
     if (error.status !== undefined) safeErr.status = error.status;
+    if (error.httpStatus !== undefined) safeErr.httpStatus = error.httpStatus;
     if (error.code !== undefined) safeErr.code = error.code;
     if (error.isNetworkFailure !== undefined) safeErr.isNetworkFailure = error.isNetworkFailure;
     if (error.credentialRejected !== undefined) safeErr.credentialRejected = error.credentialRejected;
@@ -545,21 +587,13 @@ export function sanitizeErrorCause(error, extraKnownSecrets = [], depth = 0, see
       safeErr.headers = scrubSensitiveHeaders(error.headers, extraKnownSecrets);
     }
     if (error.request && typeof error.request === "object") {
-      const reqCopy = { ...error.request };
-      if (reqCopy.headers) {
-        reqCopy.headers = scrubSensitiveHeaders(reqCopy.headers, extraKnownSecrets);
-      }
-      if (typeof reqCopy.url === "string") {
-        reqCopy.url = redactSensitiveTokens(reqCopy.url, extraKnownSecrets);
-      }
-      safeErr.request = reqCopy;
+      safeErr.request = scrubRequestOrConfig(error.request, extraKnownSecrets, depth, seen);
     }
     if (error.config && typeof error.config === "object") {
-      const cfgCopy = { ...error.config };
-      if (cfgCopy.headers) {
-        cfgCopy.headers = scrubSensitiveHeaders(cfgCopy.headers, extraKnownSecrets);
-      }
-      safeErr.config = cfgCopy;
+      safeErr.config = scrubRequestOrConfig(error.config, extraKnownSecrets, depth, seen);
+    }
+    if (error.response && typeof error.response === "object") {
+      safeErr.response = sanitizeErrorCause(error.response, extraKnownSecrets, depth + 1, seen);
     }
     if (error.cause !== undefined) {
       safeErr.cause = sanitizeErrorCause(error.cause, extraKnownSecrets, depth + 1, seen);
@@ -567,14 +601,17 @@ export function sanitizeErrorCause(error, extraKnownSecrets = [], depth = 0, see
     return safeErr;
   }
 
-  const out = {};
+  const out = Object.create(null);
   for (const [k, v] of Object.entries(error)) {
+    if (k === "__proto__") continue;
     if (k === "headers") {
       out.headers = scrubSensitiveHeaders(v, extraKnownSecrets);
-    } else if (k === "cause" || k === "request" || k === "response" || k === "config") {
-      out[k] = sanitizeErrorCause(v, extraKnownSecrets, depth + 1, seen);
+    } else if (k === "auth" || k === "password" || k === "token" || k === "apiKey") {
+      out[k] = "[REDACTED]";
     } else if (typeof v === "string") {
       out[k] = redactSensitiveTokens(v, extraKnownSecrets);
+    } else if (v && typeof v === "object") {
+      out[k] = sanitizeErrorCause(v, extraKnownSecrets, depth + 1, seen);
     } else {
       out[k] = v;
     }

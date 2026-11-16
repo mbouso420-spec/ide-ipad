@@ -27,7 +27,14 @@ function getAtob() {
  */
 export function bytesToBase64(bytes) {
   if (!bytes || bytes.length === 0) return "";
-  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let view;
+  if (bytes instanceof Uint8Array) {
+    view = bytes;
+  } else if (ArrayBuffer.isView(bytes)) {
+    view = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  } else {
+    view = new Uint8Array(bytes);
+  }
   const btoaFn = getBtoa();
   if (!btoaFn) {
     const nodeBuf = typeof globalThis !== "undefined" ? globalThis.Buffer : null;
@@ -105,13 +112,16 @@ export function base64ToBytes(base64, { strict = true } = {}) {
   }
 }
 
+const sharedTextEncoder = typeof TextEncoder === "function" ? new TextEncoder() : null;
+
 /**
  * Codifica texto UTF-8 a Base64 estándar.
  * @param {string} text
  * @returns {string}
  */
 export function utf8ToBase64(text) {
-  const bytes = new TextEncoder().encode(String(text ?? ""));
+  const encoder = sharedTextEncoder || new TextEncoder();
+  const bytes = encoder.encode(String(text ?? ""));
   return bytesToBase64(bytes);
 }
 
@@ -142,5 +152,8 @@ export function slugifyName(name, { allowDots = false, collapse = true, fallback
     ? (collapse ? /[^a-z0-9._-]+/g : /[^a-z0-9._-]/g)
     : (collapse ? /[^a-z0-9-_]+/g : /[^a-z0-9-_]/g);
   const slug = cleaned.replace(pattern, "-").replace(/^-+|-+$/g, "");
-  return slug || fallback;
+  if (!slug || /^\.+$/.test(slug)) {
+    return fallback;
+  }
+  return slug;
 }

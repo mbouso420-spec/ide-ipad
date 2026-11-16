@@ -44,7 +44,9 @@ export function initQuickOpenModal({
   const listEl = document.getElementById("quick-open-list");
 
   let filtered = [];
+  let renderedButtons = [];
   let activeIndex = 0;
+  let lastHighlightedIndex = 0;
   let currentTargetLine = null;
 
   function open(initialPrefix = "") {
@@ -235,6 +237,8 @@ export function initQuickOpenModal({
     }
 
     listEl.innerHTML = "";
+    renderedButtons = [];
+    lastHighlightedIndex = activeIndex;
     if (filtered.length === 0) {
       const emptyLi = document.createElement("li");
       emptyLi.className = "quick-open-empty";
@@ -247,11 +251,15 @@ export function initQuickOpenModal({
       return;
     }
 
+    const frag = typeof document.createDocumentFragment === "function"
+      ? document.createDocumentFragment()
+      : null;
     filtered.forEach((item, idx) => {
       const li = document.createElement("li");
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = idx === activeIndex ? "quick-open-item is-active" : "quick-open-item";
+      btn.dataset.itemIndex = String(idx);
 
       const isCmd = item.kind === "command";
       const dir = isCmd
@@ -280,32 +288,44 @@ export function initQuickOpenModal({
         </span>
       `;
 
-      btn.addEventListener("click", () => {
-        if (item.kind === "command") {
-          close();
-          try {
-            item.cmd.run?.();
-          } catch (err) {
-            console.error("[CommandPalette] Error al ejecutar comando:", err);
-          }
-        } else {
-          pickFile(item.file.path, currentTargetLine);
-        }
-      });
+      renderedButtons.push(btn);
       li.appendChild(btn);
-      listEl.appendChild(li);
+      (frag || listEl).appendChild(li);
     });
+    if (frag) {
+      listEl.appendChild(frag);
+    }
   }
 
-  function syncHighlight() {
-    if (!listEl) return;
-    const buttons = listEl.querySelectorAll(".quick-open-item");
-    buttons.forEach((btn, idx) => {
-      btn.classList.toggle("is-active", idx === activeIndex);
-      if (idx === activeIndex && btn instanceof HTMLElement) {
-        btn.scrollIntoView({ block: "nearest" });
+  listEl?.addEventListener("click", (event) => {
+    const btn = event.target?.closest?.(".quick-open-item");
+    if (!btn) return;
+    const idx = Number(btn.dataset.itemIndex);
+    const item = Number.isInteger(idx) ? filtered[idx] : null;
+    if (!item) return;
+    if (item.kind === "command") {
+      close();
+      try {
+        item.cmd.run?.();
+      } catch (err) {
+        console.error("[CommandPalette] Error al ejecutar comando:", err);
       }
-    });
+    } else {
+      pickFile(item.file.path, currentTargetLine);
+    }
+  }, listenOpts);
+
+  function syncHighlight() {
+    if (!listEl || renderedButtons.length === 0) return;
+    if (lastHighlightedIndex !== activeIndex) {
+      renderedButtons[lastHighlightedIndex]?.classList.remove("is-active");
+    }
+    const nextBtn = renderedButtons[activeIndex];
+    if (nextBtn) {
+      nextBtn.classList.add("is-active");
+      nextBtn.scrollIntoView?.({ block: "nearest" });
+    }
+    lastHighlightedIndex = activeIndex;
   }
 
   return {

@@ -147,6 +147,8 @@ export function initExplorerController({
     contextMenuEl = document.createElement("div");
     contextMenuEl.id = "tree-context-menu";
     contextMenuEl.className = "tree-context-menu";
+    contextMenuEl.setAttribute("role", "menu");
+    contextMenuEl.setAttribute("aria-label", "Acciones de archivo o carpeta");
     contextMenuEl.hidden = true;
     document.body.appendChild(contextMenuEl);
 
@@ -181,9 +183,11 @@ export function initExplorerController({
     const renameItem = document.createElement("button");
     renameItem.type = "button";
     renameItem.className = "tree-context-item";
+    renameItem.setAttribute("role", "menuitem");
     renameItem.innerHTML = `${icon("edit")}<span>Renombrar</span>`;
     renameItem.addEventListener("click", () => {
       closeContextMenu();
+      pendingDeletePath = null;
       renamingTarget = { path: node.path, isFolder: node.isFolder };
       renderTree(currentEntries, currentActiveFileId);
     });
@@ -194,6 +198,7 @@ export function initExplorerController({
         const dupItem = document.createElement("button");
         dupItem.type = "button";
         dupItem.className = "tree-context-item";
+        dupItem.setAttribute("role", "menuitem");
         dupItem.innerHTML = `${icon("copy")}<span>Duplicar</span>`;
         dupItem.addEventListener("click", () => {
           closeContextMenu();
@@ -206,6 +211,7 @@ export function initExplorerController({
         const dlItem = document.createElement("button");
         dlItem.type = "button";
         dlItem.className = "tree-context-item";
+        dlItem.setAttribute("role", "menuitem");
         dlItem.innerHTML = `${icon("download")}<span>Descargar</span>`;
         dlItem.addEventListener("click", () => {
           closeContextMenu();
@@ -218,9 +224,11 @@ export function initExplorerController({
     const delItem = document.createElement("button");
     delItem.type = "button";
     delItem.className = "tree-context-item is-danger";
+    delItem.setAttribute("role", "menuitem");
     delItem.innerHTML = `${icon("trash")}<span>Eliminar</span>`;
     delItem.addEventListener("click", () => {
       closeContextMenu();
+      renamingTarget = null;
       pendingDeletePath = node.path;
       renderTree(currentEntries, currentActiveFileId);
     });
@@ -280,9 +288,11 @@ export function initExplorerController({
     if (!btnDeleteProject) return;
     if (pendingProjectDelete) {
       btnDeleteProject.className = "tree-confirm-delete";
+      btnDeleteProject.setAttribute("aria-label", "Confirmar eliminación del proyecto");
       btnDeleteProject.innerHTML = "Confirmar";
     } else {
       btnDeleteProject.className = "btn btn-ghost btn-sm btn-icon";
+      btnDeleteProject.setAttribute("aria-label", "Eliminar proyecto actual");
       btnDeleteProject.innerHTML = icon("trash");
     }
   }
@@ -322,6 +332,7 @@ export function initExplorerController({
   async function processImportFileList(fileList) {
     if (!fileList || fileList.length === 0) return;
 
+    const sourceProjectId = currentRenderedProjectId;
     const imported = [];
     const rejected = [];
     for (const file of fileList) {
@@ -337,9 +348,17 @@ export function initExplorerController({
         rejected.push(`${file.name} (el nombre tiene caracteres no permitidos)`);
         continue;
       }
-      const decoded = decodeImportedFile(new Uint8Array(await file.arrayBuffer()), file.name, {
-        allowBinaryAssets: true
-      });
+      let decoded;
+      try {
+        const buffer = await file.arrayBuffer();
+        if (currentRenderedProjectId !== sourceProjectId) return;
+        decoded = decodeImportedFile(new Uint8Array(buffer), file.name, {
+          allowBinaryAssets: true
+        });
+      } catch {
+        rejected.push(`${file.name} (no se pudo leer el archivo)`);
+        continue;
+      }
       if (!decoded.ok) {
         rejected.push(`${file.name} (${decoded.reason})`);
         continue;
@@ -352,6 +371,7 @@ export function initExplorerController({
       });
     }
 
+    if (currentRenderedProjectId !== sourceProjectId) return;
     const rejectedMsg = rejected.length > 0 ? `No se importó: ${rejected.join(", ")}` : "";
     if (imported.length === 0) {
       if (rejectedMsg) setAutosaveStatus(rejectedMsg);
@@ -362,14 +382,19 @@ export function initExplorerController({
     const conflicts = imported.filter((item) => existingFiles.has(item.path));
     if (conflicts.length === 0) {
       await onImportFiles(imported);
-      if (rejectedMsg) setAutosaveStatus(rejectedMsg);
+      if (currentRenderedProjectId === sourceProjectId && rejectedMsg) {
+        setAutosaveStatus(rejectedMsg);
+      }
       return;
     }
 
     // Hay archivos con el mismo nombre: no se pisa nada sin una confirmación explícita.
     openImportOverwriteConfirm(conflicts.map((c) => c.path), async () => {
+      if (currentRenderedProjectId !== sourceProjectId) return;
       await onImportFiles(imported);
-      if (rejectedMsg) setAutosaveStatus(rejectedMsg);
+      if (currentRenderedProjectId === sourceProjectId && rejectedMsg) {
+        setAutosaveStatus(rejectedMsg);
+      }
     }, rejectedMsg);
   }
 
@@ -386,7 +411,7 @@ export function initExplorerController({
   }, listenOpts);
 
   treeContainer?.addEventListener("dragleave", (event) => {
-    if (event.target === treeContainer || !treeContainer.contains(event.relatedTarget)) {
+    if (!treeContainer.contains(event.relatedTarget)) {
       treeContainer.classList.remove("is-drag-over");
     }
   }, listenOpts);
@@ -534,9 +559,13 @@ export function initExplorerController({
       }
     });
 
+    let submitting = false;
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (submitting) return;
       const val = input.value;
+      submitting = true;
+      okBtn.disabled = true;
       try {
         await onSubmit(val);
         close();
@@ -544,6 +573,9 @@ export function initExplorerController({
         errEl.hidden = false;
         errEl.textContent = error instanceof Error ? error.message : "No se pudo crear el elemento.";
         input.focus();
+      } finally {
+        submitting = false;
+        okBtn.disabled = false;
       }
     });
 
@@ -568,6 +600,10 @@ export function initExplorerController({
       renamingTarget = null;
       pendingProjectDelete = false;
       collapsedFolders.clear();
+      lastStructureSignature = null;
+      if (treeContainer) {
+        treeContainer.scrollTop = 0;
+      }
       if (inlineSlot) {
         inlineSlot.hidden = true;
         inlineSlot.innerHTML = "";
@@ -718,10 +754,14 @@ export function initExplorerController({
       if (action === "toggle-folder") {
         if (collapsedFolders.has(node.path)) {
           collapsedFolders.delete(node.path);
+          selectedFolderPath = node.path;
         } else {
           collapsedFolders.add(node.path);
+          const folderPrefix = `${node.path}/`;
+          if (selectedFolderPath === node.path || selectedFolderPath.startsWith(folderPrefix)) {
+            selectedFolderPath = "";
+          }
         }
-        selectedFolderPath = selectedFolderPath === node.path ? "" : node.path;
         renderTree(currentEntries, currentActiveFileId);
         return;
       }
@@ -736,7 +776,17 @@ export function initExplorerController({
 
       if (action === "confirm-delete") {
         pendingDeletePath = null;
-        if (selectedFolderPath === node.path) {
+        if (node.isFolder) {
+          const folderPrefix = `${node.path}/`;
+          if (selectedFolderPath === node.path || selectedFolderPath.startsWith(folderPrefix)) {
+            selectedFolderPath = "";
+          }
+          for (const folderPath of Array.from(collapsedFolders)) {
+            if (folderPath === node.path || folderPath.startsWith(folderPrefix)) {
+              collapsedFolders.delete(folderPath);
+            }
+          }
+        } else if (selectedFolderPath === node.path) {
           selectedFolderPath = "";
         }
         await onDeleteEntry(node.path, node.isFolder);
@@ -750,12 +800,14 @@ export function initExplorerController({
       }
 
       if (action === "rename") {
+        pendingDeletePath = null;
         renamingTarget = { path: node.path, isFolder: node.isFolder };
         renderTree(currentEntries, currentActiveFileId);
         return;
       }
 
       if (action === "delete") {
+        renamingTarget = null;
         pendingDeletePath = node.path;
         renderTree(currentEntries, currentActiveFileId);
       }
@@ -873,6 +925,7 @@ export function initExplorerController({
         yesBtn.type = "button";
         yesBtn.className = "tree-confirm-delete";
         yesBtn.dataset.treeAction = "confirm-delete";
+        yesBtn.setAttribute("aria-label", `Confirmar borrado de ${node.name}`);
         yesBtn.textContent = "Borrar";
 
         const noBtn = document.createElement("button");
@@ -975,8 +1028,10 @@ export function initExplorerController({
     errEl.className = "explorer-inline-error";
     errEl.hidden = true;
 
+    let submitting = false;
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
+      if (submitting) return;
       const oldPath = node.path;
       const isFolder = node.isFolder;
       let targetPath;
@@ -993,14 +1048,41 @@ export function initExplorerController({
         renderTree(currentEntries, currentActiveFileId);
         return;
       }
+      submitting = true;
+      okBtn.disabled = true;
       try {
         renamingTarget = null;
         await onRenameEntry(oldPath, targetPath, isFolder);
+        if (isFolder) {
+          const oldPrefix = `${oldPath}/`;
+          if (selectedFolderPath === oldPath) {
+            selectedFolderPath = targetPath;
+          } else if (selectedFolderPath.startsWith(oldPrefix)) {
+            selectedFolderPath = `${targetPath}/${selectedFolderPath.slice(oldPrefix.length)}`;
+          }
+          const nextCollapsed = new Set();
+          for (const folderPath of collapsedFolders) {
+            if (folderPath === oldPath) {
+              nextCollapsed.add(targetPath);
+            } else if (folderPath.startsWith(oldPrefix)) {
+              nextCollapsed.add(`${targetPath}/${folderPath.slice(oldPrefix.length)}`);
+            } else {
+              nextCollapsed.add(folderPath);
+            }
+          }
+          collapsedFolders.clear();
+          for (const folderPath of nextCollapsed) {
+            collapsedFolders.add(folderPath);
+          }
+        }
       } catch (error) {
         renamingTarget = { path: oldPath, isFolder };
         errEl.hidden = false;
         errEl.textContent = error instanceof Error ? error.message : "No se pudo renombrar.";
         input.focus();
+      } finally {
+        submitting = false;
+        okBtn.disabled = false;
       }
     });
 

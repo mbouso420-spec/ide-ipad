@@ -2,7 +2,7 @@ import { hydrateIcons } from "./ui/icons.js";
 import { initLayoutController } from "./ui/layout.js";
 import { initSymbolBar } from "./ui/symbolBar.js";
 import { generateDuplicatePath, initExplorerController } from "./ui/explorerController.js";
-import { buildZipArchive, downloadZip } from "./storage/zipExporter.js";
+import { buildZipBlob, downloadZip } from "./storage/zipExporter.js";
 import { initDiffModal } from "./ui/diffModal.js";
 import { initLivePreviewModal } from "./ui/livePreviewModal.js";
 import { initQuickOpenModal } from "./ui/quickOpenModal.js";
@@ -36,6 +36,7 @@ import {
 } from "./ai/providers.js";
 import {
   cacheSingleGithubFileContent,
+  closeWorkspaceBroadcast,
   createLocalProject,
   deleteProject,
   deleteProjectEntry,
@@ -56,7 +57,9 @@ import {
   requestPersistentStorage,
   saveCredentialsBackup,
   saveProjectChatHistory,
+  saveProjectGistId,
   saveProjectState,
+  saveProjectTabsState,
   setSavedActiveProjectId,
   updateFileContent,
   upsertEntry,
@@ -248,6 +251,7 @@ async function initApp() {
     getActiveFileId: () => activeFileId,
     getActiveProject: () => activeProject,
     saveProjectState,
+    saveProjectTabsState,
     isFileDirtyForProject,
     onOpenFile: (path) => openOrFocusFile(path),
     onRequestCloseTab: (path) => requestCloseTab(path),
@@ -434,6 +438,7 @@ async function initApp() {
           run: () => {
             delete document.documentElement.dataset.theme;
             removeStoredValue(THEME_STORAGE_KEY);
+            settingsModal?.syncControls?.();
           }
         },
         {
@@ -445,6 +450,7 @@ async function initApp() {
           run: () => {
             document.documentElement.dataset.theme = "dracula";
             saveStoredValue(THEME_STORAGE_KEY, "dracula");
+            settingsModal?.syncControls?.();
           }
         },
         {
@@ -456,6 +462,7 @@ async function initApp() {
           run: () => {
             document.documentElement.dataset.theme = "nord";
             saveStoredValue(THEME_STORAGE_KEY, "nord");
+            settingsModal?.syncControls?.();
           }
         },
         {
@@ -467,6 +474,7 @@ async function initApp() {
           run: () => {
             document.documentElement.dataset.theme = "monokai";
             saveStoredValue(THEME_STORAGE_KEY, "monokai");
+            settingsModal?.syncControls?.();
           }
         },
         {
@@ -515,6 +523,12 @@ async function initApp() {
       const activeFile = filesOnly.find((f) => f.id === activeFileId);
       if (!activeFile || isBinaryFile(activeFile)) return;
       editor.insertAtCursor(text, cursorBack);
+    },
+    onToggle(touchKeyboardVisible) {
+      const hardwareMode = !touchKeyboardVisible;
+      editor.setHardwareKeyboardMode?.(hardwareMode);
+      splitController?.setHardwareKeyboardMode?.(hardwareMode);
+      settingsModal?.syncControls?.();
     }
   });
 
@@ -529,6 +543,14 @@ async function initApp() {
     },
     onMinimapChange(visible) {
       statusBar.syncMinimapPressed(visible);
+    },
+    onKeyStorageModeChange(mode) {
+      void github?.refreshTopbarBadge?.();
+      explorer?.setAutosaveStatus?.(
+        mode === "session"
+          ? "Claves solo en esta sesión"
+          : "Claves persistentes en este dispositivo"
+      );
     },
     onThinkingSpeedChange(speed) {
       chat?.syncThinkingSpeed?.(speed);
@@ -572,91 +594,137 @@ async function initApp() {
     await downloadSingleFile(current.id);
   }
 
+  let pendingProjectSelectSeq = 0;
+
   explorer = initExplorerController({
     onSelectFile(path) {
       openOrFocusFile(path);
     },
     async onCreateEntry(path, isFolder) {
-      await autosaveManager.flushPendingSaves();
-      const isImg = !isFolder && isImageFile(path) && !path.toLowerCase().endsWith(".svg");
-      await upsertEntry(activeProject.id, path, {
-        isFolder,
-        content: isFolder ? "" : (isImg ? "" : defaultStarterTemplate(path)),
-        isBinary: isImg,
-        base64: null,
-        allowOverwrite: false
-      });
-      await reloadProjectEntries();
-      if (!isFolder) {
-        await openOrFocusFile(path);
-      } else {
-        renderWorkspaceView();
+      const sourceProjectId = activeProject?.id;
+      if (!sourceProjectId) return;
+      try {
+        await autosaveManager.flushPendingSaves();
+        if (activeProject?.id !== sourceProjectId) return;
+        const isImg = !isFolder && isImageFile(path) && !path.toLowerCase().endsWith(".svg");
+        await upsertEntry(sourceProjectId, path, {
+          isFolder,
+          content: isFolder ? "" : (isImg ? "" : defaultStarterTemplate(path)),
+          isBinary: isImg,
+          base64: null,
+          allowOverwrite: false
+        });
+        if (activeProject?.id !== sourceProjectId) return;
+        await reloadProjectEntries();
+        if (activeProject?.id !== sourceProjectId) return;
+        if (!isFolder) {
+          await openOrFocusFile(path);
+        } else {
+          renderWorkspaceView();
+        }
+        await github.refreshTopbarBadge();
+      } catch (error) {
+        if (activeProject?.id === sourceProjectId) {
+          explorer.setAutosaveStatus(
+            error instanceof Error ? error.message : "No se pudo crear el elemento"
+          );
+        }
       }
-      await github.refreshTopbarBadge();
     },
     async onRenameEntry(oldPath, newPath, isFolder) {
-      await autosaveManager.flushPendingSaves();
-      const affectedUnloaded = filesOnly.filter(
-        (f) =>
-          f.contentLoaded === false &&
-          (f.id === oldPath || (isFolder && f.id.startsWith(`${oldPath}/`)))
-      );
-      const sourceProjectId = activeProject.id;
-      if (affectedUnloaded.length > 0) {
-        await githubLazySync.ensureFilesLoaded(affectedUnloaded);
-      }
-      if (activeProject.id !== sourceProjectId) {
-        return;
-      }
-
-      await renameProjectEntry(activeProject.id, oldPath, newPath, isFolder);
-
-      openTabIds = openTabIds.map((id) => {
-        if (id === oldPath) return newPath;
-        if (isFolder && id.startsWith(`${oldPath}/`)) {
-          return `${newPath}${id.slice(oldPath.length)}`;
+      const sourceProjectId = activeProject?.id;
+      if (!sourceProjectId) return;
+      try {
+        await autosaveManager.flushPendingSaves();
+        if (activeProject?.id !== sourceProjectId) return;
+        const affectedUnloaded = filesOnly.filter(
+          (f) =>
+            f.contentLoaded === false &&
+            (f.id === oldPath || (isFolder && f.id.startsWith(`${oldPath}/`)))
+        );
+        if (affectedUnloaded.length > 0) {
+          await githubLazySync.ensureFilesLoaded(affectedUnloaded);
         }
-        return id;
-      });
-      if (activeFileId === oldPath) {
-        activeFileId = newPath;
-      } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
-        activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
-      }
-      splitController?.handleEntryRenamed(oldPath, newPath, isFolder);
-      editor.renameFileStates(oldPath, newPath, isFolder);
+        if (activeProject?.id !== sourceProjectId) {
+          return;
+        }
 
-      await tabManager.persistTabsState();
-      await reloadProjectEntries();
-      renderWorkspaceView();
-      await github.refreshTopbarBadge();
+        await renameProjectEntry(sourceProjectId, oldPath, newPath, isFolder);
+        if (activeProject?.id !== sourceProjectId) {
+          return;
+        }
+
+        openTabIds = openTabIds.map((id) => {
+          if (id === oldPath) return newPath;
+          if (isFolder && id.startsWith(`${oldPath}/`)) {
+            return `${newPath}${id.slice(oldPath.length)}`;
+          }
+          return id;
+        });
+        if (activeFileId === oldPath) {
+          activeFileId = newPath;
+        } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
+          activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
+        }
+        splitController?.handleEntryRenamed(oldPath, newPath, isFolder);
+        editor.renameFileStates(oldPath, newPath, isFolder);
+
+        await tabManager.persistTabsState();
+        if (activeProject?.id !== sourceProjectId) return;
+        await reloadProjectEntries();
+        if (activeProject?.id !== sourceProjectId) return;
+        renderWorkspaceView();
+        await github.refreshTopbarBadge();
+      } catch (error) {
+        if (activeProject?.id === sourceProjectId) {
+          explorer.setAutosaveStatus(
+            error instanceof Error ? error.message : "No se pudo renombrar el elemento"
+          );
+        }
+      }
     },
     async onDeleteEntry(path, isFolder) {
-      await autosaveManager.flushPendingSaves();
-      await deleteProjectEntry(activeProject.id, path, isFolder);
+      const sourceProjectId = activeProject?.id;
+      if (!sourceProjectId) return;
+      try {
+        await autosaveManager.flushPendingSaves();
+        if (activeProject?.id !== sourceProjectId) return;
+        await deleteProjectEntry(sourceProjectId, path, isFolder);
+        if (activeProject?.id !== sourceProjectId) return;
 
-      const removedTabs = openTabIds.filter(
-        (id) => id === path || (isFolder && id.startsWith(`${path}/`))
-      );
-      for (const rem of removedTabs) {
-        editor.dropFileState(rem);
-        splitController?.dropFileState(rem);
+        const removedTabs = openTabIds.filter(
+          (id) => id === path || (isFolder && id.startsWith(`${path}/`))
+        );
+        for (const rem of removedTabs) {
+          editor.dropFileState(rem);
+          splitController?.dropFileState(rem);
+        }
+
+        openTabIds = openTabIds.filter(
+          (id) => id !== path && !(isFolder && id.startsWith(`${path}/`))
+        );
+        if (!openTabIds.includes(activeFileId)) {
+          activeFileId = openTabIds[0] || null;
+        }
+
+        await tabManager.persistTabsState();
+        if (activeProject?.id !== sourceProjectId) return;
+        await reloadProjectEntries();
+        if (activeProject?.id !== sourceProjectId) return;
+        renderWorkspaceView();
+        await github.refreshTopbarBadge();
+      } catch (error) {
+        if (activeProject?.id === sourceProjectId) {
+          explorer.setAutosaveStatus(
+            error instanceof Error ? error.message : "No se pudo eliminar el elemento"
+          );
+        }
       }
-
-      openTabIds = openTabIds.filter(
-        (id) => id !== path && !(isFolder && id.startsWith(`${path}/`))
-      );
-      if (!openTabIds.includes(activeFileId)) {
-        activeFileId = openTabIds[0] || null;
-      }
-
-      await tabManager.persistTabsState();
-      await reloadProjectEntries();
-      renderWorkspaceView();
-      await github.refreshTopbarBadge();
     },
     async onSwitchProject(selectedValue) {
+      const selectSeq = ++pendingProjectSelectSeq;
       await autosaveManager.flushPendingSaves();
+      if (selectSeq !== pendingProjectSelectSeq) return;
       if (selectedValue.startsWith("ghlive::")) {
         const parts = selectedValue.split("::");
         const fullName = parts[1] || "";
@@ -672,6 +740,7 @@ async function initApp() {
             repo,
             branch: defaultBranch
           });
+          if (selectSeq !== pendingProjectSelectSeq) return;
           const createdProj = await hydrateLazyGithubProject({
             owner,
             repo,
@@ -679,8 +748,11 @@ async function initApp() {
             commitSha: index.commitSha,
             entries: index.entries
           });
+          if (selectSeq !== pendingProjectSelectSeq) return;
           projects = await listProjects();
+          if (selectSeq !== pendingProjectSelectSeq) return;
           await switchProject(createdProj.id);
+          if (selectSeq !== pendingProjectSelectSeq) return;
           if (index.isTruncated) {
             explorer.setAutosaveStatus(
               `Atención: Árbol de ${repo} incompleto (truncado por GitHub en ${index.entries.length} archivos)`
@@ -691,6 +763,7 @@ async function initApp() {
             );
           }
         } catch (error) {
+          if (selectSeq !== pendingProjectSelectSeq) return;
           explorer.renderProjects(projects, activeProject.id);
           explorer.setAutosaveStatus(
             error instanceof Error ? error.message : "No se pudo conectar con GitHub"
@@ -702,86 +775,131 @@ async function initApp() {
       await switchProject(selectedValue);
     },
     async onCreateProject(name) {
-      await autosaveManager.flushPendingSaves();
-      const created = await createLocalProject(name);
-      projects = await listProjects();
-      await switchProject(created.id);
+      const selectSeq = ++pendingProjectSelectSeq;
+      try {
+        await autosaveManager.flushPendingSaves();
+        if (selectSeq !== pendingProjectSelectSeq) return;
+        const created = await createLocalProject(name);
+        if (selectSeq !== pendingProjectSelectSeq) return;
+        projects = await listProjects();
+        if (selectSeq !== pendingProjectSelectSeq) return;
+        await switchProject(created.id);
+      } catch (error) {
+        explorer.setAutosaveStatus(
+          error instanceof Error ? error.message : "No se pudo crear el espacio"
+        );
+      }
     },
     async onDeleteCurrentProject() {
       if (projects.length <= 1) return;
-      await autosaveManager.flushPendingSaves();
-      const removedId = activeProject.id;
-      await deleteProject(removedId);
-      projects = await listProjects();
-      await switchProject(projects[0].id);
+      const selectSeq = ++pendingProjectSelectSeq;
+      const removedId = activeProject?.id;
+      if (!removedId) return;
+      try {
+        await autosaveManager.flushPendingSaves();
+        if (selectSeq !== pendingProjectSelectSeq || activeProject?.id !== removedId) return;
+        await deleteProject(removedId);
+        projects = await listProjects();
+        if (selectSeq !== pendingProjectSelectSeq) return;
+        if (projects.length > 0) {
+          await switchProject(projects[0].id);
+        }
+      } catch (error) {
+        explorer.setAutosaveStatus(
+          error instanceof Error ? error.message : "No se pudo eliminar el espacio"
+        );
+      }
     },
     async onImportFiles(importedList) {
+      const sourceProjectId = activeProject?.id;
       await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return;
       let lastPath = null;
       let importedCount = 0;
+      let importError = null;
       try {
         for (const item of importedList) {
-          await upsertEntry(activeProject.id, item.path, {
+          if (activeProject?.id !== sourceProjectId) return;
+          await upsertEntry(sourceProjectId, item.path, {
             isFolder: false,
             content: item.content,
             isBinary: Boolean(item.isBinary),
             base64: item.base64 || null
           });
           editor.dropFileState(item.path);
+          splitController?.dropFileState(item.path);
           lastPath = item.path;
           importedCount += 1;
         }
       } catch (error) {
-        explorer.setAutosaveStatus(
-          error instanceof Error ? error.message : "No se pudo importar el archivo"
-        );
+        importError = error;
       }
+      if (activeProject?.id !== sourceProjectId) return;
       await reloadProjectEntries();
+      if (activeProject?.id !== sourceProjectId) return;
       if (lastPath) {
         await openOrFocusFile(lastPath);
-        if (importedCount > 0) {
-          explorer.setAutosaveStatus(
-            importedCount === 1 ? "Archivo importado" : `${importedCount} archivos importados`
-          );
-        }
       } else {
         renderWorkspaceView();
+      }
+      if (activeProject?.id !== sourceProjectId) return;
+      if (importError) {
+        const errMsg = importError instanceof Error ? importError.message : "No se pudo importar el archivo";
+        explorer.setAutosaveStatus(
+          importedCount > 0
+            ? `Importación parcial (${importedCount}/${importedList.length}): ${errMsg}`
+            : errMsg
+        );
+      } else if (importedCount > 0) {
+        explorer.setAutosaveStatus(
+          importedCount === 1 ? "Archivo importado" : `${importedCount} archivos importados`
+        );
       }
       await github.refreshTopbarBadge();
     },
     async onDuplicateEntry(sourcePath) {
+      const sourceProjectId = activeProject?.id;
       await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return;
       const source = filesOnly.find((f) => f.id === sourcePath);
       if (!source) return;
 
       try {
         await githubLazySync.ensureFileContentLoaded(source);
       } catch (error) {
-        explorer.setAutosaveStatus(
-          error instanceof Error ? error.message : "No se pudo leer el archivo a duplicar"
-        );
+        if (activeProject?.id === sourceProjectId) {
+          explorer.setAutosaveStatus(
+            error instanceof Error ? error.message : "No se pudo leer el archivo a duplicar"
+          );
+        }
         return;
       }
+      if (activeProject?.id !== sourceProjectId) return;
 
       const existingPaths = new Set(filesOnly.map((f) => f.path));
       const newPath = generateDuplicatePath(source.path, existingPaths);
 
-      await upsertEntry(activeProject.id, newPath, {
+      await upsertEntry(sourceProjectId, newPath, {
         isFolder: false,
         content: source.content,
         isBinary: Boolean(source.isBinary),
         base64: source.base64 || null,
         allowOverwrite: false
       });
+      if (activeProject?.id !== sourceProjectId) return;
       await reloadProjectEntries();
+      if (activeProject?.id !== sourceProjectId) return;
       await openOrFocusFile(newPath);
+      if (activeProject?.id !== sourceProjectId) return;
       explorer.setAutosaveStatus(`Archivo duplicado como "${newPath.split("/").pop()}"`);
       await github.refreshTopbarBadge();
     },
     onDownloadFile: downloadSingleFile,
     onDownloadActiveFile: downloadCurrentActiveFile,
     async onExportProjectZip() {
+      const sourceProjectId = activeProject?.id;
       await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return;
       if (!filesOnly || filesOnly.length === 0) {
         explorer.setAutosaveStatus("No hay archivos para exportar");
         return;
@@ -792,12 +910,15 @@ async function initApp() {
       if (unloaded.length > 0) {
         try {
           await githubLazySync.ensureFilesLoaded(unloaded, (done, total) => {
-            explorer.setAutosaveStatus(`Descargando archivos para el ZIP (${done}/${total})…`);
+            if (activeProject?.id === sourceProjectId) {
+              explorer.setAutosaveStatus(`Descargando archivos para el ZIP (${done}/${total})…`);
+            }
           });
         } catch {
           // Continuar si falla la red
         }
       }
+      if (activeProject?.id !== sourceProjectId) return;
 
       try {
         const zipFiles = filesOnly.map((f) => {
@@ -812,9 +933,9 @@ async function initApp() {
             content: f.content || ""
           };
         });
-        const zipBytes = buildZipArchive(zipFiles);
+        const zipBlob = buildZipBlob(zipFiles);
         const projectName = (activeProject?.name || "proyecto").replace(/[/\\?%*:|"<>]/g, "-");
-        downloadZip(zipBytes, `${projectName}.zip`);
+        downloadZip(zipBlob, `${projectName}.zip`);
         explorer.setAutosaveStatus(`Proyecto exportado como "${projectName}.zip"`);
       } catch (err) {
         explorer.setAutosaveStatus(
@@ -823,14 +944,18 @@ async function initApp() {
       }
     },
     async onSaveRepoOffline() {
+      const sourceProjectId = activeProject?.id;
       if (activeProject.kind !== "github" || !activeProject.github) return;
       await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return;
 
       const pending = filesOnly.filter((f) => f.contentLoaded === false && f.blobSha);
       if (pending.length === 0) {
-        await markProjectOfflineCached(activeProject.id, true);
+        await markProjectOfflineCached(sourceProjectId, true);
+        if (activeProject?.id !== sourceProjectId) return;
         activeProject.offlineCached = true;
         projects = await listProjects();
+        if (activeProject?.id !== sourceProjectId) return;
         explorer.renderProjects(projects, activeProject.id);
         githubLazySync.syncOfflineButtonState();
         explorer.setAutosaveStatus("Copia offline completa en el iPad");
@@ -845,25 +970,34 @@ async function initApp() {
       });
       explorer.setAutosaveStatus(`Guardando copia offline (0/${pending.length})…`);
 
-      const sourceProjectId = activeProject.id;
       try {
         await githubLazySync.ensureFilesLoaded(pending, (done, total) => {
-          explorer.setAutosaveStatus(`Guardando copia offline (${done}/${total})…`);
+          if (activeProject?.id === sourceProjectId) {
+            explorer.setAutosaveStatus(`Guardando copia offline (${done}/${total})…`);
+          }
         });
         if (activeProject.id !== sourceProjectId) {
           return;
         }
-        await markProjectOfflineCached(activeProject.id, true);
+        await markProjectOfflineCached(sourceProjectId, true);
+        if (activeProject.id !== sourceProjectId) {
+          return;
+        }
         activeProject.offlineCached = true;
         projects = await listProjects();
+        if (activeProject.id !== sourceProjectId) {
+          return;
+        }
         explorer.renderProjects(projects, activeProject.id);
         githubLazySync.syncOfflineButtonState();
         explorer.setAutosaveStatus("Copia offline guardada en el iPad");
       } catch (error) {
-        githubLazySync.syncOfflineButtonState();
-        explorer.setAutosaveStatus(
-          error instanceof Error ? error.message : "No se pudo completar la copia offline"
-        );
+        if (activeProject?.id === sourceProjectId) {
+          githubLazySync.syncOfflineButtonState();
+          explorer.setAutosaveStatus(
+            error instanceof Error ? error.message : "No se pudo completar la copia offline"
+          );
+        }
       }
     },
     async onCloudBackupProject() {
@@ -876,28 +1010,35 @@ async function initApp() {
         }
         return;
       }
+      const sourceProject = activeProject;
+      if (!sourceProject) return;
+      const sourceProjectId = sourceProject.id;
       try {
         explorer.setAutosaveStatus("Respaldando en Gist privado…");
         await autosaveManager.flushPendingSaves();
-        const projectEntries = await getProjectEntries(activeProject.id);
+        const projectEntries = await getProjectEntries(sourceProjectId);
         const res = await saveProjectToGist(token, {
-          projectName: activeProject.name,
+          projectName: sourceProject.name,
           entries: projectEntries,
-          existingGistId: activeProject.gistId || null
+          existingGistId: sourceProject.gistId || null
         });
-        activeProject.gistId = res.id;
-        await saveProjectState(activeProject);
-        explorer.setAutosaveStatus(`¡Respaldado en Gist! (${res.id.slice(0, 6)})`);
+        sourceProject.gistId = res.id;
+        await saveProjectGistId(sourceProjectId, res.id);
+        if (activeProject?.id === sourceProjectId) {
+          explorer.setAutosaveStatus(`¡Respaldado en Gist! (${res.id.slice(0, 6)})`);
+        }
       } catch (err) {
-        const msg = err?.message || "al respaldar en Gist";
-        if (
-          msg.includes("Resource not accessible") ||
-          msg.includes("permiso para Gists") ||
-          msg.includes("token no tiene permiso")
-        ) {
-          explorer.setAutosaveStatus("Error: el token necesita permiso 'Gists: Read and write'");
-        } else {
-          explorer.setAutosaveStatus(`Error: ${msg}`);
+        if (activeProject?.id === sourceProjectId) {
+          const msg = err?.message || "al respaldar en Gist";
+          if (
+            msg.includes("Resource not accessible") ||
+            msg.includes("permiso para Gists") ||
+            msg.includes("token no tiene permiso")
+          ) {
+            explorer.setAutosaveStatus("Error: el token necesita permiso 'Gists: Read and write'");
+          } else {
+            explorer.setAutosaveStatus(`Error: ${msg}`);
+          }
         }
       }
     }
@@ -1021,9 +1162,12 @@ async function initApp() {
       return true;
     },
     async onApplyWholeFile(code, lang, contextHint = null) {
+      const sourceProjectId = activeProject?.id;
       await ensureAnOpenFile(lang);
+      if (activeProject?.id !== sourceProjectId) return;
       const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
-      if (!activeFile) return;
+      if (!activeFile || isBinaryFile(activeFile) || activeFile.contentLoaded === false) return;
+      const targetFileId = activeFile.id;
       const smart = computeSmartReplacement(activeFile.content ?? "", code, {
         cursorLine: activeSelection?.cursorLine || 1,
         selectionFrom: 0,
@@ -1035,6 +1179,7 @@ async function initApp() {
         oldCode: activeFile.content,
         newCode: smart.text,
         onConfirm() {
+          if (activeProject?.id !== sourceProjectId || activeFileId !== targetFileId) return;
           editor.replaceEntireDocument(smart.text);
           layout.closeRightOnCompactAction();
         }
@@ -1049,31 +1194,56 @@ async function initApp() {
         return false;
       }
       if (!norm) return false;
+      const sourceProjectId = activeProject?.id;
+      await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return false;
       let targetFile = filesOnly.find((f) => normalizePath(f.path) === norm);
       if (!targetFile) {
-        await upsertEntry(activeProject.id, norm, {
+        await upsertEntry(sourceProjectId, norm, {
           content: code,
           isFolder: false,
           allowOverwrite: true
         });
+        if (activeProject?.id !== sourceProjectId) return false;
         await reloadProjectEntries();
+        if (activeProject?.id !== sourceProjectId) return false;
         targetFile = filesOnly.find((f) => normalizePath(f.path) === norm);
         if (targetFile) {
           await openOrFocusFile(targetFile.id);
         }
       } else {
+        if (isBinaryFile(targetFile)) return false;
+        autosaveManager.clearTimersForProject(sourceProjectId, (p) => normalizePath(p) === norm);
         await openOrFocusFile(targetFile.id);
-        editor.replaceEntireDocument(code);
-        targetFile.content = code;
-        autosaveManager.scheduleAutosave(activeProject.id, targetFile.id, code);
-        tabManager.renderTabs();
+        if (activeProject?.id !== sourceProjectId) return false;
+        const freshTarget = filesOnly.find((f) => f.id === targetFile.id);
+        if (!freshTarget || isBinaryFile(freshTarget)) return false;
+        if (activeFileId === freshTarget.id && freshTarget.contentLoaded !== false) {
+          editor.replaceEntireDocument(code);
+          splitController?.replaceIfActive(freshTarget.id, code);
+          freshTarget.content = code;
+          autosaveManager.scheduleAutosave(sourceProjectId, freshTarget.id, code);
+          tabManager.renderTabs();
+        } else {
+          freshTarget.content = code;
+          freshTarget.contentLoaded = true;
+          await updateFileContent(sourceProjectId, freshTarget.path, code);
+          if (activeProject?.id !== sourceProjectId) return false;
+          editor.dropFileState(freshTarget.id);
+          splitController?.replaceIfActive(freshTarget.id, code);
+          tabManager.renderTabs();
+        }
       }
       return true;
     },
     async onApplyMultiFile(filesToApply) {
       if (!Array.isArray(filesToApply) || filesToApply.length === 0) return false;
+      const sourceProjectId = activeProject?.id;
+      await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return false;
       let firstValidNorm = null;
       for (const item of filesToApply) {
+        if (activeProject?.id !== sourceProjectId) return false;
         const rawPath = String(item?.path || "").trim().replace(/^(?:\.\/)+/, "");
         let norm;
         try {
@@ -1082,11 +1252,17 @@ async function initApp() {
           continue;
         }
         if (!norm) continue;
-        if (!firstValidNorm) firstValidNorm = norm;
         const existing = filesOnly.find((f) => normalizePath(f.path) === norm);
+        if (existing && isBinaryFile(existing)) {
+          continue;
+        }
+        if (!firstValidNorm) firstValidNorm = norm;
+        autosaveManager.clearTimersForProject(sourceProjectId, (p) => normalizePath(p) === norm);
         if (existing) {
           existing.content = item.code;
-          await updateFileContent(activeProject.id, norm, item.code);
+          existing.contentLoaded = true;
+          await updateFileContent(sourceProjectId, norm, item.code);
+          if (activeProject?.id !== sourceProjectId) return false;
           if (activeFileId === existing.id) {
             editor.replaceEntireDocument(item.code);
           } else {
@@ -1094,19 +1270,23 @@ async function initApp() {
           }
           splitController?.replaceIfActive(existing.id, item.code);
         } else {
-          await upsertEntry(activeProject.id, norm, {
+          await upsertEntry(sourceProjectId, norm, {
             content: item.code,
             isFolder: false,
             allowOverwrite: true
           });
+          if (activeProject?.id !== sourceProjectId) return false;
         }
       }
+      if (activeProject?.id !== sourceProjectId) return false;
       await reloadProjectEntries();
+      if (activeProject?.id !== sourceProjectId) return false;
       if (!firstValidNorm) return false;
       const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
       if (firstTarget) {
         await openOrFocusFile(firstTarget.id);
       }
+      if (activeProject?.id !== sourceProjectId) return false;
       tabManager.renderTabs();
       return true;
     },
@@ -1271,9 +1451,15 @@ async function initApp() {
     statusBar.syncZoomReadout(editor.stepFontSize(1));
   }, appListenOpts);
 
+  let switchProjectSeq = 0;
+
   async function switchProject(projectId) {
+    const seq = ++switchProjectSeq;
     const nextProj = await getProject(projectId);
-    if (!nextProj) return;
+    if (!nextProj || seq !== switchProjectSeq) return;
+
+    const nextProjects = await listProjects();
+    if (seq !== switchProjectSeq) return;
 
     for (const f of filesOnly) {
       editor.dropFileState(f.id);
@@ -1281,10 +1467,11 @@ async function initApp() {
     }
 
     activeProject = nextProj;
+    projects = nextProjects;
     setSavedActiveProjectId(activeProject.id);
-    projects = await listProjects();
 
     await reloadProjectEntries();
+    if (seq !== switchProjectSeq) return;
 
     const validPaths = new Set(filesOnly.map((f) => f.id));
     openTabIds = (activeProject.openTabIds || []).filter((id) => validPaths.has(id));
@@ -1306,9 +1493,11 @@ async function initApp() {
         try {
           await githubLazySync.ensureFileContentLoaded(activeTarget);
         } catch {
+          if (seq !== switchProjectSeq) return;
           openTabIds = openTabIds.filter((id) => id !== activeFileId);
           activeFileId = openTabIds[0] || null;
         }
+        if (seq !== switchProjectSeq) return;
       }
     }
 
@@ -1329,6 +1518,10 @@ async function initApp() {
       .map((e) => {
         const meta = inferFileMeta(e.path);
         const shortName = e.path.split("/").pop() || e.path;
+        const resolvedBase64 = e.base64 || (e.isBinary && typeof e.content === "string" ? e.content : null);
+        const resolvedBaseBase64 = Object.prototype.hasOwnProperty.call(e, "baseBase64")
+          ? (e.baseBase64 ?? null)
+          : (e.trackedInGithub && e.isBinary ? resolvedBase64 : null);
         return {
           id: e.path,
           path: e.path,
@@ -1344,7 +1537,8 @@ async function initApp() {
           trackedInGithub: Boolean(e.trackedInGithub),
           forceModified: Boolean(e.forceModified),
           isBinary: Boolean(e.isBinary),
-          base64: e.base64 || (e.isBinary && typeof e.content === "string" ? e.content : null)
+          base64: resolvedBase64,
+          baseBase64: resolvedBaseBase64
         };
       });
   }
@@ -1415,18 +1609,24 @@ async function initApp() {
   }
 
   async function closeTab(filePath) {
-    const idx = openTabIds.indexOf(filePath);
-    if (idx === -1) return;
+    const sourceProjectId = activeProject?.id;
+    const initialIdx = openTabIds.indexOf(filePath);
+    if (initialIdx === -1) return;
 
-    await autosaveManager.flushFile(activeProject.id, filePath);
+    await autosaveManager.flushFile(sourceProjectId, filePath);
+    if (activeProject?.id !== sourceProjectId) return;
 
-    openTabIds.splice(idx, 1);
+    const currentIdx = openTabIds.indexOf(filePath);
+    if (currentIdx === -1) return;
+
+    openTabIds.splice(currentIdx, 1);
     editor.dropFileState(filePath);
     splitController?.dropFileState(filePath);
     if (activeFileId === filePath) {
-      activeFileId = openTabIds.length > 0 ? openTabIds[Math.min(idx, openTabIds.length - 1)] : null;
+      activeFileId = openTabIds.length > 0 ? openTabIds[Math.min(currentIdx, openTabIds.length - 1)] : null;
     }
     await tabManager.persistTabsState();
+    if (activeProject?.id !== sourceProjectId) return;
     renderWorkspaceView();
   }
 
@@ -1441,6 +1641,7 @@ async function initApp() {
     if (activeFile) {
       if (emptyStateEl) emptyStateEl.hidden = true;
       if (isBinaryFile(activeFile)) {
+        editor.clearActiveFile();
         if (editorMountEl) editorMountEl.hidden = true;
         binaryPreview.render(activeFile);
         symbolBar.setLanguage(activeFile.lang);
@@ -1471,10 +1672,13 @@ async function initApp() {
       return false;
     }
     if (activeProject.kind === "github") {
+      const contentModified = isBinaryFile(file)
+        ? (file.base64 ?? null) !== (file.baseBase64 ?? null) || file.content !== file.baseContent
+        : file.content !== file.baseContent;
       return (
         Boolean(file.forceModified) ||
         !file.trackedInGithub ||
-        file.content !== file.baseContent
+        contentModified
       );
     }
     return false;
@@ -1494,6 +1698,7 @@ async function initApp() {
     destroy() {
       appListeners?.abort();
       broadcastSync?.destroy?.();
+      closeWorkspaceBroadcast();
       autosaveManager?.destroy?.();
       statusBar?.destroy?.();
       splitController?.destroy?.();
@@ -1552,19 +1757,25 @@ function registerPwaServiceWorker() {
     new URLSearchParams(window.location.search).get("sw") === "1";
 
   if (isLocalDev && !allowLocalSw) {
-    navigator.serviceWorker.getRegistrations().then((regs) => {
-      for (const reg of regs) {
-        reg.unregister();
-      }
-    });
-    if ("caches" in window) {
-      caches.keys().then((keys) => {
-        for (const k of keys) {
-          if (k.startsWith("studio-ide-shell-")) {
-            caches.delete(k);
-          }
+    navigator.serviceWorker
+      .getRegistrations()
+      .then((regs) => {
+        for (const reg of regs) {
+          reg.unregister().catch(() => {});
         }
-      });
+      })
+      .catch(() => {});
+    if ("caches" in window) {
+      caches
+        .keys()
+        .then((keys) => {
+          for (const k of keys) {
+            if (k.startsWith("studio-ide-shell-")) {
+              caches.delete(k).catch(() => {});
+            }
+          }
+        })
+        .catch(() => {});
     }
     return;
   }
@@ -1664,5 +1875,14 @@ export async function cacheAndSyncGithubFile({
 }
 
 if (typeof document !== "undefined") {
-  document.addEventListener("DOMContentLoaded", initApp);
+  const startApp = () => {
+    void initApp().catch((err) => {
+      console.error("[Studio IDE] Error fatal al inicializar:", err);
+    });
+  };
+  if (document.readyState === "interactive" || document.readyState === "complete") {
+    startApp();
+  } else if (typeof document.addEventListener === "function") {
+    document.addEventListener("DOMContentLoaded", startApp, { once: true });
+  }
 }

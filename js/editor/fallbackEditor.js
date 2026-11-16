@@ -244,13 +244,76 @@ export function createFallbackEditor({
     errorMarkers.syncRuler(activeFileId, Math.max(1, getFallbackLines().length));
   }
 
+  function clearErrorMarkers() {
+    errorMarkers.clearFile(activeFileId);
+    syncFallbackErrorRuler();
+  }
+
+  function setHardwareKeyboardMode(nextState) {
+    hardwareKeyboard = Boolean(nextState);
+    saveStoredValue(prefKeys.hardwareKeyboard, String(hardwareKeyboard));
+    applyHardwareKeyboardAttributes(hardwareKeyboard, textarea, !isSplitInstance);
+    return hardwareKeyboard;
+  }
+
+  function replaceSelection(text, contextHint = null) {
+    const start = textarea.selectionStart ?? 0;
+    const end = textarea.selectionEnd ?? 0;
+    if (start < end) {
+      insertInTextarea(text, 0);
+      return;
+    }
+    const before = textarea.value.slice(0, end);
+    const lastNl = before.lastIndexOf("\n");
+    const cursorLine = lastNl === -1 ? 1 : before.split("\n").length;
+    const smart = computeSmartReplacement(textarea.value, text, {
+      cursorLine,
+      selectionFrom: start,
+      selectionTo: end,
+      contextHint
+    });
+    if (smart.mode === "full") {
+      textarea.value = smart.insertedText;
+      textarea.setSelectionRange(0, 0);
+    } else {
+      textarea.value = smart.text;
+      textarea.setSelectionRange(smart.from, smart.from + smart.insertedText.length);
+    }
+    if (activeFileId) onDocChange(activeFileId, textarea.value);
+    fallbackMinimap?.render();
+    emitSel();
+  }
+
+  function replaceEntireDocument(text, { preserveCursorLine = false } = {}) {
+    let prevLine = 1;
+    if (preserveCursorLine) {
+      const head = textarea.selectionStart || 0;
+      prevLine = textarea.value.slice(0, head).split("\n").length;
+    }
+    textarea.value = text;
+    let nextOffset = 0;
+    if (preserveCursorLine && prevLine > 1) {
+      const lines = getFallbackLines();
+      const clamped = Math.max(1, Math.min(prevLine, lines.length));
+      for (let i = 0; i < clamped - 1; i += 1) {
+        nextOffset += lines[i].length + 1;
+      }
+    }
+    textarea.setSelectionRange(nextOffset, nextOffset);
+    if (activeFileId) {
+      onDocChange?.(activeFileId, text);
+    }
+    fallbackMinimap?.render();
+    emitSel();
+  }
+
   return {
     openFile(file) {
       if (!file || file.isBinary || file.encoding === "base64") {
         return;
       }
       activeFileId = file.id;
-      activeLang = file.lang;
+      activeLang = file.lang || inferFileMeta(file.id).lang || "js";
       if (mountEl && !mountEl.contains(textarea)) {
         mountEl.appendChild(textarea);
       }
@@ -265,7 +328,9 @@ export function createFallbackEditor({
       activeFileId = null;
       textarea.value = "";
       fallbackAutocompleteBar.hide();
-      this.clearErrorMarkers();
+      clearErrorMarkers();
+      fallbackMinimap?.render();
+      fallbackMinimap?.updateSlider();
       onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     },
     dropFileState(fileId) {
@@ -273,14 +338,20 @@ export function createFallbackEditor({
       if (activeFileId === fileId) {
         activeFileId = null;
         textarea.value = "";
-        this.clearErrorMarkers();
+        fallbackAutocompleteBar.hide();
+        clearErrorMarkers();
+        fallbackMinimap?.render();
+        fallbackMinimap?.updateSlider();
         onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
       }
     },
     purgeViewDocument() {
+      fallbackAutocompleteBar.hide();
       textarea.value = "";
       cachedLineText = null;
       cachedLines = [];
+      fallbackMinimap?.render();
+      fallbackMinimap?.updateSlider();
     },
     renameFileStates(oldPath, newPath, isFolder) {
       errorMarkers.renamePaths(oldPath, newPath, isFolder);
@@ -295,58 +366,13 @@ export function createFallbackEditor({
       activeLang = inferFileMeta(activeFileId).lang;
     },
     insertAtCursor: insertInTextarea,
-    replaceSelection(text, contextHint = null) {
-      const start = textarea.selectionStart ?? 0;
-      const end = textarea.selectionEnd ?? 0;
-      if (start < end) {
-        insertInTextarea(text, 0);
-        return;
-      }
-      const before = textarea.value.slice(0, end);
-      const lastNl = before.lastIndexOf("\n");
-      const cursorLine = lastNl === -1 ? 1 : before.split("\n").length;
-      const smart = computeSmartReplacement(textarea.value, text, {
-        cursorLine,
-        selectionFrom: start,
-        selectionTo: end,
-        contextHint
-      });
-      if (smart.mode === "full") {
-        textarea.value = smart.insertedText;
-        textarea.setSelectionRange(0, 0);
-      } else {
-        textarea.value = smart.text;
-        textarea.setSelectionRange(smart.from, smart.from + smart.insertedText.length);
-      }
-      if (activeFileId) onDocChange(activeFileId, textarea.value);
-      emitSel();
-    },
-    replaceEntireDocument(text, { preserveCursorLine = false } = {}) {
-      let prevLine = 1;
-      if (preserveCursorLine) {
-        const head = textarea.selectionStart || 0;
-        prevLine = textarea.value.slice(0, head).split("\n").length;
-      }
-      textarea.value = text;
-      let nextOffset = 0;
-      if (preserveCursorLine && prevLine > 1) {
-        const lines = getFallbackLines();
-        const clamped = Math.max(1, Math.min(prevLine, lines.length));
-        for (let i = 0; i < clamped - 1; i += 1) {
-          nextOffset += lines[i].length + 1;
-        }
-      }
-      textarea.setSelectionRange(nextOffset, nextOffset);
-      if (activeFileId) {
-        onDocChange?.(activeFileId, text);
-      }
-      emitSel();
-    },
+    replaceSelection,
+    replaceEntireDocument,
     replaceCode(text, forceWholeDoc = false, contextHint = null) {
       if (forceWholeDoc) {
-        this.replaceEntireDocument(text);
+        replaceEntireDocument(text);
       } else {
-        this.replaceSelection(text, contextHint);
+        replaceSelection(text, contextHint);
       }
     },
     addErrorMarker(lineNum, errorMessage) {
@@ -360,10 +386,7 @@ export function createFallbackEditor({
       textarea.setSelectionRange(offset, offset);
       syncFallbackErrorRuler();
     },
-    clearErrorMarkers() {
-      errorMarkers.clearFile(activeFileId);
-      syncFallbackErrorRuler();
-    },
+    clearErrorMarkers,
     getErrorMarkers() {
       return errorMarkers.getMarkers(activeFileId);
     },
@@ -395,14 +418,9 @@ export function createFallbackEditor({
     getFontSize: () => fontSize,
     toggleMinimap: (force) => fallbackMinimap?.toggle(force),
     isMinimapVisible: () => (fallbackMinimap ? fallbackMinimap.isVisible() : false),
-    setHardwareKeyboardMode(nextState) {
-      hardwareKeyboard = Boolean(nextState);
-      saveStoredValue(prefKeys.hardwareKeyboard, String(hardwareKeyboard));
-      applyHardwareKeyboardAttributes(hardwareKeyboard, textarea);
-      return hardwareKeyboard;
-    },
+    setHardwareKeyboardMode,
     toggleHardwareKeyboardMode() {
-      return this.setHardwareKeyboardMode(!hardwareKeyboard);
+      return setHardwareKeyboardMode(!hardwareKeyboard);
     },
     isHardwareKeyboardMode: () => hardwareKeyboard,
     getActiveFileId: () => activeFileId,

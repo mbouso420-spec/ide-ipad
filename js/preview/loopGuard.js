@@ -47,10 +47,14 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
   /** @type {Array<{ line: number, body: any }>} */
   const loopsList = [];
   let hasShadowRisk = Boolean(module);
+  let hasGlobalThisShadow = false;
   const visit = (node) => {
     if (!node || typeof node.type !== "string") return;
-    if (node.type === "WithStatement" || (node.type === "Identifier" && node.name === "__studioLoopGuard")) {
+    if (node.type === "WithStatement") {
       hasShadowRisk = true;
+    } else if (node.type === "Identifier") {
+      if (node.name === "__studioLoopGuard") hasShadowRisk = true;
+      if (node.name === "globalThis") hasGlobalThisShadow = true;
     }
     if (LOOP_TYPES.has(node.type) && node.body) {
       loopsList.push({
@@ -74,7 +78,9 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
     return { code: source, loops: 0, instrumented: false };
   }
 
-  const guardCallee = hasShadowRisk ? "globalThis.__studioLoopGuard" : "__studioLoopGuard";
+  const guardCallee = hasGlobalThisShadow
+    ? (module ? "self.__studioLoopGuard" : "__studioLoopGuard")
+    : (hasShadowRisk ? "globalThis.__studioLoopGuard" : "__studioLoopGuard");
   /** @type {Array<{ pos: number, text: string }>} */
   const edits = [];
   for (const item of loopsList) {
@@ -127,9 +133,14 @@ export function buildLoopGuardRuntime(limitMs = LOOP_GUARD_LIMIT_MS) {
     lastFree = _now();
     tripped = false;
   }, 100) : null;
+  var isGuardTimerId = function (id) {
+    if (guardTimerId === null || guardTimerId === undefined) return false;
+    if (id === guardTimerId) return true;
+    return (typeof id === "number" || typeof id === "string") && id !== "" && Number(id) === Number(guardTimerId);
+  };
   if (_clearInterval) {
     var safeClearInterval = function (id) {
-      if (guardTimerId !== null && guardTimerId !== undefined && id === guardTimerId) return;
+      if (isGuardTimerId(id)) return;
       return _clearInterval(id);
     };
     try { window.clearInterval = safeClearInterval; } catch (_) {}
@@ -139,7 +150,7 @@ export function buildLoopGuardRuntime(limitMs = LOOP_GUARD_LIMIT_MS) {
   }
   if (_clearTimeout) {
     var safeClearTimeout = function (id) {
-      if (guardTimerId !== null && guardTimerId !== undefined && id === guardTimerId) return;
+      if (isGuardTimerId(id)) return;
       return _clearTimeout(id);
     };
     try { window.clearTimeout = safeClearTimeout; } catch (_) {}

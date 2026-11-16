@@ -73,20 +73,43 @@ function getAllStorageKeys(storage) {
   }
 }
 
+function getDefaultStorage() {
+  try {
+    return typeof window !== "undefined" ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function doesBackupKeyBelongToProject(storage, key, projectId) {
+  if (!key || !projectId) return false;
+  if (key === getEmergencyBackupKey(projectId)) return true;
+  if (!key.startsWith(`${EMERGENCY_BACKUP_PREFIX}${projectId}_`)) return false;
+  const payload = parseBackupPayload(storage.getItem(key));
+  if (payload.projectId) {
+    return payload.projectId === projectId;
+  }
+  return payload.items.some((it) => it.projectId === projectId);
+}
+
 function parseBackupPayload(raw) {
-  if (!raw) return { savedAt: 0, items: [] };
+  if (!raw) return { savedAt: 0, projectId: null, items: [] };
   try {
     const parsed = JSON.parse(raw);
-    const savedAt = typeof parsed?.savedAt === "number" ? parsed.savedAt : 0;
+    const savedAt = typeof parsed?.savedAt === "number" && Number.isFinite(parsed.savedAt) && parsed.savedAt > 0
+      ? parsed.savedAt
+      : 0;
+    const projectId = typeof parsed?.projectId === "string" && parsed.projectId ? parsed.projectId : null;
     const items = Array.isArray(parsed?.items) ? parsed.items : [];
     return {
       savedAt,
+      projectId,
       items: items.filter(
         (it) => it && typeof it.projectId === "string" && typeof it.filePath === "string" && typeof it.content === "string"
       )
     };
   } catch {
-    return { savedAt: 0, items: [] };
+    return { savedAt: 0, projectId: null, items: [] };
   }
 }
 
@@ -103,7 +126,10 @@ const MAX_EMERGENCY_BACKUP_CHARS = 2 * 1024 * 1024;
  * @param {string|null} [instanceId]
  * @returns {boolean} true si quedó escrito
  */
-export function writeEmergencyBackup(items, storage = window.localStorage, projectId = null, instanceId = null) {
+export function writeEmergencyBackup(items, storage = getDefaultStorage(), projectId = null, instanceId = null) {
+  if (!storage || typeof storage.getItem !== "function" || typeof storage.setItem !== "function") {
+    return false;
+  }
   const clean = (Array.isArray(items) ? items : []).filter(
     (it) => it && typeof it.projectId === "string" && typeof it.filePath === "string" && typeof it.content === "string"
   );
@@ -165,7 +191,8 @@ export function writeEmergencyBackup(items, storage = window.localStorage, proje
  * @param {string|null} [instanceId]
  * @returns {Array<{ projectId: string, filePath: string, content: string }>}
  */
-export function readEmergencyBackup(storage = window.localStorage, projectId = null, instanceId = null) {
+export function readEmergencyBackup(storage = getDefaultStorage(), projectId = null, instanceId = null) {
+  if (!storage || typeof storage.getItem !== "function") return [];
   const dedupByKey = new Map();
   const collect = (raw, filterPid = null) => {
     const payload = parseBackupPayload(raw);
@@ -181,9 +208,9 @@ export function readEmergencyBackup(storage = window.localStorage, projectId = n
 
   if (projectId && instanceId) {
     const targetKey = getEmergencyBackupKey(projectId, instanceId);
-    collect(storage.getItem(targetKey));
+    collect(storage.getItem(targetKey), projectId);
     if (dedupByKey.size === 0) {
-      collect(storage.getItem(getEmergencyBackupKey(projectId)));
+      collect(storage.getItem(getEmergencyBackupKey(projectId)), projectId);
     }
     if (dedupByKey.size === 0) {
       collect(storage.getItem(EMERGENCY_BACKUP_KEY), projectId);
@@ -192,13 +219,12 @@ export function readEmergencyBackup(storage = window.localStorage, projectId = n
   }
 
   if (projectId && !instanceId) {
-    collect(storage.getItem(getEmergencyBackupKey(projectId)));
+    collect(storage.getItem(getEmergencyBackupKey(projectId)), projectId);
 
-    const prefix = `${EMERGENCY_BACKUP_PREFIX}${projectId}_`;
     const keys = getAllStorageKeys(storage);
     for (const k of keys) {
-      if (k && k.startsWith(prefix)) {
-        collect(storage.getItem(k));
+      if (doesBackupKeyBelongToProject(storage, k, projectId)) {
+        collect(storage.getItem(k), projectId);
       }
     }
 
@@ -229,7 +255,8 @@ export function readEmergencyBackup(storage = window.localStorage, projectId = n
  * @param {string|null} [projectId]
  * @param {string|null} [instanceId]
  */
-export function clearEmergencyBackup(storage = window.localStorage, projectId = null, instanceId = null) {
+export function clearEmergencyBackup(storage = getDefaultStorage(), projectId = null, instanceId = null) {
+  if (!storage || typeof storage.removeItem !== "function") return;
   try {
     if (projectId && instanceId) {
       storage.removeItem(getEmergencyBackupKey(projectId, instanceId));
@@ -237,10 +264,9 @@ export function clearEmergencyBackup(storage = window.localStorage, projectId = 
     }
     if (projectId && !instanceId) {
       storage.removeItem(getEmergencyBackupKey(projectId));
-      const prefix = `${EMERGENCY_BACKUP_PREFIX}${projectId}_`;
       const keys = getAllStorageKeys(storage);
       for (const k of keys) {
-        if (k && k.startsWith(prefix)) {
+        if (doesBackupKeyBelongToProject(storage, k, projectId)) {
           storage.removeItem(k);
         }
       }
@@ -306,11 +332,18 @@ function hasRecordReader(db) {
   );
 }
 
-async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache) {
+async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache, filterProjectId = null) {
   let restored = 0;
   const canReadRecord = hasRecordReader(db);
-  if (snap.items.length > 0) {
-    for (const item of snap.items) {
+  if (!db || typeof db.updateFileContent !== "function" || (!canReadRecord && typeof db.entryExists !== "function")) {
+    return 0;
+  }
+  const itemsToApply = filterProjectId
+    ? snap.items.filter((it) => it.projectId === filterProjectId)
+    : snap.items;
+
+  if (itemsToApply.length > 0) {
+    for (const item of itemsToApply) {
       if (canReadRecord) {
         // Una única lectura por snapshot/archivo: evita duplicar viajes a IndexedDB (entryExists + getEntryRecord).
         const record = await readInitialDbRecord(
@@ -320,38 +353,54 @@ async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEn
           recordCache,
           projectEntriesCache
         );
-        if (!record || record.deleted || record.isFolder) {
+        if (!record || record.deleted || record.isFolder || record.isBinary || record.encoding === "base64") {
           continue;
         }
         if (
           snap.savedAt > 0 &&
           typeof record.updatedAt === "number" &&
+          Number.isFinite(record.updatedAt) &&
           snap.savedAt < record.updatedAt
         ) {
           continue;
         }
-      } else if (typeof db.entryExists === "function") {
+      } else {
         if (!(await db.entryExists(item.projectId, item.filePath))) {
           continue;
         }
-      } else {
-        continue;
       }
 
       const updated = await db.updateFileContent(item.projectId, item.filePath, item.content);
-      if (updated === null || (updated && (updated.deleted || updated.isFolder))) {
+      if (updated === null || (updated && (updated.deleted || updated.isFolder || updated.isBinary || updated.encoding === "base64"))) {
         continue;
       }
       restored += 1;
     }
   }
 
-  // Solo eliminar la clave si no fue modificada concurrentemente mientras corrían los await.
+  // Solo eliminar o actualizar la clave si no fue modificada concurrentemente mientras corrían los await.
   try {
     if (storage.getItem(snap.key) === snap.raw) {
-      storage.removeItem(snap.key);
+      const remainingItems = filterProjectId
+        ? snap.items.filter((it) => it.projectId !== filterProjectId)
+        : [];
+      if (remainingItems.length > 0) {
+        storage.setItem(
+          snap.key,
+          JSON.stringify({
+            savedAt: snap.savedAt || Date.now(),
+            projectId: snap.projectId || null,
+            instanceId: null,
+            items: remainingItems
+          })
+        );
+      } else {
+        storage.removeItem(snap.key);
+      }
     }
-  } catch (_) {}
+  } catch (_) {
+    /* entorno restringido sin escritura */
+  }
 
   return restored;
 }
@@ -365,7 +414,8 @@ async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEn
  * @param {string|null} [instanceId]
  * @returns {Promise<number>} cantidad de archivos recuperados
  */
-export async function restoreEmergencyBackup(db, storage = window.localStorage, projectId = null, instanceId = null) {
+export async function restoreEmergencyBackup(db, storage = getDefaultStorage(), projectId = null, instanceId = null) {
+  if (!storage || typeof storage.getItem !== "function") return 0;
   const recordCache = new Map();
   const projectEntriesCache = new Map();
 
@@ -375,12 +425,14 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
     const raw = storage.getItem(key);
     if (!raw) return 0;
     const payload = parseBackupPayload(raw);
+    if (payload.projectId && payload.projectId !== projectId) return 0;
     return applySnapshotAndCleanup(
       db,
       storage,
-      { key, raw, savedAt: payload.savedAt, items: payload.items },
+      { key, raw, savedAt: payload.savedAt, projectId: payload.projectId, items: payload.items },
       recordCache,
-      projectEntriesCache
+      projectEntriesCache,
+      projectId
     );
   }
 
@@ -400,7 +452,7 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
   const allKeys = getAllStorageKeys(storage);
   for (const k of allKeys) {
     if (k && k.startsWith(EMERGENCY_BACKUP_PREFIX)) {
-      if (!projectId || k === getEmergencyBackupKey(projectId) || k.startsWith(`${EMERGENCY_BACKUP_PREFIX}${projectId}_`)) {
+      if (!projectId || doesBackupKeyBelongToProject(storage, k, projectId)) {
         targetKeys.push(k);
       }
     }
@@ -418,6 +470,7 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
       raw,
       index,
       savedAt: payload.savedAt,
+      projectId: payload.projectId,
       items: payload.items
     };
   });
@@ -427,7 +480,14 @@ export async function restoreEmergencyBackup(db, storage = window.localStorage, 
 
   let totalRestored = 0;
   for (const snap of snapshots) {
-    totalRestored += await applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache);
+    totalRestored += await applySnapshotAndCleanup(
+      db,
+      storage,
+      snap,
+      recordCache,
+      projectEntriesCache,
+      projectId || null
+    );
   }
 
   return totalRestored;

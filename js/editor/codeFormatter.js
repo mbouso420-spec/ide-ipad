@@ -22,6 +22,11 @@ const RAW_HTML_TAGS = new Set(["pre", "textarea", "script", "style"]);
 const RAW_HTML_CLOSE_REGEXES = new Map(
   Array.from(RAW_HTML_TAGS, (tag) => [tag, new RegExp(`</${tag}\\s*>`, "i")])
 );
+const RAW_HTML_CLOSE_SCAN_REGEXES = new Map(
+  Array.from(RAW_HTML_TAGS, (tag) => [tag, new RegExp(`</${tag}\\s*>`, "ig")])
+);
+const HTML_TAG_HEAD_STICKY_RE = /<(\/?)([!a-zA-Z][a-zA-Z0-9:-]*)/y;
+const RUST_CHAR_LITERAL_RE = /'(?:\\(?:[nrt\\'"0]|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\})|[^'\\\r\n])'/y;
 
 const BRACE_LANGUAGES = new Set([
   "js",
@@ -162,20 +167,29 @@ function formatBraceCode(code, lang, indentSize) {
   const rawLines = normalizeLineEndings(code).split("\n");
   const isPreprocessorLang = lang === "c" || lang === "cpp" || lang === "csharp";
   const hasRegexLiterals = lang === "js" || lang === "ts" || lang === "tsx";
+  const hasRawBackticks = lang === "go";
+  const hasLifetimes = lang === "rust";
+  const isCppLike = lang === "cpp" || lang === "c";
+  const isCSharp = lang === "csharp";
 
   const out = [];
   const rawLineIndices = new Set();
   let braceDepth = 0;
   const caseStack = [];
   let inBlockComment = false;
+  let inGoRawString = false;
+  let cSharpRawDelim = "";
+  let cppRawEndMarker = "";
+  let rustRawHashLen = -1;
   let templateStack = [];
 
   for (const rawLine of rawLines) {
     const insideLiteralTemplate =
       templateStack.length > 0 &&
       templateStack[templateStack.length - 1].exprDepth === 0;
+    const inRawMulti = Boolean(inGoRawString || cppRawEndMarker || cSharpRawDelim || rustRawHashLen >= 0);
 
-    if (insideLiteralTemplate) {
+    if (inRawMulti || insideLiteralTemplate) {
       rawLineIndices.add(out.length);
       out.push(rawLine);
     } else if (inBlockComment) {
@@ -283,6 +297,49 @@ function formatBraceCode(code, lang, indentSize) {
         continue;
       }
 
+      if (inGoRawString) {
+        if (ch === "`") {
+          inGoRawString = false;
+          prevNonSpace = ")";
+          prevWord = "";
+        }
+        continue;
+      }
+
+      if (cppRawEndMarker) {
+        if (rawLine.startsWith(cppRawEndMarker, i)) {
+          i += cppRawEndMarker.length - 1;
+          cppRawEndMarker = "";
+          prevNonSpace = ")";
+          prevWord = "";
+        }
+        continue;
+      }
+
+      if (rustRawHashLen >= 0) {
+        if (ch === '"') {
+          let hashes = 0;
+          while (hashes < rustRawHashLen && rawLine[i + 1 + hashes] === "#") hashes += 1;
+          if (hashes === rustRawHashLen) {
+            i += hashes;
+            rustRawHashLen = -1;
+            prevNonSpace = ")";
+            prevWord = "";
+          }
+        }
+        continue;
+      }
+
+      if (cSharpRawDelim) {
+        if (rawLine.startsWith(cSharpRawDelim, i)) {
+          i += cSharpRawDelim.length - 1;
+          cSharpRawDelim = "";
+          prevNonSpace = ")";
+          prevWord = "";
+        }
+        continue;
+      }
+
       if (quote) {
         if (ch === "\\") {
           i += 1;
@@ -304,8 +361,85 @@ function formatBraceCode(code, lang, indentSize) {
         i += 1;
         continue;
       }
+      if (isCppLike && ch === "R" && next === '"' && !/[A-Za-z0-9_$]/.test(prevWord)) {
+        const parenOffset = rawLine.indexOf("(", i + 2);
+        if (parenOffset !== -1) {
+          const delim = rawLine.slice(i + 2, parenOffset);
+          if (delim.length <= 16 && !/[\s()\\]/.test(delim)) {
+            cppRawEndMarker = `)${delim}"`;
+            i = parenOffset;
+            prevWord = "";
+            continue;
+          }
+        }
+      }
+      if (hasLifetimes && (ch === "r" || (ch === "b" && next === "r")) && !/[A-Za-z0-9_$]/.test(prevWord)) {
+        const startPos = ch === "b" ? i + 2 : i + 1;
+        let k = startPos;
+        while (rawLine[k] === "#") k += 1;
+        if (rawLine[k] === '"') {
+          rustRawHashLen = k - startPos;
+          i = k;
+          prevWord = "";
+          continue;
+        }
+      }
+      if (isCSharp && ch === '"' && next === '"' && rawLine[i + 2] === '"') {
+        let k = i;
+        while (rawLine[k] === '"') k += 1;
+        cSharpRawDelim = '"'.repeat(k - i);
+        i = k - 1;
+        prevWord = "";
+        continue;
+      }
+      if (isCSharp && ch === "@" && next === '"') {
+        let j = i + 2;
+        let closedVerbatim = false;
+        while (j < rawLine.length) {
+          if (rawLine[j] === '"') {
+            if (rawLine[j + 1] === '"') {
+              j += 2;
+              continue;
+            }
+            closedVerbatim = true;
+            break;
+          }
+          j += 1;
+        }
+        if (closedVerbatim) {
+          i = j;
+          prevNonSpace = ")";
+          prevWord = "";
+          continue;
+        }
+        cSharpRawDelim = '"';
+        i += 1;
+        prevWord = "";
+        continue;
+      }
+      if (ch === "'" && hasLifetimes) {
+        RUST_CHAR_LITERAL_RE.lastIndex = i;
+        if (RUST_CHAR_LITERAL_RE.test(rawLine)) {
+          i = RUST_CHAR_LITERAL_RE.lastIndex - 1;
+          prevNonSpace = ")";
+          prevWord = "";
+          continue;
+        }
+        // Lifetime de Rust ('a, 'static, '_): avanzar sin abrir comilla de texto
+        let j = i + 1;
+        while (j < rawLine.length && /[A-Za-z0-9_]/.test(rawLine[j])) j += 1;
+        i = Math.max(i, j - 1);
+        prevNonSpace = "'";
+        prevWord = "";
+        continue;
+      }
       if (ch === "'" || ch === '"') {
         quote = ch;
+        prevWord = "";
+        continue;
+      }
+      if (ch === "`" && hasRawBackticks) {
+        inGoRawString = true;
         prevWord = "";
         continue;
       }
@@ -314,7 +448,7 @@ function formatBraceCode(code, lang, indentSize) {
         prevWord = "";
         continue;
       }
-      if (ch === "/" && hasRegexLiterals && canStartRegexLiteral(prevNonSpace, prevWord)) {
+      if (ch === "/" && hasRegexLiterals && prevNonSpace !== "<" && canStartRegexLiteral(prevNonSpace, prevWord)) {
         // Consumir regex literal hasta / sin escapar
         let inRegexClass = false;
         let j = i + 1;
@@ -377,6 +511,12 @@ function formatBraceCode(code, lang, indentSize) {
       } else if (ch === "}") {
         if (braceDepth > 0) braceDepth -= 1;
         if (caseStack.length > 0) caseStack.pop();
+      } else if (hasRegexLiterals && ((ch === "+" && next === "+") || (ch === "-" && next === "-"))) {
+        // Postfix/prefix ++ y -- terminan o preceden un operando, nunca un literal /regex/
+        i += 1;
+        prevWord = "";
+        prevNonSpace = ")";
+        continue;
       }
 
       if (!/\s/.test(ch)) {
@@ -393,38 +533,71 @@ function formatBraceCode(code, lang, indentSize) {
   return finalizeOutput(out, rawLineIndices);
 }
 
+function trimTrailingInlineSpaces(chunks) {
+  while (chunks.length > 0) {
+    const last = chunks[chunks.length - 1];
+    const trimmedLast = last.replace(/[ \t]+$/, "");
+    if (trimmedLast.length === 0) {
+      chunks.pop();
+    } else {
+      if (trimmedLast.length !== last.length) {
+        chunks[chunks.length - 1] = trimmedLast;
+      }
+      return trimmedLast.endsWith("\n");
+    }
+  }
+  return false;
+}
+
 function formatCss(code, indentSize) {
   const unit = " ".repeat(indentSize);
   const src = normalizeLineEndings(code);
 
   // Fase 1: expandir reglas de una sola línea fuera de strings, comentarios y paréntesis url(...)
-  let expanded = "";
+  const chunks = [];
   let inComment = false;
+  let commentInline = false;
   let quote = "";
   let parenDepth = 0;
+
+  const isChunkBoundaryBeforeComment = () => {
+    for (let idx = chunks.length - 1; idx >= 0; idx -= 1) {
+      const part = chunks[idx];
+      for (let c = part.length - 1; c >= 0; c -= 1) {
+        const ch = part[c];
+        if (ch === "\n" || ch === "{" || ch === "}" || ch === ";") return true;
+        if (ch !== " " && ch !== "\t" && ch !== "\r") return false;
+      }
+    }
+    return true;
+  };
 
   for (let i = 0; i < src.length; i += 1) {
     const ch = src[i];
     const next = src[i + 1] || "";
 
     if (inComment) {
-      expanded += ch;
+      chunks.push(ch);
       if (ch === "*" && next === "/") {
-        expanded += "/";
+        chunks.push("/");
         inComment = false;
         i += 1;
-        expanded += "\n";
-        while (i + 1 < src.length && /[ \t\n]/.test(src[i + 1])) i += 1;
+        let sawNewline = false;
+        while (i + 1 < src.length && /[ \t\n]/.test(src[i + 1])) {
+          if (src[i + 1] === "\n") sawNewline = true;
+          i += 1;
+        }
+        chunks.push(sawNewline || !commentInline || i + 1 >= src.length ? "\n" : " ");
       }
       continue;
     }
 
     if (quote) {
-      expanded += ch;
+      chunks.push(ch);
       if (ch === "\\") {
         if (i + 1 < src.length) {
           i += 1;
-          expanded += src[i];
+          chunks.push(src[i]);
         }
         continue;
       }
@@ -434,14 +607,15 @@ function formatCss(code, indentSize) {
 
     if (ch === "/" && next === "*") {
       inComment = true;
-      expanded += "/*";
+      commentInline = !isChunkBoundaryBeforeComment();
+      chunks.push("/*");
       i += 1;
       continue;
     }
 
     if (ch === "'" || ch === '"') {
       quote = ch;
-      expanded += ch;
+      chunks.push(ch);
       continue;
     }
 
@@ -450,32 +624,34 @@ function formatCss(code, indentSize) {
 
     if (parenDepth === 0) {
       if (ch === "{") {
-        expanded = expanded.replace(/[ \t]+$/, "");
-        if (expanded.length > 0 && !expanded.endsWith("\n")) {
-          expanded += " ";
+        const endsWithNewline = trimTrailingInlineSpaces(chunks);
+        if (chunks.length > 0 && !endsWithNewline) {
+          chunks.push(" ");
         }
-        expanded += "{\n";
+        chunks.push("{\n");
         while (i + 1 < src.length && /[ \t\n]/.test(src[i + 1])) i += 1;
         continue;
       }
       if (ch === "}") {
-        expanded = expanded.replace(/[ \t]+$/, "");
-        if (expanded.length > 0 && !expanded.endsWith("\n")) {
-          expanded += "\n";
+        const endsWithNewline = trimTrailingInlineSpaces(chunks);
+        if (chunks.length > 0 && !endsWithNewline) {
+          chunks.push("\n");
         }
-        expanded += "}\n";
+        chunks.push("}\n");
         while (i + 1 < src.length && /[ \t\n]/.test(src[i + 1])) i += 1;
         continue;
       }
       if (ch === ";") {
-        expanded += ";\n";
+        chunks.push(";\n");
         while (i + 1 < src.length && /[ \t\n]/.test(src[i + 1])) i += 1;
         continue;
       }
     }
 
-    expanded += ch;
+    chunks.push(ch);
   }
+
+  const expanded = chunks.join("");
 
   // Fase 2: indentar por profundidad de llaves respetando comentarios
   const lines = expanded.split("\n");
@@ -537,12 +713,57 @@ function formatCss(code, indentSize) {
   return finalizeOutput(out);
 }
 
-function scanHtmlTagsInLine(trimmed, startIdx = 0) {
+function scanHtmlTagsInLine(trimmed, startIdx = 0, pendingOpenTag = null) {
   let delta = 0;
   let inComment = false;
   let rawTag = null;
+  let openTagState = pendingOpenTag ? { ...pendingOpenTag } : null;
+
+  const finalizeTag = (isClosing, tagName, selfClosing, afterCloseIdx) => {
+    if (isClosing) {
+      delta -= 1;
+      return { resumeIdx: afterCloseIdx, stop: false };
+    }
+    if (VOID_HTML_TAGS.has(tagName) || selfClosing) {
+      return { resumeIdx: afterCloseIdx, stop: false };
+    }
+    delta += 1;
+    if (RAW_HTML_TAGS.has(tagName)) {
+      const closeRe = RAW_HTML_CLOSE_SCAN_REGEXES.get(tagName);
+      let closeMatch = null;
+      if (closeRe) {
+        closeRe.lastIndex = afterCloseIdx + 1;
+        closeMatch = closeRe.exec(trimmed);
+      }
+      if (closeMatch) {
+        delta -= 1;
+        return { resumeIdx: closeMatch.index + closeMatch[0].length - 1, stop: false };
+      }
+      rawTag = tagName;
+      return { resumeIdx: trimmed.length, stop: true };
+    }
+    return { resumeIdx: afterCloseIdx, stop: false };
+  };
 
   for (let i = startIdx; i < trimmed.length; i += 1) {
+    if (openTagState) {
+      const ch = trimmed[i];
+      if (openTagState.attrQuote) {
+        if (ch === openTagState.attrQuote) openTagState.attrQuote = "";
+      } else if (ch === '"' || ch === "'") {
+        openTagState.attrQuote = ch;
+      } else if (ch === ">") {
+        const prevNonSpace = trimmed.slice(0, i).trimEnd();
+        const selfClosing = prevNonSpace.endsWith("/");
+        const { isClosing, tagName } = openTagState;
+        openTagState = null;
+        const step = finalizeTag(isClosing, tagName, selfClosing, i);
+        i = step.resumeIdx;
+        if (step.stop) break;
+      }
+      continue;
+    }
+
     if (inComment) {
       if (trimmed.startsWith("-->", i)) {
         inComment = false;
@@ -557,12 +778,13 @@ function scanHtmlTagsInLine(trimmed, startIdx = 0) {
     }
     if (trimmed[i] !== "<") continue;
 
-    const headMatch = trimmed.slice(i).match(/^<(\/?)([!a-zA-Z][a-zA-Z0-9:-]*)/);
+    HTML_TAG_HEAD_STICKY_RE.lastIndex = i;
+    const headMatch = HTML_TAG_HEAD_STICKY_RE.exec(trimmed);
     if (!headMatch) continue;
 
     const isClosing = Boolean(headMatch[1]);
     const tagName = headMatch[2].toLowerCase();
-    let j = i + headMatch[0].length;
+    let j = HTML_TAG_HEAD_STICKY_RE.lastIndex;
     let attrQuote = "";
 
     while (j < trimmed.length) {
@@ -577,35 +799,22 @@ function scanHtmlTagsInLine(trimmed, startIdx = 0) {
       j += 1;
     }
 
-    if (j >= trimmed.length) break;
-
-    const attrs = trimmed.slice(i + headMatch[0].length, j);
-    if (isClosing) {
-      delta -= 1;
-      i = j;
-      continue;
-    }
-    if (VOID_HTML_TAGS.has(tagName) || /\/\s*$/.test(attrs.trim())) {
-      i = j;
-      continue;
-    }
-
-    delta += 1;
-    if (RAW_HTML_TAGS.has(tagName)) {
-      const closeRe = RAW_HTML_CLOSE_REGEXES.get(tagName);
-      const closeMatch = closeRe ? closeRe.exec(trimmed.slice(j + 1)) : null;
-      if (closeMatch) {
-        delta -= 1;
-        i = j + 1 + closeMatch.index + closeMatch[0].length - 1;
-        continue;
-      }
-      rawTag = tagName;
+    if (j >= trimmed.length) {
+      openTagState = { isClosing, tagName, attrQuote };
       break;
     }
-    i = j;
+
+    let attrEnd = j - 1;
+    while (attrEnd >= HTML_TAG_HEAD_STICKY_RE.lastIndex && (trimmed[attrEnd] === " " || trimmed[attrEnd] === "\t")) {
+      attrEnd -= 1;
+    }
+    const isSelfClosing = attrEnd >= HTML_TAG_HEAD_STICKY_RE.lastIndex && trimmed[attrEnd] === "/";
+    const step = finalizeTag(isClosing, tagName, isSelfClosing, j);
+    i = step.resumeIdx;
+    if (step.stop) break;
   }
 
-  return { delta, inComment, rawTag };
+  return { delta, inComment, rawTag, pendingOpenTag: openTagState };
 }
 
 function formatHtml(code, indentSize) {
@@ -616,6 +825,7 @@ function formatHtml(code, indentSize) {
   let depth = 0;
   let inComment = false;
   let rawTag = null;
+  let pendingOpenTag = null;
 
   for (const rawLine of lines) {
     if (rawTag) {
@@ -639,10 +849,11 @@ function formatHtml(code, indentSize) {
       const endIdx = trimmed.indexOf("-->");
       if (endIdx !== -1) {
         inComment = false;
-        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3);
+        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3, null);
         depth = Math.max(0, depth + scannedAfter.delta);
         inComment = scannedAfter.inComment;
         rawTag = scannedAfter.rawTag;
+        pendingOpenTag = scannedAfter.pendingOpenTag;
       }
       continue;
     }
@@ -653,16 +864,28 @@ function formatHtml(code, indentSize) {
       continue;
     }
 
+    if (pendingOpenTag) {
+      const attrIndent = trimmed.startsWith(">") || trimmed.startsWith("/>") ? depth : depth + 1;
+      out.push(`${unit.repeat(attrIndent)}${trimmed}`);
+      const scannedOpen = scanHtmlTagsInLine(trimmed, 0, pendingOpenTag);
+      inComment = scannedOpen.inComment;
+      rawTag = scannedOpen.rawTag;
+      pendingOpenTag = scannedOpen.pendingOpenTag;
+      depth = Math.max(0, depth + scannedOpen.delta);
+      continue;
+    }
+
     if (trimmed.startsWith("<!--")) {
       out.push(`${unit.repeat(depth)}${trimmed}`);
       const endIdx = trimmed.indexOf("-->");
       if (endIdx === -1) {
         inComment = true;
       } else {
-        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3);
+        const scannedAfter = scanHtmlTagsInLine(trimmed, endIdx + 3, null);
         depth = Math.max(0, depth + scannedAfter.delta);
         inComment = scannedAfter.inComment;
         rawTag = scannedAfter.rawTag;
+        pendingOpenTag = scannedAfter.pendingOpenTag;
       }
       continue;
     }
@@ -675,9 +898,10 @@ function formatHtml(code, indentSize) {
     const lineDepth = Math.max(0, depth - leadingCloses);
     out.push(`${unit.repeat(lineDepth)}${trimmed}`);
 
-    const scanned = scanHtmlTagsInLine(trimmed, 0);
+    const scanned = scanHtmlTagsInLine(trimmed, 0, null);
     inComment = scanned.inComment;
     rawTag = scanned.rawTag;
+    pendingOpenTag = scanned.pendingOpenTag;
     depth = Math.max(0, depth + scanned.delta);
   }
 
@@ -711,10 +935,7 @@ function formatSql(code) {
     }
     if (quote) {
       out += ch;
-      if (ch === "\\" && i + 1 < src.length) {
-        i += 1;
-        out += src[i];
-      } else if (ch === quote) {
+      if (ch === quote) {
         if (next === quote) {
           out += next;
           i += 1;
@@ -810,7 +1031,10 @@ function formatMarkdownOrText(code, preserveMarkdownBreaks = false) {
 export function formatCode(code, lang = "text", options = {}) {
   const original = String(code ?? "");
   const cleanLang = String(lang || "text").toLowerCase();
-  const indentSize = Math.max(2, Math.min(8, Number(options.indentSize || getIndentSize(cleanLang))));
+  const parsedIndent = options && options.indentSize !== undefined ? Number(options.indentSize) : NaN;
+  const indentSize = Number.isFinite(parsedIndent)
+    ? Math.max(2, Math.min(8, Math.round(parsedIndent)))
+    : getIndentSize(cleanLang);
 
   if (!original.trim()) {
     return {

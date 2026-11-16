@@ -21,5 +21,5 @@ const FOUR_SPACE_LANGUAGES = new Set([
  * @returns {number}
  */
 export function getIndentSize(lang) {
-  return FOUR_SPACE_LANGUAGES.has(lang) ? 4 : 2;
+  return FOUR_SPACE_LANGUAGES.has(String(lang || "").toLowerCase()) ? 4 : 2;
 }

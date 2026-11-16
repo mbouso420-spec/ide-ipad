@@ -23,6 +23,7 @@ export function initDiffModal() {
     }
   }, listenOpts);
   dialog?.addEventListener("close", () => {
+    if (dialog.open) return;
     pendingConfirmAction = null;
   }, listenOpts);
 

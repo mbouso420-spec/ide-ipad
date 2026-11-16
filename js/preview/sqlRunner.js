@@ -128,6 +128,11 @@ function hasMultipleSqlStatements(sql) {
       }
       continue;
     }
+    if (ch === "[") {
+      const closeBracket = src.indexOf("]", i + 1);
+      i = closeBracket === -1 ? src.length : closeBracket + 1;
+      continue;
+    }
     if (ch === ";") {
       seenSemicolon = true;
     } else if (seenSemicolon && !/\s/.test(ch)) {
@@ -175,6 +180,74 @@ export function convertResultsToJson(results, maxRows = Infinity) {
   return out;
 }
 
+function isWithSelectStatement(strippedSql) {
+  const src = String(strippedSql || "");
+  const backtick = String.fromCharCode(96);
+  let i = 0;
+  let depth = 0;
+  let passedWith = false;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "'" || ch === '"' || ch === backtick) {
+      const q = ch;
+      i += 1;
+      while (i < src.length) {
+        if (src[i] === q) {
+          if (src[i + 1] === q) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+    if (ch === "[") {
+      const closeBracket = src.indexOf("]", i + 1);
+      i = closeBracket === -1 ? src.length : closeBracket + 1;
+      continue;
+    }
+    if (ch === "(") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      if (depth > 0) depth -= 1;
+      i += 1;
+      continue;
+    }
+    if (depth === 0 && /[A-Za-z_]/.test(ch)) {
+      let end = i + 1;
+      while (end < src.length && /[A-Za-z0-9_$]/.test(src[end])) {
+        end += 1;
+      }
+      const word = src.slice(i, end).toUpperCase();
+      if (!passedWith) {
+        if (word === "WITH") passedWith = true;
+      } else if (
+        word === "SELECT" ||
+        word === "INSERT" ||
+        word === "UPDATE" ||
+        word === "DELETE" ||
+        word === "REPLACE" ||
+        word === "CREATE" ||
+        word === "DROP" ||
+        word === "ALTER" ||
+        word === "PRAGMA"
+      ) {
+        return word === "SELECT";
+      }
+      i = end;
+      continue;
+    }
+    i += 1;
+  }
+  return false;
+}
+
 /**
  * Determina si una consulta SQL corresponde a una sentencia de selección (SELECT o WITH ... SELECT).
  * @param {string} sql
@@ -184,7 +257,9 @@ export function isSelectQuery(sql) {
   if (!sql || typeof sql !== "string") return false;
   if (hasMultipleSqlStatements(sql)) return false;
   const stripped = stripSqlCommentsSafe(sql).trim();
-  return /^(WITH\s+[\s\S]+?SELECT|SELECT\b)/i.test(stripped);
+  if (/^SELECT\b/i.test(stripped)) return true;
+  if (/^WITH\b/i.test(stripped)) return isWithSelectStatement(stripped);
+  return false;
 }
 
 /**
@@ -232,6 +307,11 @@ export function hasLimitClause(sql, stripComments = stripSqlCommentsSafe) {
       i = closeBracket === -1 ? src.length : closeBracket + 1;
       prevNonWs = "]";
       prevWord = "";
+      continue;
+    }
+    if (ch === "[") {
+      const closeBracket = src.indexOf("]", i + 1);
+      i = closeBracket === -1 ? src.length : closeBracket + 1;
       continue;
     }
     if (ch === "(") {
@@ -318,8 +398,10 @@ export function buildCountQuery(query) {
  * @returns {string}
  */
 export function buildSqlRunnerPreview(sqlFile) {
-  const safeTitle = escapeHtml(sqlFile.shortName || "consulta.sql");
-  const safeContent = JSON.stringify(sqlFile.content || "").replace(/</g, "\\u003c");
+  const rawTitle = String(sqlFile?.shortName || "consulta.sql");
+  const safeTitle = escapeHtml(rawTitle);
+  const safeTitleJson = JSON.stringify(rawTitle).replace(/</g, "\\u003c");
+  const safeContent = JSON.stringify(sqlFile?.content || "").replace(/</g, "\\u003c");
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -871,31 +953,32 @@ export function buildSqlRunnerPreview(sqlFile) {
           lastResults = res;
           lastFullQuery = code;
           isPaginatedQuery = false;
-          renderResults(res, "Script inicial (" + ${JSON.stringify(safeTitle)} + ")");
+          renderResults(res, "Script inicial (" + ${safeTitleJson} + ")");
           sendLog("log", "SQL ejecutado: " + (res.length > 0 ? res.length + " consulta(s) con datos" : "Sentencias DDL/DML exitosas"));
         } catch (e) {
           var errDiv = document.createElement("div");
           errDiv.className = "status-banner status-err";
-          errDiv.textContent = "Error de SQLite: " + e.message;
+          var initErrMsg = e && e.message ? e.message : String(e);
+          errDiv.textContent = "Error de SQLite: " + initErrMsg;
           resultsArea.appendChild(errDiv);
-          sendLog("error", "Error SQLite: " + e.message);
+          sendLog("error", "Error SQLite: " + initErrMsg);
         }
       }
 
       var safeCsvCell = ${escapeCsvField.toString()};
       var stripSqlCommentsSafe = ${stripSqlCommentsSafe.toString()};
-      var stripSqlCommentsClient = stripSqlCommentsSafe;
       var hasMultipleStatementsClient = ${hasMultipleSqlStatements.toString()};
       var hasLimitClauseClient = ${hasLimitClause.toString()};
+      var isWithSelectStatementClient = ${isWithSelectStatement.toString()};
 
       function runCustomQuery() {
         var query = (queryInput.value || "").trim();
         if (!query || !db) return;
 
-        var clean = stripSqlCommentsClient(query).trim().replace(/;+\\s*$/, "");
+        var clean = stripSqlCommentsSafe(query).trim().replace(/;+\\s*$/, "");
         var isSingle = !hasMultipleStatementsClient(query);
-        var isSelect = isSingle && /^(WITH\\s+[\\s\\S]+?SELECT|SELECT\\b)/i.test(clean);
-        var hasLimit = hasLimitClauseClient(clean, stripSqlCommentsClient);
+        var isSelect = isSingle && (/^SELECT\\b/i.test(clean) || (/^WITH\\b/i.test(clean) && isWithSelectStatementClient(clean)));
+        var hasLimit = hasLimitClauseClient(clean, stripSqlCommentsSafe);
 
         if (isSelect && !hasLimit) {
           lastFullQuery = clean;
@@ -909,7 +992,9 @@ export function buildSqlRunnerPreview(sqlFile) {
             if (countRes && countRes[0] && countRes[0].values && countRes[0].values[0]) {
               totalRows = countRes[0].values[0][0];
             }
-          } catch (_) {}
+          } catch (_) {
+            totalRows = null;
+          }
 
           var totalPages = totalRows !== null ? Math.max(1, Math.ceil(totalRows / PAGE_SIZE)) : 1;
 
@@ -919,9 +1004,7 @@ export function buildSqlRunnerPreview(sqlFile) {
             var paginatedSql = clean + " LIMIT " + PAGE_SIZE + " OFFSET " + offset + ";";
             try {
               var res = db.exec(paginatedSql);
-              if (res && res.length > 0) {
-                lastResults = res;
-              }
+              lastResults = res || [];
               renderResults(res, query, {
                 isRealPagination: true,
                 currentPage: page,
@@ -931,37 +1014,40 @@ export function buildSqlRunnerPreview(sqlFile) {
                 onPageChange: executePage
               });
               sendLog("log", "Consulta SQL paginada (pág " + page + "): " + paginatedSql);
+              return true;
             } catch (e) {
               var errDiv = document.createElement("div");
+              var pageErrMsg = e && e.message ? e.message : String(e);
               errDiv.className = "status-banner status-err";
-              errDiv.textContent = "Error en consulta paginada: " + e.message;
+              errDiv.textContent = "Error en consulta paginada: " + pageErrMsg;
               resultsArea.appendChild(errDiv);
-              sendLog("error", "Error SQL: " + e.message);
+              sendLog("error", "Error SQL: " + pageErrMsg);
+              return false;
             }
           }
 
-          executePage(1);
-          queryInput.value = "";
+          if (executePage(1)) {
+            queryInput.value = "";
+          }
           return;
         }
 
         resultsArea.innerHTML = "";
         try {
           var res = db.exec(query);
-          if (res && res.length > 0) {
-            lastResults = res;
-            lastFullQuery = query;
-            isPaginatedQuery = false;
-          }
+          lastResults = res || [];
+          lastFullQuery = query;
+          isPaginatedQuery = false;
           renderResults(res, query);
           sendLog("log", "Consulta SQL: " + query + " (" + (res && res[0] ? res[0].values.length : 0) + " filas)");
           queryInput.value = "";
         } catch (e) {
           var errDiv = document.createElement("div");
+          var queryErrMsg = e && e.message ? e.message : String(e);
           errDiv.className = "status-banner status-err";
-          errDiv.textContent = "Error en consulta: " + e.message;
+          errDiv.textContent = "Error en consulta: " + queryErrMsg;
           resultsArea.appendChild(errDiv);
-          sendLog("error", "Error SQL: " + e.message);
+          sendLog("error", "Error SQL: " + queryErrMsg);
         }
       }
 
@@ -1002,7 +1088,7 @@ export function buildSqlRunnerPreview(sqlFile) {
       function getExportDataset() {
         if (isPaginatedQuery && lastFullQuery && db) {
           try {
-            var baseQuery = stripSqlCommentsClient(lastFullQuery).trim().replace(/;+\\s*$/, "");
+            var baseQuery = stripSqlCommentsSafe(lastFullQuery).trim().replace(/;+\\s*$/, "");
             var boundedSql = baseQuery + " LIMIT " + (EXPORT_MAX_ROWS + 1) + ";";
             var fullRes = db.exec(boundedSql);
             if (fullRes && fullRes.length > 0) {

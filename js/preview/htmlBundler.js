@@ -24,7 +24,9 @@ import {
   getParentFolder,
   resolveRelativePath,
   escapeAttr,
-  escapeHtmlText
+  escapeHtmlText,
+  sanitizeSvgMarkup,
+  safeEncodeURIComponent
 } from "./previewUtils.js";
 import {
   buildExactModuleMap,
@@ -389,7 +391,9 @@ export function savePreviewHtml(projectId, htmlPath) {
   if (typeof localStorage === "undefined" || !htmlPath) return;
   try {
     localStorage.setItem(`studio_preview_last_html:${projectId || "default"}`, htmlPath);
-  } catch (_) {}
+  } catch (_) {
+    /* localStorage no disponible o cuota agotada */
+  }
 }
 
 /**
@@ -513,7 +517,9 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
 }
 
 export function findSiblingHtmlInSameFolder(scopeFiles, folder, targetFile) {
+  if (!Array.isArray(scopeFiles) || !targetFile) return null;
   const htmlInSameDir = scopeFiles.filter((f) => {
+    if (!f || !f.path) return false;
     const ext = getFileExtension(f.path);
     return HTML_EXTENSIONS.has(ext) && getParentFolder(f.path) === folder;
   });
@@ -521,10 +527,15 @@ export function findSiblingHtmlInSameFolder(scopeFiles, folder, targetFile) {
   if (htmlInSameDir.length === 0) return null;
 
   const preferred =
-    htmlInSameDir.find((f) => f.shortName.toLowerCase() === "index.html") || htmlInSameDir[0];
+    htmlInSameDir.find((f) => (f.shortName || "").toLowerCase() === "index.html") || htmlInSameDir[0];
 
-  const escapedName = targetFile.shortName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const linksThisJs = new RegExp(`src=["'][^"']*${escapedName}["']`, "i").test(preferred.content);
+  const targetName = targetFile.shortName || String(targetFile.path || "").split("/").pop() || "";
+  const escapedName = targetName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const linksThisJs = Boolean(
+    escapedName &&
+    typeof preferred.content === "string" &&
+    new RegExp(`src=["'][^"']*${escapedName}["']`, "i").test(preferred.content)
+  );
 
   return {
     file: preferred,
@@ -540,7 +551,20 @@ ${buildLoopGuardRuntime()}
   function formatArgs(args) {
     return Array.prototype.slice.call(args).map(function (item) {
       if (typeof item === "string") return item;
-      try { return JSON.stringify(item, null, 2); } catch (_) { return String(item); }
+      if (item === undefined) return "undefined";
+      if (item === null) return "null";
+      if (typeof item === "bigint") return item.toString() + "n";
+      if (typeof item === "symbol") return String(item);
+      if (typeof item === "function") return "[Function " + (item.name || "anon") + "]";
+      if (item instanceof Error) {
+        var header = (item.name || "Error") + ": " + (item.message || "");
+        return item.stack ? header + "\\n" + item.stack : header;
+      }
+      try {
+        return JSON.stringify(item, null, 2);
+      } catch (_) {
+        return String(item);
+      }
     }).join(" ");
   }
   function send(level, args) {
@@ -550,13 +574,18 @@ ${buildLoopGuardRuntime()}
       if (mirror) {
         var box = document.getElementById("__js_screen_log");
         if (box) {
+          while (box.children.length >= 500 && box.firstChild) {
+            box.removeChild(box.firstChild);
+          }
           var row = document.createElement("div");
           row.className = level === "error" ? "js-line js-line-error" : level === "warn" ? "js-line js-line-warn" : "js-line";
           row.textContent = msg;
           box.appendChild(row);
         }
       }
-    } catch (_) {}
+    } catch (_) {
+      /* omitir error de mirror en consola */
+    }
   }
   var origLog = console.log, origWarn = console.warn, origErr = console.error;
   console.log = function () { send("log", arguments); origLog.apply(console, arguments); };
@@ -573,7 +602,19 @@ ${buildLoopGuardRuntime()}
     send("error", [e.message + (e.lineno && !fromLoopGuard ? " (línea " + e.lineno + ")" : "")]);
   });
   window.addEventListener("unhandledrejection", function (e) {
-    send("error", ["Promesa rechazada: " + (e.reason && e.reason.message ? e.reason.message : String(e.reason))]);
+    var stErr = document.getElementById("__js_status");
+    if (stErr) {
+      stErr.dataset.failed = "1";
+      stErr.style.color = "var(--err)";
+      stErr.textContent = "Error en ejecución";
+    }
+    var reasonText = "Promesa rechazada desconocida";
+    try {
+      reasonText = e.reason && e.reason.message ? e.reason.message : String(e.reason);
+    } catch (_) {
+      reasonText = "[objeto de rechazo no serializable]";
+    }
+    send("error", ["Promesa rechazada: " + reasonText]);
   });
   // Mini-REPL interactivo conectado al panel Consola JS de Studio IDE
   window.addEventListener("message", function (ev) {
@@ -596,13 +637,13 @@ ${buildLoopGuardRuntime()}
     return String(ref == null ? "" : ref).replace(/[\\u0000-\\u001f\\u007f]+/g, "").trim().toLowerCase();
   }
   function isBlockedNavScheme(normRef) {
-    return /^(javascript:|vbscript:|data:)/.test(normRef);
+    return /^(javascript:|vbscript:|data:|file:|filesystem:)/.test(normRef);
   }
   // Interceptor total de navegación local en enlaces
   document.addEventListener("click", function (e) {
-    var a = e.target && e.target.closest ? e.target.closest("a[href]") : null;
+    var a = e.target && e.target.closest ? e.target.closest("a[href], area[href], a[xlink\\:href]") : null;
     if (!a) return;
-    var href = a.getAttribute("href");
+    var href = a.getAttribute("href") || a.getAttribute("xlink:href") || "";
     if (!href) return;
     var normHref = normalizeNavRef(href);
     if (isBlockedNavScheme(normHref)) {
@@ -629,7 +670,8 @@ ${buildLoopGuardRuntime()}
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (!form || !form.getAttribute) return;
-    var action = form.getAttribute("action");
+    var submitter = e.submitter;
+    var action = (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) || form.getAttribute("action");
     if (!action) return;
     var normAction = normalizeNavRef(action);
     if (isBlockedNavScheme(normAction)) {
@@ -653,7 +695,11 @@ ${buildLoopGuardRuntime()}
       if (!targetUrl || typeof targetUrl !== "string") return;
       var normTarget = normalizeNavRef(targetUrl);
       if (!normTarget || isBlockedNavScheme(normTarget)) return;
-      if (normTarget.startsWith("#") || /^(https?:|mailto:|tel:)/.test(normTarget)) {
+      if (normTarget.startsWith("#")) {
+        window.location.hash = targetUrl;
+        return;
+      }
+      if (/^(https?:|mailto:|tel:)/.test(normTarget)) {
         window.open(targetUrl, "_blank", "noopener,noreferrer");
         return;
       }
@@ -668,32 +714,31 @@ ${buildLoopGuardRuntime()}
       window.location.assign = triggerNav;
       window.location.replace = triggerNav;
     }
-  } catch (_) {}
+  } catch (_) {
+    /* location no redefinible en este entorno */
+  }
 })();
 </script>`;
 }
 
-export function bundleHtmlWithFolderAssets(
-  entryPath,
-  rawHtml,
-  fileMap,
-  ensureJsFile = null,
-  transformJs = (code) => code,
-  ensureCssFile = null,
-  allowParentTraversal = false
-) {
-  const dir = getParentFolder(entryPath);
+const escapeCloseStyle = (css) => css.replace(/<\/style(?=[\s>/]|$)/gi, "<\\/style");
+const escapeCloseScript = (js) => js.replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
 
-  const escapesDirectoryScope = (rawRef) => {
+function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversal = false) {
+  const safeFileMap = fileMap instanceof Map ? fileMap : new Map();
+  const scopeDepth = scopeDir ? scopeDir.split("/").filter(Boolean).length : 0;
+
+  const escapesDirectoryScope = (rawRef, baseDir = scopeDir) => {
     const unified = String(rawRef || "").trim().replace(/\\/g, "/");
-    if (!unified || unified.startsWith("/")) return false;
-    let depth = 0;
+    if (!unified) return false;
+    if (unified.startsWith("/") && scopeDir) return true;
+    let depth = baseDir ? baseDir.split("/").filter(Boolean).length : 0;
     for (const seg of unified.split("/")) {
       const part = seg.trim();
       if (!part || part === ".") continue;
       if (part === "..") {
         depth -= 1;
-        if (depth < 0) return true;
+        if (depth < scopeDepth) return true;
       } else {
         depth += 1;
       }
@@ -704,11 +749,11 @@ export function bundleHtmlWithFolderAssets(
   let lowerFileMap = null;
   const lookupEntry = (key) => {
     if (!key) return null;
-    const direct = fileMap.get(key);
+    const direct = safeFileMap.get(key);
     if (direct) return direct;
     if (!lowerFileMap) {
       lowerFileMap = new Map();
-      for (const [k, v] of fileMap.entries()) {
+      for (const [k, v] of safeFileMap.entries()) {
         const lowerKey = String(k || "").toLowerCase();
         if (lowerKey && !lowerFileMap.has(lowerKey)) {
           lowerFileMap.set(lowerKey, v);
@@ -726,22 +771,25 @@ export function bundleHtmlWithFolderAssets(
     if (!cleanRef) {
       return null;
     }
-    if (escapesDirectoryScope(cleanRef) && !allowParentTraversal) {
+    if (!allowParentTraversal && escapesDirectoryScope(cleanRef, baseDir)) {
       return null;
     }
     const resolved = resolveRelativePath(baseDir, cleanRef);
+    if (!allowParentTraversal && scopeDir && resolved !== scopeDir && !resolved.startsWith(`${scopeDir}/`)) {
+      return null;
+    }
     let asset = lookupEntry(resolved);
     if (!asset && cleanRef.startsWith("./")) {
       asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.slice(2)));
     }
-    if (!asset && cleanRef.startsWith("/") && baseDir) {
+    if (!asset && cleanRef.startsWith("/") && baseDir && (allowParentTraversal || !scopeDir)) {
       asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.replace(/^\/+/, "")));
     }
     if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("./") && !cleanRef.startsWith("../")) {
       const candidate = lookupEntry(normalizePath(cleanRef));
       if (candidate) {
         const candPath = normalizePath(candidate.path || "");
-        if (!baseDir || allowParentTraversal || candPath.startsWith(`${baseDir}/`)) {
+        if (!scopeDir || allowParentTraversal || candPath.startsWith(`${scopeDir}/`)) {
           asset = candidate;
         }
       }
@@ -749,19 +797,6 @@ export function bundleHtmlWithFolderAssets(
     return asset || null;
   };
 
-  const resolveRawEntry = (rawHref) => resolveEntryFromDir(rawHref, dir);
-
-  const resolveAsset = (rawHref) => {
-    const asset = resolveRawEntry(rawHref);
-    if (!asset || typeof asset.content !== "string") {
-      return null;
-    }
-    return asset;
-  };
-
-  let inlinedActiveJs = false;
-  let inlinedActiveCss = false;
-  const deferredScripts = [];
   let totalInlinedCssBytes = 0;
 
   function resolveCssAssetMime(filePath) {
@@ -781,7 +816,7 @@ export function bundleHtmlWithFolderAssets(
     return compact;
   }
 
-  function buildEntryDataUrl(entry, refPath, mimeResolver = getImageMimeType) {
+  function buildEntryDataUrl(entry, refPath, mimeResolver = getImageMimeType, { enforceCssBudget = false } = {}) {
     if (!entry) return null;
     const targetPath = entry.path || refPath || "";
     const ext = getFileExtension(targetPath);
@@ -793,11 +828,25 @@ export function bundleHtmlWithFolderAssets(
           : null;
     const safeB64 = sanitizeBase64Payload(rawB64);
     if (safeB64) {
+      if (enforceCssBudget) {
+        if (safeB64.length > MAX_PREVIEW_ASSET_BYTES * 2) return null;
+        if (totalInlinedCssBytes + safeB64.length > MAX_TOTAL_INLINED_CSS * 2) return null;
+        totalInlinedCssBytes += safeB64.length;
+      }
       const mime = mimeResolver(targetPath);
       return `data:${mime};base64,${safeB64}`;
     }
     if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
-      const encodedSvg = encodeURIComponent(entry.content)
+      if (enforceCssBudget && entry.content.length > MAX_PREVIEW_ASSET_BYTES) {
+        return null;
+      }
+      const sanitizedSvg = sanitizeSvgMarkup(entry.content);
+      if (!sanitizedSvg) return null;
+      if (enforceCssBudget) {
+        if (totalInlinedCssBytes + sanitizedSvg.length > MAX_TOTAL_INLINED_CSS) return null;
+        totalInlinedCssBytes += sanitizedSvg.length;
+      }
+      const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
         .replace(/'/g, "%27")
         .replace(/"/g, "%22");
       return `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
@@ -814,7 +863,7 @@ export function bundleHtmlWithFolderAssets(
         }
         const rawUrl = (quotedUrl || bareUrl || "").trim();
         const entry = resolveEntryFromDir(rawUrl, cssDir);
-        const dataUrl = buildEntryDataUrl(entry, rawUrl, resolveCssAssetMime);
+        const dataUrl = buildEntryDataUrl(entry, rawUrl, resolveCssAssetMime, { enforceCssBudget: true });
         if (dataUrl) {
           return `url("${dataUrl}")`;
         }
@@ -824,18 +873,10 @@ export function bundleHtmlWithFolderAssets(
   }
 
   const escapeCommentBody = (txt) => String(txt || "").replace(/\*\//g, "* /");
+  const MAX_CSS_IMPORT_DEPTH = 64;
 
-  /**
-   * Incrusta recursivamente directivas CSS `@import` locales resolviéndolas desde la memoria del bundle,
-   * preservando condiciones complejas (@media, @layer, @supports), usando pila `ancestors` para ciclos reales
-   * y aplicando límites estrictos de tamaño.
-   *
-   * @param {string} cssContent
-   * @param {string} cssPath
-   * @param {Set<string>} [ancestors]
-   * @returns {string}
-   */
-  function inlineCssImports(cssContent, cssPath, ancestors = new Set()) {
+  function inlineCssImports(cssContent, cssPath, ancestors = new Set(), depth = 0) {
+    if (depth > MAX_CSS_IMPORT_DEPTH) return "";
     const cleanPath = normalizePath(cssPath);
     if (ancestors.has(cleanPath)) return "";
     ancestors.add(cleanPath);
@@ -845,7 +886,7 @@ export function bundleHtmlWithFolderAssets(
       const importRegex =
         /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
 
-      const withImports = cssContent.replace(
+      const withImports = String(cssContent || "").replace(
         importRegex,
         (match, commentBlock, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
           if (commentBlock) {
@@ -876,7 +917,7 @@ export function bundleHtmlWithFolderAssets(
           totalInlinedCssBytes += importedAsset.content.length;
 
           // 3. Resolución recursiva de dependencias hijas
-          const inlinedChild = inlineCssImports(importedAsset.content, importedAsset.path, ancestors);
+          const inlinedChild = inlineCssImports(importedAsset.content, importedAsset.path, ancestors, depth + 1);
 
           // 4. Extracción y preservación de condiciones (layer, supports, media)
           const conds = parseCssImportConditions(rawConditions);
@@ -896,8 +937,50 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
-  const escapeCloseStyle = (css) => css.replace(/<\/style(?=[\s>/]|$)/gi, "<\\/style");
-  const escapeCloseScript = (js) => js.replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
+  return {
+    resolveEntryFromDir,
+    buildEntryDataUrl,
+    inlineCssUrls,
+    inlineCssImports,
+    getTotalInlinedCssBytes: () => totalInlinedCssBytes,
+    addInlinedCssBytes: (n) => {
+      totalInlinedCssBytes += n;
+    }
+  };
+}
+
+export function bundleHtmlWithFolderAssets(
+  entryPath,
+  rawHtml,
+  fileMap,
+  ensureJsFile = null,
+  transformJs = (code) => code,
+  ensureCssFile = null,
+  allowParentTraversal = false
+) {
+  const dir = getParentFolder(entryPath);
+  const {
+    resolveEntryFromDir,
+    buildEntryDataUrl,
+    inlineCssUrls,
+    inlineCssImports,
+    getTotalInlinedCssBytes,
+    addInlinedCssBytes
+  } = createProjectAssetHelpers(dir, fileMap, allowParentTraversal);
+
+  const resolveRawEntry = (rawHref) => resolveEntryFromDir(rawHref, dir);
+
+  const resolveAsset = (rawHref) => {
+    const asset = resolveRawEntry(rawHref);
+    if (!asset || typeof asset.content !== "string") {
+      return null;
+    }
+    return asset;
+  };
+
+  let inlinedActiveJs = false;
+  let inlinedActiveCss = false;
+  const deferredScripts = [];
 
   const SCRIPT_REGEX_KEYWORDS = new Set([
     "return",
@@ -1106,52 +1189,67 @@ export function bundleHtmlWithFolderAssets(
     let cursor = 0;
 
     while (cursor < src.length) {
-      const commentIdx = src.indexOf("<!--", cursor);
-      const scriptRe = /<script(?=[\s>])/gi;
-      scriptRe.lastIndex = cursor;
-      const scriptMatch = scriptRe.exec(src);
-      if (!scriptMatch) break;
+      const ltIdx = src.indexOf("<", cursor);
+      if (ltIdx === -1) break;
 
-      if (commentIdx !== -1 && commentIdx < scriptMatch.index) {
-        const endComment = src.indexOf("-->", commentIdx + 4);
+      if (src.startsWith("<!--", ltIdx)) {
+        const endComment = src.indexOf("-->", ltIdx + 4);
         const nextPos = endComment === -1 ? src.length : endComment + 3;
         chunks.push(src.slice(cursor, nextPos));
         cursor = nextPos;
         continue;
       }
 
-      const ltIdx = scriptMatch.index;
-      const openEnd = scanScriptOpenTagEnd(src, ltIdx + 7);
-      if (openEnd === -1) break;
+      if (/^<script(?=[\s/>])/i.test(src.slice(ltIdx, ltIdx + 9))) {
+        const openEnd = scanScriptOpenTagEnd(src, ltIdx + 7);
+        if (openEnd === -1) break;
 
-      const attrs = src.slice(ltIdx + 7, openEnd);
-      const bodyStart = openEnd + 1;
-      const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
-      const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
-      const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
-      const isJsLike =
-        !hasSrc &&
-        (!typeVal ||
-          typeVal === "module" ||
-          typeVal === "text/javascript" ||
-          typeVal === "application/javascript" ||
-          typeVal === "text/typescript" ||
-          typeVal === "application/typescript" ||
-          typeVal === "text/tsx" ||
-          typeVal === "text/jsx" ||
-          typeVal === "text/babel");
+        const attrs = src.slice(ltIdx + 7, openEnd);
+        const bodyStart = openEnd + 1;
+        const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
+        const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
+        const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+        const isJsLike =
+          !hasSrc &&
+          (!typeVal ||
+            typeVal === "module" ||
+            typeVal === "text/javascript" ||
+            typeVal === "application/javascript" ||
+            typeVal === "text/typescript" ||
+            typeVal === "application/typescript" ||
+            typeVal === "text/tsx" ||
+            typeVal === "text/jsx" ||
+            typeVal === "text/babel");
 
-      const closeRes = scanScriptCloseTag(src, bodyStart, isJsLike);
-      if (!closeRes) break;
+        const closeRes = scanScriptCloseTag(src, bodyStart, isJsLike);
+        if (!closeRes) break;
 
-      const idx = entries.length;
-      entries.push({
-        fullTag: src.slice(ltIdx, closeRes.tagEnd),
-        attrs,
-        inlineCode: src.slice(bodyStart, closeRes.bodyEnd)
-      });
-      chunks.push(src.slice(cursor, ltIdx), `${prefix}${idx}__`);
-      cursor = closeRes.tagEnd;
+        const idx = entries.length;
+        entries.push({
+          fullTag: src.slice(ltIdx, closeRes.tagEnd),
+          attrs,
+          inlineCode: src.slice(bodyStart, closeRes.bodyEnd)
+        });
+        chunks.push(src.slice(cursor, ltIdx), `${prefix}${idx}__`);
+        cursor = closeRes.tagEnd;
+        continue;
+      }
+
+      // Saltar etiquetas HTML normales respetando comillas para no confundir "<!--" ni "<script>" en atributos
+      if (/^<[a-zA-Z!/]/.test(src.slice(ltIdx, ltIdx + 2))) {
+        const tagEnd = scanScriptOpenTagEnd(src, ltIdx + 1);
+        if (tagEnd === -1) {
+          chunks.push(src.slice(cursor, ltIdx + 1));
+          cursor = ltIdx + 1;
+        } else {
+          chunks.push(src.slice(cursor, tagEnd + 1));
+          cursor = tagEnd + 1;
+        }
+        continue;
+      }
+
+      chunks.push(src.slice(cursor, ltIdx + 1));
+      cursor = ltIdx + 1;
     }
 
     chunks.push(src.slice(cursor));
@@ -1181,11 +1279,11 @@ export function bundleHtmlWithFolderAssets(
     }
 
     // 2. Control de presupuesto total acumulado de CSS inlined
-    if (totalInlinedCssBytes + asset.content.length > MAX_TOTAL_INLINED_CSS) {
+    if (getTotalInlinedCssBytes() + asset.content.length > MAX_TOTAL_INLINED_CSS) {
       return `<!-- [Studio IDE]: stylesheet "${escapeAttr(asset.path)}" omitido: presupuesto total de CSS superado -->\n${tag}`;
     }
 
-    totalInlinedCssBytes += asset.content.length;
+    addInlinedCssBytes(asset.content.length);
     const safeCss = escapeCloseStyle(inlineCssImports(asset.content, asset.path));
     return `<style data-source="${escapeAttr(asset.path)}">\n${safeCss}\n</style>`;
   });
@@ -1200,7 +1298,7 @@ export function bundleHtmlWithFolderAssets(
       } else {
         html = `${warnTag}\n${html}`;
       }
-    } else if (totalInlinedCssBytes + cssContent.length > MAX_TOTAL_INLINED_CSS) {
+    } else if (getTotalInlinedCssBytes() + cssContent.length > MAX_TOTAL_INLINED_CSS) {
       const warnTag = `<!-- [Studio IDE]: stylesheet "${escapeAttr(cssPath)}" omitido: presupuesto total de CSS superado -->`;
       if (/<head\b[^>]*>/i.test(html)) {
         html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${warnTag}`);
@@ -1208,7 +1306,7 @@ export function bundleHtmlWithFolderAssets(
         html = `${warnTag}\n${html}`;
       }
     } else {
-      totalInlinedCssBytes += cssContent.length;
+      addInlinedCssBytes(cssContent.length);
       const safeExtraCss = escapeCloseStyle(inlineCssImports(cssContent, cssPath));
       const styleTag = `<style data-source="${escapeAttr(cssPath)}">\n${safeExtraCss}\n</style>`;
       if (/<head\b[^>]*>/i.test(html)) {
@@ -1495,21 +1593,32 @@ export function bundleHtmlWithFolderAssets(
     return `<script${isModule ? ' type="module"' : ""} data-source="${escapeAttr(asset.path)}">\n${safeJs}\n</script>`;
   }
 
-  if (scriptEntries.length > 0) {
-    const maskRe = new RegExp(`${scriptMaskPrefix}(\\d+)__`, "g");
-    html = html.replace(maskRe, (_, idxStr) => processScannedScript(scriptEntries[Number(idxStr)]));
-  }
+  const processedScripts = scriptEntries.length > 0
+    ? scriptEntries.map((entry) => processScannedScript(entry))
+    : [];
 
   if (ensureJsFile && !inlinedActiveJs) {
-    const bundledExtra = tryBundleLocalModules(ensureJsFile.content, ensureJsFile.path);
+    const extraPath = ensureJsFile.path || "main.js";
+    const extraExt = getFileExtension(extraPath);
+    const needsExtraTranspile = TS_EXTENSIONS.has(extraExt) || extraExt === "jsx";
+    const precompiledExtra = needsExtraTranspile
+      ? transpileTypeScriptAndJsx(ensureJsFile.content || "", {
+          jsx: extraExt === "tsx" || extraExt === "jsx",
+          fileName: extraPath
+        }).code
+      : String(ensureJsFile.content || "");
+    const bundledExtra = tryBundleLocalModules(ensureJsFile.content, extraPath, precompiledExtra);
     if (bundledExtra) {
       const modAttr = bundledExtra.isModuleTag ? ' type="module"' : "";
       deferredScripts.push(
-        `<script${modAttr} data-source="${escapeAttr(ensureJsFile.path)}">\n${bundledExtra.scriptCode}\n</script>`
+        `<script${modAttr} data-source="${escapeAttr(extraPath)}">\n${bundledExtra.scriptCode}\n</script>`
       );
     } else {
-      const safeExtraJs = compileScriptContent(ensureJsFile.content, ensureJsFile.path, "", false);
-      deferredScripts.push(`<script data-source="${escapeAttr(ensureJsFile.path)}">\n${safeExtraJs}\n</script>`);
+      const usageExtra = inspectModuleUsage(precompiledExtra);
+      const isExtraModule = Boolean(usageExtra.hasModuleSyntax || usageExtra.hasTopLevelAwait);
+      const safeExtraJs = compileScriptContent(ensureJsFile.content, extraPath, "", isExtraModule, precompiledExtra);
+      const modAttr = isExtraModule ? ' type="module"' : "";
+      deferredScripts.push(`<script${modAttr} data-source="${escapeAttr(extraPath)}">\n${safeExtraJs}\n</script>`);
     }
   }
 
@@ -1524,9 +1633,18 @@ export function bundleHtmlWithFolderAssets(
 
   const bridge = buildConsoleBridgeScript(false);
   if (/<head\b[^>]*>/i.test(html)) {
-    return html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${bridge}`);
+    html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${bridge}`);
+  } else {
+    html = `${bridge}\n${html}`;
   }
-  return `${bridge}\n${html}`;
+
+  // Desenmascarar los <script> después de inyectar <head>/</body> para que literales dentro de JS no alteren el HTML
+  if (processedScripts.length > 0) {
+    const maskRe = new RegExp(`${scriptMaskPrefix}(\\d+)__`, "g");
+    html = html.replace(maskRe, (_, idxStr) => processedScripts[Number(idxStr)] ?? "");
+  }
+
+  return html;
 }
 
 export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code, options = {}) {
@@ -1589,15 +1707,27 @@ export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, o
     }
   }
   const isModule = Boolean(!usesLocalModules && (moduleUsage.hasModuleSyntax || moduleUsage.hasTopLevelAwait));
-  const safeName = escapeHtmlText(jsFile.path);
+  const safeName = escapeHtmlText(String(jsFile?.path || "script.js"));
 
   let scriptSnippet = "";
   if (usesLocalModules) {
+    const cssAssetMap =
+      options?.assetMap instanceof Map
+        ? options.assetMap
+        : Array.isArray(options?.companionFiles)
+          ? buildWorkspaceAssetMap(options.companionFiles)
+          : exactMap;
+    const { inlineCssImports } = createProjectAssetHelpers(
+      getParentFolder(jsFile?.path || ""),
+      cssAssetMap,
+      allowParentTraversal
+    );
     const bundle = buildVirtualModuleBundle({
       entryPath: jsFile.path,
       entryCode: jsFile.content,
       exactMap,
       transformJs,
+      transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
       allowParentTraversal,
       precompiledEntryCode: normalizedJsCode,
       precomputedEntryUsage: moduleUsage
@@ -1632,7 +1762,7 @@ ${statusFooter}
 }
 </script>`;
   } else {
-    const safeJs = transformJs(jsFile.content, isModule).replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
+    const safeJs = transformJs(normalizedJsCode, isModule).replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
     scriptSnippet = isModule
       ? `<script type="module">
 ${safeJs}
@@ -1675,6 +1805,7 @@ ${safeJs}
         stErr.style.color = "var(--err)";
         stErr.textContent = "Error en ejecución: " + (err && err.message ? err.message : String(err));
       }
+      console.error(err);
     }
 </script>`;
   }
@@ -1792,10 +1923,13 @@ export function buildStandaloneImagePreview(imageFile) {
   if (b64) {
     imgSrc = `data:${mime};base64,${b64}`;
   } else if (ext === "svg" && typeof imageFile?.content === "string" && imageFile.content.trim().length > 0) {
-    const encodedSvg = encodeURIComponent(imageFile.content)
-      .replace(/'/g, "%27")
-      .replace(/"/g, "%22");
-    imgSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+    const sanitizedSvg = sanitizeSvgMarkup(imageFile.content);
+    if (sanitizedSvg) {
+      const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
+        .replace(/'/g, "%27")
+        .replace(/"/g, "%22");
+      imgSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
+    }
   }
 
   let sizeFormatted = "";

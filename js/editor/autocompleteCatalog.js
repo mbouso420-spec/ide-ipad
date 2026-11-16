@@ -400,11 +400,11 @@ export function extractWordBeforeCursor(docText, cursorOffset) {
     return { word: "", from: pos, to: pos };
   }
   const before = safeDoc.slice(0, pos);
-  const match = before.match(/(#?[A-Za-z_][A-Za-z0-9_:.!-]*)$/);
+  const match = before.match(/(^|[^A-Za-z0-9_])(#?[A-Za-z_][A-Za-z0-9_:.!-]*)$/);
   if (!match) {
     return { word: "", from: pos, to: pos };
   }
-  const word = match[1];
+  const word = match[2];
   return {
     word,
     from: pos - word.length,
@@ -498,11 +498,16 @@ export function scoreCompletionMatch(query, candidateLabel) {
       }
 
       // 4b. Similitud con el prefijo o palabra completa (ej: "prinf" -> "printf", "retrun" -> "return")
-      const prefixSlice = targetWord.slice(0, Math.min(targetWord.length, q.length + 1));
-      const distPrefix = computeEditDistance(q, prefixSlice);
-      const distFull = computeEditDistance(q, targetWord);
-      const bestDist = Math.min(distPrefix, distFull);
       const maxAllowed = q.length >= 5 ? 2 : 1;
+      const prefixSlice = targetWord.slice(0, Math.min(targetWord.length, q.length + 1));
+      const distPrefix = Math.abs(q.length - prefixSlice.length) <= maxAllowed
+        ? computeEditDistance(q, prefixSlice)
+        : maxAllowed + 1;
+      const distFull =
+        targetWord.length <= 40 && Math.abs(q.length - targetWord.length) <= maxAllowed
+          ? computeEditDistance(q, targetWord)
+          : maxAllowed + 1;
+      const bestDist = Math.min(distPrefix, distFull);
       if (bestDist <= maxAllowed) {
         return 54 - bestDist * 10 - Math.min(12, Math.abs(targetWord.length - q.length));
       }
@@ -571,13 +576,13 @@ export function getLanguageCompletions(lang, query, docTextOrWords = "", limit =
     : lang || "js";
 
   const pool = [];
-  if (LANGUAGE_COMPLETIONS[normalizedLang]) {
+  if (Object.hasOwn(LANGUAGE_COMPLETIONS, normalizedLang)) {
     pool.push(...LANGUAGE_COMPLETIONS[normalizedLang]);
   }
-  if (normalizedLang === "cpp" && LANGUAGE_COMPLETIONS.c) {
+  if (normalizedLang === "cpp" && Object.hasOwn(LANGUAGE_COMPLETIONS, "c")) {
     pool.push(...LANGUAGE_COMPLETIONS.c);
   }
-  if (normalizedLang === "ts" && LANGUAGE_COMPLETIONS.js) {
+  if (normalizedLang === "ts" && Object.hasOwn(LANGUAGE_COMPLETIONS, "js")) {
     pool.push(...LANGUAGE_COMPLETIONS.js);
   }
 
@@ -639,14 +644,10 @@ export function createAutocompleteBarController({
     return {
       update() {},
       hide() {},
-      moveSelection() {
-        return false;
-      },
       acceptCurrent() {
         return false;
       },
       isOpen: () => false,
-      getItems: () => [],
       destroy() {}
     };
   }
@@ -705,6 +706,9 @@ export function createAutocompleteBarController({
   function renderPills() {
     if (!trackEl) return;
     trackEl.innerHTML = "";
+    const frag = typeof document.createDocumentFragment === "function"
+      ? document.createDocumentFragment()
+      : null;
     currentItems.slice(0, 6).forEach((item, idx) => {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -741,8 +745,15 @@ export function createAutocompleteBarController({
         onAccept(item, currentWordRange);
       });
 
-      trackEl.appendChild(btn);
+      if (frag) {
+        frag.appendChild(btn);
+      } else {
+        trackEl.appendChild(btn);
+      }
     });
+    if (frag) {
+      trackEl.appendChild(frag);
+    }
   }
 
   function hide() {
@@ -750,14 +761,6 @@ export function createAutocompleteBarController({
     selectedIndex = 0;
     if (barEl) barEl.hidden = true;
     if (trackEl) trackEl.innerHTML = "";
-  }
-
-  function moveSelection(delta) {
-    if (currentItems.length === 0) return false;
-    const max = Math.min(6, currentItems.length);
-    selectedIndex = (selectedIndex + delta + max) % max;
-    renderPills();
-    return true;
   }
 
   function acceptCurrent() {
@@ -771,10 +774,8 @@ export function createAutocompleteBarController({
   return {
     update,
     hide,
-    moveSelection,
     acceptCurrent,
     isOpen: () => currentItems.length > 0,
-    getItems: () => [...currentItems],
     destroy() {
       hide();
       if (createdLocally && barEl?.parentElement) {

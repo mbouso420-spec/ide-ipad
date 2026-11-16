@@ -715,8 +715,8 @@
   max-width: 100%;
   min-height: 0;
   border: 0;
-  background: var(--color-accent-ink);
-  color: var(--color-paper);
+  background: #ffffff;
+  color: #111827;
   transition: max-width var(--dur-short) var(--ease-out);
 }
 
@@ -1003,7 +1003,6 @@
 .tree-context-item:hover,
 .tree-context-item:focus-visible {
   background: var(--color-paper-3);
-  outline: none;
 }
 
 .tree-context-item:focus-visible {

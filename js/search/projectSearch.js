@@ -47,62 +47,115 @@ export function escapeRegExp(str) {
  */
 const MAX_LINE_SNIPPET_LENGTH = 300;
 const SNIPPET_MATCH_LEADING_CONTEXT = 60;
-const WILDCARD_EQUIV_CLASSES = new Set(["[\\s\\S]", "[\\S\\s]", "[\\w\\W]", "[\\W\\w]", "[\\d\\D]", "[\\D\\d]"]);
+const WILDCARD_EQUIV_CLASSES = new Set(["[\\s\\S]", "[\\S\\s]", "[\\w\\W]", "[\\W\\w]", "[\\d\\D]", "[\\D\\d]", "[^]"]);
 const SAMPLE_OVERLAP_CHARS = (() => {
-  const chars = ["\t", "\n"];
+  const chars = [
+    "\0",
+    "\x01",
+    "\x08",
+    "\t",
+    "\n",
+    "\v",
+    "\f",
+    "\r",
+    "\x1f",
+    "\x7f"
+  ];
   for (let code = 32; code <= 126; code += 1) {
     chars.push(String.fromCharCode(code));
   }
-  // Muestras Unicode no-ASCII para detectar solapamientos entre clases Unicode/negadas (ej. [^\x00-\x7f], \W, [á-ú]).
-  chars.push("á", "é", "í", "ó", "ú", "ñ", "ü", "ç", "ß", "α", "Ω", "ж", "中", "😀");
+  // Muestras Unicode no-ASCII y espacios Unicode para detectar solapamientos entre clases Unicode/negadas.
+  chars.push(
+    "\u00a0",
+    "\u0100",
+    "\u0150",
+    "\u0200",
+    "\u2000",
+    "\u3000",
+    "á",
+    "é",
+    "í",
+    "ó",
+    "ú",
+    "ñ",
+    "ü",
+    "ç",
+    "ß",
+    "α",
+    "Ω",
+    "ж",
+    "中",
+    "😀"
+  );
   return chars;
 })();
 
-function classifyEscapeAtom(escaped) {
+const ESCAPE_CONTROL_CHARS = {
+  t: "\t",
+  n: "\n",
+  r: "\r",
+  f: "\f",
+  v: "\v",
+  0: "\0"
+};
+
+function classifyEscapeAtom(escaped, caseSensitive = true) {
   if ("wWdDsS".includes(escaped)) {
-    return { type: "atom", kind: "shorthand", value: escaped };
+    return { type: "atom", kind: "shorthand", value: escaped, caseSensitive };
   }
-  return { type: "atom", kind: "lit", value: escaped };
+  if (Object.hasOwn(ESCAPE_CONTROL_CHARS, escaped)) {
+    return { type: "atom", kind: "lit", value: ESCAPE_CONTROL_CHARS[escaped], caseSensitive };
+  }
+  return { type: "atom", kind: "lit", value: escaped, caseSensitive };
 }
 
-function skipGroupHeader(src, lparenIndex) {
+function parseGroupHeader(src, lparenIndex, inheritedCaseSensitive = true) {
   const afterParen = lparenIndex + 1;
   if (src[afterParen] !== "?") {
-    return afterParen;
+    return { nextIndex: afterParen, isAssertion: false, caseSensitive: inheritedCaseSensitive };
   }
   const mod = src[afterParen + 1];
-  if (mod === ":" || mod === "=" || mod === "!") {
-    return afterParen + 2;
+  if (mod === ":") {
+    return { nextIndex: afterParen + 2, isAssertion: false, caseSensitive: inheritedCaseSensitive };
+  }
+  if (mod === "=" || mod === "!") {
+    return { nextIndex: afterParen + 2, isAssertion: true, caseSensitive: inheritedCaseSensitive };
   }
   if (mod === "<") {
     const afterLt = src[afterParen + 2];
     if (afterLt === "=" || afterLt === "!") {
-      return afterParen + 3;
+      return { nextIndex: afterParen + 3, isAssertion: true, caseSensitive: inheritedCaseSensitive };
     }
     const closeGt = src.indexOf(">", afterParen + 2);
     if (closeGt !== -1 && !/[()]/.test(src.slice(afterParen + 2, closeGt))) {
-      return closeGt + 1;
+      return { nextIndex: closeGt + 1, isAssertion: false, caseSensitive: inheritedCaseSensitive };
     }
   }
   if (mod === "P" && src[afterParen + 2] === "<") {
     const closeGt = src.indexOf(">", afterParen + 3);
     if (closeGt !== -1 && !/[()]/.test(src.slice(afterParen + 3, closeGt))) {
-      return closeGt + 1;
+      return { nextIndex: closeGt + 1, isAssertion: false, caseSensitive: inheritedCaseSensitive };
     }
   }
-  const flagMatch = /^[a-z-]+:/i.exec(src.slice(afterParen + 1));
+  const flagMatch = /^([a-z]*)(?:-([a-z]*))?:/i.exec(src.slice(afterParen + 1));
   if (flagMatch) {
-    return afterParen + 1 + flagMatch[0].length;
+    let nextCase = inheritedCaseSensitive;
+    if ((flagMatch[1] || "").includes("i")) nextCase = false;
+    if ((flagMatch[2] || "").includes("i")) nextCase = true;
+    return { nextIndex: afterParen + 1 + flagMatch[0].length, isAssertion: false, caseSensitive: nextCase };
   }
-  return afterParen + 1;
+  return { nextIndex: afterParen + 1, isAssertion: false, caseSensitive: inheritedCaseSensitive };
 }
 
 const MAX_CONTIGUOUS_OPTIONALS = 10;
 
-function tokenizeRegexPattern(src) {
+function tokenizeRegexPattern(src, { caseSensitive = true } = {}) {
   const tokens = [];
+  const caseStack = [Boolean(caseSensitive)];
   for (let i = 0; i < src.length; i += 1) {
     const ch = src[i];
+    const currentCase = caseStack[caseStack.length - 1];
+    const classFlags = currentCase ? "" : "i";
     if (ch === "\\") {
       const next = src[i + 1] ?? "";
       if (next >= "1" && next <= "9") {
@@ -119,18 +172,79 @@ function tokenizeRegexPattern(src) {
         tokens.push({ type: "backref" });
         continue;
       }
+      if (next === "x") {
+        const hexMatch = /^[0-9a-fA-F]{2}/.exec(src.slice(i + 2));
+        if (hexMatch) {
+          i += 1 + 2;
+          tokens.push({
+            type: "atom",
+            kind: "lit",
+            value: String.fromCodePoint(Number.parseInt(hexMatch[0], 16)),
+            caseSensitive: currentCase
+          });
+          continue;
+        }
+      }
+      if (next === "u") {
+        if (src[i + 2] === "{") {
+          const braceHex = /^\{([0-9a-fA-F]+)\}/.exec(src.slice(i + 2));
+          if (braceHex) {
+            const cp = Number.parseInt(braceHex[1], 16);
+            i += 1 + braceHex[0].length;
+            tokens.push({
+              type: "atom",
+              kind: "lit",
+              value: cp <= 0x10ffff ? String.fromCodePoint(cp) : "",
+              caseSensitive: currentCase
+            });
+            continue;
+          }
+        } else {
+          const u4 = /^[0-9a-fA-F]{4}/.exec(src.slice(i + 2));
+          if (u4) {
+            i += 1 + 4;
+            tokens.push({
+              type: "atom",
+              kind: "lit",
+              value: String.fromCodePoint(Number.parseInt(u4[0], 16)),
+              caseSensitive: currentCase
+            });
+            continue;
+          }
+        }
+      }
+      if ((next === "p" || next === "P") && src[i + 2] === "{") {
+        const closeBrace = src.indexOf("}", i + 3);
+        if (closeBrace !== -1) {
+          const propExpr = src.slice(i, closeBrace + 1);
+          i = closeBrace;
+          let compiledRe = null;
+          try {
+            compiledRe = new RegExp(`^${propExpr}$`, currentCase ? "u" : "iu");
+          } catch {
+            compiledRe = null;
+          }
+          tokens.push({ type: "atom", kind: "class", value: propExpr, compiledRe, caseSensitive: currentCase });
+          continue;
+        }
+      }
+      if (next === "c" && /^[A-Za-z]$/.test(src[i + 2] ?? "")) {
+        const ctrlCode = src.charCodeAt(i + 2) % 32;
+        i += 2;
+        tokens.push({ type: "atom", kind: "lit", value: String.fromCharCode(ctrlCode), caseSensitive: currentCase });
+        continue;
+      }
       i += 1;
       if (next === "b" || next === "B") {
         tokens.push({ type: "anchor" });
       } else {
-        tokens.push(classifyEscapeAtom(next));
+        tokens.push(classifyEscapeAtom(next, currentCase));
       }
       continue;
     }
     if (ch === "[") {
       let end = i + 1;
       if (src[end] === "^") end += 1;
-      if (src[end] === "]") end += 1;
       while (end < src.length) {
         if (src[end] === "\\") {
           end += 2;
@@ -142,25 +256,28 @@ function tokenizeRegexPattern(src) {
       const rawClass = src.slice(i, end < src.length ? end + 1 : src.length);
       i = end < src.length ? end : src.length - 1;
       if (WILDCARD_EQUIV_CLASSES.has(rawClass)) {
-        tokens.push({ type: "atom", kind: "wildcard", value: "." });
+        tokens.push({ type: "atom", kind: "wildcard", value: ".", caseSensitive: currentCase });
       } else {
         // Precompilar una sola vez para evitar instanciar new RegExp por cada carácter muestreado.
         let compiledRe = null;
         try {
-          compiledRe = new RegExp(`^${rawClass}$`);
+          compiledRe = new RegExp(`^${rawClass}$`, classFlags);
         } catch {
           compiledRe = null;
         }
-        tokens.push({ type: "atom", kind: "class", value: rawClass, compiledRe });
+        tokens.push({ type: "atom", kind: "class", value: rawClass, compiledRe, caseSensitive: currentCase });
       }
       continue;
     }
     if (ch === "(") {
-      tokens.push({ type: "lparen" });
-      i = skipGroupHeader(src, i) - 1;
+      const header = parseGroupHeader(src, i, currentCase);
+      caseStack.push(header.caseSensitive);
+      tokens.push({ type: "lparen", isAssertion: header.isAssertion, caseSensitive: header.caseSensitive });
+      i = header.nextIndex - 1;
       continue;
     }
     if (ch === ")") {
+      if (caseStack.length > 1) caseStack.pop();
       tokens.push({ type: "rparen" });
       continue;
     }
@@ -174,12 +291,12 @@ function tokenizeRegexPattern(src) {
     }
     if (ch === "+" || ch === "*") {
       if (src[i + 1] === "?") i += 1;
-      tokens.push({ type: "quant" });
+      tokens.push({ type: "quant", nullable: ch === "*" });
       continue;
     }
     if (ch === "?") {
       if (src[i + 1] === "?") i += 1;
-      tokens.push({ type: "optional" });
+      tokens.push({ type: "optional", nullable: true });
       continue;
     }
     if (ch === "{") {
@@ -191,25 +308,30 @@ function tokenizeRegexPattern(src) {
         const maxStr = braceMatch[2];
         const isVariableOrMulti = maxStr !== undefined || min > 1;
         if (maxStr === "1" && min === 0) {
-          tokens.push({ type: "optional" });
-        } else if (isVariableOrMulti && !(maxStr === undefined && min === 1)) {
-          tokens.push({ type: "quant" });
+          tokens.push({ type: "optional", nullable: true });
+        } else if (isVariableOrMulti) {
+          tokens.push({ type: "quant", nullable: min === 0 });
+        } else if (min === 0 && maxStr === undefined) {
+          tokens.push({ type: "optional", nullable: true });
         }
         continue;
       }
     }
     if (ch === ".") {
-      tokens.push({ type: "atom", kind: "wildcard", value: "." });
+      tokens.push({ type: "atom", kind: "wildcard", value: ".", caseSensitive: currentCase });
     } else {
-      tokens.push({ type: "atom", kind: "lit", value: ch });
+      tokens.push({ type: "atom", kind: "lit", value: ch, caseSensitive: currentCase });
     }
   }
   return tokens;
 }
 
-function atomMatchesChar(atom, ch) {
+function atomMatchesChar(atom, ch, caseSensitive = true) {
+  const effectiveCase = atom.caseSensitive !== undefined ? atom.caseSensitive : caseSensitive;
   if (atom.kind === "wildcard") return ch !== "\n";
-  if (atom.kind === "lit") return atom.value === ch;
+  if (atom.kind === "lit") {
+    return effectiveCase ? atom.value === ch : atom.value.toLowerCase() === ch.toLowerCase();
+  }
   if (atom.kind === "shorthand") {
     switch (atom.value) {
       case "d": return /\d/.test(ch);
@@ -227,27 +349,31 @@ function atomMatchesChar(atom, ch) {
   return true;
 }
 
-function atomsCanOverlap(a, b) {
+function atomsCanOverlap(a, b, caseSensitive = true) {
   if (!a || !b) return false;
   if (a.type === "alt-group") {
-    return a.atoms.some((inner) => atomsCanOverlap(inner, b));
+    return a.atoms.some((inner) => atomsCanOverlap(inner, b, caseSensitive));
   }
   if (b.type === "alt-group") {
-    return b.atoms.some((inner) => atomsCanOverlap(a, inner));
+    return b.atoms.some((inner) => atomsCanOverlap(a, inner, caseSensitive));
   }
   if (a.kind === "wildcard" || b.kind === "wildcard") return true;
-  if (a.kind === "lit") return atomMatchesChar(b, a.value);
-  if (b.kind === "lit") return atomMatchesChar(a, b.value);
-  if (a.kind === b.kind && a.value === b.value) return true;
-  return SAMPLE_OVERLAP_CHARS.some((ch) => atomMatchesChar(a, ch) && atomMatchesChar(b, ch));
+  const effectiveCaseA = a.caseSensitive !== undefined ? a.caseSensitive : caseSensitive;
+  const effectiveCaseB = b.caseSensitive !== undefined ? b.caseSensitive : caseSensitive;
+  if (a.kind === "lit") return atomMatchesChar(b, a.value, effectiveCaseB);
+  if (b.kind === "lit") return atomMatchesChar(a, b.value, effectiveCaseA);
+  if (a.kind === b.kind && a.value === b.value && effectiveCaseA === effectiveCaseB) return true;
+  return SAMPLE_OVERLAP_CHARS.some(
+    (ch) => atomMatchesChar(a, ch, effectiveCaseA) && atomMatchesChar(b, ch, effectiveCaseB)
+  );
 }
 
-function anyAtomOverlaps(listA, listB) {
+function anyAtomOverlaps(listA, listB, caseSensitive = true) {
   if (!listA?.length || !listB?.length) return false;
-  return listA.some((a) => listB.some((b) => atomsCanOverlap(a, b)));
+  return listA.some((a) => listB.some((b) => atomsCanOverlap(a, b, caseSensitive)));
 }
 
-function branchesTokensOverlap(branchA, branchB) {
+function branchesTokensOverlap(branchA, branchB, caseSensitive = true) {
   if (branchA.length === 0 || branchB.length === 0) return false;
   const lenA = branchA.length;
   const lenB = branchB.length;
@@ -263,7 +389,7 @@ function branchesTokensOverlap(branchA, branchB) {
     if (memo.has(key)) return memo.get(key);
 
     let result = false;
-    if (atomsCanOverlap(branchA[i], branchB[j]) && canAlign(i + 1, j + 1, true)) {
+    if (atomsCanOverlap(branchA[i], branchB[j], caseSensitive) && canAlign(i + 1, j + 1, true)) {
       result = true;
     } else if (branchA[i]?.isOptional && canAlign(i + 1, j, matchedAny)) {
       result = true;
@@ -278,11 +404,11 @@ function branchesTokensOverlap(branchA, branchB) {
   return canAlign(0, 0, false);
 }
 
-function groupHasOverlappingBranches(branches) {
+function groupHasOverlappingBranches(branches, caseSensitive = true) {
   if (branches.length < 2) return false;
   for (let a = 0; a < branches.length; a += 1) {
     for (let b = a + 1; b < branches.length; b += 1) {
-      if (branchesTokensOverlap(branches[a], branches[b])) {
+      if (branchesTokensOverlap(branches[a], branches[b], caseSensitive)) {
         return true;
       }
     }
@@ -290,48 +416,68 @@ function groupHasOverlappingBranches(branches) {
   return false;
 }
 
-function createFrame(isRoot = false) {
+function createBranchState() {
   return {
-    isRoot,
-    hasQuantifier: false,
-    hasBackref: false,
-    hasAlternationOverlap: false,
-    branches: [[]],
     prevQuantified: null,
     startsWithQuantified: false,
     leadingQuantified: null,
+    leadingNullable: true,
     sawFirstToken: false,
-    consecutiveOptionals: 0
+    allNullable: true,
+    consecutiveOptionals: 0,
+    optionalCount: 0
   };
+}
+
+function createFrame({ isAssertion = false } = {}) {
+  return {
+    isAssertion: Boolean(isAssertion),
+    hasQuantifier: false,
+    hasBackref: false,
+    hasOptional: false,
+    hasAlternationOverlap: false,
+    branches: [[]],
+    activeBranch: createBranchState(),
+    completedBranches: []
+  };
+}
+
+function mergeAtomLists(listA, listB) {
+  const out = [];
+  if (Array.isArray(listA)) out.push(...listA);
+  if (Array.isArray(listB)) out.push(...listB);
+  return out.length > 0 ? out : null;
 }
 
 /**
  * Detecta patrones de expresiones regulares susceptibles a Catastrophic Backtracking (ReDoS):
- * 1. Cuantificadores anidados a cualquier nivel de paréntesis: (a+)+, ((a)+)+, (a{1,5})+, ([a-z]+)*
- * 2. Cuantificadores adyacentes solapados en raíz u otro nivel: .*.*!$, a+a+!$
- * 3. Alternancias solapadas (incluidos átomos opcionales anulables) o con comodines dentro de grupos cuantificados: (a|a)+, (a|ab)+, (a?b|b)+, (a|b?a)+
- * 4. Backreferences cuantificadas ((a+)\1+) y cascadas de > 10 opcionales contiguos.
+ * 1. Cuantificadores anidados a cualquier nivel de paréntesis: (a+)+, ((a)+)+, (a{1,5})+, ([a-z]+)*, (?:a?)+
+ * 2. Cuantificadores adyacentes o separados por anulables/aserciones: .*.*!$, a+a+!$, a+b*a+!$, a+(?=a)a+!$
+ * 3. Alternancias solapadas (incluidos átomos opcionales anulables o entre ramas en secuencia): (a|a)+, a+(?:a+|c+)!$, (?:a+|c+)a+!$
+ * 4. Backreferences cuantificadas ((a+)\1+) y cascadas de > 10 opcionales contiguos (incluidos grupos opcionales).
  * @param {string} rawPattern
+ * @param {{ caseSensitive?: boolean }} [options]
  * @returns {boolean}
  */
-export function hasUnsafeReDoSPattern(rawPattern) {
+export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
+  const caseSensitive = options?.caseSensitive !== false;
   const src = String(rawPattern || "");
-  const tokens = tokenizeRegexPattern(src);
-  const frames = [createFrame(true)];
+  const tokens = tokenizeRegexPattern(src, { caseSensitive });
+  const frames = [createFrame()];
 
   for (let i = 0; i < tokens.length; i += 1) {
     const tok = tokens[i];
     const current = frames[frames.length - 1];
+    const br = current.activeBranch;
 
     if (tok.type === "anchor" || tok.type === "quant" || tok.type === "optional") {
       continue;
     }
 
     if (tok.type === "alt") {
+      current.completedBranches.push(current.activeBranch);
       current.branches.push([]);
-      current.prevQuantified = null;
-      current.sawFirstToken = false;
-      current.consecutiveOptionals = 0;
+      current.activeBranch = createBranchState();
       continue;
     }
 
@@ -347,81 +493,150 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       }
       current.hasBackref = true;
       if (isOptional) {
-        current.consecutiveOptionals += 1;
-        if (current.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
+        current.hasOptional = true;
+        br.consecutiveOptionals += 1;
+        br.optionalCount += 1;
+        if (br.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
       } else {
-        current.consecutiveOptionals = 0;
-        current.prevQuantified = null;
+        br.allNullable = false;
+        br.consecutiveOptionals = 0;
+        br.prevQuantified = null;
       }
-      current.sawFirstToken = true;
+      br.sawFirstToken = true;
       continue;
     }
 
     if (tok.type === "lparen") {
-      frames.push(createFrame(false));
+      frames.push(createFrame({ isAssertion: Boolean(tok.isAssertion) }));
       continue;
     }
 
     if (tok.type === "rparen") {
       if (frames.length <= 1) continue;
       const group = frames.pop();
+      group.completedBranches.push(group.activeBranch);
       const parent = frames[frames.length - 1];
+      const pBr = parent.activeBranch;
       const nextTok = tokens[i + 1];
       const groupQuantified = nextTok?.type === "quant";
       const groupOptional = nextTok?.type === "optional";
+      const isNullableQuant = Boolean(nextTok?.nullable);
       if (groupQuantified || groupOptional) {
         i += 1;
       }
 
-      const branchOverlap = groupHasOverlappingBranches(group.branches);
+      if (group.isAssertion) {
+        if (group.hasBackref) parent.hasBackref = true;
+        if (group.hasAlternationOverlap) parent.hasAlternationOverlap = true;
+        continue;
+      }
+
+      const branchOverlap = groupHasOverlappingBranches(group.branches, caseSensitive);
       const hasNestedOverlap = group.hasAlternationOverlap || branchOverlap;
+      const groupAtoms = group.branches.flat();
+      const groupAllNullable = group.completedBranches.every((b) => b.allNullable);
 
       if (groupQuantified) {
-        if (group.hasQuantifier || group.hasBackref || hasNestedOverlap) {
+        if (group.hasQuantifier || group.hasBackref || group.hasOptional || groupAllNullable || hasNestedOverlap) {
           return true;
         }
         parent.hasQuantifier = true;
-        parent.consecutiveOptionals = 0;
-        const groupAtoms = group.branches.flat();
+        if (!isNullableQuant) {
+          pBr.allNullable = false;
+          pBr.consecutiveOptionals = 0;
+        } else {
+          parent.hasOptional = true;
+        }
         if (groupAtoms.length > 0) {
-          if (anyAtomOverlaps(parent.prevQuantified, groupAtoms)) {
+          if (anyAtomOverlaps(pBr.prevQuantified, groupAtoms, caseSensitive)) {
             return true;
           }
-          parent.prevQuantified = groupAtoms;
-          if (!parent.sawFirstToken) {
-            parent.startsWithQuantified = true;
-            parent.leadingQuantified = groupAtoms;
+          pBr.prevQuantified = isNullableQuant
+            ? mergeAtomLists(pBr.prevQuantified, groupAtoms)
+            : groupAtoms;
+          if (!pBr.sawFirstToken || pBr.leadingNullable) {
+            pBr.startsWithQuantified = true;
+            pBr.leadingQuantified = mergeAtomLists(pBr.leadingQuantified, groupAtoms);
+          }
+          if (!isNullableQuant) {
+            pBr.leadingNullable = false;
           }
         }
-        parent.sawFirstToken = true;
+        pBr.sawFirstToken = true;
         const branch = parent.branches[parent.branches.length - 1];
         if (group.branches.length === 1) {
           branch.push(...group.branches[0]);
         } else if (groupAtoms.length > 0) {
-          branch.push({ type: "alt-group", atoms: groupAtoms });
+          branch.push({ type: "alt-group", atoms: groupAtoms, isOptional: isNullableQuant });
         }
+        continue;
+      }
+
+      // Grupo vacío (): no restablecer estado cuantificado ni racha de opcionales del padre
+      if (groupAtoms.length === 0 && !group.hasBackref) {
         continue;
       }
 
       if (group.hasQuantifier) parent.hasQuantifier = true;
       if (group.hasBackref) parent.hasBackref = true;
+      if (group.hasOptional) parent.hasOptional = true;
       if (hasNestedOverlap) parent.hasAlternationOverlap = true;
 
-      if (group.startsWithQuantified && anyAtomOverlaps(parent.prevQuantified, group.leadingQuantified)) {
+      let unionLeading = null;
+      let anyStartsQuantified = false;
+      let unionEnding = null;
+      let maxBranchOpts = 0;
+      for (const bState of group.completedBranches) {
+        if (bState.startsWithQuantified && bState.leadingQuantified) {
+          anyStartsQuantified = true;
+          unionLeading = mergeAtomLists(unionLeading, bState.leadingQuantified);
+        }
+        if (bState.prevQuantified) {
+          unionEnding = mergeAtomLists(unionEnding, bState.prevQuantified);
+        }
+        if (bState.optionalCount > maxBranchOpts) {
+          maxBranchOpts = bState.optionalCount;
+        }
+      }
+
+      if (anyStartsQuantified && anyAtomOverlaps(pBr.prevQuantified, unionLeading, caseSensitive)) {
         return true;
       }
+
       if (groupOptional) {
-        parent.consecutiveOptionals += 1;
-        if (parent.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
-      } else {
-        parent.consecutiveOptionals = 0;
-        if (!parent.sawFirstToken && group.startsWithQuantified) {
-          parent.startsWithQuantified = true;
-          parent.leadingQuantified = group.leadingQuantified;
+        parent.hasOptional = true;
+        const addedOpts = groupAllNullable ? Math.max(1, maxBranchOpts) : 1;
+        pBr.consecutiveOptionals += addedOpts;
+        pBr.optionalCount += addedOpts;
+        if (pBr.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
+        if (unionEnding) {
+          pBr.prevQuantified = mergeAtomLists(pBr.prevQuantified, unionEnding);
         }
-        parent.prevQuantified = group.prevQuantified;
+        if (anyStartsQuantified && (!pBr.sawFirstToken || pBr.leadingNullable)) {
+          pBr.startsWithQuantified = true;
+          pBr.leadingQuantified = mergeAtomLists(pBr.leadingQuantified, unionLeading);
+        }
+      } else {
+        if (!groupAllNullable) {
+          pBr.allNullable = false;
+          pBr.consecutiveOptionals = 0;
+        } else {
+          pBr.consecutiveOptionals += maxBranchOpts;
+          pBr.optionalCount += maxBranchOpts;
+          if (pBr.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
+        }
+        if (anyStartsQuantified && (!pBr.sawFirstToken || pBr.leadingNullable)) {
+          pBr.startsWithQuantified = true;
+          pBr.leadingQuantified = mergeAtomLists(pBr.leadingQuantified, unionLeading);
+        }
+        if (!groupAllNullable) {
+          pBr.leadingNullable = false;
+          pBr.prevQuantified = unionEnding;
+        } else {
+          pBr.prevQuantified = mergeAtomLists(pBr.prevQuantified, unionEnding);
+        }
       }
-      parent.sawFirstToken = true;
+      pBr.sawFirstToken = true;
 
       const branch = parent.branches[parent.branches.length - 1];
       if (group.branches.length === 1) {
@@ -431,9 +646,8 @@ export function hasUnsafeReDoSPattern(rawPattern) {
           branch.push(...group.branches[0]);
         }
       } else {
-        const flatAtoms = group.branches.flat();
-        if (flatAtoms.length > 0) {
-          branch.push({ type: "alt-group", atoms: flatAtoms, isOptional: groupOptional });
+        if (groupAtoms.length > 0) {
+          branch.push({ type: "alt-group", atoms: groupAtoms, isOptional: groupOptional || groupAllNullable });
         }
       }
       continue;
@@ -443,6 +657,7 @@ export function hasUnsafeReDoSPattern(rawPattern) {
       const nextTok = tokens[i + 1];
       const isQuantified = nextTok?.type === "quant";
       const isOptional = nextTok?.type === "optional";
+      const isNullableQuant = Boolean(nextTok?.nullable);
       if (isQuantified || isOptional) {
         i += 1;
       }
@@ -452,25 +667,37 @@ export function hasUnsafeReDoSPattern(rawPattern) {
 
       if (isQuantified) {
         current.hasQuantifier = true;
-        current.consecutiveOptionals = 0;
-        if (anyAtomOverlaps(current.prevQuantified, [tok])) {
+        if (!isNullableQuant) {
+          br.allNullable = false;
+          br.consecutiveOptionals = 0;
+        } else {
+          current.hasOptional = true;
+        }
+        if (anyAtomOverlaps(br.prevQuantified, [tok], caseSensitive)) {
           return true;
         }
-        current.prevQuantified = [tok];
-        if (!current.sawFirstToken) {
-          current.startsWithQuantified = true;
-          current.leadingQuantified = [tok];
+        br.prevQuantified = isNullableQuant ? mergeAtomLists(br.prevQuantified, [tok]) : [tok];
+        if (!br.sawFirstToken || br.leadingNullable) {
+          br.startsWithQuantified = true;
+          br.leadingQuantified = mergeAtomLists(br.leadingQuantified, [tok]);
+        }
+        if (!isNullableQuant) {
+          br.leadingNullable = false;
         }
       } else if (isOptional) {
-        current.consecutiveOptionals += 1;
-        if (current.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) {
+        current.hasOptional = true;
+        br.consecutiveOptionals += 1;
+        br.optionalCount += 1;
+        if (br.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) {
           return true;
         }
       } else {
-        current.consecutiveOptionals = 0;
-        current.prevQuantified = null;
+        br.allNullable = false;
+        br.leadingNullable = false;
+        br.consecutiveOptionals = 0;
+        br.prevQuantified = null;
       }
-      current.sawFirstToken = true;
+      br.sawFirstToken = true;
     }
   }
 
@@ -495,7 +722,7 @@ export function searchInFiles(files, query, options = {}) {
   try {
     let pattern;
     if (isRegex) {
-      if (hasUnsafeReDoSPattern(query)) {
+      if (hasUnsafeReDoSPattern(query, { caseSensitive })) {
         return {
           results: [],
           totalMatches: 0,
@@ -512,8 +739,17 @@ export function searchInFiles(files, query, options = {}) {
       pattern = `\\b(?:${pattern})\\b`;
     }
 
-    const flags = caseSensitive ? "g" : "gi";
-    regex = new RegExp(pattern, flags);
+    const needsUnicode = /\\(?:p|P)\{|\\u\{/.test(pattern);
+    const flags = `${caseSensitive ? "g" : "gi"}${needsUnicode ? "u" : ""}`;
+    try {
+      regex = new RegExp(pattern, flags);
+    } catch (unicodeErr) {
+      if (needsUnicode) {
+        regex = new RegExp(pattern, caseSensitive ? "g" : "gi");
+      } else {
+        throw unicodeErr;
+      }
+    }
   } catch (err) {
     return {
       results: [],
@@ -523,19 +759,41 @@ export function searchInFiles(files, query, options = {}) {
     };
   }
 
+  const hasAnchorOutsideClass = (pat) => {
+    let inClass = false;
+    for (let k = 0; k < pat.length; k += 1) {
+      const ch = pat[k];
+      if (ch === "\\") {
+        k += 1;
+        continue;
+      }
+      if (ch === "[" && !inClass) {
+        inClass = true;
+        continue;
+      }
+      if (ch === "]" && inClass) {
+        inClass = false;
+        continue;
+      }
+      if (!inClass && (ch === "^" || ch === "$")) return true;
+    }
+    return false;
+  };
+  const canPretestWholeFile = !isRegex || !hasAnchorOutsideClass(cleanQuery);
+
   const results = [];
   let totalMatchesCount = 0;
 
   for (const file of files || []) {
     if (!file || file.isFolder || file.isBinary) continue;
-    if (typeof file.content !== "string" || !file.content) continue;
+    if (typeof file.path !== "string" || typeof file.content !== "string" || !file.content) continue;
 
     const baseName = file.path.split(/[/\\]/).pop() || file.path;
     const ext = baseName.includes(".") ? baseName.split(".").pop().toLowerCase() : "";
     if (BINARY_EXTENSIONS.has(ext)) continue;
 
     // Optimización: si el archivo no contiene el patrón, evitar escanear línea a línea.
-    if (!isRegex || (!cleanQuery.includes("^") && !cleanQuery.includes("$"))) {
+    if (canPretestWholeFile) {
       regex.lastIndex = 0;
       if (!regex.test(file.content)) continue;
       regex.lastIndex = 0;

@@ -185,6 +185,16 @@ async function fetchWithTimeout(request, timeoutMs = 12000, fetchInit = undefine
     return fetchInit ? fetch(request, fetchInit) : fetch(request);
   }
   const controller = new AbortCtrl();
+  const externalSignal = fetchInit?.signal || (request && typeof request === "object" ? request.signal : null);
+  let onExternalAbort = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason);
+    } else if (typeof externalSignal.addEventListener === "function") {
+      onExternalAbort = () => controller.abort(externalSignal.reason);
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+    }
+  }
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const init = fetchInit ? { ...fetchInit, signal: controller.signal } : { signal: controller.signal };
@@ -192,6 +202,9 @@ async function fetchWithTimeout(request, timeoutMs = 12000, fetchInit = undefine
   } finally {
     if (typeof clearTimeout === "function") {
       clearTimeout(timer);
+    }
+    if (externalSignal && onExternalAbort && typeof externalSignal.removeEventListener === "function") {
+      externalSignal.removeEventListener("abort", onExternalAbort);
     }
   }
 }
@@ -207,11 +220,13 @@ function hasSafeRedirectOrigin(response, originalUrl) {
   }
 }
 
-async function precacheShellUrl(cache, url) {
+async function precacheShellUrl(cache, url, limitFetch = (fn) => fn()) {
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      const res = await fetch(new Request(url, { cache: "reload" }));
+      const res = await limitFetch(() =>
+        fetchWithTimeout(new Request(url, { cache: "reload" }), 12000)
+      );
       if (isCacheableResponse(res)) {
         await safeCachePut(cache, url, res);
         return;
@@ -235,7 +250,7 @@ async function precacheShellUrl(cache, url) {
 }
 
 async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0, limitFetch = (fn) => fn()) {
-  if (!targetUrl || state.visited.has(targetUrl) || state.visited.size >= 80 || depth > 2) {
+  if (!targetUrl || state.visited.has(targetUrl) || state.visited.size >= 160 || depth > 2) {
     return;
   }
   let parsed;
@@ -316,7 +331,7 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0, limitFe
 
   const childTasks = [];
   for (const spec of specifiers) {
-    if (state.visited.size >= 80) break;
+    if (state.visited.size >= 160) break;
     if (spec.startsWith("/") || spec.startsWith("./") || spec.startsWith("../") || spec.startsWith("https://")) {
       try {
         const resolved = new URL(spec, baseForRel).href;
@@ -330,11 +345,12 @@ async function warmExternalScriptUrl(cache, targetUrl, state, depth = 0, limitFe
 }
 
 self.addEventListener("install", (event) => {
+  const limitShellFetch = createConcurrencyLimiter(8);
   event.waitUntil(
     Promise.all([
       caches
         .open(SHELL_CACHE)
-        .then((cache) => Promise.all(APP_SHELL_URLS.map((url) => precacheShellUrl(cache, url)))),
+        .then((cache) => Promise.all(APP_SHELL_URLS.map((url) => precacheShellUrl(cache, url, limitShellFetch)))),
       caches
         .open(RUNTIME_CACHE)
         .then(async (cache) => {
@@ -399,7 +415,7 @@ self.addEventListener("fetch", (event) => {
           return cached;
         }
 
-        const networkPromise = fetch(request)
+        const networkPromise = fetchWithTimeout(request, 15000)
           .then(async (response) => {
             if (isCacheableResponse(response) && hasSafeRedirectOrigin(response, request.url)) {
               await safeCachePut(cache, request, response);

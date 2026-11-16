@@ -43,7 +43,6 @@ const ICONS = {
   search: '<circle cx="11" cy="11" r="8"></circle><path d="m21 21-4.3-4.3"></path>',
   wrapText: '<line x1="3" x2="21" y1="6" y2="6"></line><path d="M3 12h15a3 3 0 1 1 0 6h-4"></path><polyline points="16 16 14 18 16 20"></polyline><line x1="3" x2="10" y1="18" y2="18"></line>',
   play: '<polygon points="6 3 20 12 6 21 6 3"></polygon>',
-  gauge: '<path d="m12 14 4-4"></path><path d="M3.34 19a10 10 0 1 1 17.32 0"></path>',
   zap: '<polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>',
   gitCompare: '<circle cx="18" cy="18" r="3"></circle><circle cx="6" cy="6" r="3"></circle><path d="M13 6h3a2 2 0 0 1 2 2v7"></path><path d="M11 18H8a2 2 0 0 1-2-2V9"></path>',
   terminal: '<polyline points="4 17 10 11 4 5"></polyline><line x1="12" x2="20" y1="19" y2="19"></line>',
@@ -66,7 +65,7 @@ const ICONS = {
  * @returns {string}
  */
 export function icon(name, extraClass = "") {
-  const paths = ICONS[name] ?? ICONS.code;
+  const paths = Object.hasOwn(ICONS, name) ? ICONS[name] : ICONS.code;
   const safeExtra = String(extraClass || "")
     .replace(/[^a-zA-Z0-9_\-\s]/g, " ")
     .trim()

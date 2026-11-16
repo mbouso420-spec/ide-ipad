@@ -63,14 +63,23 @@ export function classifyRemotePullChanges({
     if (p) localEntryByPath.set(p, entry);
   }
 
-  const safeUpdates = [];
+  const safeUpdatesMap = new Map();
   const safeDeletions = [];
   const conflicts = [];
   const seenConflictPaths = new Set();
 
+  function recordSafeUpdate(path, status, blobSha = null) {
+    safeUpdatesMap.set(path, {
+      path,
+      status,
+      blobSha: blobSha || null
+    });
+  }
+
   function recordConflict(path, remoteStatus, localStatus, blobSha = null) {
     if (seenConflictPaths.has(path)) return;
     seenConflictPaths.add(path);
+    safeUpdatesMap.delete(path);
     conflicts.push({
       path,
       remoteStatus,
@@ -106,11 +115,7 @@ export function classifyRemotePullChanges({
       if (localDest) {
         recordConflict(cleanPath, "added", localDest.status, file.blobSha || null);
       } else {
-        safeUpdates.push({
-          path: cleanPath,
-          status: "added",
-          blobSha: file.blobSha || null
-        });
+        recordSafeUpdate(cleanPath, "added", file.blobSha || null);
       }
       continue;
     }
@@ -135,14 +140,11 @@ export function classifyRemotePullChanges({
     if (localPending) {
       recordConflict(cleanPath, status || "modified", localPending.status, file.blobSha || null);
     } else {
-      safeUpdates.push({
-        path: cleanPath,
-        status: status || "modified",
-        blobSha: file.blobSha || null
-      });
+      recordSafeUpdate(cleanPath, status || "modified", file.blobSha || null);
     }
   }
 
+  const safeUpdates = Array.from(safeUpdatesMap.values());
   safeUpdates.sort((a, b) => a.path.localeCompare(b.path));
   safeDeletions.sort((a, b) => a.path.localeCompare(b.path));
   conflicts.sort((a, b) => a.path.localeCompare(b.path));

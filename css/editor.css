@@ -364,6 +364,11 @@
   border: var(--rule-hair) solid var(--color-rule);
 }
 
+.editor-binary-dim {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-ink-2);
+}
+
 .editor-binary-desc {
   font-size: var(--text-sm);
   color: var(--color-muted);

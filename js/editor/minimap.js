@@ -52,21 +52,42 @@ export function createMinimapController({
 
   const handlePointerMove = (e) => {
     if (!isDragging) return;
+    if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
     e.preventDefault();
     updateScrollFromPointer(e);
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e) => {
+    if (e && activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
     isDragging = false;
     if (activePointerId !== null) {
       try {
         containerEl?.releasePointerCapture?.(activePointerId);
-      } catch (_) {}
+      } catch (_) {
+        /* captura ya liberada o elemento desconectado */
+      }
       activePointerId = null;
     }
     window.removeEventListener("pointermove", handlePointerMove);
     window.removeEventListener("pointerup", handlePointerUp);
     window.removeEventListener("pointercancel", handlePointerUp);
+  };
+
+  const handlePointerDown = (e) => {
+    e.preventDefault();
+    isDragging = true;
+    activePointerId = e.pointerId ?? null;
+    if (activePointerId !== null) {
+      try {
+        containerEl?.setPointerCapture?.(activePointerId);
+      } catch (_) {
+        /* entorno sin setPointerCapture */
+      }
+    }
+    updateScrollFromPointer(e);
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
   };
 
   function initDOM() {
@@ -103,28 +124,43 @@ export function createMinimapController({
     setupEvents();
   }
 
-  function isElementHidden(el) {
+  let cachedCssHidden = false;
+
+  function isElementHidden(el, { skipStyleCheck = false } = {}) {
     if (!el || el.hidden || el.isConnected === false) return true;
+    if (skipStyleCheck) {
+      return cachedCssHidden;
+    }
     if (typeof getComputedStyle === "function") {
       try {
         const style = getComputedStyle(el);
         if (style && (style.display === "none" || style.visibility === "hidden")) {
           return true;
         }
-      } catch (_) {}
+      } catch (_) {
+        /* elemento desconectado o entorno sin getComputedStyle */
+      }
     }
     return false;
   }
 
-  function getRenderDimensions() {
+  function getRenderDimensions({ skipStyleCheck = false } = {}) {
     if (!isVisible || !canvas || !ctx || !containerEl) return null;
-    if (isElementHidden(containerEl) || isElementHidden(mountEl)) return null;
-    if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    if (!skipStyleCheck) {
+      cachedCssHidden = isElementHidden(containerEl) || isElementHidden(mountEl);
+    }
+    if (isElementHidden(containerEl, { skipStyleCheck }) || isElementHidden(mountEl, { skipStyleCheck })) {
+      return null;
+    }
+    if (!skipStyleCheck && typeof window !== "undefined" && typeof window.matchMedia === "function") {
       try {
         if (window.matchMedia("(max-width: 48rem)").matches) {
+          cachedCssHidden = true;
           return null;
         }
-      } catch (_) {}
+      } catch (_) {
+        /* matchMedia no disponible */
+      }
     }
     const width = Number(containerEl.clientWidth) || 0;
     const height = Number(containerEl.clientHeight) || 0;
@@ -134,23 +170,8 @@ export function createMinimapController({
 
   function setupEvents() {
     if (!containerEl) return;
-
-    const handlePointerDown = (e) => {
-      e.preventDefault();
-      isDragging = true;
-      activePointerId = e.pointerId ?? null;
-      if (activePointerId !== null) {
-        try {
-          containerEl.setPointerCapture?.(activePointerId);
-        } catch (_) {}
-      }
-      updateScrollFromPointer(e);
-      window.addEventListener("pointermove", handlePointerMove);
-      window.addEventListener("pointerup", handlePointerUp);
-      window.addEventListener("pointercancel", handlePointerUp);
-    };
-
     containerEl.addEventListener("pointerdown", handlePointerDown);
+    containerEl.addEventListener("lostpointercapture", handlePointerUp);
   }
 
   function updateScrollFromPointer(e) {
@@ -188,13 +209,14 @@ export function createMinimapController({
       const sampled = sampleDocLines(Math.max(1, Math.round(height)));
       totalLines = Math.max(1, sampled?.totalLines || 1);
       const lineHeight = Math.min(3, Math.max(1, height / totalLines));
+      const effectiveHeight = Math.min(height, totalLines * (lineHeight + 3));
       const maxChars = 80;
       ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
 
       for (const sample of sampled?.samples || []) {
         const line = sample?.text || "";
         if (!line.trim()) continue;
-        const y = (sample.index / totalLines) * height;
+        const y = (sample.index / totalLines) * effectiveHeight;
         const indent = line.search(/\S|$/);
         const startX = Math.min(width - 6, indent * 1.5);
         const textLen = Math.min(maxChars, line.trim().length);
@@ -213,8 +235,9 @@ export function createMinimapController({
       totalLines = Math.max(1, lines.length);
     }
 
-    // Altura por línea proporcional
+    // Altura por línea proporcional acotada para archivos cortos
     const lineHeight = Math.min(3, Math.max(1, height / totalLines));
+    const effectiveHeight = Math.min(height, totalLines * (lineHeight + 3));
     const maxChars = 80;
 
     ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
@@ -225,7 +248,7 @@ export function createMinimapController({
       const line = (useIndexed ? getLine(i) : lines[i]) || "";
       if (!line.trim()) continue;
 
-      const y = (i / totalLines) * height;
+      const y = (i / totalLines) * effectiveHeight;
       const indent = line.search(/\S|$/);
       const startX = Math.min(width - 6, indent * 1.5);
       const textLen = Math.min(maxChars, line.trim().length);
@@ -242,7 +265,7 @@ export function createMinimapController({
     if (sliderRaf) return;
     sliderRaf = safeRequestAnim(() => {
       sliderRaf = null;
-      if (!sliderEl || !getRenderDimensions()) return;
+      if (!sliderEl || !getRenderDimensions({ skipStyleCheck: true })) return;
       const viewport = typeof getViewport === "function" ? getViewport() : { top: 0, height: 100, totalHeight: 100 };
       const containerH = containerEl.clientHeight || 0;
       if (containerH <= 1) return;
@@ -251,8 +274,14 @@ export function createMinimapController({
       const topRatio = Math.max(0, Math.min(1, viewport.top / totalH));
       const heightRatio = Math.max(0.05, Math.min(1, viewport.height / totalH));
 
-      const sliderTop = topRatio * containerH;
-      const sliderHeight = heightRatio * containerH;
+      const sliderHeight = Math.min(
+        containerH,
+        Math.max(Math.min(20, containerH), heightRatio * containerH)
+      );
+      const sliderTop = Math.min(
+        Math.max(0, topRatio * containerH),
+        Math.max(0, containerH - sliderHeight)
+      );
 
       sliderEl.style.transform = `translateY(${sliderTop}px)`;
       sliderEl.style.height = `${sliderHeight}px`;
@@ -260,8 +289,9 @@ export function createMinimapController({
   }
 
   function requestRender() {
-    if (animFrameId) safeCancelAnim(animFrameId);
+    if (animFrameId) return;
     animFrameId = safeRequestAnim(() => {
+      animFrameId = null;
       render();
     });
   }
@@ -280,12 +310,20 @@ export function createMinimapController({
   }
 
   function destroy() {
-    if (animFrameId) safeCancelAnim(animFrameId);
-    if (sliderRaf) safeCancelAnim(sliderRaf);
+    if (animFrameId) {
+      safeCancelAnim(animFrameId);
+      animFrameId = null;
+    }
+    if (sliderRaf) {
+      safeCancelAnim(sliderRaf);
+      sliderRaf = null;
+    }
     if (resizeObserver) {
       resizeObserver.disconnect();
       resizeObserver = null;
     }
+    containerEl?.removeEventListener("pointerdown", handlePointerDown);
+    containerEl?.removeEventListener("lostpointercapture", handlePointerUp);
     window.removeEventListener("pointermove", handlePointerMove);
     window.removeEventListener("pointerup", handlePointerUp);
     window.removeEventListener("pointercancel", handlePointerUp);

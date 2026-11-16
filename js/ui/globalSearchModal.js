@@ -1,5 +1,5 @@
 import { searchInFiles } from "../search/projectSearch.js";
-import { hydrateIcons } from "./icons.js";
+import { icon } from "./icons.js";
 import { keyboardRouter } from "./keyboardRouter.js";
 import { escapeHtml } from "../utils/dom.js";
 
@@ -26,15 +26,19 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   let debounceTimer = null;
   let currentResults = [];
   let flatMatchItems = [];
+  let renderedRows = [];
   let selectedIndex = 0;
 
   function open() {
     if (!dialog) return;
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
     if (input) {
       input.value = "";
     }
     currentResults = [];
     flatMatchItems = [];
+    renderedRows = [];
     selectedIndex = 0;
     renderEmptyState("Escribí un texto o expresión regular para buscar en todo el proyecto.");
     if (!dialog.open) {
@@ -51,6 +55,8 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   }
 
   function close() {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
     keyboardRouter.popModal("global-search-dialog");
     if (dialog?.open) {
       dialog.close();
@@ -62,6 +68,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
     if (!query.trim()) {
       currentResults = [];
       flatMatchItems = [];
+      renderedRows = [];
       selectedIndex = 0;
       renderEmptyState("Escribí un texto o expresión regular para buscar en todo el proyecto.");
       return;
@@ -75,6 +82,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
     });
 
     if (searchRes.error) {
+      renderedRows = [];
       renderErrorState(searchRes.error);
       return;
     }
@@ -96,6 +104,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   }
 
   function renderEmptyState(message) {
+    renderedRows = [];
     if (statsEl) statsEl.textContent = "";
     if (resultsEl) {
       resultsEl.innerHTML = `<div class="search-empty-state"><p>${escapeHtml(message)}</p></div>`;
@@ -103,6 +112,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   }
 
   function renderErrorState(err) {
+    renderedRows = [];
     if (statsEl) statsEl.textContent = "Error en la búsqueda";
     if (resultsEl) {
       resultsEl.innerHTML = `<div class="search-error-state"><p>${escapeHtml(err)}</p></div>`;
@@ -111,6 +121,8 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
   function renderResults({ results, totalMatches, filesMatched }, query) {
     if (!resultsEl || !statsEl) return;
+
+    renderedRows = [];
 
     if (totalMatches === 0) {
       statsEl.textContent = "Sin coincidencias";
@@ -128,6 +140,10 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
     const container = document.createElement("div");
     container.className = "search-results-list";
+    const groupFrag = typeof document.createDocumentFragment === "function"
+      ? document.createDocumentFragment()
+      : null;
+    const fileIconHtml = icon("fileCode");
 
     let flatIdx = 0;
 
@@ -138,7 +154,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
       const fileHeader = document.createElement("div");
       fileHeader.className = "search-file-header";
       fileHeader.innerHTML = `
-        <span class="search-file-icon" data-icon="fileCode"></span>
+        <span class="search-file-icon">${fileIconHtml}</span>
         <span class="search-file-path" title="${escapeHtml(fileItem.path)}">${escapeHtml(fileItem.path)}</span>
         <span class="search-file-count">${fileItem.totalMatches}</span>
       `;
@@ -146,6 +162,9 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
       const matchesList = document.createElement("div");
       matchesList.className = "search-matches-list";
+      const matchFrag = typeof document.createDocumentFragment === "function"
+        ? document.createDocumentFragment()
+        : null;
 
       for (const m of fileItem.matches) {
         const itemIdx = flatIdx++;
@@ -167,25 +186,18 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
           <span class="search-snippet code-font">${highlightedSnippet}</span>
         `;
 
-        matchRow.addEventListener("click", () => {
-          onSelectMatch?.({
-            path: fileItem.path,
-            line: m.line,
-            column: m.column
-          });
-          close();
-        });
-
-        matchesList.appendChild(matchRow);
+        renderedRows.push(matchRow);
+        (matchFrag || matchesList).appendChild(matchRow);
       }
 
+      if (matchFrag) matchesList.appendChild(matchFrag);
       fileGroup.appendChild(matchesList);
-      container.appendChild(fileGroup);
+      (groupFrag || container).appendChild(fileGroup);
     }
 
+    if (groupFrag) container.appendChild(groupFrag);
     resultsEl.innerHTML = "";
     resultsEl.appendChild(container);
-    hydrateIcons(container);
   }
 
   function highlightSnippet(text, start, end) {
@@ -197,16 +209,16 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
   function updateSelection(newIdx) {
     if (flatMatchItems.length === 0) return;
+    const prevIdx = selectedIndex;
     selectedIndex = Math.max(0, Math.min(newIdx, flatMatchItems.length - 1));
-
-    const rows = resultsEl?.querySelectorAll(".search-match-row");
-    rows?.forEach((row) => {
-      const isSel = Number(row.dataset.flatIndex) === selectedIndex;
-      row.classList.toggle("is-selected", isSel);
-      if (isSel) {
-        row.scrollIntoView({ block: "nearest" });
-      }
-    });
+    if (prevIdx !== selectedIndex) {
+      renderedRows[prevIdx]?.classList.remove("is-selected");
+    }
+    const nextRow = renderedRows[selectedIndex];
+    if (nextRow) {
+      nextRow.classList.add("is-selected");
+      nextRow.scrollIntoView?.({ block: "nearest" });
+    }
   }
 
   // Eventos de interfaz
@@ -215,6 +227,21 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
   dialog?.addEventListener("click", (e) => {
     if (e.target === dialog) close();
+  }, listenOpts);
+
+  resultsEl?.addEventListener("click", (e) => {
+    const row = e.target?.closest?.(".search-match-row");
+    if (!row) return;
+    const flatIdx = Number(row.dataset.flatIndex);
+    const match = Number.isInteger(flatIdx) && flatMatchItems[flatIdx]
+      ? flatMatchItems[flatIdx]
+      : {
+          path: row.dataset.path,
+          line: Number(row.dataset.line) || 1,
+          column: Number(row.dataset.column) || 1
+        };
+    close();
+    onSelectMatch?.(match);
   }, listenOpts);
 
   input?.addEventListener("input", () => {
@@ -233,10 +260,15 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
       updateSelection(selectedIndex - 1);
     } else if (e.key === "Enter") {
       e.preventDefault();
+      if (debounceTimer !== null) {
+        clearTimeout(debounceTimer);
+        debounceTimer = null;
+        performSearch();
+      }
       if (flatMatchItems[selectedIndex]) {
         const item = flatMatchItems[selectedIndex];
-        onSelectMatch?.(item);
         close();
+        onSelectMatch?.(item);
       }
     }
   }, listenOpts);

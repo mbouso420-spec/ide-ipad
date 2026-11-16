@@ -53,6 +53,19 @@ export function initGithubLocalBackupPanel({
   const gistRestoreStatus = document.getElementById("gh-gist-restore-status");
 
   let gistRefreshSeq = 0;
+  let isPanelActionBusy = false;
+  let destroyed = false;
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
+
+  function setActionBusy(busy) {
+    isPanelActionBusy = busy;
+    if (backupGistBtn) backupGistBtn.disabled = busy;
+    if (confirmPublishBtn) confirmPublishBtn.disabled = busy;
+    if (cancelPublishBtn) cancelPublishBtn.disabled = busy;
+    if (publishRepoBtn) publishRepoBtn.disabled = busy;
+    if (restoreGistBtn) restoreGistBtn.disabled = busy || !gistSelect?.value;
+  }
 
   function hidePublishRepoBox() {
     if (publishRepoBox) publishRepoBox.hidden = true;
@@ -68,7 +81,7 @@ export function initGithubLocalBackupPanel({
   }
 
   async function refresh(project) {
-    if (!project) return;
+    if (!project || destroyed) return;
     hidePublishRepoBox();
     if (localProjectNameEl) {
       localProjectNameEl.textContent = project.name;
@@ -92,9 +105,12 @@ export function initGithubLocalBackupPanel({
         return;
       }
 
+      gistSelect.innerHTML = '<option value="">Cargando respaldos en Gists…</option>';
+      if (restoreGistBtn) restoreGistBtn.disabled = true;
+
       fetchUserGistBackups(token)
         .then((backups) => {
-          if (seq !== gistRefreshSeq) return;
+          if (destroyed || seq !== gistRefreshSeq) return;
           gistSelect.innerHTML = "";
           if (backups.length === 0) {
             gistSelect.innerHTML = '<option value="">No tenés respaldos de Studio IDE en tus Gists</option>';
@@ -116,15 +132,18 @@ export function initGithubLocalBackupPanel({
           if (restoreGistBtn) restoreGistBtn.disabled = true;
         })
         .catch((err) => {
-          if (seq !== gistRefreshSeq) return;
+          if (destroyed || seq !== gistRefreshSeq) return;
           const msg = formatSafeErrorMessage(err, [token], "");
+          const isAuth401 = err?.status === 401 || err?.credentialRejected;
           const isPermission403 =
             err?.status === 403 &&
             (msg.includes("Resource not accessible") ||
               msg.includes("permiso") ||
               msg.toLowerCase().includes("gist") ||
               msg.toLowerCase().includes("scope"));
-          if (isPermission403 || msg.includes("permiso para Gists")) {
+          if (isAuth401) {
+            gistSelect.innerHTML = '<option value="">Token inválido o vencido (reconectá arriba)</option>';
+          } else if (isPermission403 || msg.includes("permiso para Gists")) {
             gistSelect.innerHTML =
               '<option value="">Tu token no tiene permiso para Gists (podés publicar en repositorio)</option>';
           } else {
@@ -136,6 +155,7 @@ export function initGithubLocalBackupPanel({
   }
 
   backupGistBtn?.addEventListener("click", async () => {
+    if (isPanelActionBusy) return;
     const token = getGithubToken();
     if (!token) {
       setGithubStatus(localBackupStatus, "Conectá tu token de GitHub arriba primero.", "error");
@@ -145,18 +165,24 @@ export function initGithubLocalBackupPanel({
 
     const project = getActiveProject();
     if (!project) return;
+    const sourceProjectId = project.id;
 
-    backupGistBtn.disabled = true;
+    setActionBusy(true);
     setGithubStatus(localBackupStatus, "Guardando copia en Gist privado de GitHub…", "neutral");
 
     try {
       await onFlushPendingSaves?.();
-      const entries = await getProjectEntries(project.id);
+      const entries = await getProjectEntries(sourceProjectId);
       const result = await saveProjectToGist(token, {
         projectName: project.name,
         entries,
         existingGistId: project.gistId || null
       });
+
+      const currentProj = getActiveProject();
+      if (destroyed || !currentProj || currentProj.id !== sourceProjectId || currentProj.kind === "github") {
+        return;
+      }
 
       project.gistId = result.id;
       await saveProjectState(project);
@@ -169,6 +195,7 @@ export function initGithubLocalBackupPanel({
       if (backupGistText) {
         backupGistText.textContent = "Actualizar Gist Privado";
       }
+      void refresh(project);
     } catch (err) {
       const msg = formatSafeErrorMessage(err, [token], "No se pudo guardar el Gist.");
       if (msg.includes("Resource not accessible") || msg.includes("permiso para Gists")) {
@@ -181,11 +208,12 @@ export function initGithubLocalBackupPanel({
         setGithubStatus(localBackupStatus, `Error al respaldar en Gist: ${msg}`, "error");
       }
     } finally {
-      backupGistBtn.disabled = false;
+      setActionBusy(false);
     }
-  });
+  }, listenOpts);
 
   publishRepoBtn?.addEventListener("click", () => {
+    if (isPanelActionBusy) return;
     const token = getGithubToken();
     if (!token) {
       setGithubStatus(localBackupStatus, "Conectá tu token de GitHub arriba primero.", "error");
@@ -206,11 +234,11 @@ export function initGithubLocalBackupPanel({
         publishNameInput.select();
       }
     }
-  });
+  }, listenOpts);
 
   cancelPublishBtn?.addEventListener("click", () => {
     hidePublishRepoBox();
-  });
+  }, listenOpts);
 
   publishNameInput?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -220,9 +248,10 @@ export function initGithubLocalBackupPanel({
       event.preventDefault();
       hidePublishRepoBox();
     }
-  });
+  }, listenOpts);
 
   confirmPublishBtn?.addEventListener("click", async () => {
+    if (isPanelActionBusy) return;
     const token = getGithubToken();
     if (!token) {
       setGithubStatus(localBackupStatus, "Conectá tu token de GitHub arriba primero.", "error");
@@ -243,9 +272,7 @@ export function initGithubLocalBackupPanel({
     const isPrivate = publishVisibilitySelect ? publishVisibilitySelect.value === "private" : true;
     const visibilityLabel = isPrivate ? "privado" : "público";
 
-    if (confirmPublishBtn) confirmPublishBtn.disabled = true;
-    if (cancelPublishBtn) cancelPublishBtn.disabled = true;
-    if (publishRepoBtn) publishRepoBtn.disabled = true;
+    setActionBusy(true);
     setGithubStatus(localBackupStatus, `Creando repositorio ${visibilityLabel} y subiendo archivos a GitHub…`, "neutral");
 
     try {
@@ -280,24 +307,23 @@ export function initGithubLocalBackupPanel({
         setGithubStatus(localBackupStatus, `Error al publicar repositorio: ${msg}`, "error");
       }
     } finally {
-      if (confirmPublishBtn) confirmPublishBtn.disabled = false;
-      if (cancelPublishBtn) cancelPublishBtn.disabled = false;
-      if (publishRepoBtn) publishRepoBtn.disabled = false;
+      setActionBusy(false);
     }
-  });
+  }, listenOpts);
 
   gistSelect?.addEventListener("change", () => {
     if (restoreGistBtn) {
-      restoreGistBtn.disabled = !gistSelect.value;
+      restoreGistBtn.disabled = isPanelActionBusy || !gistSelect.value;
     }
-  });
+  }, listenOpts);
 
   restoreGistBtn?.addEventListener("click", async () => {
+    if (isPanelActionBusy) return;
     const token = getGithubToken();
     const gistId = gistSelect?.value;
     if (!token || !gistId) return;
 
-    restoreGistBtn.disabled = true;
+    setActionBusy(true);
     setGithubStatus(gistRestoreStatus, "Descargando y restaurando proyecto desde Gist…", "neutral");
 
     try {
@@ -310,13 +336,18 @@ export function initGithubLocalBackupPanel({
       const msg = formatSafeErrorMessage(err, [token], "No se pudo restaurar el Gist.");
       setGithubStatus(gistRestoreStatus, `Error al restaurar: ${msg}`, "error");
     } finally {
-      restoreGistBtn.disabled = !gistSelect?.value;
+      setActionBusy(false);
     }
-  });
+  }, listenOpts);
 
   return {
     hidePublishRepoBox,
     setSectionVisible,
-    refresh
+    refresh,
+    destroy() {
+      destroyed = true;
+      gistRefreshSeq += 1;
+      listenerController?.abort();
+    }
   };
 }

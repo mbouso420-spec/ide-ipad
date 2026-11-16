@@ -31,41 +31,54 @@ export function downloadBlob(blob, filename, { revokeDelayMs = 1500 } = {}) {
   if (!blob || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
     return false;
   }
+  if (typeof Blob !== "undefined" && !(blob instanceof Blob)) {
+    return false;
+  }
   if (typeof document === "undefined" || typeof document.createElement !== "function") {
     return false;
   }
 
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = String(filename || "download");
-  if (anchor.style) {
-    anchor.style.display = "none";
-  }
-
-  const container = document.body || document.documentElement;
-  if (container && typeof container.appendChild === "function") {
-    container.appendChild(anchor);
-  }
+  let url = "";
+  let anchor = null;
+  const safeName =
+    String(filename || "download")
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+      .trim() || "download";
+  const delayMs = Number.isFinite(Number(revokeDelayMs)) ? Math.max(0, Number(revokeDelayMs)) : 1500;
 
   try {
-    anchor.click();
-  } finally {
-    if (anchor.parentNode && typeof anchor.parentNode.removeChild === "function") {
-      anchor.parentNode.removeChild(anchor);
-    } else if (typeof anchor.remove === "function") {
-      anchor.remove();
+    url = URL.createObjectURL(blob);
+    anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = safeName;
+    if (anchor.style) {
+      anchor.style.display = "none";
     }
 
-    const scheduleRevoke = typeof window !== "undefined" && typeof window.setTimeout === "function"
-      ? window.setTimeout.bind(window)
-      : setTimeout;
-    if (typeof URL.revokeObjectURL === "function") {
+    const container = document.body || document.documentElement;
+    if (container && typeof container.appendChild === "function") {
+      container.appendChild(anchor);
+    }
+
+    anchor.click();
+  } finally {
+    if (anchor) {
+      if (anchor.parentNode && typeof anchor.parentNode.removeChild === "function") {
+        anchor.parentNode.removeChild(anchor);
+      } else if (typeof anchor.remove === "function") {
+        anchor.remove();
+      }
+    }
+
+    if (url && typeof URL.revokeObjectURL === "function") {
+      const scheduleRevoke = typeof window !== "undefined" && typeof window.setTimeout === "function"
+        ? window.setTimeout.bind(window)
+        : setTimeout;
       scheduleRevoke(() => {
         try {
           URL.revokeObjectURL(url);
         } catch (_) {}
-      }, Math.max(0, revokeDelayMs));
+      }, delayMs);
     }
   }
   return true;

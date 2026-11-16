@@ -29,7 +29,10 @@ const GH_USER_CACHE_KEY = "ide.github.userLogin";
 const liveSyncedByProvider = new Map();
 const liveModelsByProvider = new Map();
 
-const CONTROL_CHARS_RE = /[\x00-\x1f\x7f]/;
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/;
+const NON_BYTE_STRING_RE = /[^\x00-\xff]/;
+const MAX_KEY_BUNDLE_JSON_BYTES = 1024 * 1024;
+const MAX_SSE_BUFFER_CHARS = 2 * 1024 * 1024;
 
 function getStorageArea(kind) {
   if (typeof window !== "undefined") {
@@ -157,13 +160,15 @@ export function getModelContextWindow(providerId, modelId) {
   if (!provider) return 16000;
   if (modelId) {
     const models = getProviderModels(providerId);
-    const found = models.find((m) => m.id === modelId) || provider.models?.find((m) => m.id === modelId);
-    if (found?.contextWindow) return found.contextWindow;
+    const found = models.find((m) => m.id === modelId);
+    const preset = provider.models?.find((m) => m.id === modelId);
+    const ctxWin = found?.contextWindow || preset?.contextWindow;
+    if (ctxWin) return ctxWin;
   }
   return provider.contextWindow || 16000;
 }
 
-export function isFreeActiveGoogleModelId(id) {
+function isFreeActiveGoogleModelId(id) {
   const lower = String(id || "").toLowerCase();
   if (!lower.startsWith("gemini-") && !lower.startsWith("gemma-")) {
     return false;
@@ -219,49 +224,49 @@ export function getKeyStorageMode() {
 }
 
 export function setKeyStorageMode(nextMode) {
-  const prevMode = getKeyStorageMode();
-  if (prevMode === nextMode && nextMode !== "session") {
-    return;
-  }
-
+  const normalizedMode = nextMode === "session" ? "session" : "local";
   try {
     const local = getStorageArea("localStorage");
     const session = getStorageArea("sessionStorage");
-    local?.setItem(STORAGE_MODE_KEY, nextMode);
-    const fromStore = prevMode === "session" ? session : local;
-    const toStore = nextMode === "session" ? session : local;
+    local?.setItem(STORAGE_MODE_KEY, normalizedMode);
+    const toSession = normalizedMode === "session";
+    const toStore = toSession ? session : local;
+    const fromStore = toSession ? local : session;
 
-    for (const id of Object.keys(AI_PROVIDERS)) {
-      const k = `${KEY_PREFIX}${id}`;
+    const credentialKeys = [
+      ...Object.keys(AI_PROVIDERS).map((id) => `${KEY_PREFIX}${id}`),
+      GH_TOKEN_STORAGE_KEY,
+      GH_REPOS_CACHE_KEY,
+      GH_USER_CACHE_KEY
+    ];
+    for (const k of credentialKeys) {
       const val = fromStore?.getItem(k);
       if (val) {
         toStore?.setItem(k, val);
       }
-      if (fromStore !== toStore) {
-        fromStore?.removeItem(k);
-      }
-      if (nextMode === "session") {
+      fromStore?.removeItem(k);
+      if (toSession) {
         local?.removeItem(k);
       }
     }
-    for (const extraKey of [GH_TOKEN_STORAGE_KEY, GH_REPOS_CACHE_KEY, GH_USER_CACHE_KEY]) {
-      const val = fromStore?.getItem(extraKey);
-      if (val) {
-        toStore?.setItem(extraKey, val);
-      }
-      if (fromStore !== toStore) {
-        fromStore?.removeItem(extraKey);
-      }
-      if (nextMode === "session") {
-        local?.removeItem(extraKey);
-      }
-    }
-    if (nextMode === "session") {
+    if (toSession) {
       void saveCredentialsBackup("");
     }
   } catch {
     // Entorno restringido
   }
+}
+
+function getGithubPatFromActiveMode() {
+  const mode = getKeyStorageMode();
+  if (mode === "session") {
+    return getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) || "";
+  }
+  return (
+    getStorageArea("localStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
+    getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
+    ""
+  );
 }
 
 export function getApiKey(providerId) {
@@ -270,6 +275,9 @@ export function getApiKey(providerId) {
   }
   const k = `${KEY_PREFIX}${providerId}`;
   try {
+    if (getKeyStorageMode() === "session") {
+      return getStorageArea("sessionStorage")?.getItem(k) || "";
+    }
     return getStorageArea("sessionStorage")?.getItem(k) || getStorageArea("localStorage")?.getItem(k) || "";
   } catch {
     return "";
@@ -282,7 +290,7 @@ export function saveApiKey(providerId, apiKey) {
   }
   const k = `${KEY_PREFIX}${providerId}`;
   const raw = String(apiKey || "");
-  if (CONTROL_CHARS_RE.test(raw)) {
+  if (CONTROL_CHARS_RE.test(raw) || NON_BYTE_STRING_RE.test(raw)) {
     return;
   }
   const trimmed = raw.trim();
@@ -318,10 +326,7 @@ export function exportKeysBundle() {
     }
   }
   try {
-    const ghToken =
-      getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
-      getStorageArea("localStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
-      "";
+    const ghToken = getGithubPatFromActiveMode();
     if (ghToken) {
       bundle.githubPat = ghToken;
     }
@@ -336,7 +341,7 @@ export function exportKeysBundle() {
 }
 
 function isValidImportedSecretString(raw) {
-  if (typeof raw !== "string" || CONTROL_CHARS_RE.test(raw)) {
+  if (typeof raw !== "string" || CONTROL_CHARS_RE.test(raw) || NON_BYTE_STRING_RE.test(raw)) {
     return false;
   }
   const trimmed = raw.trim();
@@ -344,6 +349,9 @@ function isValidImportedSecretString(raw) {
 }
 
 export function importKeysBundle(rawJson) {
+  if (typeof rawJson !== "string" || rawJson.length > MAX_KEY_BUNDLE_JSON_BYTES) {
+    throw new Error("Formato de claves inválido.");
+  }
   const parsed = JSON.parse(rawJson);
   if (!parsed || typeof parsed !== "object") {
     throw new Error("Formato de claves inválido.");
@@ -363,6 +371,10 @@ export function importKeysBundle(rawJson) {
       const session = getStorageArea("sessionStorage");
       local?.removeItem(GH_TOKEN_STORAGE_KEY);
       session?.removeItem(GH_TOKEN_STORAGE_KEY);
+      local?.removeItem(GH_REPOS_CACHE_KEY);
+      session?.removeItem(GH_REPOS_CACHE_KEY);
+      local?.removeItem(GH_USER_CACHE_KEY);
+      session?.removeItem(GH_USER_CACHE_KEY);
       const target = getKeyStorageMode() === "session" ? session : local;
       target?.setItem(GH_TOKEN_STORAGE_KEY, cleanPat);
       count += 1;
@@ -381,10 +393,7 @@ export function hasStoredCredentials() {
     for (const id of Object.keys(AI_PROVIDERS)) {
       if (getApiKey(id)) return true;
     }
-    const ghToken =
-      getStorageArea("sessionStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
-      getStorageArea("localStorage")?.getItem(GH_TOKEN_STORAGE_KEY) ||
-      "";
+    const ghToken = getGithubPatFromActiveMode();
     return Boolean(ghToken && ghToken.trim());
   } catch {
     return false;
@@ -500,18 +509,24 @@ export async function validateApiKey(providerId, apiKey, signal) {
   const headers =
     check.header === "bearer" ? { Authorization: `Bearer ${cleanKey}` } : { [check.header]: cleanKey };
 
+  const connect = createFetchConnectSignal(signal, 20000);
   let res;
   try {
-    res = await fetch(check.url, { headers, signal });
+    res = await fetch(check.url, { headers, signal: connect.signal });
   } catch (error) {
-    if (isAbortError(error)) {
+    if (isAbortError(error) && !connect.signal.aborted) {
       throw error;
     }
-    const friendly = toFriendlyNetworkError(error, label);
-    if (friendly?.isNetworkFailure) {
+    if (signal?.aborted) {
+      throw error;
+    }
+    const friendly = toFriendlyNetworkError(error, label, [cleanKey]);
+    if (friendly?.isNetworkFailure || error?.name === "TimeoutError") {
       return { status: "offline", message: `Sin conexión: no se pudo verificar la clave de ${label}.` };
     }
     return { status: "unknown", message: `No se pudo verificar la clave de ${label} ahora.` };
+  } finally {
+    connect.cleanup();
   }
 
   if (res.ok || res.status === 429) {
@@ -524,7 +539,10 @@ export async function validateApiKey(providerId, apiKey, signal) {
   try {
     const data = await res.json();
     detail = String(data?.error?.message || data?.detail || data?.message || "");
-  } catch {
+  } catch (err) {
+    if (isAbortError(err) || signal?.aborted) {
+      throw err;
+    }
     // Sin cuerpo JSON
   }
 
@@ -561,11 +579,20 @@ export async function fetchLiveFreeModels(providerId, apiKey, signal, options = 
     if (isAbortError(error)) {
       throw error;
     }
-    const friendly = toFriendlyNetworkError(error, providerLabel(providerId));
+    const friendly = toFriendlyNetworkError(error, providerLabel(providerId), [apiKey]);
     if (friendly instanceof Error && friendly.message) {
       friendly.message = redactSensitiveTokens(friendly.message, [apiKey]);
     }
     throw friendly;
+  }
+}
+
+async function fetchWithModelsTimeout(url, fetchInit, signal) {
+  const connect = createFetchConnectSignal(signal, 20000);
+  try {
+    return await fetch(url, { ...fetchInit, signal: connect.signal });
+  } finally {
+    connect.cleanup();
   }
 }
 
@@ -591,7 +618,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     }
     // La clave viaja en cabecera (no en la URL) para que no quede en historiales, logs ni cachés intermedias.
     const url = "https://generativelanguage.googleapis.com/v1beta/models";
-    const res = await fetch(url, { signal, headers: { "x-goog-api-key": apiKey } });
+    const res = await fetchWithModelsTimeout(url, { headers: { "x-goog-api-key": apiKey } }, signal);
     if (!res.ok) {
       if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
         markTokenRejectedInSession(scope, apiKey);
@@ -615,9 +642,9 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
 
     filtered.sort((a, b) => scoreGoogleModel(a.id) - scoreGoogleModel(b.id));
 
+    liveSyncedByProvider.set("gemini", apiKey);
     if (filtered.length > 0) {
       liveModelsByProvider.set("gemini", filtered);
-      liveSyncedByProvider.set("gemini", apiKey);
     }
     return filtered;
   }
@@ -626,10 +653,11 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     if (!apiKey) {
       throw new Error("Pegá primero tu API Key gratuita de Groq.");
     }
-    const res = await fetch("https://api.groq.com/openai/v1/models", {
-      headers: { Authorization: `Bearer ${apiKey}` },
+    const res = await fetchWithModelsTimeout(
+      "https://api.groq.com/openai/v1/models",
+      { headers: { Authorization: `Bearer ${apiKey}` } },
       signal
-    });
+    );
     if (!res.ok) {
       if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
         markTokenRejectedInSession(scope, apiKey);
@@ -649,15 +677,15 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
 
     filtered.sort((a, b) => scoreGroqModel(a.id) - scoreGroqModel(b.id));
 
+    liveSyncedByProvider.set("groq", apiKey);
     if (filtered.length > 0) {
       liveModelsByProvider.set("groq", filtered);
-      liveSyncedByProvider.set("groq", apiKey);
     }
     return filtered;
   }
 
   if (providerId === "openrouter") {
-    const res = await fetch("https://openrouter.ai/api/v1/models", { signal });
+    const res = await fetchWithModelsTimeout("https://openrouter.ai/api/v1/models", {}, signal);
     if (!res.ok) {
       throw new Error(`Error al consultar OpenRouter (${res.status}).`);
     }
@@ -684,10 +712,11 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     if (!apiKey) {
       throw new Error("Pegá primero tu clave gratuita de Mistral.");
     }
-    const res = await fetch("https://api.mistral.ai/v1/models", {
-      headers: { Authorization: `Bearer ${apiKey}` },
+    const res = await fetchWithModelsTimeout(
+      "https://api.mistral.ai/v1/models",
+      { headers: { Authorization: `Bearer ${apiKey}` } },
       signal
-    });
+    );
     if (!res.ok) {
       if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
         markTokenRejectedInSession(scope, apiKey);
@@ -705,6 +734,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
       })
       .map((m) => ({ id: m.id, label: m.id }));
 
+    liveSyncedByProvider.set("mistral", apiKey);
     if (filtered.length > 0) {
       const preferred = ["codestral-latest", "devstral-small-latest", "mistral-small-latest"];
       filtered.sort((a, b) => {
@@ -716,7 +746,6 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
         return a.id.localeCompare(b.id);
       });
       liveModelsByProvider.set("mistral", filtered);
-      liveSyncedByProvider.set("mistral", apiKey);
     }
     return filtered;
   }
@@ -818,7 +847,7 @@ async function streamGeminiWithFallback({
   onModelsSynced,
   signal
 }) {
-  let cleanRequested = model.replace(/^models\//, "");
+  let cleanRequested = String(model || "").replace(/^models\//, "");
 
   if (liveSyncedByProvider.get("gemini") !== apiKey) {
     try {
@@ -884,7 +913,7 @@ async function streamGeminiWithFallback({
         if (isAbortError(rawError)) {
           throw rawError;
         }
-        const error = toFriendlyNetworkError(rawError, providerLabel("gemini"));
+        const error = toFriendlyNetworkError(rawError, providerLabel("gemini"), [apiKey]);
         if (emittedAnyChunk || error?.isNetworkFailure) {
           // Ya se mostró parte de la respuesta (reintentar duplicaría texto) o no hay red (reintentar no sirve).
           throw error;
@@ -988,7 +1017,7 @@ async function streamOpenAiWithFallback({
       if (isAbortError(rawError)) {
         throw rawError;
       }
-      const error = toFriendlyNetworkError(rawError, providerLabel(provider.id));
+      const error = toFriendlyNetworkError(rawError, providerLabel(provider.id), [apiKey]);
       if (emittedAnyChunk || error?.isNetworkFailure) {
         // Ya se mostró parte de la respuesta (reintentar duplicaría texto) o no hay red (reintentar no sirve).
         throw error;
@@ -1142,6 +1171,11 @@ async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history
       res.body,
       (jsonStr) => {
         const payload = JSON.parse(jsonStr);
+        if (payload?.error?.message) {
+          const streamErr = new Error(redactSensitiveTokens(`Gemini (${cleanModel}): ${payload.error.message}`, [apiKey]));
+          streamErr.httpStatus = Number(payload.error.code) || 500;
+          throw streamErr;
+        }
         const parts = payload?.candidates?.[0]?.content?.parts;
         if (Array.isArray(parts)) {
           for (const part of parts) {
@@ -1216,6 +1250,13 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
       res.body,
       (jsonStr) => {
         const payload = JSON.parse(jsonStr);
+        if (payload?.error?.message) {
+          const streamErr = new Error(
+            redactSensitiveTokens(`${AI_PROVIDERS[providerId]?.name || providerId} (${model}): ${payload.error.message}`, [apiKey])
+          );
+          streamErr.httpStatus = Number(payload.error.code || payload.error.status) || 500;
+          throw streamErr;
+        }
         const delta = payload?.choices?.[0]?.delta?.content;
         if (typeof delta === "string" && delta.length > 0) {
           onChunk(delta);
@@ -1369,6 +1410,9 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
         break;
       }
       buffer += decoder.decode(value, { stream: true });
+      if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+        throw new Error("El flujo SSE superó el límite de tamaño de evento permitido.");
+      }
       drainLines(false);
     }
 
@@ -1393,22 +1437,22 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
   }
 }
 
-export const AI_TEMP_STORAGE_KEY = "studio_ai_temp";
-export const AI_BUDGET_STORAGE_KEY = "studio_ai_budget";
-export const AI_THINKING_SPEED_STORAGE_KEY = "studio_ai_thinking_speed";
+const AI_TEMP_STORAGE_KEY = "studio_ai_temp";
+const AI_BUDGET_STORAGE_KEY = "studio_ai_budget";
+const AI_THINKING_SPEED_STORAGE_KEY = "studio_ai_thinking_speed";
 
 export function getAiThinkingSpeed() {
   try {
     const val = getStorageArea("localStorage")?.getItem(AI_THINKING_SPEED_STORAGE_KEY);
     if (val === "baja" || val === "media" || val === "alta") return val;
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
   return "media";
 }
 
 export function setAiThinkingSpeed(speed) {
   try {
     getStorageArea("localStorage")?.setItem(AI_THINKING_SPEED_STORAGE_KEY, String(speed));
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
 }
 
 export function getThinkingBudget(speed = getAiThinkingSpeed()) {
@@ -1427,14 +1471,14 @@ export function getAiTemperature() {
   try {
     const val = parseFloat(getStorageArea("localStorage")?.getItem(AI_TEMP_STORAGE_KEY));
     if (!isNaN(val) && val >= 0 && val <= 2) return val;
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
   return 0.25;
 }
 
 export function setAiTemperature(temp) {
   try {
     getStorageArea("localStorage")?.setItem(AI_TEMP_STORAGE_KEY, String(temp));
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
 }
 
 export function getAiContextBudget() {
@@ -1442,14 +1486,14 @@ export function getAiContextBudget() {
     const val = getStorageArea("localStorage")?.getItem(AI_BUDGET_STORAGE_KEY);
     if (val === "compact") return 8000;
     if (val === "large") return 40000;
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
   return 16000;
 }
 
 export function setAiContextBudget(mode) {
   try {
     getStorageArea("localStorage")?.setItem(AI_BUDGET_STORAGE_KEY, String(mode));
-  } catch (_) {}
+  } catch (_) { /* entorno restringido */ }
 }
 
 async function extractApiError(res, label, secret = "") {
