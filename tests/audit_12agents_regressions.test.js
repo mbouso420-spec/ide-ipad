@@ -9,7 +9,8 @@ import { formatMdInline } from "../js/preview/markdownPreview.js";
 import {
   buildStandaloneTsPreview,
   buildWorkspaceAssetMap,
-  bundleHtmlWithFolderAssets
+  bundleHtmlWithFolderAssets,
+  extractTextAssetPaths
 } from "../js/preview/htmlBundler.js";
 import { compileAndRunWandbox, mountCRunnerView, WAIT_INPUT_MARKER } from "../js/preview/cRunner.js";
 import { createAutosaveManager } from "../js/workspace/autosaveManager.js";
@@ -750,5 +751,45 @@ describe("Regresiones Auditoría 12 Agentes — AppSec, Estabilidad, Rendimiento
     } finally {
       document.body.innerHTML = prevBody;
     }
+  });
+
+  test("Catálogo dinámico: extractTextAssetPaths + runtime asset bridge resuelven imágenes JS/JSON y Unicode NFD/NFC sin romper scope", () => {
+    const jsCatalogo = `
+      fetch("./data/productos.json")
+        .then(r => r.json())
+        .then(items => {
+          grid.innerHTML = items.map(p => '<img src="' + p.img + '">').join("");
+        });
+      const fallbackImg = "img/Butaca%20Mendoza.webp";
+    `;
+    const deps = extractTextAssetPaths("productos.html", jsCatalogo, [
+      { path: "data/productos.json" },
+      { path: "img/Butaca Mendoza.webp" }
+    ]);
+    assert.equal(deps.includes("data/productos.json"), true);
+    assert.equal(deps.includes("img/Butaca Mendoza.webp"), true);
+
+    const nfdName = "img/Sofa\u0301.png";
+    const assets = buildWorkspaceAssetMap([
+      { path: "sub/data/productos.json", shortName: "productos.json", content: '[{"img":"img/Uspallata.png"}]' },
+      { path: `sub/${nfdName}`, shortName: "Sofá.png", isBinary: true, base64: "AQID" },
+      { path: "sub/img/Uspallata.png", shortName: "Uspallata.png", isBinary: true, base64: "BAUG" },
+      { path: "secret.png", shortName: "secret.png", isBinary: true, base64: "SECRETO" }
+    ]);
+
+    const bundled = bundleHtmlWithFolderAssets(
+      "sub/productos.html",
+      '<html><head></head><body><img src="img/Sofá.png"><div id="grid"></div><script>fetch("./data/productos.json");</script></body></html>',
+      assets,
+      null,
+      (c) => c,
+      null,
+      false
+    );
+    assert.equal(bundled.includes("data:image/png;base64,AQID"), true);
+    assert.equal(bundled.includes("data:image/png;base64,BAUG"), true);
+    assert.equal(bundled.includes("SECRETO"), false);
+    assert.equal(bundled.includes("MutationObserver"), true);
+    assert.equal(bundled.includes("productos.json"), true);
   });
 });

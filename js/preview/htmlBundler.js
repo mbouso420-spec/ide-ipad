@@ -746,21 +746,31 @@ function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversal = fal
     return false;
   };
 
+  const normalizeLookupKey = (raw) => {
+    const str = String(raw || "");
+    return typeof str.normalize === "function" ? str.normalize("NFC") : str;
+  };
+
   let lowerFileMap = null;
   const lookupEntry = (key) => {
     if (!key) return null;
     const direct = safeFileMap.get(key);
     if (direct) return direct;
+    const nfcKey = normalizeLookupKey(key);
+    if (nfcKey !== key) {
+      const nfcDirect = safeFileMap.get(nfcKey);
+      if (nfcDirect) return nfcDirect;
+    }
     if (!lowerFileMap) {
       lowerFileMap = new Map();
       for (const [k, v] of safeFileMap.entries()) {
-        const lowerKey = String(k || "").toLowerCase();
+        const lowerKey = normalizeLookupKey(k).toLowerCase();
         if (lowerKey && !lowerFileMap.has(lowerKey)) {
           lowerFileMap.set(lowerKey, v);
         }
       }
     }
-    return lowerFileMap.get(key.toLowerCase()) || null;
+    return lowerFileMap.get(nfcKey.toLowerCase()) || null;
   };
 
   const resolveEntryFromDir = (rawHref, baseDir) => {
@@ -947,6 +957,373 @@ function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversal = fal
       totalInlinedCssBytes += n;
     }
   };
+}
+
+const TEXT_REFERENCED_ASSET_RE =
+  /(["'`])([^"'`\r\n]{1,320}\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|json|mp4|webm|ogg|mp3|wav|m4a|flac|woff2?|ttf|otf)(?:[?#][^"'`\r\n]*)?)\1/gi;
+
+/**
+ * Extrae posibles rutas locales a imágenes, media o datos JSON referenciadas dentro de archivos JS/TS/JSON
+ * para asegurar su descarga bajo demanda en proyectos lazy de GitHub antes de construir la vista previa.
+ */
+const RUNTIME_DATA_EXT_MIMES = {
+  json: "application/json; charset=utf-8",
+  txt: "text/plain; charset=utf-8",
+  csv: "text/csv; charset=utf-8",
+  xml: "application/xml; charset=utf-8"
+};
+const MAX_RUNTIME_ASSET_MAP_CHARS = 16 * 1024 * 1024;
+
+function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversal, buildEntryDataUrl, getMediaMimeType) {
+  if (!fileMap || fileMap.size === 0) return "";
+  const scopeDir = dir ? normalizePath(dir) : "";
+  const urlEntries = Object.create(null);
+  const textEntries = Object.create(null);
+  let totalChars = 0;
+  let hasEntries = false;
+
+  for (const [rawKey, entry] of fileMap.entries()) {
+    if (!entry || !entry.path) continue;
+    const normPath = normalizePath(entry.path || rawKey);
+    if (!normPath) continue;
+    if (!allowParentTraversal && scopeDir && normPath !== scopeDir && !normPath.startsWith(`${scopeDir}/`)) {
+      continue;
+    }
+    const ext = getFileExtension(normPath);
+    if (Object.prototype.hasOwnProperty.call(RUNTIME_DATA_EXT_MIMES, ext) && typeof entry.content === "string") {
+      if (entry.content.length <= MAX_PREVIEW_ASSET_BYTES && totalChars + entry.content.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
+        textEntries[normPath] = { content: entry.content, mime: RUNTIME_DATA_EXT_MIMES[ext] };
+        totalChars += entry.content.length;
+        hasEntries = true;
+      }
+      continue;
+    }
+    if (IMAGE_EXTENSIONS.has(ext) || entry.isBinary) {
+      const dataUrl = buildEntryDataUrl(entry, normPath, getMediaMimeType);
+      if (dataUrl && totalChars + dataUrl.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
+        urlEntries[normPath] = dataUrl;
+        totalChars += dataUrl.length;
+        hasEntries = true;
+      }
+    }
+  }
+
+  if (!hasEntries) return "";
+
+  const payloadJson = escapeCloseScript(
+    JSON.stringify({
+      baseDir: scopeDir,
+      allowParent: Boolean(allowParentTraversal),
+      urls: urlEntries,
+      texts: textEntries
+    })
+  );
+
+  return `<script>
+(function () {
+  var cfg = ${payloadJson};
+  var normNfc = function (s) {
+    var str = String(s == null ? "" : s);
+    return typeof str.normalize === "function" ? str.normalize("NFC") : str;
+  };
+  var urlLower = Object.create(null);
+  var textLower = Object.create(null);
+  Object.keys(cfg.urls).forEach(function (k) { urlLower[normNfc(k).toLowerCase()] = cfg.urls[k]; });
+  Object.keys(cfg.texts).forEach(function (k) { textLower[normNfc(k).toLowerCase()] = cfg.texts[k]; });
+
+  function cleanNormPath(p) {
+    var parts = String(p || "").replace(/\\\\/g, "/").split("/");
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i].trim();
+      if (!seg || seg === ".") continue;
+      if (seg === "..") {
+        if (out.length > 0) out.pop();
+      } else {
+        out.push(seg);
+      }
+    }
+    return out.join("/");
+  }
+
+  function decodeRef(raw) {
+    var noHash = String(raw || "").trim().split("#")[0].split("?")[0].replace(/\\\\/g, "/");
+    try { return decodeURIComponent(noHash); } catch (_) { return noHash; }
+  }
+
+  function lookupFromMap(exactMap, lowerMap, rawRef) {
+    if (!rawRef || typeof rawRef !== "string") return null;
+    var trimmed = rawRef.trim();
+    if (!trimmed || /^(https?:|data:|blob:|#|javascript:|vbscript:|file:)/i.test(trimmed)) return null;
+    var clean = decodeRef(trimmed);
+    if (!clean) return null;
+
+    var candidates = [];
+    if (clean.charAt(0) === "/") {
+      var rootPart = cleanNormPath(clean.replace(/^\\/+/, ""));
+      if (cfg.baseDir && (cfg.allowParent || !cfg.baseDir)) {
+        candidates.push(cleanNormPath(cfg.baseDir + "/" + rootPart));
+      }
+      candidates.push(rootPart);
+    } else {
+      if (cfg.baseDir) {
+        candidates.push(cleanNormPath(cfg.baseDir + "/" + clean));
+      }
+      candidates.push(cleanNormPath(clean));
+    }
+
+    for (var i = 0; i < candidates.length; i++) {
+      var cand = candidates[i];
+      if (!cand) continue;
+      if (!cfg.allowParent && cfg.baseDir && cand !== cfg.baseDir && cand.indexOf(cfg.baseDir + "/") !== 0) {
+        continue;
+      }
+      if (Object.prototype.hasOwnProperty.call(exactMap, cand)) return exactMap[cand];
+      var nfcLower = normNfc(cand).toLowerCase();
+      if (Object.prototype.hasOwnProperty.call(lowerMap, nfcLower)) return lowerMap[nfcLower];
+    }
+    return null;
+  }
+
+  function resolveUrl(rawRef) {
+    return lookupFromMap(cfg.urls, urlLower, rawRef);
+  }
+
+  function resolveSrcset(rawSrcset) {
+    if (!rawSrcset || typeof rawSrcset !== "string") return rawSrcset;
+    return rawSrcset.replace(/([^\\s,]+)(\\s+[^\\s,]+)?/g, function (m, u, desc) {
+      var resolved = resolveUrl(u);
+      return resolved ? (desc ? resolved + desc : resolved) : m;
+    });
+  }
+
+  function patchElementMedia(el) {
+    if (!el || el.nodeType !== 1 || !el.getAttribute) return;
+    var tag = el.tagName;
+    if (tag === "IMG" || tag === "SOURCE" || tag === "VIDEO" || tag === "AUDIO" || tag === "INPUT") {
+      var curSrc = el.getAttribute("src");
+      if (curSrc) {
+        var resolvedSrc = resolveUrl(curSrc);
+        if (resolvedSrc && curSrc !== resolvedSrc) {
+          origSetAttr.call(el, "src", resolvedSrc);
+        }
+      }
+    }
+    if (tag === "IMG" || tag === "SOURCE") {
+      var curSrcset = el.getAttribute("srcset");
+      if (curSrcset) {
+        var resolvedSet = resolveSrcset(curSrcset);
+        if (resolvedSet && resolvedSet !== curSrcset) {
+          origSetAttr.call(el, "srcset", resolvedSet);
+        }
+      }
+    }
+    if (tag === "VIDEO") {
+      var curPoster = el.getAttribute("poster");
+      if (curPoster) {
+        var resolvedPoster = resolveUrl(curPoster);
+        if (resolvedPoster && curPoster !== resolvedPoster) {
+          origSetAttr.call(el, "poster", resolvedPoster);
+        }
+      }
+    }
+    var st = el.getAttribute("style");
+    if (st && st.indexOf("url(") !== -1) {
+      var nextSt = st.replace(/url\\(\\s*(?:["']([^"']+)["']|([^)"'\\s]+))\\s*\\)/gi, function (fm, qUrl, bUrl) {
+        var r = resolveUrl(qUrl || bUrl || "");
+        return r ? 'url("' + r + '")' : fm;
+      });
+      if (nextSt !== st) origSetAttr.call(el, "style", nextSt);
+    }
+  }
+
+  function scanSubtree(root) {
+    if (!root || root.nodeType !== 1) return;
+    patchElementMedia(root);
+    if (typeof root.querySelectorAll === "function") {
+      var nodes = root.querySelectorAll("img[src],source[src],video[src],audio[src],input[type='image'][src],img[srcset],source[srcset],video[poster],[style*='url(']");
+      for (var i = 0; i < nodes.length; i++) patchElementMedia(nodes[i]);
+    }
+  }
+
+  var origSetAttr = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (name, value) {
+    var lowerName = String(name || "").toLowerCase();
+    if (lowerName === "src" && (this.tagName === "IMG" || this.tagName === "SOURCE" || this.tagName === "VIDEO" || this.tagName === "AUDIO" || this.tagName === "INPUT")) {
+      var r = resolveUrl(String(value));
+      if (r) value = r;
+    } else if (lowerName === "srcset" && (this.tagName === "IMG" || this.tagName === "SOURCE")) {
+      value = resolveSrcset(String(value));
+    } else if (lowerName === "poster" && this.tagName === "VIDEO") {
+      var rp = resolveUrl(String(value));
+      if (rp) value = rp;
+    }
+    return origSetAttr.call(this, name, value);
+  };
+
+  function wrapUrlProp(proto, prop) {
+    try {
+      var desc = Object.getOwnPropertyDescriptor(proto, prop);
+      if (desc && desc.configurable && typeof desc.set === "function") {
+        Object.defineProperty(proto, prop, {
+          configurable: true,
+          enumerable: desc.enumerable,
+          get: desc.get,
+          set: function (val) {
+            var r = resolveUrl(String(val == null ? "" : val));
+            return desc.set.call(this, r || val);
+          }
+        });
+      }
+    } catch (_) {}
+  }
+  if (typeof HTMLImageElement !== "undefined") wrapUrlProp(HTMLImageElement.prototype, "src");
+  if (typeof HTMLSourceElement !== "undefined") wrapUrlProp(HTMLSourceElement.prototype, "src");
+  if (typeof HTMLVideoElement !== "undefined") wrapUrlProp(HTMLVideoElement.prototype, "poster");
+
+  try {
+    var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+    if (innerDesc && innerDesc.configurable && typeof innerDesc.set === "function") {
+      Object.defineProperty(Element.prototype, "innerHTML", {
+        configurable: true,
+        enumerable: innerDesc.enumerable,
+        get: innerDesc.get,
+        set: function (htmlStr) {
+          innerDesc.set.call(this, htmlStr);
+          scanSubtree(this);
+        }
+      });
+    }
+  } catch (_) {}
+
+  if (typeof MutationObserver === "function") {
+    try {
+      var obs = new MutationObserver(function (mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          var m = mutations[i];
+          if (m.type === "attributes") {
+            patchElementMedia(m.target);
+          } else if (m.addedNodes) {
+            for (var j = 0; j < m.addedNodes.length; j++) {
+              scanSubtree(m.addedNodes[j]);
+            }
+          }
+        }
+      });
+      obs.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["src", "srcset", "poster", "style"]
+      });
+    } catch (_) {}
+  }
+
+  if (typeof window.fetch === "function") {
+    var origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      var reqUrl = typeof input === "string" ? input : (input && typeof input.url === "string" ? input.url : "");
+      var textAsset = lookupFromMap(cfg.texts, textLower, reqUrl);
+      if (textAsset) {
+        return Promise.resolve(new Response(textAsset.content, {
+          status: 200,
+          headers: { "Content-Type": textAsset.mime }
+        }));
+      }
+      var dataUrl = resolveUrl(reqUrl);
+      if (dataUrl) {
+        return origFetch(dataUrl, init);
+      }
+      return origFetch(input, init);
+    };
+  }
+
+  if (typeof XMLHttpRequest === "function") {
+    var origXhrOpen = XMLHttpRequest.prototype.open;
+    var origXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__studioReqUrl = url;
+      return origXhrOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function () {
+      var textAsset = lookupFromMap(cfg.texts, textLower, this.__studioReqUrl);
+      if (textAsset) {
+        var xhr = this;
+        Promise.resolve().then(function () {
+          try {
+            Object.defineProperty(xhr, "readyState", { configurable: true, value: 4 });
+            Object.defineProperty(xhr, "status", { configurable: true, value: 200 });
+            Object.defineProperty(xhr, "responseText", { configurable: true, value: textAsset.content });
+            Object.defineProperty(xhr, "response", { configurable: true, value: textAsset.content });
+          } catch (_) {}
+          if (typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
+          if (typeof xhr.onload === "function") xhr.onload();
+          xhr.dispatchEvent(new Event("load"));
+        });
+        return;
+      }
+      var dataUrl = resolveUrl(this.__studioReqUrl);
+      if (dataUrl) {
+        origXhrOpen.call(this, "GET", dataUrl, true);
+      }
+      return origXhrSend.apply(this, arguments);
+    };
+  }
+})();
+</script>`;
+}
+
+export function extractTextAssetPaths(entryPath, rawText, allFiles = []) {
+  if (!rawText || typeof rawText !== "string") return [];
+  const dir = getParentFolder(entryPath);
+  const paths = new Set();
+
+  const knownByBase = new Map();
+  if (Array.isArray(allFiles)) {
+    for (const f of allFiles) {
+      if (!f || !f.path) continue;
+      const clean = normalizePath(f.path);
+      const base = clean.split("/").pop()?.toLowerCase();
+      if (!base) continue;
+      if (!knownByBase.has(base)) {
+        knownByBase.set(base, [clean]);
+      } else {
+        knownByBase.get(base).push(clean);
+      }
+    }
+  }
+
+  let match;
+  TEXT_REFERENCED_ASSET_RE.lastIndex = 0;
+  while ((match = TEXT_REFERENCED_ASSET_RE.exec(rawText)) !== null) {
+    const rawRef = match[2];
+    if (!rawRef || rawRef.includes("${")) continue;
+    const trimmed = rawRef.trim().split("?")[0].split("#")[0];
+    if (!trimmed || /^(https?:|data:|blob:|\/\/|#)/i.test(trimmed)) continue;
+
+    const candidates = [trimmed.replace(/\\/g, "/")];
+    const decoded = decodePreviewPathRef(rawRef);
+    if (decoded && decoded !== candidates[0]) {
+      candidates.push(decoded);
+    }
+    for (const clean of candidates) {
+      const resolved = resolveRelativePath(dir, clean);
+      if (resolved) paths.add(resolved);
+      const rootClean = normalizePath(clean);
+      if (rootClean) paths.add(rootClean);
+      const baseName = rootClean.split("/").pop()?.toLowerCase();
+      const sameBase = baseName ? knownByBase.get(baseName) : null;
+      if (sameBase && sameBase.length > 0 && sameBase.length <= 4) {
+        for (const candidatePath of sameBase) {
+          if (candidatePath.endsWith(`/${rootClean}`) || candidatePath === rootClean) {
+            paths.add(candidatePath);
+          }
+        }
+      }
+    }
+  }
+
+  return Array.from(paths);
 }
 
 export function bundleHtmlWithFolderAssets(
@@ -1632,10 +2009,20 @@ export function bundleHtmlWithFolderAssets(
   }
 
   const bridge = buildConsoleBridgeScript(false);
+  const runtimeAssetsBridge = (processedScripts.length > 0 || ensureJsFile)
+    ? buildRuntimeAssetsBridgeScript(
+        dir,
+        fileMap,
+        allowParentTraversal,
+        buildEntryDataUrl,
+        getMediaMimeType
+      )
+    : "";
+  const combinedHeadBridge = runtimeAssetsBridge ? `${bridge}\n${runtimeAssetsBridge}` : bridge;
   if (/<head\b[^>]*>/i.test(html)) {
-    html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${bridge}`);
+    html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${combinedHeadBridge}`);
   } else {
-    html = `${bridge}\n${html}`;
+    html = `${combinedHeadBridge}\n${html}`;
   }
 
   // Desenmascarar los <script> después de inyectar <head>/</body> para que literales dentro de JS no alteren el HTML

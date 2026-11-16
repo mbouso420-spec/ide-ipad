@@ -65,6 +65,7 @@ import {
   extractReferencedAssetPaths,
   extractCssImportPaths,
   extractModuleDependencyPaths,
+  extractTextAssetPaths,
   getSavedPreviewHtml,
   savePreviewHtml,
   findBestHtmlEntrypoint,
@@ -288,9 +289,14 @@ export function initLivePreviewModal({
       return extractCssImportPaths(file.path, file.content, { includeMedia: true });
     }
     if (JS_EXTENSIONS.has(ext) || TS_EXTENSIONS.has(ext) || ext === "jsx") {
-      return extractModuleDependencyPaths(file.path, file.content, allFiles, {
+      const modDeps = extractModuleDependencyPaths(file.path, file.content, allFiles, {
         allowParentTraversal: true
       });
+      const textDeps = extractTextAssetPaths(file.path, file.content, allFiles);
+      return Array.from(new Set([...modDeps, ...textDeps]));
+    }
+    if (ext === "json") {
+      return extractTextAssetPaths(file.path, file.content, allFiles);
     }
     return [];
   }
