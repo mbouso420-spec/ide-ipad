@@ -63,7 +63,7 @@ import {
   findTargetHtmlFile,
   findSiblingHtmlInSameFolder
 } from "./html/entrypointResolver.js";
-import { buildConsoleBridgeScript } from "./html/consoleBridge.js";
+import { buildConsoleBridgeScript, rewriteProgrammaticNavigation } from "./html/consoleBridge.js";
 import {
   buildStandaloneTsPreview,
   buildStandaloneJsPreview,
@@ -399,6 +399,8 @@ export function bundleHtmlWithFolderAssets(
   ensureCssFile = null,
   allowParentTraversal = false
 ) {
+  const baseTransformJs = typeof transformJs === "function" ? transformJs : (code) => code;
+  const safeTransformJs = (code, isModule) => baseTransformJs(rewriteProgrammaticNavigation(code), isModule);
   const dir = getParentFolder(entryPath);
   const {
     resolveEntryFromDir,
@@ -595,7 +597,7 @@ export function bundleHtmlWithFolderAssets(
         }).code;
       }
     }
-    const rendered = typeof transformJs === "function" ? transformJs(executable, isModule) : executable;
+    const rendered = safeTransformJs(executable, isModule);
     return escapeCloseScript(rendered);
   }
 
@@ -617,7 +619,7 @@ export function bundleHtmlWithFolderAssets(
       entryPath: sourcePath,
       entryCode: rawCode,
       exactMap: exactModuleMap,
-      transformJs,
+      transformJs: safeTransformJs,
       transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
       allowParentTraversal,
       precompiledEntryCode: jsCode,
@@ -746,6 +748,17 @@ export function bundleHtmlWithFolderAssets(
       html = `${html}\n${deferredBlock}`;
     }
   }
+
+  // Neutralizar <meta http-equiv="refresh"> y <base href="..."> locales para evitar escapes fuera del srcdoc
+  html = html.replace(/<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*>/gi, "");
+  html = html.replace(/<base\b[^>]*href=["'](?!(?:https?:)?\/\/)[^"']*["'][^>]*>/gi, "");
+
+  // Reescribir location.href / location.assign / location.replace en atributos on* inline (ej. onclick="location.href='index.html'")
+  html = html.replace(/(\bon[a-z]+\s*=\s*)(["'])([\s\S]*?)\2/gi, (full, prefix, quote, handlerCode) => {
+    if (!handlerCode.includes("location")) return full;
+    const rewritten = rewriteProgrammaticNavigation(handlerCode);
+    return rewritten === handlerCode ? full : `${prefix}${quote}${rewritten}${quote}`;
+  });
 
   const bridge = buildConsoleBridgeScript(false);
   const runtimeAssetsBridge = (processedScripts.length > 0 || ensureJsFile)

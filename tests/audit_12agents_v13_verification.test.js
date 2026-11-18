@@ -16,7 +16,7 @@ import {
   isIgnoredPreviewPath
 } from "../js/preview/previewUtils.js";
 import { buildWorkspaceAssetMap, bundleHtmlWithFolderAssets, buildMarkdownPreview, findTargetHtmlFile } from "../js/preview/htmlBundler.js";
-import { buildConsoleBridgeScript } from "../js/preview/html/consoleBridge.js";
+import { buildConsoleBridgeScript, rewriteProgrammaticNavigation } from "../js/preview/html/consoleBridge.js";
 import { runWasiModule } from "../js/preview/wasiRunner.js";
 import { sanitizeVirtualSourcePath } from "../js/preview/clangWorker.js";
 import { buildStandalonePythonPreview } from "../js/preview/pythonRunner.js";
@@ -767,6 +767,40 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
       const compiled = bundleHtmlWithFolderAssets("pages/catalogo.html", files[1].content, assetMap, null, (c) => c, null, true);
       assert.match(compiled, /img\/productos\/zapato\.png/);
       assert.match(compiled, /urlBaseCounts/);
+    });
+
+    test("rewriteProgrammaticNavigation intercepta location.href/assign/replace, onclick y neutraliza <base>/<meta refresh>", () => {
+      const sample = [
+        "window.location.href = 'index.html';",
+        "location.href = '/';",
+        "document.location.assign('productos.html');",
+        "location.replace('./');",
+        "window.location = 'inicio.html';",
+        "const { location = 'AR' } = cfg;",
+        "const txt = \"window.location.href = 'no-tocar.html'\";",
+        "if (window.location.href === 'x') { console.log('ok'); }"
+      ].join("\n");
+      const rewritten = rewriteProgrammaticNavigation(sample);
+      assert.match(rewritten, /window\.__ideNavigate\('index\.html'\);/);
+      assert.match(rewritten, /window\.__ideNavigate\('\/'\);/);
+      assert.match(rewritten, /window\.__ideNavigate\('productos\.html'\);/);
+      assert.match(rewritten, /window\.__ideNavigate\('\.\/'\);/);
+      assert.match(rewritten, /window\.__ideNavigate\('inicio\.html'\);/);
+      assert.match(rewritten, /const \{ location = 'AR' \} = cfg;/);
+      assert.match(rewritten, /"window\.location\.href = 'no-tocar\.html'"/);
+      assert.match(rewritten, /if \(window\.location\.href === 'x'\)/);
+
+      const bridge = buildConsoleBridgeScript(false);
+      assert.match(bridge, /__ideNavigate/);
+      assert.match(bridge, /window\.open\s*=/);
+
+      const html = `<html><head><base href="/"><meta http-equiv="refresh" content="0;url=index.html"></head><body><button onclick="location.href='index.html'">Inicio</button><script>window.location.href='index.html';</script></body></html>`;
+      const files = [{ path: "productos.html", content: html }];
+      const bundled = bundleHtmlWithFolderAssets("productos.html", html, buildWorkspaceAssetMap(files), null, (c) => c, null, true);
+      assert.doesNotMatch(bundled, /<base\s+href=/i);
+      assert.doesNotMatch(bundled, /http-equiv=["']?refresh/i);
+      assert.match(bundled, /onclick="window\.__ideNavigate\('index\.html'\)"/);
+      assert.match(bundled, /window\.__ideNavigate\('index\.html'\);/);
     });
   });
 });

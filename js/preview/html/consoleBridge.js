@@ -4,6 +4,311 @@
 
 import { buildLoopGuardRuntime } from "../loopGuard.js";
 
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  "return", "throw", "case", "in", "of", "typeof", "void", "delete", "await", "yield", "else", "do"
+]);
+const DECL_KEYWORDS = new Set(["var", "let", "const", "function", "class", "catch"]);
+
+function isIdentStart(ch) {
+  return (ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "_" || ch === "$";
+}
+
+function isIdentPart(ch) {
+  return isIdentStart(ch) || (ch >= "0" && ch <= "9");
+}
+
+function skipWs(src, idx) {
+  while (idx < src.length && /\s/.test(src[idx])) idx++;
+  return idx;
+}
+
+function scanQuotedString(src, start, quote) {
+  let i = start + 1;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === quote) return i + 1;
+    i++;
+  }
+  return src.length;
+}
+
+function scanRegexLiteral(src, start) {
+  let i = start + 1;
+  let inClass = false;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (ch === "/" && !inClass) {
+      i++;
+      while (i < src.length && /[a-z]/i.test(src[i])) i++;
+      return i;
+    } else if (ch === "\n" || ch === "\r") {
+      return start + 1;
+    }
+    i++;
+  }
+  return start + 1;
+}
+
+function canPrecedeRegex(prevChar, prevWord) {
+  if (!prevChar) return true;
+  if ("([\{,;=:?!&|^~+-*%<>".includes(prevChar)) return true;
+  return Boolean(prevWord && REGEX_PRECEDING_KEYWORDS.has(prevWord));
+}
+
+function scanRhsExpressionEnd(src, start) {
+  let i = start;
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  let prevChar = "=";
+  let prevWord = "";
+  const tplStack = [];
+
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (tplStack.length > 0 && tplStack[tplStack.length - 1] === brace) {
+      if (ch === "\\") { i += 2; continue; }
+      if (ch === "`") { tplStack.pop(); i++; prevChar = "`"; prevWord = ""; continue; }
+      if (ch === "$" && next === "{") { i += 2; brace++; continue; }
+      i++;
+      continue;
+    }
+
+    if (ch === "'" || ch === "\"") {
+      i = scanQuotedString(src, i, ch);
+      prevChar = ch;
+      prevWord = "";
+      continue;
+    }
+    if (ch === "`") {
+      tplStack.push(brace);
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      const nl = src.indexOf("\n", i + 2);
+      i = nl === -1 ? src.length : nl;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? src.length : end + 2;
+      continue;
+    }
+    if (ch === "/" && canPrecedeRegex(prevChar, prevWord)) {
+      i = scanRegexLiteral(src, i);
+      prevChar = "/";
+      prevWord = "";
+      continue;
+    }
+
+    if (ch === "(") paren++;
+    else if (ch === ")") {
+      if (paren === 0 && bracket === 0 && brace === 0) break;
+      paren--;
+    } else if (ch === "[") bracket++;
+    else if (ch === "]") {
+      if (bracket === 0 && paren === 0 && brace === 0) break;
+      bracket--;
+    } else if (ch === "{") brace++;
+    else if (ch === "}") {
+      if (brace === 0 && paren === 0 && bracket === 0) break;
+      brace--;
+      if (tplStack.length > 0 && tplStack[tplStack.length - 1] === brace) {
+        i++;
+        continue;
+      }
+    } else if (paren === 0 && bracket === 0 && brace === 0) {
+      if (ch === ";" || ch === ",") break;
+      if (ch === "\n" || ch === "\r") {
+        const afterWs = skipWs(src, i);
+        const nextTok = src[afterWs] || "";
+        const continues =
+          nextTok === "." || nextTok === "?" || nextTok === ":" || nextTok === "+" ||
+          "+?:=,&|".includes(prevChar);
+        if (!continues) break;
+        i = afterWs;
+        continue;
+      }
+    }
+
+    if (!/\s/.test(ch)) {
+      if (isIdentStart(ch)) {
+        let j = i + 1;
+        while (j < src.length && isIdentPart(src[j])) j++;
+        prevWord = src.slice(i, j);
+        prevChar = src[j - 1];
+        i = j;
+        continue;
+      }
+      prevChar = ch;
+      prevWord = "";
+    }
+    i++;
+  }
+  return i;
+}
+
+/**
+ * Reescribe asignaciones y llamadas a `location` (`location.href = ...`, `location.assign(...)`,
+ * `location.replace(...)`, `window.location = ...`) hacia `window.__ideNavigate(...)` para evitar
+ * que `<iframe srcdoc>` navegue fuera del sandbox hacia la URL del IDE padre.
+ */
+export function rewriteProgrammaticNavigation(code) {
+  const src = String(code || "");
+  if (!src.includes("location")) return src;
+
+  let out = "";
+  let i = 0;
+  let lastCopied = 0;
+  let prevChar = "";
+  let prevWord = "";
+  let braceDepth = 0;
+  const tplStack = [];
+
+  while (i < src.length) {
+    const ch = src[i];
+    const next = src[i + 1];
+
+    if (tplStack.length > 0 && tplStack[tplStack.length - 1] === braceDepth) {
+      if (ch === "\\") { i += 2; continue; }
+      if (ch === "`") { tplStack.pop(); i++; prevChar = "`"; prevWord = ""; continue; }
+      if (ch === "$" && next === "{") { i += 2; braceDepth++; continue; }
+      i++;
+      continue;
+    }
+
+    if (ch === "'" || ch === "\"") {
+      i = scanQuotedString(src, i, ch);
+      prevChar = ch;
+      prevWord = "";
+      continue;
+    }
+    if (ch === "`") {
+      tplStack.push(braceDepth);
+      i++;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      const nl = src.indexOf("\n", i + 2);
+      i = nl === -1 ? src.length : nl + 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      const end = src.indexOf("*/", i + 2);
+      i = end === -1 ? src.length : end + 2;
+      continue;
+    }
+    if (ch === "/" && canPrecedeRegex(prevChar, prevWord)) {
+      i = scanRegexLiteral(src, i);
+      prevChar = "/";
+      prevWord = "";
+      continue;
+    }
+
+    if (isIdentStart(ch)) {
+      let j = i + 1;
+      while (j < src.length && isIdentPart(src[j])) j++;
+      const word = src.slice(i, j);
+
+      const isRootObj = word === "window" || word === "self" || word === "globalThis" || word === "document";
+      const isBareLoc = word === "location" && prevChar !== "." && !DECL_KEYWORDS.has(prevWord);
+
+      let locEnd = -1;
+      if (isBareLoc) {
+        locEnd = j;
+      } else if (isRootObj && prevChar !== "." && !DECL_KEYWORDS.has(prevWord)) {
+        let p = skipWs(src, j);
+        if (src[p] === ".") {
+          p = skipWs(src, p + 1);
+          if (src.slice(p, p + 8) === "location" && !isIdentPart(src[p + 8] || "")) {
+            locEnd = p + 8;
+          }
+        }
+      }
+
+      if (locEnd !== -1) {
+        let k = skipWs(src, locEnd);
+        if (src[k] === ".") {
+          const propStart = skipWs(src, k + 1);
+          let propEnd = propStart;
+          while (propEnd < src.length && isIdentPart(src[propEnd])) propEnd++;
+          const prop = src.slice(propStart, propEnd);
+          const afterProp = skipWs(src, propEnd);
+          if ((prop === "assign" || prop === "replace") && src[afterProp] === "(") {
+            out += src.slice(lastCopied, i) + "window.__ideNavigate(";
+            i = afterProp + 1;
+            lastCopied = i;
+            prevChar = "(";
+            prevWord = "";
+            continue;
+          }
+          if (prop === "href" && src[afterProp] === "=" && src[afterProp + 1] !== "=" && src[afterProp + 1] !== ">") {
+            const rhsStart = skipWs(src, afterProp + 1);
+            const rhsEnd = scanRhsExpressionEnd(src, rhsStart);
+            const rhsExpr = src.slice(rhsStart, rhsEnd).trim();
+            if (rhsExpr) {
+              out += src.slice(lastCopied, i) + `window.__ideNavigate(${rhsExpr})`;
+              i = rhsEnd;
+              lastCopied = i;
+              prevChar = ")";
+              prevWord = "";
+              continue;
+            }
+          }
+        } else if (
+          src[k] === "=" &&
+          src[k + 1] !== "=" &&
+          src[k + 1] !== ">" &&
+          (!isBareLoc || !prevChar || ";})".includes(prevChar) || prevWord === "else")
+        ) {
+          const rhsStart = skipWs(src, k + 1);
+          const rhsEnd = scanRhsExpressionEnd(src, rhsStart);
+          const rhsExpr = src.slice(rhsStart, rhsEnd).trim();
+          if (rhsExpr) {
+            out += src.slice(lastCopied, i) + `window.__ideNavigate(${rhsExpr})`;
+            i = rhsEnd;
+            lastCopied = i;
+            prevChar = ")";
+            prevWord = "";
+            continue;
+          }
+        }
+      }
+
+      prevWord = word;
+      prevChar = src[j - 1];
+      i = j;
+      continue;
+    }
+
+    if (ch === "{") braceDepth++;
+    else if (ch === "}") {
+      if (braceDepth > 0) braceDepth--;
+    }
+
+    if (!/\s/.test(ch)) {
+      prevChar = ch;
+      prevWord = "";
+    }
+    i++;
+  }
+
+  return lastCopied === 0 ? src : out + src.slice(lastCopied);
+}
+
 export function buildConsoleBridgeScript(mirrorOnScreen) {
   return `<script>
 ${buildLoopGuardRuntime()}
@@ -139,7 +444,8 @@ ${buildLoopGuardRuntime()}
   }
   // Interceptor total de navegación local en enlaces
   document.addEventListener("click", function (e) {
-    var a = e.target && e.target.closest ? e.target.closest("a[href], area[href], a[xlink\\:href]") : null;
+    var rawTarget = e.target && e.target.nodeType === 3 ? e.target.parentElement : e.target;
+    var a = rawTarget && rawTarget.closest ? rawTarget.closest("a[href], area[href], a[xlink\\:href]") : null;
     if (!a) return;
     var href = a.getAttribute("href") || a.getAttribute("xlink:href") || "";
     if (!href) return;
@@ -170,7 +476,11 @@ ${buildLoopGuardRuntime()}
     if (!form || !form.getAttribute) return;
     var submitter = e.submitter;
     var action = (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) || form.getAttribute("action");
-    if (!action) return;
+    if (!action) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     var normAction = normalizeNavRef(action);
     if (isBlockedNavScheme(normAction)) {
       e.preventDefault();
@@ -187,26 +497,53 @@ ${buildLoopGuardRuntime()}
     }, "*");
   }, true);
 
-  // Interceptor de llamadas programáticas de navegación
+  // Interceptor de llamadas programáticas de navegación (incluyendo rewrite de location.*)
+  var origOpen = typeof window.open === "function" ? window.open.bind(window) : null;
+  var triggerNav = function (targetUrl) {
+    if (targetUrl == null) return;
+    var rawTarget = typeof targetUrl === "string" ? targetUrl : String(targetUrl);
+    var normTarget = normalizeNavRef(rawTarget);
+    if (!normTarget) normTarget = "/";
+    if (isBlockedNavScheme(normTarget)) return;
+    if (normTarget.startsWith("#")) {
+      window.location.hash = rawTarget;
+      return;
+    }
+    if (/^(https?:|mailto:|tel:|blob:)/.test(normTarget)) {
+      if (origOpen) origOpen(rawTarget, "_blank", "noopener,noreferrer");
+      return;
+    }
+    parent.postMessage({
+      source: "studio-ide-preview",
+      action: "navigate",
+      href: rawTarget || "/"
+    }, "*");
+  };
   try {
-    var triggerNav = function (targetUrl) {
-      if (!targetUrl || typeof targetUrl !== "string") return;
-      var normTarget = normalizeNavRef(targetUrl);
-      if (!normTarget || isBlockedNavScheme(normTarget)) return;
-      if (normTarget.startsWith("#")) {
-        window.location.hash = targetUrl;
-        return;
-      }
-      if (/^(https?:|mailto:|tel:)/.test(normTarget)) {
-        window.open(targetUrl, "_blank", "noopener,noreferrer");
-        return;
-      }
-      parent.postMessage({
-        source: "studio-ide-preview",
-        action: "navigate",
-        href: targetUrl
-      }, "*");
-    };
+    Object.defineProperty(window, "__ideNavigate", {
+      value: triggerNav,
+      configurable: true,
+      writable: true,
+      enumerable: false
+    });
+  } catch (_) {
+    window.__ideNavigate = triggerNav;
+  }
+  try {
+    if (origOpen) {
+      window.open = function (url, target, features) {
+        var tgt = String(target || "").trim().toLowerCase();
+        var raw = url == null ? "" : String(url);
+        var norm = normalizeNavRef(raw);
+        if (raw && (!tgt || tgt === "_self" || tgt === "_parent" || tgt === "_top") && !/^(https?:|mailto:|tel:|blob:)/.test(norm)) {
+          triggerNav(raw);
+          return null;
+        }
+        return origOpen(url, target, features);
+      };
+    }
+  } catch (_) {}
+  try {
     window.navigate = triggerNav;
     if (window.location) {
       window.location.assign = triggerNav;
