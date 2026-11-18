@@ -141,15 +141,13 @@ export function createFallbackEditor({
   }, listenerOpts);
 
   const emitSel = () => {
+    const val = textarea.value;
     const start = textarea.selectionStart ?? 0;
     const end = textarea.selectionEnd ?? 0;
-    const before = textarea.value.slice(0, end);
-    const lastNl = before.lastIndexOf("\n");
+    const lastNl = end > 0 ? val.lastIndexOf("\n", end - 1) : -1;
     let cursorLine = 1;
-    if (lastNl !== -1) {
-      for (let i = 0; i <= lastNl; i++) {
-        if (before.charCodeAt(i) === 10) cursorLine += 1;
-      }
+    for (let i = 0; i <= lastNl; i++) {
+      if (val.charCodeAt(i) === 10) cursorLine += 1;
     }
     const cursorCol = lastNl === -1 ? end + 1 : end - lastNl;
 
@@ -157,8 +155,12 @@ export function createFallbackEditor({
       onSelectionChange({ text: "", lineCount: 0, cursorLine, cursorCol });
       return;
     }
-    const text = textarea.value.slice(start, end);
-    onSelectionChange({ text, lineCount: text.split("\n").length, cursorLine, cursorCol });
+    const text = val.slice(start, end);
+    let selLines = 1;
+    for (let i = 0; i < text.length; i++) {
+      if (text.charCodeAt(i) === 10) selLines += 1;
+    }
+    onSelectionChange({ text, lineCount: selLines, cursorLine, cursorCol });
   };
 
   textarea.addEventListener("select", emitSel, listenerOpts);

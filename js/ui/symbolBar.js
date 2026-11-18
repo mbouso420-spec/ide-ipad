@@ -356,7 +356,6 @@ export function initSymbolBar({ onInsert, onToggle }) {
   return {
     setLanguage,
     isVisible: () => visible,
-    setVisible,
     destroy() {
       listenerController?.abort();
     }

@@ -630,9 +630,98 @@ button.chat-tools-toggle-btn:focus-visible {
   color: var(--color-ink);
 }
 
+/* Popover @archivo en el compositor de IA */
+.chat-mention-popover {
+  position: absolute;
+  left: var(--space-sm);
+  right: var(--space-sm);
+  bottom: calc(100% + var(--space-2xs));
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2xs);
+  border-radius: var(--radius-card);
+  border: var(--rule-hair) solid var(--color-rule-strong);
+  background: var(--color-paper-2);
+  box-shadow: 0 10px 28px oklch(0% 0 0 / 0.45);
+  z-index: var(--z-sticky);
+}
+
+.chat-mention-head {
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+  padding: 4px var(--space-xs);
+  border-bottom: var(--rule-hair) solid var(--color-rule);
+  margin-bottom: 2px;
+}
+
+.chat-mention-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  width: 100%;
+  min-height: 34px;
+  padding: 4px var(--space-xs);
+  border: none;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-ink);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-mention-item:hover,
+.chat-mention-item.is-selected {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+}
+
+.chat-mention-icon {
+  display: inline-flex;
+  flex-shrink: 0;
+  color: var(--color-muted);
+}
+
+.chat-mention-item.is-selected .chat-mention-icon {
+  color: var(--color-accent-text);
+}
+
+.chat-mention-name {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.chat-mention-path {
+  color: var(--color-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.context-chip.is-mention {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+}
+
+.chat-extra-limit-warn {
+  font-size: var(--text-xs);
+  color: var(--color-warning);
+  padding-inline: var(--space-2xs);
+}
+
 @media (pointer: coarse) {
   .field-control,
   .chat-input {
     font-size: var(--text-touch-input);
+  }
+
+  .chat-mention-item {
+    min-height: 40px;
   }
 }

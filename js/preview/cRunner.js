@@ -388,7 +388,13 @@ function detectRunnerLanguage(filePath, companionFiles = []) {
   };
 }
 
-export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
+export const COMPILER_MODES = Object.freeze({
+  AUTO: "auto",
+  WANDBOX: "wandbox",
+  WASM: "wasm"
+});
+
+function resolveCompilationUnit({ activeFile, companionFiles = [] }) {
   const {
     ext,
     isRust,
@@ -399,7 +405,8 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
     isC,
     isCppFamily,
     compiler,
-    options
+    options,
+    langLabel
   } = detectRunnerLanguage(activeFile.path, companionFiles);
 
   // Si el archivo activo es un header (.h/.hpp) o un módulo auxiliar sin `main()`,
@@ -479,7 +486,13 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
       .replace(/[\r\n\x00-\x1f\x7f]/g, "")
       .replace(/\\/g, "/")
       .replace(/^\/+/, "");
-    if (!relName) relName = "companion.c";
+    const relSegments = relName.split("/");
+    if (
+      !relName ||
+      relSegments.some((seg) => !seg || seg === "." || seg === ".." || seg === "__proto__" || seg === "constructor" || seg === "prototype")
+    ) {
+      continue;
+    }
     if (relName.startsWith("-") || relName.startsWith("@")) {
       relName = `./${relName}`;
     }
@@ -502,23 +515,41 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
     // Verificar si el archivo compañero define su propia función `main()`.
     const compHasMain = hasMainFunction(compContent);
 
-    // Si el archivo compañero define `main()`, es un programa INDEPENDIENTE
-    // (ej: otro ejercicio o programa separado en la misma carpeta).
-    // Si lo vinculáramos a la compilación de `activeFile`, el linker fallará con:
-    // `multiple definition of 'main'`.
-    // Por ende, NUNCA se debe compilar ni enlazar como módulo adicional.
+    // Si el archivo compañero define `main()`, es un programa INDEPENDIENTE:
+    // nunca se vincula como módulo auxiliar para evitar "multiple definition of main".
     if (compHasMain) {
       continue;
     }
 
     // Si NO define `main()`, es un módulo auxiliar (ej: utils.c, calculos.cpp).
-    // Se incluye en `codes` y se pasa al compilador para enlace.
     codes.push({
       file: relName,
       code: compContent
     });
     extraSourceFiles.push(relName);
   }
+
+  return {
+    effectiveMainFile,
+    codes,
+    extraSourceFiles,
+    isC,
+    isCppFamily,
+    compiler,
+    options,
+    langLabel
+  };
+}
+
+export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "" }) {
+  const {
+    effectiveMainFile,
+    codes,
+    extraSourceFiles,
+    isCppFamily,
+    compiler,
+    options
+  } = resolveCompilationUnit({ activeFile, companionFiles });
 
   const rawOptions = isCppFamily ? ["-O2", "-Wall", "-lm"] : [];
   if (extraSourceFiles.length > 0) {
@@ -533,6 +564,212 @@ export function buildWandboxPayload({ activeFile, companionFiles = [], stdin = "
     stdin: String(stdin || ""),
     "compiler-option-raw": rawOptions.join("\n")
   };
+}
+
+/**
+ * Construye el payload para el compilador offline Clang WASM en Web Worker.
+ * @param {{ activeFile: { path: string, content: string }, companionFiles?: Array<{ path: string, content: string }>, stdin?: string }} params
+ */
+export function buildClangWasmPayload({ activeFile, companionFiles = [], stdin = "" }) {
+  const {
+    effectiveMainFile,
+    codes,
+    extraSourceFiles,
+    isC,
+    isCppFamily
+  } = resolveCompilationUnit({ activeFile, companionFiles });
+
+  const cleanMain = normalizePath(effectiveMainFile.path);
+  const lastSlash = cleanMain.lastIndexOf("/");
+  const mainFileName = lastSlash >= 0 ? cleanMain.slice(lastSlash + 1) : cleanMain || (isC ? "main.c" : "main.cpp");
+
+  const files = {
+    [mainFileName]: String(effectiveMainFile.content || "")
+  };
+  for (const item of codes) {
+    files[item.file] = String(item.code || "");
+  }
+
+  return {
+    isC,
+    isCppFamily,
+    mainFileName,
+    files,
+    extraSources: extraSourceFiles.slice(),
+    stdin: String(stdin || "")
+  };
+}
+
+/**
+ * Ejecuta Clang WASM dentro de un Web Worker dedicado de módulo ES (`./clangWorker.js`).
+ */
+function compileAndRunClangWorker(
+  wasmPayload,
+  {
+    timeoutMs = 90000,
+    signal = null,
+    onPhase = () => {},
+    workerFactory = null,
+    workerRef = null
+  } = {}
+) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      const abortErr = new Error("Compilación cancelada.");
+      abortErr.name = "AbortError";
+      reject(abortErr);
+      return;
+    }
+
+    const createWorker = workerFactory || (() => new Worker("./js/preview/clangWorker.js", { type: "module" }));
+    let worker = workerRef?.current || null;
+    if (!worker) {
+      try {
+        worker = createWorker();
+        if (workerRef) workerRef.current = worker;
+      } catch (err) {
+        reject(new Error(`No se pudo iniciar el Web Worker de Clang WASM: ${err?.message || err}`));
+        return;
+      }
+    }
+
+    const requestId = `clang-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let settled = false;
+    let timerId = null;
+
+    const terminateWorker = () => {
+      try { worker.terminate(); } catch (_) {}
+      if (workerRef && workerRef.current === worker) {
+        workerRef.current = null;
+      }
+    };
+
+    const cleanup = () => {
+      if (timerId !== null) {
+        clearTimeout(timerId);
+        timerId = null;
+      }
+      worker.removeEventListener("message", onMessage);
+      worker.removeEventListener("error", onError);
+      if (signal && onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
+
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      terminateWorker();
+      const abortErr = new Error("Compilación WASM cancelada.");
+      abortErr.name = "AbortError";
+      reject(abortErr);
+    };
+
+    const onMessage = (event) => {
+      const msg = event?.data;
+      if (!msg || msg.id !== requestId) return;
+      if (msg.type === "phase") {
+        onPhase(msg.phase);
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (msg.ok) {
+        resolve(msg.result);
+      } else {
+        reject(new Error(msg.error || "Fallo al compilar con Clang WASM."));
+      }
+    };
+
+    const onError = (event) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      terminateWorker();
+      reject(new Error(event?.message || "Error inesperado en el Web Worker de Clang WASM."));
+    };
+
+    if (timeoutMs > 0) {
+      timerId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        terminateWorker();
+        reject(new Error("Tiempo de espera agotado en la compilación/ejecución WASM local."));
+      }, timeoutMs);
+    }
+
+    worker.addEventListener("message", onMessage);
+    worker.addEventListener("error", onError);
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    worker.postMessage({
+      id: requestId,
+      action: "compileAndRun",
+      payload: wasmPayload
+    });
+  });
+}
+
+/**
+ * Orquesta compilación en modo Auto (Wandbox -> fallback Clang WASM offline), Solo Wandbox o Solo WASM.
+ */
+export async function compileAndRunWithFallback({
+  mode = COMPILER_MODES.AUTO,
+  isOnline = typeof navigator !== "undefined" ? navigator.onLine !== false : true,
+  isCppFamily = true,
+  wandboxPayload,
+  wasmPayload,
+  wandboxFn,
+  wasmFn,
+  signal = null,
+  onStatus = () => {}
+}) {
+  if (mode === COMPILER_MODES.WASM) {
+    if (!isCppFamily) {
+      throw new Error("El compilador offline Clang WASM solo está disponible para C y C++.");
+    }
+    onStatus("Compilando offline en Clang WASM...");
+    const res = await wasmFn(wasmPayload);
+    return { ...res, engine: "wasm-clang", usedFallback: false };
+  }
+
+  if (mode === COMPILER_MODES.WANDBOX || !isCppFamily) {
+    const res = await wandboxFn(wandboxPayload);
+    return { ...res, engine: "wandbox", usedFallback: false };
+  }
+
+  // Modo AUTO para C / C++: usar WASM directamente si no hay red; intentar Wandbox y hacer fallback si falla.
+  if (!isOnline) {
+    onStatus("Sin conexión: compilando offline con Clang WASM...");
+    const wasmRes = await wasmFn(wasmPayload);
+    return {
+      ...wasmRes,
+      engine: "wasm-clang",
+      usedFallback: true,
+      fallbackReason: "Sin conexión a internet"
+    };
+  }
+
+  try {
+    const res = await wandboxFn(wandboxPayload);
+    return { ...res, engine: "wandbox", usedFallback: false };
+  } catch (err) {
+    const isCancelled = signal?.aborted || err?.name === "AbortError";
+    if (isCancelled) throw err;
+    onStatus("Wandbox no disponible — cambiando a Clang WASM offline...");
+    const wasmRes = await wasmFn(wasmPayload);
+    return {
+      ...wasmRes,
+      engine: "wasm-clang",
+      usedFallback: true,
+      fallbackReason: err?.message || "Error de conexión con Wandbox"
+    };
+  }
 }
 
 /**
@@ -763,7 +1000,9 @@ export function mountCRunnerView(containerEl, {
   companionFiles = [],
   onCompilerResult = () => {},
   onGoToLine = () => {},
-  fetchFn = (typeof window !== "undefined" ? window.fetch : fetch)
+  fetchFn = (typeof window !== "undefined" ? window.fetch : fetch),
+  initialMode = COMPILER_MODES.AUTO,
+  wasmFn = null
 }) {
   if (!containerEl) return { destroy: () => {}, run: async () => {} };
   mountedRunnerInstances.get(containerEl)?.destroy();
@@ -772,6 +1011,7 @@ export function mountCRunnerView(containerEl, {
   const listenerAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
   const listenerOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
   let focusTimerId = 0;
+  const wasmWorkerRef = { current: null };
 
   const { isC, isCppFamily, langLabel } = detectRunnerLanguage(activeFile.path, companionFiles);
   const initialPayload = buildWandboxPayload({ activeFile, companionFiles, stdin: "" });
@@ -800,12 +1040,44 @@ export function mountCRunnerView(containerEl, {
   companionBadge.textContent = companionLabel;
   meta.append(title, badge, companionBadge);
 
+  let selectedMode = Object.values(COMPILER_MODES).includes(initialMode)
+    ? initialMode
+    : COMPILER_MODES.AUTO;
+
+  const headerActions = document.createElement("div");
+  headerActions.className = "c-runner-actions";
+
+  let modeSelect = null;
+  if (isCppFamily) {
+    modeSelect = document.createElement("select");
+    modeSelect.className = "field-control c-compiler-select";
+    modeSelect.setAttribute("aria-label", "Motor de compilación C/C++");
+    modeSelect.title = "Auto intenta Wandbox y usa Clang WASM offline si no hay conexión";
+    const opts = [
+      { value: COMPILER_MODES.AUTO, label: "Auto (Wandbox → WASM)" },
+      { value: COMPILER_MODES.WANDBOX, label: "Solo Wandbox (online)" },
+      { value: COMPILER_MODES.WASM, label: "Clang WASM (offline)" }
+    ];
+    for (const optDef of opts) {
+      const opt = document.createElement("option");
+      opt.value = optDef.value;
+      opt.textContent = optDef.label;
+      modeSelect.appendChild(opt);
+    }
+    modeSelect.value = selectedMode;
+    modeSelect.addEventListener("change", () => {
+      selectedMode = modeSelect.value;
+    }, listenerOpts);
+    headerActions.appendChild(modeSelect);
+  }
+
   const btnCompile = document.createElement("button");
   btnCompile.type = "button";
   btnCompile.className = "btn btn-primary btn-sm btn-c-compile";
   btnCompile.innerHTML = '<span data-icon="play"></span><span>Compilar y Ejecutar</span> <span class="c-key-hint" style="opacity:0.75;font-size:11px;">(Ctrl+Enter)</span>';
 
-  header.append(meta, btnCompile);
+  headerActions.appendChild(btnCompile);
+  header.append(meta, headerActions);
 
   // 2. Modo avanzado: Tarjeta stdin colapsable para lote
   const hasInteractiveInput = /\b(scanf|cin|getline|getchar|fgets|gets)\b/.test(activeFile.content || "");
@@ -965,11 +1237,50 @@ export function mountCRunnerView(containerEl, {
       );
     }
 
+    const wasmPayload = isCppFamily
+      ? buildClangWasmPayload({
+          activeFile,
+          companionFiles,
+          stdin: effectiveStdin
+        })
+      : null;
+    if (wasmPayload) {
+      wasmPayload.files[wasmPayload.mainFileName] = String(payload.code || "");
+    }
+
+    const runWasm = wasmFn || ((wp) => compileAndRunClangWorker(wp, {
+      timeoutMs: 90000,
+      signal: activeRequestController?.signal || null,
+      workerRef: wasmWorkerRef,
+      onPhase: (phase) => {
+        if (isDestroyed) return;
+        if (phase === "loading-toolchain") {
+          termStatus.textContent = "Descargando Clang WASM (~23 MB, 1ra vez)...";
+        } else if (phase === "compiling") {
+          termStatus.textContent = "Compilando offline en Clang WASM...";
+        } else if (phase === "running") {
+          termStatus.textContent = "Ejecutando binario WebAssembly...";
+        }
+      }
+    }));
+
     const t0 = performance.now();
     try {
-      const res = await compileAndRunWandbox(payload, fetchFn, 25000, activeRequestController?.signal || null);
+      const res = await compileAndRunWithFallback({
+        mode: selectedMode,
+        isCppFamily,
+        wandboxPayload: payload,
+        wasmPayload,
+        wandboxFn: (wp) => compileAndRunWandbox(wp, fetchFn, 25000, activeRequestController?.signal || null),
+        wasmFn: runWasm,
+        signal: activeRequestController?.signal || null,
+        onStatus: (msg) => {
+          if (!isDestroyed) termStatus.textContent = msg;
+        }
+      });
       if (isDestroyed) return;
       const ms = Math.round(performance.now() - t0);
+      const engineTag = res.engine === "wasm-clang" ? " • Clang WASM offline" : "";
       const rawStdoutWithMarker = String(res.stdout || "");
       const waitingForInput = rawStdoutWithMarker.includes(WAIT_INPUT_MARKER);
       const cleanResStdout = waitingForInput
@@ -1128,19 +1439,29 @@ export function mountCRunnerView(containerEl, {
       if (waitingForInput) {
         termStatus.className = "c-term-status is-running";
         termStatus.textContent = sessionInputs.length === 0
-          ? `Esperando dato en consola (${ms} ms)`
-          : `Paso ${sessionInputs.length} — Esperando dato (${ms} ms)`;
+          ? `Esperando dato en consola (${ms} ms${engineTag})`
+          : `Paso ${sessionInputs.length} — Esperando dato (${ms} ms${engineTag})`;
         termInput.placeholder = "Escribí el dato solicitado y presioná Enter...";
         scheduleFocus();
       } else if (res.status === 0 && !hasInteractiveInput) {
         termStatus.className = "c-term-status is-ok";
-        termStatus.textContent = `Código de salida: 0 (Éxito) — ${ms} ms`;
+        termStatus.textContent = `Código de salida: 0 (Éxito) — ${ms} ms${engineTag}`;
         termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
       } else {
         termStatus.className = "c-term-status is-ok";
-        termStatus.textContent = `Paso ${sessionInputs.length} — Finalizado (${ms} ms)`;
+        termStatus.textContent = `Paso ${sessionInputs.length} — Finalizado (${ms} ms${engineTag})`;
         termInput.placeholder = "Programa finalizado. Tocá 'Reiniciar' para volver a ejecutar.";
         scheduleFocus();
+      }
+      if (res.usedFallback && sessionInputs.length === 0) {
+        const fallbackNote = document.createElement("div");
+        fallbackNote.className = "c-term-hint";
+        fallbackNote.textContent = `ℹ Compilado localmente con Clang WASM (${res.fallbackReason || "modo offline"}).`;
+        if (typeof termBody.prepend === "function") {
+          termBody.prepend(fallbackNote);
+        } else {
+          termBody.appendChild(fallbackNote);
+        }
       }
     } catch (err) {
       if (pushedInput && sessionInputs.length > 0) {
@@ -1259,6 +1580,8 @@ export function mountCRunnerView(containerEl, {
         focusTimerId = 0;
       }
       try { activeRequestController?.abort(); } catch (_) {}
+      try { wasmWorkerRef.current?.terminate(); } catch (_) {}
+      wasmWorkerRef.current = null;
       try { listenerAbort?.abort(); } catch (_) {}
       if (!listenerAbort) {
         containerEl.removeEventListener("keydown", handleKeydown);

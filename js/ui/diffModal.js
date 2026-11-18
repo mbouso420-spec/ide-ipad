@@ -1,12 +1,13 @@
 /**
  * Visor de diferencias (Diff en verde y rojo) para revisar cambios línea por línea
- * antes de aplicar reemplazos de la IA o antes de hacer Commit y Push en GitHub.
+ * en un archivo único o en lotes multi-archivo (IA con selección por archivo y revisión pre-commit).
  */
 export function initDiffModal() {
   const dialog = document.getElementById("diff-dialog");
   const titleEl = document.getElementById("diff-dialog-title");
   const statsEl = document.getElementById("diff-dialog-stats");
   const bodyEl = document.getElementById("diff-lines-view");
+  const multiBarEl = document.getElementById("diff-multi-bar");
   const closeBtn = document.getElementById("btn-close-diff");
   const cancelBtn = document.getElementById("btn-diff-cancel");
   const confirmBtn = document.getElementById("btn-diff-confirm");
@@ -14,40 +15,97 @@ export function initDiffModal() {
   const listenerController = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
   let pendingConfirmAction = null;
+  let pendingCancelAction = null;
+  let multiState = null;
 
-  closeBtn?.addEventListener("click", () => close(), listenOpts);
-  cancelBtn?.addEventListener("click", () => close(), listenOpts);
+  closeBtn?.addEventListener("click", () => close(true), listenOpts);
+  cancelBtn?.addEventListener("click", () => close(true), listenOpts);
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
-      close();
+      close(true);
     }
   }, listenOpts);
   dialog?.addEventListener("close", () => {
     if (dialog.open) return;
+    const cancelCb = pendingCancelAction;
     pendingConfirmAction = null;
+    pendingCancelAction = null;
+    multiState = null;
+    if (multiBarEl) {
+      multiBarEl.hidden = true;
+      multiBarEl.innerHTML = "";
+    }
+    if (typeof cancelCb === "function") {
+      cancelCb();
+    }
   }, listenOpts);
 
   confirmBtn?.addEventListener("click", () => {
     const action = pendingConfirmAction;
-    close();
+    const snapshotMulti = multiState;
+    pendingCancelAction = null;
+    close(false);
     if (typeof action === "function") {
-      action();
+      if (snapshotMulti?.selectable) {
+        const selectedItems = snapshotMulti.items.filter((it) => it.checked);
+        action(selectedItems);
+      } else {
+        action();
+      }
     }
   }, listenOpts);
 
-  function close() {
+  function close(invokeCancel = false) {
+    const cancelCb = invokeCancel ? pendingCancelAction : null;
     pendingConfirmAction = null;
+    pendingCancelAction = null;
+    multiState = null;
+    if (multiBarEl) {
+      multiBarEl.hidden = true;
+      multiBarEl.innerHTML = "";
+    }
     dialog?.close();
+    if (typeof cancelCb === "function") {
+      cancelCb();
+    }
   }
 
-  function renderDiffView({ title, oldCode, newCode, confirmLabel, onConfirm }) {
-    if (!dialog || !bodyEl) return;
+  const INITIAL_DIFF_ROW_CHUNK = 1500;
 
-    pendingConfirmAction = onConfirm || null;
-    if (titleEl) {
-      titleEl.textContent = title || "Revisar diferencias";
+  function buildDiffRowNode(row) {
+    if (row.type === "skip") {
+      const skipEl = document.createElement("div");
+      skipEl.className = "diff-row diff-row-skip";
+      skipEl.textContent = `… ${row.count} líneas sin cambios …`;
+      return skipEl;
     }
 
+    const rowEl = document.createElement("div");
+    rowEl.className =
+      row.type === "add"
+        ? "diff-row diff-row-add"
+        : row.type === "del"
+          ? "diff-row diff-row-del"
+          : "diff-row";
+
+    const numEl = document.createElement("span");
+    numEl.className = "diff-line-num";
+    numEl.textContent = String(row.lineNo ?? "");
+
+    const signEl = document.createElement("span");
+    signEl.className = "diff-line-sign";
+    signEl.textContent = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
+
+    const textEl = document.createElement("span");
+    textEl.className = "diff-line-code";
+    textEl.textContent = row.text;
+
+    rowEl.append(numEl, signEl, textEl);
+    return rowEl;
+  }
+
+  function renderLinesDiff(oldCode, newCode) {
+    if (!bodyEl) return;
     const { rows, addedCount, removedCount, lineEndingsOnly } = computeLineDiff(oldCode || "", newCode || "");
     if (statsEl) {
       statsEl.innerHTML = `
@@ -64,44 +122,150 @@ export function initDiffModal() {
         ? "Los archivos solo difieren en el formato de fin de línea (CRLF de Windows vs LF de Unix)."
         : "El contenido nuevo es idéntico al actual (sin diferencias).";
       bodyEl.appendChild(empty);
-    } else {
-      const frag = document.createDocumentFragment();
-      for (const row of rows) {
-        if (row.type === "skip") {
-          const skipEl = document.createElement("div");
-          skipEl.className = "diff-row diff-row-skip";
-          skipEl.textContent = `… ${row.count} líneas sin cambios …`;
-          frag.appendChild(skipEl);
-          continue;
-        }
-
-        const rowEl = document.createElement("div");
-        rowEl.className =
-          row.type === "add"
-            ? "diff-row diff-row-add"
-            : row.type === "del"
-              ? "diff-row diff-row-del"
-              : "diff-row";
-
-        const numEl = document.createElement("span");
-        numEl.className = "diff-line-num";
-        numEl.textContent = String(row.lineNo ?? "");
-
-        const signEl = document.createElement("span");
-        signEl.className = "diff-line-sign";
-        signEl.textContent = row.type === "add" ? "+" : row.type === "del" ? "-" : " ";
-
-        const textEl = document.createElement("span");
-        textEl.className = "diff-line-code";
-        textEl.textContent = row.text;
-
-        rowEl.append(numEl, signEl, textEl);
-        frag.appendChild(rowEl);
-      }
-      bodyEl.appendChild(frag);
+      return;
     }
 
+    let renderedCount = 0;
+    const appendChunk = (existingLoadMoreEl = null) => {
+      const nextEnd = Math.min(rows.length, renderedCount + INITIAL_DIFF_ROW_CHUNK);
+      const target = typeof document.createDocumentFragment === "function" ? document.createDocumentFragment() : bodyEl;
+      for (; renderedCount < nextEnd; renderedCount += 1) {
+        target.appendChild(buildDiffRowNode(rows[renderedCount]));
+      }
+      if (existingLoadMoreEl) {
+        existingLoadMoreEl.remove();
+      }
+      if (renderedCount < rows.length) {
+        const remaining = rows.length - renderedCount;
+        const loadMoreBtn = document.createElement("button");
+        loadMoreBtn.type = "button";
+        loadMoreBtn.className = "btn btn-ghost btn-sm diff-load-more-btn";
+        loadMoreBtn.textContent = `Mostrar ${Math.min(remaining, INITIAL_DIFF_ROW_CHUNK)} líneas más (${remaining} restantes)`;
+        loadMoreBtn.addEventListener("click", () => appendChunk(loadMoreBtn));
+        target.appendChild(loadMoreBtn);
+      }
+      if (target !== bodyEl) {
+        bodyEl.appendChild(target);
+      }
+    };
+
+    appendChunk(null);
+  }
+
+  function renderMultiBar() {
+    if (!multiBarEl || !multiState) return;
+    const { items, activeIndex, selectable } = multiState;
+    multiBarEl.hidden = false;
+    multiBarEl.innerHTML = "";
+
+    const navRow = document.createElement("div");
+    navRow.className = "diff-multi-nav";
+
+    const btnPrev = document.createElement("button");
+    btnPrev.type = "button";
+    btnPrev.className = "btn btn-ghost btn-sm";
+    btnPrev.id = "btn-diff-prev";
+    btnPrev.textContent = "← Anterior";
+    btnPrev.disabled = activeIndex <= 0;
+    btnPrev.addEventListener("click", () => {
+      if (multiState && multiState.activeIndex > 0) {
+        multiState.activeIndex -= 1;
+        syncActiveMultiItem();
+      }
+    });
+
+    const counter = document.createElement("span");
+    counter.className = "diff-multi-counter code-font";
+    counter.textContent = `Archivo ${activeIndex + 1} de ${items.length}`;
+
+    const btnNext = document.createElement("button");
+    btnNext.type = "button";
+    btnNext.className = "btn btn-ghost btn-sm";
+    btnNext.id = "btn-diff-next";
+    btnNext.textContent = "Siguiente →";
+    btnNext.disabled = activeIndex >= items.length - 1;
+    btnNext.addEventListener("click", () => {
+      if (multiState && multiState.activeIndex < multiState.items.length - 1) {
+        multiState.activeIndex += 1;
+        syncActiveMultiItem();
+      }
+    });
+
+    navRow.append(btnPrev, counter, btnNext);
+
+    const chipsList = document.createElement("div");
+    chipsList.className = "diff-multi-files";
+
+    items.forEach((item, idx) => {
+      const wrap = document.createElement("div");
+      wrap.className = `diff-multi-file-pill${idx === activeIndex ? " is-active" : ""}`;
+
+      if (selectable) {
+        const cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = Boolean(item.checked);
+        cb.setAttribute("aria-label", `Incluir ${item.path}`);
+        cb.addEventListener("change", () => {
+          item.checked = cb.checked;
+          syncConfirmMultiButton();
+        });
+        wrap.appendChild(cb);
+      }
+
+      const fileBtn = document.createElement("button");
+      fileBtn.type = "button";
+      fileBtn.className = "diff-multi-file-btn code-font";
+      const tag = item.badge || (item.isNew ? "Nuevo" : "Editado");
+      fileBtn.textContent = `${item.path} (${tag})`;
+      fileBtn.addEventListener("click", () => {
+        if (!multiState) return;
+        multiState.activeIndex = idx;
+        syncActiveMultiItem();
+      });
+
+      wrap.appendChild(fileBtn);
+      chipsList.appendChild(wrap);
+    });
+
+    multiBarEl.append(navRow, chipsList);
+  }
+
+  function syncConfirmMultiButton() {
+    if (!confirmBtn || !multiState?.selectable) return;
+    const selectedCount = multiState.items.filter((it) => it.checked).length;
+    confirmBtn.disabled = selectedCount === 0;
+    confirmBtn.textContent = `Aplicar seleccionados (${selectedCount})`;
+  }
+
+  function syncActiveMultiItem() {
+    if (!multiState || multiState.items.length === 0) return;
+    const current = multiState.items[multiState.activeIndex];
+    if (titleEl) {
+      titleEl.textContent = current.title || `${multiState.baseTitle}: ${current.path}`;
+    }
+    renderLinesDiff(current.oldCode || "", current.newCode || "");
+    renderMultiBar();
+    syncConfirmMultiButton();
+  }
+
+  function renderDiffView({ title, oldCode, newCode, confirmLabel, onConfirm }) {
+    if (!dialog || !bodyEl) return;
+
+    multiState = null;
+    if (multiBarEl) {
+      multiBarEl.hidden = true;
+      multiBarEl.innerHTML = "";
+    }
+    pendingConfirmAction = onConfirm || null;
+    pendingCancelAction = null;
+    if (titleEl) {
+      titleEl.textContent = title || "Revisar diferencias";
+    }
+
+    renderLinesDiff(oldCode || "", newCode || "");
+
     if (confirmBtn && cancelBtn) {
+      confirmBtn.disabled = false;
       if (onConfirm) {
         confirmBtn.hidden = false;
         confirmBtn.textContent = confirmLabel || "Confirmar y aplicar";
@@ -112,6 +276,43 @@ export function initDiffModal() {
       }
     }
 
+    if (!dialog.open) {
+      dialog.showModal();
+    }
+  }
+
+  function openMultiFileDiff({ title = "Revisar lote multi-archivo", items = [], initialIndex = 0, selectable = false, onConfirm = null, onCancel = null }) {
+    if (!dialog || !bodyEl || !Array.isArray(items) || items.length === 0) {
+      onCancel?.();
+      return;
+    }
+
+    const safeIdx = Math.max(0, Math.min(items.length - 1, Number(initialIndex) || 0));
+    multiState = {
+      baseTitle: title,
+      selectable: Boolean(selectable),
+      activeIndex: safeIdx,
+      items: items.map((it) => ({
+        ...it,
+        checked: it.checked !== false
+      }))
+    };
+
+    pendingConfirmAction = selectable ? onConfirm : null;
+    pendingCancelAction = onCancel;
+
+    if (confirmBtn && cancelBtn) {
+      if (selectable && typeof onConfirm === "function") {
+        confirmBtn.hidden = false;
+        cancelBtn.textContent = "Cancelar";
+      } else {
+        confirmBtn.hidden = true;
+        confirmBtn.disabled = false;
+        cancelBtn.textContent = "Cerrar";
+      }
+    }
+
+    syncActiveMultiItem();
     if (!dialog.open) {
       dialog.showModal();
     }
@@ -135,8 +336,30 @@ export function initDiffModal() {
         onConfirm: null
       });
     },
+    openMultiFileApplyDiff({ files, onConfirm, onCancel }) {
+      openMultiFileDiff({
+        title: "Aplicar lote IA",
+        items: files,
+        initialIndex: 0,
+        selectable: true,
+        onConfirm,
+        onCancel
+      });
+    },
+    openMultiFileReadOnlyDiff({ title = "Cambios pendientes", items, initialIndex = 0 }) {
+      openMultiFileDiff({
+        title,
+        items,
+        initialIndex,
+        selectable: false,
+        onConfirm: null,
+        onCancel: null
+      });
+    },
     destroy() {
       pendingConfirmAction = null;
+      pendingCancelAction = null;
+      multiState = null;
       listenerController?.abort();
     }
   };
@@ -167,8 +390,6 @@ export function computeLineDiff(oldStr, newStr) {
   const n = midA.length;
   const m = midB.length;
 
-  // Zona central: LCS exacto si es chica; Myers (mínimo, O((N+M)·D)) si es grande;
-  // y solo si ni eso entra en el presupuesto, marcar la zona central como reemplazada.
   let midOps = null;
   if (n * m <= 900000) {
     midOps = lcsMiddleOps(midA, midB, start);
@@ -198,7 +419,6 @@ export function computeLineDiff(oldStr, newStr) {
     if (op.type === "del") removedCount += 1;
   }
 
-  // Colapsar bloques largos de líneas iguales dejando 3 líneas de contexto
   const CONTEXT = 3;
   const keep = new Array(rawOps.length).fill(false);
   for (let i = 0; i < rawOps.length; i += 1) {
@@ -274,10 +494,6 @@ function lcsMiddleOps(midA, midB, start) {
   return ops;
 }
 
-/**
- * Diff de Myers (script de edición mínimo) para zonas grandes con pocos cambios.
- * Devuelve null si la cantidad de ediciones supera maxD (para acotar tiempo y memoria).
- */
 function myersMiddleOps(midA, midB, start, maxD) {
   const n = midA.length;
   const m = midB.length;
@@ -285,7 +501,6 @@ function myersMiddleOps(midA, midB, start, maxD) {
   const limit = Math.min(max, maxD);
   const offset = max + 1;
   const v = new Int32Array(2 * max + 3);
-  /** @type {Int32Array[]} */
   const trace = [];
 
   let found = -1;
@@ -356,7 +571,6 @@ function myersMiddleOps(midA, midB, start, maxD) {
   }
   reversed.reverse();
 
-  // Presentación estilo unificado: dentro de cada bloque de cambios, primero las líneas borradas.
   const ops = [];
   let pendingAdds = [];
   for (const op of reversed) {

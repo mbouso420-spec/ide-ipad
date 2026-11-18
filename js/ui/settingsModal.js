@@ -2,6 +2,8 @@ import { keyboardRouter } from "./keyboardRouter.js";
 import { getStorageQuotaEstimate, formatStorageBytes } from "../storage/storageQuota.js";
 import { saveCredentialsBackup, broadcastWorkspaceChange } from "../storage/workspaceDb.js";
 import { escapeHtml, downloadBlob } from "../utils/dom.js";
+import { readStoredValue, saveStoredValue, removeStoredValue } from "../utils/storage.js";
+import { estimateTokens } from "../ai/markdownRenderer.js";
 import {
   encryptKeysPayload,
   decryptKeysPayload,
@@ -12,6 +14,7 @@ import {
   getKeyStorageMode,
   setKeyStorageMode,
   exportKeysBundle,
+  getSyncCredentialsBackupPayload,
   importKeysBundle,
   hasStoredCredentials,
   getApiKey,
@@ -138,7 +141,7 @@ export function initSettingsModal({
       }
     } catch (_) {}
 
-    const usedTokens = Math.ceil(contextChars / 4);
+    const usedTokens = estimateTokens(contextChars);
     const activeProviderId = getSavedProviderId();
     let effectiveProviderId = activeProviderId;
     let activeKey = getApiKey(activeProviderId);
@@ -304,12 +307,7 @@ export function initSettingsModal({
 
   function syncControlsWithState() {
     if (selectTheme) {
-      try {
-        const saved = localStorage.getItem(THEME_STORAGE_KEY) || "default";
-        selectTheme.value = saved;
-      } catch (_) {
-        selectTheme.value = "default";
-      }
+      selectTheme.value = readStoredValue(THEME_STORAGE_KEY, "default") || "default";
     }
 
     if (chkWordWrap && editor) {
@@ -329,12 +327,7 @@ export function initSettingsModal({
     }
 
     if (selectAutosave) {
-      try {
-        const stored = localStorage.getItem("studio_autosave_delay") || "240";
-        selectAutosave.value = stored;
-      } catch (_) {
-        selectAutosave.value = "240";
-      }
+      selectAutosave.value = readStoredValue("studio_autosave_delay", "240") || "240";
     }
 
     refreshTokensMeter();
@@ -439,14 +432,10 @@ export function initSettingsModal({
     const chosen = (e?.target ? e.target.value : selectTheme?.value) || "default";
     if (chosen === "default") {
       delete document.documentElement.dataset.theme;
-      try {
-        localStorage.removeItem(THEME_STORAGE_KEY);
-      } catch (_) {}
+      removeStoredValue(THEME_STORAGE_KEY);
     } else {
       document.documentElement.dataset.theme = chosen;
-      try {
-        localStorage.setItem(THEME_STORAGE_KEY, chosen);
-      } catch (_) {}
+      saveStoredValue(THEME_STORAGE_KEY, chosen);
     }
     onThemeChange?.(chosen);
   }, listenOpts);
@@ -498,7 +487,7 @@ export function initSettingsModal({
     notice.textContent =
       mode === "session"
         ? "Modo solo sesión activo: se limpió el respaldo persistente y las pestañas abiertas se sincronizaron."
-        : "Modo almacenamiento local activo: las credenciales cifradas se sincronizaron entre pestañas.";
+        : "Modo almacenamiento local activo: credenciales sincronizadas localmente entre pestañas (usá Exportar bóveda AES-GCM para respaldo cifrado).";
   }
 
   selectKeyStorage?.addEventListener("change", (e) => {
@@ -506,11 +495,7 @@ export function initSettingsModal({
     if (mode === "session" || mode === "local") {
       setKeyStorageMode(mode);
       try {
-        if (mode === "session" || !hasStoredCredentials()) {
-          void saveCredentialsBackup("");
-        } else {
-          void saveCredentialsBackup(exportKeysBundle());
-        }
+        void saveCredentialsBackup(getSyncCredentialsBackupPayload());
       } catch (_) {}
       broadcastWorkspaceChange({ type: "KEY_STORAGE_MODE_CHANGED", mode });
       showKeyStorageNotice(mode);
@@ -520,9 +505,7 @@ export function initSettingsModal({
 
   selectAutosave?.addEventListener("change", (e) => {
     const val = (e?.target ? e.target.value : selectAutosave?.value) || "240";
-    try {
-      localStorage.setItem("studio_autosave_delay", val);
-    } catch (_) {}
+    saveStoredValue("studio_autosave_delay", val);
   }, listenOpts);
 
   function setVaultStatus(message, type = "neutral") {
@@ -589,8 +572,9 @@ export function initSettingsModal({
       throw new Error("Solo se admite importar archivos cifrados de bóveda Studio IDE (.vault.json).");
     }
     const count = importKeysBundle(payloadJson);
-    if (getKeyStorageMode() === "local" && hasStoredCredentials()) {
-      void saveCredentialsBackup(exportKeysBundle());
+    const payload = getSyncCredentialsBackupPayload();
+    if (payload) {
+      void saveCredentialsBackup(payload);
     }
     refreshTokensMeter();
     if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {

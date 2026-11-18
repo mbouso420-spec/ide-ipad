@@ -1,7 +1,8 @@
+/**
+ * Empaquetador de documentos HTML con inlining de CSS, módulos ES/TS/JSX, medios y puente de consola.
+ */
+
 import { normalizePath } from "../storage/workspaceDb.js";
-import { getImageMimeType, IMAGE_EXTENSIONS } from "../storage/fileImport.js";
-import { formatStorageBytes } from "../storage/storageQuota.js";
-import { buildLoopGuardRuntime } from "./loopGuard.js";
 import { transpileTypeScriptAndJsx } from "./tsTranspiler.js";
 import {
   HTML_EXTENSIONS,
@@ -24,14 +25,12 @@ import {
   getParentFolder,
   resolveRelativePath,
   escapeAttr,
-  escapeHtmlText,
-  sanitizeSvgMarkup,
-  safeEncodeURIComponent
+  escapeHtmlText
 } from "./previewUtils.js";
 import {
   buildExactModuleMap,
   inspectModuleUsage,
-  isRelativeModuleSpecifier,
+  hasRelativeDepsInUsage,
   extractModuleDependencyPaths,
   buildVirtualModuleBundle,
   formatVirtualModuleExecution
@@ -42,6 +41,34 @@ import {
   renderMarkdownDocumentHtml,
   formatMdInline
 } from "./markdownPreview.js";
+import {
+  IMAGE_EXTENSIONS,
+  escapeCloseStyle,
+  escapeCloseScript,
+  filterFolderScopeFiles,
+  buildWorkspaceAssetMap,
+  extractReferencedAssetPaths,
+  parseCssImportConditions,
+  wrapCssWithConditions,
+  extractCssImportPaths,
+  createProjectAssetHelpers,
+  getMediaMimeType,
+  buildRuntimeAssetsBridgeScript,
+  extractTextAssetPaths
+} from "./html/assetResolver.js";
+import {
+  getSavedPreviewHtml,
+  savePreviewHtml,
+  findBestHtmlEntrypoint,
+  findTargetHtmlFile,
+  findSiblingHtmlInSameFolder
+} from "./html/entrypointResolver.js";
+import { buildConsoleBridgeScript } from "./html/consoleBridge.js";
+import {
+  buildStandaloneTsPreview,
+  buildStandaloneJsPreview,
+  buildStandaloneImagePreview
+} from "./html/standalonePreviews.js";
 
 export {
   HTML_EXTENSIONS,
@@ -60,6 +87,7 @@ export {
   MAX_PREVIEW_ASSET_BYTES,
   MAX_TOTAL_INLINED_CSS,
   IGNORED_PREVIEW_DIRS,
+  IMAGE_EXTENSIONS,
   getFileExtension,
   getParentFolder,
   resolveRelativePath,
@@ -69,1261 +97,297 @@ export {
   buildStandalonePythonPreview,
   buildMarkdownPreview,
   renderMarkdownDocumentHtml,
-  formatMdInline
+  formatMdInline,
+  filterFolderScopeFiles,
+  buildWorkspaceAssetMap,
+  extractReferencedAssetPaths,
+  parseCssImportConditions,
+  wrapCssWithConditions,
+  extractCssImportPaths,
+  extractTextAssetPaths,
+  getSavedPreviewHtml,
+  savePreviewHtml,
+  findBestHtmlEntrypoint,
+  findTargetHtmlFile,
+  findSiblingHtmlInSameFolder,
+  buildConsoleBridgeScript,
+  buildStandaloneTsPreview,
+  buildStandaloneJsPreview,
+  buildStandaloneImagePreview
 };
 
-/**
- * Filtra únicamente los archivos que pertenecen a la misma carpeta base (y subcarpetas relativas de ese conjunto),
- * omitiendo carpetas masivas (node_modules, dist, etc.) y archivos sin contenido descargado (lazy).
- */
-export function filterFolderScopeFiles(allFiles, baseFolder) {
-  if (!Array.isArray(allFiles)) return [];
-  const cleanBase = baseFolder ? normalizePath(baseFolder) : "";
-  const prefix = cleanBase ? `${cleanBase}/` : "";
+const SCRIPT_REGEX_KEYWORDS = new Set([
+  "return",
+  "throw",
+  "case",
+  "default",
+  "delete",
+  "void",
+  "typeof",
+  "await",
+  "yield",
+  "in",
+  "instanceof",
+  "of",
+  "new",
+  "else",
+  "do"
+]);
 
-  return allFiles.filter((f) => {
-    if (!f || !f.path) return false;
-    const clean = normalizePath(f.path);
-
-    const parts = clean.split("/");
-    for (const part of parts) {
-      if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) return false;
-    }
-
-    if (f.content === null || f.content === undefined) return false;
-    if (prefix && !clean.startsWith(prefix)) return false;
-
-    return true;
-  });
-}
-
-/**
- * Construye un mapa de todos los archivos del espacio de trabajo disponibles para la vista previa,
- * indexados por su ruta normalizada y excluyendo directorios pesados.
- */
-export function buildWorkspaceAssetMap(allFiles) {
-  const map = new Map();
-  const shortNameEntries = [];
-  const shortNameCounts = new Map();
-
-  for (const f of allFiles || []) {
-    if (!f || !f.path) continue;
-    const clean = normalizePath(f.path);
-    const parts = clean.split("/");
-    let isIgnored = false;
-    for (const part of parts) {
-      if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) {
-        isIgnored = true;
-        break;
-      }
-    }
-    if (!isIgnored) {
-      map.set(clean, f);
-      const baseName = f.shortName || clean.split("/").pop();
-      if (baseName) {
-        shortNameCounts.set(baseName, (shortNameCounts.get(baseName) || 0) + 1);
-        shortNameEntries.push([baseName, f]);
-      }
-    }
-  }
-
-  // Registrar atajos `shortName` solo si no colisionan ni ocultan rutas exactas
-  for (const [baseName, file] of shortNameEntries) {
-    if (!map.has(baseName) && shortNameCounts.get(baseName) === 1) {
-      map.set(baseName, file);
-    }
-  }
-
-  return map;
-}
-
-/**
- * Extrae todas las rutas relativas de hojas CSS, scripts JS, imágenes y recursos referenciados por el HTML.
- */
-function decodePreviewPathRef(rawRef) {
-  const stripped = String(rawRef || "")
-    .trim()
-    .split("?")[0]
-    .split("#")[0]
-    .replace(/\\/g, "/");
-  if (!stripped || !stripped.includes("%")) {
-    return stripped;
-  }
-  try {
-    return decodeURIComponent(stripped).replace(/\\/g, "/");
-  } catch {
-    return stripped;
-  }
-}
-
-export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
-  if (!rawHtml || typeof rawHtml !== "string") return [];
-  const dir = getParentFolder(entryPath);
-  const paths = new Set();
-  const includeMedia = Boolean(options?.includeMedia);
-
-  const addCandidateRef = (rawRef) => {
-    if (!rawRef || typeof rawRef !== "string") return;
-    const rawTrimmed = rawRef.trim().split("?")[0].split("#")[0];
-    if (!rawTrimmed || /^(https?:|data:|blob:|\/\/|#)/i.test(rawTrimmed)) return;
-    const candidates = [rawTrimmed.replace(/\\/g, "/")];
-    const decoded = decodePreviewPathRef(rawRef);
-    if (decoded && decoded !== candidates[0]) {
-      candidates.push(decoded);
-    }
-    for (const clean of candidates) {
-      const resolved = resolveRelativePath(dir, clean);
-      if (resolved) paths.add(resolved);
-      const rootClean = normalizePath(clean);
-      if (rootClean) paths.add(rootClean);
-    }
-  };
-
-  // 1. <link rel="stylesheet"> (o iconos favoritos si includeMedia es true)
-  const linkRegex = /<link\b[^>]*>/gi;
-  let match;
-  while ((match = linkRegex.exec(rawHtml)) !== null) {
-    const isStyle = /\brel=["']stylesheet["']/i.test(match[0]);
-    const isIcon = includeMedia && /\brel=["'](?:icon|shortcut\s+icon|apple-touch-icon)["']/i.test(match[0]);
-    if (isStyle || isIcon) {
-      const hrefMatch = match[0].match(/href=["']([^"']+)["']/i);
-      if (hrefMatch && hrefMatch[1]) addCandidateRef(hrefMatch[1]);
-    }
-  }
-
-  // 2. <script src="...">
-  const scriptRegex = /<script\b[^>]*src=["']([^"']+)["'][^>]*>/gi;
-  while ((match = scriptRegex.exec(rawHtml)) !== null) {
-    if (match[1]) addCandidateRef(match[1]);
-  }
-
-  if (includeMedia) {
-    // 3. <img src="...">, <source src="...">, <input src="...">, <video src="...">, <audio src="...">
-    const mediaSrcRegex = /<(?:img|source|input|video|audio)\b[^>]*?(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\1|([^\s"'=<>`]+))[^>]*>/gi;
-    while ((match = mediaSrcRegex.exec(rawHtml)) !== null) {
-      const ref = match[2] || match[3];
-      if (ref) addCandidateRef(ref);
-    }
-
-    // 4. srcset="..." en <img> y <source>
-    const srcsetRegex = /\bsrcset=["']([^"']+)["']/gi;
-    while ((match = srcsetRegex.exec(rawHtml)) !== null) {
-      const entries = match[1].split(",");
-      for (const e of entries) {
-        const url = e.trim().split(/\s+/)[0];
-        if (url) addCandidateRef(url);
-      }
-    }
-
-    // 5. <video poster="...">
-    const videoRegex = /<video\b[^>]*poster=["']([^"']+)["'][^>]*>/gi;
-    while ((match = videoRegex.exec(rawHtml)) !== null) {
-      if (match[1]) addCandidateRef(match[1]);
-    }
-
-    // 6. <image href="..." xlink:href="..."> en SVG
-    const svgImgRegex = /<image\b[^>]*\b(?:xlink:)?href=["']([^"']+)["'][^>]*>/gi;
-    while ((match = svgImgRegex.exec(rawHtml)) !== null) {
-      if (match[1]) addCandidateRef(match[1]);
-    }
-
-    // 7. url(...) en estilos inline o bloques <style>
-    const urlRegex = /url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)/gi;
-    while ((match = urlRegex.exec(rawHtml)) !== null) {
-      const url = match[1] || match[2];
-      if (url) addCandidateRef(url);
-    }
-  }
-
-  return Array.from(paths);
-}
-
-/**
- * Analiza las condiciones complejas asociadas a una regla `@import` de CSS
- * (tales como capas `@layer`, consultas de soporte `@supports` y consultas de medios `@media`).
- * @param {string} rawConditions
- * @returns {{ layerClause: string, supportsCondition: string, mediaQueries: string }}
- */
-function extractBalancedCssFunction(conditions, keyword) {
-  const re = new RegExp(`\\b${keyword}\\(`, "i");
-  const match = re.exec(conditions);
-  if (!match) {
-    return null;
-  }
-  const startIdx = match.index;
-  const openParenIdx = startIdx + match[0].length - 1;
-  let depth = 1;
-  let p = openParenIdx + 1;
+function scanScriptOpenTagEnd(src, fromIdx) {
+  let p = fromIdx;
   let quote = null;
-  while (p < conditions.length && depth > 0) {
-    const ch = conditions[p];
+  while (p < src.length) {
+    const ch = src[p];
     if (quote) {
-      if (ch === "\\") {
-        p += 2;
-        continue;
-      }
       if (ch === quote) quote = null;
-    } else {
-      if (ch === '"' || ch === "'") {
-        quote = ch;
-      } else if (ch === "(") {
-        depth += 1;
-      } else if (ch === ")") {
-        depth -= 1;
-        if (depth === 0) {
-          const inner = conditions.slice(openParenIdx + 1, p).trim();
-          const rest = (conditions.slice(0, startIdx) + conditions.slice(p + 1)).trim();
-          return { inner, rest };
-        }
-      }
+      p += 1;
+      continue;
     }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      p += 1;
+      continue;
+    }
+    if (ch === ">") return p;
     p += 1;
   }
-  return null;
+  return -1;
 }
 
-export function parseCssImportConditions(rawConditions) {
-  let conditions = (rawConditions || "").trim();
-  let layerClause = "";
-  let supportsCondition = "";
-  let mediaQueries = "";
-
-  if (!conditions) {
-    return { layerClause, supportsCondition, mediaQueries };
+function scanScriptCloseTag(src, bodyStart, isJsLike) {
+  if (!isJsLike) {
+    const rest = src.slice(bodyStart);
+    const m = /<\/script(?:\s[^>]*)?>/i.exec(rest);
+    if (!m) return null;
+    return { bodyEnd: bodyStart + m.index, tagEnd: bodyStart + m.index + m[0].length };
   }
 
-  // 1. Extraer layer(...) o layer
-  const extractedLayer = extractBalancedCssFunction(conditions, "layer");
-  if (extractedLayer) {
-    layerClause = extractedLayer.inner ? `@layer ${extractedLayer.inner}` : `@layer`;
-    conditions = extractedLayer.rest;
-  } else {
-    const layerBareMatch = conditions.match(/\blayer\b/i);
-    if (layerBareMatch) {
-      layerClause = `@layer`;
-      conditions = conditions.replace(layerBareMatch[0], "").trim();
+  let p = bodyStart;
+  let lastSig = { kind: "start", value: "" };
+  const tplDepthStack = [];
+
+  const skipQuoted = (start, q) => {
+    let j = start + 1;
+    while (j < src.length) {
+      if (src[j] === "\\") {
+        j += 2;
+        continue;
+      }
+      if (src[j] === q) return j + 1;
+      j += 1;
     }
-  }
-
-  // 2. Extraer supports(...) soportando paréntesis anidados p. ej. supports((a) and (b))
-  const extractedSupports = extractBalancedCssFunction(conditions, "supports");
-  if (extractedSupports) {
-    supportsCondition = extractedSupports.inner;
-    conditions = extractedSupports.rest;
-  }
-
-  // 3. El resto de las condiciones corresponden a la lista de media queries
-  mediaQueries = conditions.trim();
-
-  return { layerClause, supportsCondition, mediaQueries };
-}
-
-/**
- * Envuelve el código CSS inlined con las condiciones semánticas preservadas del `@import`.
- * @param {string} cssContent
- * @param {{ layerClause?: string, supportsCondition?: string, mediaQueries?: string, commentHeader?: string }} options
- * @returns {string}
- */
-export function wrapCssWithConditions(cssContent, { layerClause = "", supportsCondition = "", mediaQueries = "", commentHeader = "" } = {}) {
-  let wrapped = cssContent;
-  if (mediaQueries) {
-    wrapped = `@media ${mediaQueries} {\n${wrapped}\n}`;
-  }
-  if (supportsCondition) {
-    wrapped = `@supports (${supportsCondition}) {\n${wrapped}\n}`;
-  }
-  if (layerClause) {
-    wrapped = `${layerClause} {\n${wrapped}\n}`;
-  }
-  return commentHeader ? `${commentHeader}\n${wrapped}` : wrapped;
-}
-
-/**
- * Extrae las rutas locales de reglas @import url(...) presentes en un archivo CSS.
- * Soporta URLs entre comillas simples, dobles, url(...) y con especificadores condicionales (layer, media, supports).
- *
- * @param {string} cssPath Ruta del archivo CSS contenedor (para resolver rutas relativas).
- * @param {string} cssContent Contenido textual de la hoja de estilo.
- * @returns {string[]} Lista de rutas normalizadas de archivos a incrustar.
- */
-export function extractCssImportPaths(cssPath, cssContent, options = {}) {
-  if (!cssContent || typeof cssContent !== "string") return [];
-  const dir = getParentFolder(cssPath);
-  const paths = new Set();
-  const addCssCandidate = (rawUrl) => {
-    if (!rawUrl || /^(https?:|data:|blob:|\/\/|#)/i.test(rawUrl.trim())) return;
-    const cleanRef = decodePreviewPathRef(rawUrl);
-    if (!cleanRef) return;
-    const resolved = resolveRelativePath(dir, cleanRef);
-    if (resolved) paths.add(resolved);
-    const rootClean = normalizePath(cleanRef);
-    if (rootClean) paths.add(rootClean);
+    return src.length;
   };
-  // Ignorar comentarios /* ... */ para no extraer @import comentados
-  const importRegex =
-    /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
-  let match;
-  while ((match = importRegex.exec(cssContent)) !== null) {
-    if (match[1]) continue;
-    const importUrl = match[2] || match[3] || match[4];
-    addCssCandidate(importUrl);
-  }
-  if (options?.includeMedia) {
-    const urlRegex = /(\/\*[\s\S]*?\*\/)|url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)/gi;
-    while ((match = urlRegex.exec(cssContent)) !== null) {
-      if (match[1]) continue;
-      addCssCandidate(match[2] || match[3]);
-    }
-  }
-  return Array.from(paths);
-}
 
-export function getSavedPreviewHtml(projectId) {
-  if (typeof localStorage === "undefined") return null;
-  try {
-    return localStorage.getItem(`studio_preview_last_html:${projectId || "default"}`) || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-export function savePreviewHtml(projectId, htmlPath) {
-  if (typeof localStorage === "undefined" || !htmlPath) return;
-  try {
-    localStorage.setItem(`studio_preview_last_html:${projectId || "default"}`, htmlPath);
-  } catch (_) {
-    /* localStorage no disponible o cuota agotada */
-  }
-}
-
-/**
- * Resuelve el mejor archivo HTML de entrada cuando la pestaña activa es JS o CSS.
- */
-export function findBestHtmlEntrypoint(allFiles, activeFile, preferredHtmlPath = null) {
-  const htmlFiles = (allFiles || []).filter((f) => {
-    if (!f || !f.path) return false;
-    const clean = normalizePath(f.path);
-    const parts = clean.split("/");
-    for (const part of parts) {
-      if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) return false;
-    }
-    const ext = getFileExtension(f.path);
-    return HTML_EXTENSIONS.has(ext) && typeof f.content === "string";
-  });
-  if (htmlFiles.length === 0) return null;
-
-  const activePath = normalizePath(activeFile.path);
-  const activeShort = activeFile.shortName || activePath.split("/").pop();
-  const activeFolder = getParentFolder(activePath);
-  const escapedName = activeShort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  const scriptRegex = new RegExp(`<script[^>]+src=["'][^"']*${escapedName}["']`, "i");
-  const linkRegex = new RegExp(`<link[^>]+href=["'][^"']*${escapedName}["']`, "i");
-
-  const directRefs = htmlFiles.filter((f) => {
-    const content = f.content || "";
-    return scriptRegex.test(content) || linkRegex.test(content);
-  });
-
-  if (directRefs.length > 0) {
-    const sameFolder = directRefs.find((f) => getParentFolder(f.path) === activeFolder);
-    if (sameFolder) return sameFolder;
-    const index = directRefs.find((f) => (f.shortName || "").toLowerCase() === "index.html");
-    if (index) return index;
-    return directRefs[0];
-  }
-
-  if (preferredHtmlPath) {
-    const cleanPref = normalizePath(preferredHtmlPath);
-    const preferred = htmlFiles.find((f) => normalizePath(f.path) === cleanPref);
-    if (preferred) return preferred;
-  }
-
-  const indexInSameFolder = htmlFiles.find(
-    (f) => getParentFolder(f.path) === activeFolder && (f.shortName || "").toLowerCase() === "index.html"
-  );
-  if (indexInSameFolder) return indexInSameFolder;
-
-  const indexInRoot = htmlFiles.find(
-    (f) => !getParentFolder(f.path) && (f.shortName || "").toLowerCase() === "index.html"
-  );
-  if (indexInRoot) return indexInRoot;
-
-  const anyIndex = htmlFiles.find((f) => (f.shortName || "").toLowerCase() === "index.html");
-  if (anyIndex) return anyIndex;
-
-  const anyInSameFolder = htmlFiles.find((f) => getParentFolder(f.path) === activeFolder);
-  if (anyInSameFolder) return anyInSameFolder;
-
-  return htmlFiles[0];
-}
-
-/**
- * Resuelve el archivo HTML de destino al navegar en enlaces dentro del iframe.
- */
-export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) {
-  if (!requestedHref || typeof requestedHref !== "string") return null;
-
-  let clean = requestedHref.trim().split("?")[0].split("#")[0];
-  if (!clean) return null;
-
-  const htmlFiles = (allFiles || []).filter((f) => {
-    if (!f || !f.path) return false;
-    const cleanPath = normalizePath(f.path);
-    const parts = cleanPath.split("/");
-    for (const part of parts) {
-      if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) return false;
-    }
-    const ext = getFileExtension(f.path);
-    return HTML_EXTENSIONS.has(ext);
-  });
-  if (htmlFiles.length === 0) return null;
-
-  const currentFolder = currentPreviewPath ? getParentFolder(currentPreviewPath) : "";
-
-  const relResolved = resolveRelativePath(currentFolder, clean);
-  const match1 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(relResolved));
-  if (match1) return match1;
-
-  if (!clean.includes(".")) {
-    const relHtml = resolveRelativePath(currentFolder, `${clean}.html`);
-    const match2 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(relHtml));
-    if (match2) return match2;
-  }
-
-  const rootClean = clean.replace(/^\/+/, "");
-  const match3 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(rootClean));
-  if (match3) return match3;
-
-  if (!rootClean.includes(".")) {
-    const match4 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(`${rootClean}.html`));
-    if (match4) return match4;
-  }
-
-  const targetBase = rootClean.split("/").pop();
-  const match5 = htmlFiles.find(
-    (f) => (f.shortName || f.path.split("/").pop()).toLowerCase() === targetBase.toLowerCase()
-  );
-  if (match5) return match5;
-
-  if (!targetBase.includes(".")) {
-    const match6 = htmlFiles.find(
-      (f) => (f.shortName || f.path.split("/").pop()).toLowerCase() === `${targetBase.toLowerCase()}.html`
-    );
-    if (match6) return match6;
-  }
-
-  return null;
-}
-
-export function findSiblingHtmlInSameFolder(scopeFiles, folder, targetFile) {
-  if (!Array.isArray(scopeFiles) || !targetFile) return null;
-  const htmlInSameDir = scopeFiles.filter((f) => {
-    if (!f || !f.path) return false;
-    const ext = getFileExtension(f.path);
-    return HTML_EXTENSIONS.has(ext) && getParentFolder(f.path) === folder;
-  });
-
-  if (htmlInSameDir.length === 0) return null;
-
-  const preferred =
-    htmlInSameDir.find((f) => (f.shortName || "").toLowerCase() === "index.html") || htmlInSameDir[0];
-
-  const targetName = targetFile.shortName || String(targetFile.path || "").split("/").pop() || "";
-  const escapedName = targetName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const linksThisJs = Boolean(
-    escapedName &&
-    typeof preferred.content === "string" &&
-    new RegExp(`src=["'][^"']*${escapedName}["']`, "i").test(preferred.content)
-  );
-
-  return {
-    file: preferred,
-    linksThisJs
-  };
-}
-
-export function buildConsoleBridgeScript(mirrorOnScreen) {
-  return `<script>
-${buildLoopGuardRuntime()}
-(function () {
-  var mirror = ${mirrorOnScreen ? "true" : "false"};
-  function formatArgs(args) {
-    return Array.prototype.slice.call(args).map(function (item) {
-      if (typeof item === "string") return item;
-      if (item === undefined) return "undefined";
-      if (item === null) return "null";
-      if (typeof item === "bigint") return item.toString() + "n";
-      if (typeof item === "symbol") return String(item);
-      if (typeof item === "function") return "[Function " + (item.name || "anon") + "]";
-      if (item instanceof Error) {
-        var header = (item.name || "Error") + ": " + (item.message || "");
-        return item.stack ? header + "\\n" + item.stack : header;
-      }
-      try {
-        return JSON.stringify(item, null, 2);
-      } catch (_) {
-        return String(item);
-      }
-    }).join(" ");
-  }
-  function send(level, args) {
-    try {
-      var msg = formatArgs(args);
-      parent.postMessage({ source: "studio-ide-preview", level: level, text: msg }, "*");
-      if (mirror) {
-        var box = document.getElementById("__js_screen_log");
-        if (box) {
-          while (box.children.length >= 500 && box.firstChild) {
-            box.removeChild(box.firstChild);
-          }
-          var row = document.createElement("div");
-          row.className = level === "error" ? "js-line js-line-error" : level === "warn" ? "js-line js-line-warn" : "js-line";
-          row.textContent = msg;
-          box.appendChild(row);
-        }
-      }
-    } catch (_) {
-      /* omitir error de mirror en consola */
-    }
-  }
-  var origLog = console.log, origWarn = console.warn, origErr = console.error;
-  console.log = function () { send("log", arguments); origLog.apply(console, arguments); };
-  console.warn = function () { send("warn", arguments); origWarn.apply(console, arguments); };
-  console.error = function () { send("error", arguments); origErr.apply(console, arguments); };
-  window.addEventListener("error", function (e) {
-    var stErr = document.getElementById("__js_status");
-    if (stErr) {
-      stErr.dataset.failed = "1";
-      stErr.style.color = "var(--err)";
-      stErr.textContent = "Error en ejecución";
-    }
-    var fromLoopGuard = /Bucle detenido en la línea/.test(e.message || "");
-    send("error", [e.message + (e.lineno && !fromLoopGuard ? " (línea " + e.lineno + ")" : "")]);
-  });
-  window.addEventListener("unhandledrejection", function (e) {
-    var stErr = document.getElementById("__js_status");
-    if (stErr) {
-      stErr.dataset.failed = "1";
-      stErr.style.color = "var(--err)";
-      stErr.textContent = "Error en ejecución";
-    }
-    var reasonText = "Promesa rechazada desconocida";
-    try {
-      reasonText = e.reason && e.reason.message ? e.reason.message : String(e.reason);
-    } catch (_) {
-      reasonText = "[objeto de rechazo no serializable]";
-    }
-    send("error", ["Promesa rechazada: " + reasonText]);
-  });
-  // Mini-REPL interactivo conectado al panel Consola JS de Studio IDE
-  window.addEventListener("message", function (ev) {
-    var d = ev.data;
-    if (!d || d.source !== "studio-ide-repl" || d.action !== "eval") return;
-    if (ev.source !== window.parent) return;
-    var code = String(d.code || "").trim();
-    if (!code) return;
-    send("log", ["> " + code]);
-    try {
-      var res = (0, eval)(code);
-      if (res !== undefined) {
-        send("log", [res]);
-      }
-    } catch (err) {
-      send("error", [err && err.message ? err.message : String(err)]);
-    }
-  });
-  function normalizeNavRef(ref) {
-    return String(ref == null ? "" : ref).replace(/[\\u0000-\\u001f\\u007f]+/g, "").trim().toLowerCase();
-  }
-  function isBlockedNavScheme(normRef) {
-    return /^(javascript:|vbscript:|data:|file:|filesystem:)/.test(normRef);
-  }
-  // Interceptor total de navegación local en enlaces
-  document.addEventListener("click", function (e) {
-    var a = e.target && e.target.closest ? e.target.closest("a[href], area[href], a[xlink\\:href]") : null;
-    if (!a) return;
-    var href = a.getAttribute("href") || a.getAttribute("xlink:href") || "";
-    if (!href) return;
-    var normHref = normalizeNavRef(href);
-    if (isBlockedNavScheme(normHref)) {
-      e.preventDefault();
-      e.stopPropagation();
-      return;
-    }
-    if (normHref.startsWith("#")) return;
-    if (/^(https?:|mailto:|tel:|blob:)/.test(normHref)) {
-      a.setAttribute("target", "_blank");
-      a.setAttribute("rel", "noopener noreferrer");
-      return;
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    parent.postMessage({
-      source: "studio-ide-preview",
-      action: "navigate",
-      href: href
-    }, "*");
-  }, true);
-
-  // Interceptor de envíos de formularios locales
-  document.addEventListener("submit", function (e) {
-    var form = e.target;
-    if (!form || !form.getAttribute) return;
-    var submitter = e.submitter;
-    var action = (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) || form.getAttribute("action");
-    if (!action) return;
-    var normAction = normalizeNavRef(action);
-    if (isBlockedNavScheme(normAction)) {
-      e.preventDefault();
-      e.stopPropagation();
-      return;
-    }
-    if (normAction.startsWith("#") || /^(https?:|mailto:|tel:)/.test(normAction)) return;
-    e.preventDefault();
-    e.stopPropagation();
-    parent.postMessage({
-      source: "studio-ide-preview",
-      action: "navigate",
-      href: action
-    }, "*");
-  }, true);
-
-  // Interceptor de llamadas programáticas de navegación
-  try {
-    var triggerNav = function (targetUrl) {
-      if (!targetUrl || typeof targetUrl !== "string") return;
-      var normTarget = normalizeNavRef(targetUrl);
-      if (!normTarget || isBlockedNavScheme(normTarget)) return;
-      if (normTarget.startsWith("#")) {
-        window.location.hash = targetUrl;
-        return;
-      }
-      if (/^(https?:|mailto:|tel:)/.test(normTarget)) {
-        window.open(targetUrl, "_blank", "noopener,noreferrer");
-        return;
-      }
-      parent.postMessage({
-        source: "studio-ide-preview",
-        action: "navigate",
-        href: targetUrl
-      }, "*");
-    };
-    window.navigate = triggerNav;
-    if (window.location) {
-      window.location.assign = triggerNav;
-      window.location.replace = triggerNav;
-    }
-  } catch (_) {
-    /* location no redefinible en este entorno */
-  }
-})();
-</script>`;
-}
-
-const escapeCloseStyle = (css) => css.replace(/<\/style(?=[\s>/]|$)/gi, "<\\/style");
-const escapeCloseScript = (js) => js.replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
-
-function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversal = false) {
-  const safeFileMap = fileMap instanceof Map ? fileMap : new Map();
-  const scopeDepth = scopeDir ? scopeDir.split("/").filter(Boolean).length : 0;
-
-  const escapesDirectoryScope = (rawRef, baseDir = scopeDir) => {
-    const unified = String(rawRef || "").trim().replace(/\\/g, "/");
-    if (!unified) return false;
-    if (unified.startsWith("/") && scopeDir) return true;
-    let depth = baseDir ? baseDir.split("/").filter(Boolean).length : 0;
-    for (const seg of unified.split("/")) {
-      const part = seg.trim();
-      if (!part || part === ".") continue;
-      if (part === "..") {
-        depth -= 1;
-        if (depth < scopeDepth) return true;
-      } else {
-        depth += 1;
-      }
-    }
+  const canRegex = () => {
+    if (lastSig.kind === "start") return true;
+    if (lastSig.kind === "op") return lastSig.value !== "++" && lastSig.value !== "--";
+    if (lastSig.kind === "ident") return SCRIPT_REGEX_KEYWORDS.has(lastSig.value);
     return false;
   };
 
-  const normalizeLookupKey = (raw) => {
-    const str = String(raw || "");
-    return typeof str.normalize === "function" ? str.normalize("NFC") : str;
-  };
-
-  let lowerFileMap = null;
-  const lookupEntry = (key) => {
-    if (!key) return null;
-    const direct = safeFileMap.get(key);
-    if (direct) return direct;
-    const nfcKey = normalizeLookupKey(key);
-    if (nfcKey !== key) {
-      const nfcDirect = safeFileMap.get(nfcKey);
-      if (nfcDirect) return nfcDirect;
-    }
-    if (!lowerFileMap) {
-      lowerFileMap = new Map();
-      for (const [k, v] of safeFileMap.entries()) {
-        const lowerKey = normalizeLookupKey(k).toLowerCase();
-        if (lowerKey && !lowerFileMap.has(lowerKey)) {
-          lowerFileMap.set(lowerKey, v);
-        }
-      }
-    }
-    return lowerFileMap.get(nfcKey.toLowerCase()) || null;
-  };
-
-  const resolveEntryFromDir = (rawHref, baseDir) => {
-    if (!rawHref || /^(https?:|data:|blob:|#|\/\/)/i.test(rawHref.trim())) {
-      return null;
-    }
-    const cleanRef = decodePreviewPathRef(rawHref);
-    if (!cleanRef) {
-      return null;
-    }
-    if (!allowParentTraversal && escapesDirectoryScope(cleanRef, baseDir)) {
-      return null;
-    }
-    const resolved = resolveRelativePath(baseDir, cleanRef);
-    if (!allowParentTraversal && scopeDir && resolved !== scopeDir && !resolved.startsWith(`${scopeDir}/`)) {
-      return null;
-    }
-    let asset = lookupEntry(resolved);
-    if (!asset && cleanRef.startsWith("./")) {
-      asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.slice(2)));
-    }
-    if (!asset && cleanRef.startsWith("/") && baseDir && (allowParentTraversal || !scopeDir)) {
-      asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.replace(/^\/+/, "")));
-    }
-    if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("./") && !cleanRef.startsWith("../")) {
-      const candidate = lookupEntry(normalizePath(cleanRef));
-      if (candidate) {
-        const candPath = normalizePath(candidate.path || "");
-        if (!scopeDir || allowParentTraversal || candPath.startsWith(`${scopeDir}/`)) {
-          asset = candidate;
-        }
-      }
-    }
-    return asset || null;
-  };
-
-  let totalInlinedCssBytes = 0;
-
-  function resolveCssAssetMime(filePath) {
-    const ext = getFileExtension(filePath || "");
-    if (ext === "woff2") return "font/woff2";
-    if (ext === "woff") return "font/woff";
-    if (ext === "ttf") return "font/ttf";
-    if (ext === "otf") return "font/otf";
-    if (ext === "eot") return "application/vnd.ms-fontobject";
-    return getImageMimeType(filePath);
-  }
-
-  function sanitizeBase64Payload(raw) {
-    if (typeof raw !== "string" || raw.length === 0) return null;
-    const compact = raw.replace(/\s+/g, "");
-    if (!compact || !/^[A-Za-z0-9+/_=-]+$/.test(compact)) return null;
-    return compact;
-  }
-
-  function buildEntryDataUrl(entry, refPath, mimeResolver = getImageMimeType, { enforceCssBudget = false } = {}) {
-    if (!entry) return null;
-    const targetPath = entry.path || refPath || "";
-    const ext = getFileExtension(targetPath);
-    const rawB64 =
-      typeof entry.base64 === "string" && entry.base64.length > 0
-        ? entry.base64
-        : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
-          ? entry.content
-          : null;
-    const safeB64 = sanitizeBase64Payload(rawB64);
-    if (safeB64) {
-      if (enforceCssBudget) {
-        if (safeB64.length > MAX_PREVIEW_ASSET_BYTES * 2) return null;
-        if (totalInlinedCssBytes + safeB64.length > MAX_TOTAL_INLINED_CSS * 2) return null;
-        totalInlinedCssBytes += safeB64.length;
-      }
-      const mime = mimeResolver(targetPath);
-      return `data:${mime};base64,${safeB64}`;
-    }
-    if (ext === "svg" && typeof entry.content === "string" && entry.content.trim().length > 0) {
-      if (enforceCssBudget && entry.content.length > MAX_PREVIEW_ASSET_BYTES) {
-        return null;
-      }
-      const sanitizedSvg = sanitizeSvgMarkup(entry.content);
-      if (!sanitizedSvg) return null;
-      if (enforceCssBudget) {
-        if (totalInlinedCssBytes + sanitizedSvg.length > MAX_TOTAL_INLINED_CSS) return null;
-        totalInlinedCssBytes += sanitizedSvg.length;
-      }
-      const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
-        .replace(/'/g, "%27")
-        .replace(/"/g, "%22");
-      return `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-    }
-    return null;
-  }
-
-  function inlineCssUrls(cssText, cssDir) {
-    return String(cssText || "").replace(
-      /(\/\*[\s\S]*?\*\/)|url\(\s*(?:(["'])([^"']+)\2|([^)"'\s]+))\s*\)/gi,
-      (fullMatch, commentBlock, _quote, quotedUrl, bareUrl) => {
-        if (commentBlock) {
-          return commentBlock;
-        }
-        const rawUrl = (quotedUrl || bareUrl || "").trim();
-        const entry = resolveEntryFromDir(rawUrl, cssDir);
-        const dataUrl = buildEntryDataUrl(entry, rawUrl, resolveCssAssetMime, { enforceCssBudget: true });
-        if (dataUrl) {
-          return `url("${dataUrl}")`;
-        }
-        return fullMatch;
-      }
-    );
-  }
-
-  const escapeCommentBody = (txt) => String(txt || "").replace(/\*\//g, "* /");
-  const MAX_CSS_IMPORT_DEPTH = 64;
-
-  function inlineCssImports(cssContent, cssPath, ancestors = new Set(), depth = 0) {
-    if (depth > MAX_CSS_IMPORT_DEPTH) return "";
-    const cleanPath = normalizePath(cssPath);
-    if (ancestors.has(cleanPath)) return "";
-    ancestors.add(cleanPath);
-
-    try {
-      const cssDir = getParentFolder(cleanPath);
-      const importRegex =
-        /(\/\*[\s\S]*?\*\/)|@import\s+(?:url\(\s*(?:["']([^"']+)["']|([^"')]+))\s*\)|["']([^"']+)["'])([^;]*);?/gi;
-
-      const withImports = String(cssContent || "").replace(
-        importRegex,
-        (match, commentBlock, urlGroup1, urlGroup2, urlGroup3, rawConditions) => {
-          if (commentBlock) {
-            return commentBlock;
-          }
-          const importUrl = urlGroup1 || urlGroup2 || urlGroup3;
-          if (!importUrl || /^(https?:|data:|blob:|\/\/)/i.test(importUrl)) {
-            return match;
-          }
-          const cleanRef = importUrl.split("?")[0].split("#")[0];
-          const safeRefComment = escapeCommentBody(cleanRef);
-          const importedAsset = resolveEntryFromDir(importUrl, cssDir);
-
-          if (!importedAsset || typeof importedAsset.content !== "string") {
-            return match;
-          }
-
-          // 1. Control de límite de tamaño por recurso individual
-          if (importedAsset.content.length > MAX_PREVIEW_ASSET_BYTES) {
-            return `/* [Studio IDE]: @import "${safeRefComment}" omitido: excede el límite de tamaño individual (${importedAsset.content.length} bytes > ${MAX_PREVIEW_ASSET_BYTES} bytes) */`;
-          }
-
-          // 2. Control de presupuesto total acumulado de CSS inlined
-          if (totalInlinedCssBytes + importedAsset.content.length > MAX_TOTAL_INLINED_CSS) {
-            return `/* [Studio IDE]: @import "${safeRefComment}" omitido: presupuesto total de CSS superado */`;
-          }
-
-          totalInlinedCssBytes += importedAsset.content.length;
-
-          // 3. Resolución recursiva de dependencias hijas
-          const inlinedChild = inlineCssImports(importedAsset.content, importedAsset.path, ancestors, depth + 1);
-
-          // 4. Extracción y preservación de condiciones (layer, supports, media)
-          const conds = parseCssImportConditions(rawConditions);
-          const cleanConditionsStr = escapeCommentBody((rawConditions || "").trim());
-          const headerComment = `/* @import "${safeRefComment}"${cleanConditionsStr ? " " + cleanConditionsStr : ""} */`;
-
-          return wrapCssWithConditions(inlinedChild, {
-            ...conds,
-            commentHeader: headerComment
-          });
-        }
-      );
-
-      return inlineCssUrls(withImports, cssDir);
-    } finally {
-      ancestors.delete(cleanPath);
-    }
-  }
-
-  return {
-    resolveEntryFromDir,
-    buildEntryDataUrl,
-    inlineCssUrls,
-    inlineCssImports,
-    getTotalInlinedCssBytes: () => totalInlinedCssBytes,
-    addInlinedCssBytes: (n) => {
-      totalInlinedCssBytes += n;
-    }
-  };
-}
-
-const TEXT_REFERENCED_ASSET_RE =
-  /(["'`])([^"'`\r\n]{1,320}\.(?:png|jpe?g|gif|webp|avif|svg|ico|bmp|json|mp4|webm|ogg|mp3|wav|m4a|flac|woff2?|ttf|otf)(?:[?#][^"'`\r\n]*)?)\1/gi;
-
-/**
- * Extrae posibles rutas locales a imágenes, media o datos JSON referenciadas dentro de archivos JS/TS/JSON
- * para asegurar su descarga bajo demanda en proyectos lazy de GitHub antes de construir la vista previa.
- */
-const RUNTIME_DATA_EXT_MIMES = {
-  json: "application/json; charset=utf-8",
-  txt: "text/plain; charset=utf-8",
-  csv: "text/csv; charset=utf-8",
-  xml: "application/xml; charset=utf-8"
-};
-const MAX_RUNTIME_ASSET_MAP_CHARS = 16 * 1024 * 1024;
-
-function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversal, buildEntryDataUrl, getMediaMimeType) {
-  if (!fileMap || fileMap.size === 0) return "";
-  const scopeDir = dir ? normalizePath(dir) : "";
-  const urlEntries = Object.create(null);
-  const textEntries = Object.create(null);
-  let totalChars = 0;
-  let hasEntries = false;
-
-  for (const [rawKey, entry] of fileMap.entries()) {
-    if (!entry || !entry.path) continue;
-    const normPath = normalizePath(entry.path || rawKey);
-    if (!normPath) continue;
-    if (!allowParentTraversal && scopeDir && normPath !== scopeDir && !normPath.startsWith(`${scopeDir}/`)) {
-      continue;
-    }
-    const ext = getFileExtension(normPath);
-    if (Object.prototype.hasOwnProperty.call(RUNTIME_DATA_EXT_MIMES, ext) && typeof entry.content === "string") {
-      if (entry.content.length <= MAX_PREVIEW_ASSET_BYTES && totalChars + entry.content.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
-        textEntries[normPath] = { content: entry.content, mime: RUNTIME_DATA_EXT_MIMES[ext] };
-        totalChars += entry.content.length;
-        hasEntries = true;
-      }
-      continue;
-    }
-    if (IMAGE_EXTENSIONS.has(ext) || entry.isBinary) {
-      const dataUrl = buildEntryDataUrl(entry, normPath, getMediaMimeType);
-      if (dataUrl && totalChars + dataUrl.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
-        urlEntries[normPath] = dataUrl;
-        totalChars += dataUrl.length;
-        hasEntries = true;
-      }
-    }
-  }
-
-  if (!hasEntries) return "";
-
-  const payloadJson = escapeCloseScript(
-    JSON.stringify({
-      baseDir: scopeDir,
-      allowParent: Boolean(allowParentTraversal),
-      urls: urlEntries,
-      texts: textEntries
-    })
-  );
-
-  return `<script>
-(function () {
-  var cfg = ${payloadJson};
-  var normNfc = function (s) {
-    var str = String(s == null ? "" : s);
-    return typeof str.normalize === "function" ? str.normalize("NFC") : str;
-  };
-  var urlLower = Object.create(null);
-  var textLower = Object.create(null);
-  Object.keys(cfg.urls).forEach(function (k) { urlLower[normNfc(k).toLowerCase()] = cfg.urls[k]; });
-  Object.keys(cfg.texts).forEach(function (k) { textLower[normNfc(k).toLowerCase()] = cfg.texts[k]; });
-
-  function cleanNormPath(p) {
-    var parts = String(p || "").replace(/\\\\/g, "/").split("/");
-    var out = [];
-    for (var i = 0; i < parts.length; i++) {
-      var seg = parts[i].trim();
-      if (!seg || seg === ".") continue;
-      if (seg === "..") {
-        if (out.length > 0) out.pop();
-      } else {
-        out.push(seg);
-      }
-    }
-    return out.join("/");
-  }
-
-  function decodeRef(raw) {
-    var noHash = String(raw || "").trim().split("#")[0].split("?")[0].replace(/\\\\/g, "/");
-    try { return decodeURIComponent(noHash); } catch (_) { return noHash; }
-  }
-
-  function lookupFromMap(exactMap, lowerMap, rawRef) {
-    if (!rawRef || typeof rawRef !== "string") return null;
-    var trimmed = rawRef.trim();
-    if (!trimmed || /^(https?:|data:|blob:|#|javascript:|vbscript:|file:)/i.test(trimmed)) return null;
-    var clean = decodeRef(trimmed);
-    if (!clean) return null;
-
-    var candidates = [];
-    if (clean.charAt(0) === "/") {
-      var rootPart = cleanNormPath(clean.replace(/^\\/+/, ""));
-      if (cfg.baseDir && (cfg.allowParent || !cfg.baseDir)) {
-        candidates.push(cleanNormPath(cfg.baseDir + "/" + rootPart));
-      }
-      candidates.push(rootPart);
-    } else {
-      if (cfg.baseDir) {
-        candidates.push(cleanNormPath(cfg.baseDir + "/" + clean));
-      }
-      candidates.push(cleanNormPath(clean));
-    }
-
-    for (var i = 0; i < candidates.length; i++) {
-      var cand = candidates[i];
-      if (!cand) continue;
-      if (!cfg.allowParent && cfg.baseDir && cand !== cfg.baseDir && cand.indexOf(cfg.baseDir + "/") !== 0) {
+  const skipRegex = (start) => {
+    let j = start + 1;
+    let inClass = false;
+    while (j < src.length) {
+      const rc = src[j];
+      if (rc === "\\") {
+        j += 2;
         continue;
       }
-      if (Object.prototype.hasOwnProperty.call(exactMap, cand)) return exactMap[cand];
-      var nfcLower = normNfc(cand).toLowerCase();
-      if (Object.prototype.hasOwnProperty.call(lowerMap, nfcLower)) return lowerMap[nfcLower];
-    }
-    return null;
-  }
-
-  function resolveUrl(rawRef) {
-    return lookupFromMap(cfg.urls, urlLower, rawRef);
-  }
-
-  function resolveSrcset(rawSrcset) {
-    if (!rawSrcset || typeof rawSrcset !== "string") return rawSrcset;
-    return rawSrcset.replace(/([^\\s,]+)(\\s+[^\\s,]+)?/g, function (m, u, desc) {
-      var resolved = resolveUrl(u);
-      return resolved ? (desc ? resolved + desc : resolved) : m;
-    });
-  }
-
-  function patchElementMedia(el) {
-    if (!el || el.nodeType !== 1 || !el.getAttribute) return;
-    var tag = el.tagName;
-    if (tag === "IMG" || tag === "SOURCE" || tag === "VIDEO" || tag === "AUDIO" || tag === "INPUT") {
-      var curSrc = el.getAttribute("src");
-      if (curSrc) {
-        var resolvedSrc = resolveUrl(curSrc);
-        if (resolvedSrc && curSrc !== resolvedSrc) {
-          origSetAttr.call(el, "src", resolvedSrc);
-        }
+      if (rc === "[") inClass = true;
+      else if (rc === "]") inClass = false;
+      else if (rc === "/" && !inClass) {
+        j += 1;
+        break;
+      } else if (rc === "\n") {
+        break;
       }
+      j += 1;
     }
-    if (tag === "IMG" || tag === "SOURCE") {
-      var curSrcset = el.getAttribute("srcset");
-      if (curSrcset) {
-        var resolvedSet = resolveSrcset(curSrcset);
-        if (resolvedSet && resolvedSet !== curSrcset) {
-          origSetAttr.call(el, "srcset", resolvedSet);
-        }
-      }
-    }
-    if (tag === "VIDEO") {
-      var curPoster = el.getAttribute("poster");
-      if (curPoster) {
-        var resolvedPoster = resolveUrl(curPoster);
-        if (resolvedPoster && curPoster !== resolvedPoster) {
-          origSetAttr.call(el, "poster", resolvedPoster);
-        }
-      }
-    }
-    var st = el.getAttribute("style");
-    if (st && st.indexOf("url(") !== -1) {
-      var nextSt = st.replace(/url\\(\\s*(?:["']([^"']+)["']|([^)"'\\s]+))\\s*\\)/gi, function (fm, qUrl, bUrl) {
-        var r = resolveUrl(qUrl || bUrl || "");
-        return r ? 'url("' + r + '")' : fm;
-      });
-      if (nextSt !== st) origSetAttr.call(el, "style", nextSt);
-    }
-  }
-
-  function scanSubtree(root) {
-    if (!root || root.nodeType !== 1) return;
-    patchElementMedia(root);
-    if (typeof root.querySelectorAll === "function") {
-      var nodes = root.querySelectorAll("img[src],source[src],video[src],audio[src],input[type='image'][src],img[srcset],source[srcset],video[poster],[style*='url(']");
-      for (var i = 0; i < nodes.length; i++) patchElementMedia(nodes[i]);
-    }
-  }
-
-  var origSetAttr = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function (name, value) {
-    var lowerName = String(name || "").toLowerCase();
-    if (lowerName === "src" && (this.tagName === "IMG" || this.tagName === "SOURCE" || this.tagName === "VIDEO" || this.tagName === "AUDIO" || this.tagName === "INPUT")) {
-      var r = resolveUrl(String(value));
-      if (r) value = r;
-    } else if (lowerName === "srcset" && (this.tagName === "IMG" || this.tagName === "SOURCE")) {
-      value = resolveSrcset(String(value));
-    } else if (lowerName === "poster" && this.tagName === "VIDEO") {
-      var rp = resolveUrl(String(value));
-      if (rp) value = rp;
-    }
-    return origSetAttr.call(this, name, value);
+    while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
+    return j;
   };
 
-  function wrapUrlProp(proto, prop) {
-    try {
-      var desc = Object.getOwnPropertyDescriptor(proto, prop);
-      if (desc && desc.configurable && typeof desc.set === "function") {
-        Object.defineProperty(proto, prop, {
-          configurable: true,
-          enumerable: desc.enumerable,
-          get: desc.get,
-          set: function (val) {
-            var r = resolveUrl(String(val == null ? "" : val));
-            return desc.set.call(this, r || val);
-          }
-        });
+  while (p < src.length) {
+    if (tplDepthStack.length > 0 && tplDepthStack[tplDepthStack.length - 1] === 0) {
+      const tc = src[p];
+      if (tc === "\\") {
+        p += 2;
+        continue;
       }
-    } catch (_) {}
-  }
-  if (typeof HTMLImageElement !== "undefined") wrapUrlProp(HTMLImageElement.prototype, "src");
-  if (typeof HTMLSourceElement !== "undefined") wrapUrlProp(HTMLSourceElement.prototype, "src");
-  if (typeof HTMLVideoElement !== "undefined") wrapUrlProp(HTMLVideoElement.prototype, "poster");
-
-  try {
-    var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
-    if (innerDesc && innerDesc.configurable && typeof innerDesc.set === "function") {
-      Object.defineProperty(Element.prototype, "innerHTML", {
-        configurable: true,
-        enumerable: innerDesc.enumerable,
-        get: innerDesc.get,
-        set: function (htmlStr) {
-          innerDesc.set.call(this, htmlStr);
-          scanSubtree(this);
-        }
-      });
+      if (tc === "`") {
+        tplDepthStack.pop();
+        lastSig = { kind: "literal", value: "`" };
+        p += 1;
+        continue;
+      }
+      if (tc === "$" && src[p + 1] === "{") {
+        tplDepthStack[tplDepthStack.length - 1] = 1;
+        lastSig = { kind: "op", value: "{" };
+        p += 2;
+        continue;
+      }
+      p += 1;
+      continue;
     }
-  } catch (_) {}
 
-  if (typeof MutationObserver === "function") {
-    try {
-      var obs = new MutationObserver(function (mutations) {
-        for (var i = 0; i < mutations.length; i++) {
-          var m = mutations[i];
-          if (m.type === "attributes") {
-            patchElementMedia(m.target);
-          } else if (m.addedNodes) {
-            for (var j = 0; j < m.addedNodes.length; j++) {
-              scanSubtree(m.addedNodes[j]);
-            }
-          }
-        }
-      });
-      obs.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["src", "srcset", "poster", "style"]
-      });
-    } catch (_) {}
-  }
+    const ch = src[p];
+    if (ch === "<" && src[p + 1] === "/" && tplDepthStack.length === 0) {
+      const closeMatch = /^<\/script(?:\s[^>]*)?>/i.exec(src.slice(p, Math.min(src.length, p + 256)));
+      if (closeMatch) {
+        return { bodyEnd: p, tagEnd: p + closeMatch[0].length };
+      }
+    }
 
-  if (typeof window.fetch === "function") {
-    var origFetch = window.fetch.bind(window);
-    window.fetch = function (input, init) {
-      var reqUrl = typeof input === "string" ? input : (input && typeof input.url === "string" ? input.url : "");
-      var textAsset = lookupFromMap(cfg.texts, textLower, reqUrl);
-      if (textAsset) {
-        return Promise.resolve(new Response(textAsset.content, {
-          status: 200,
-          headers: { "Content-Type": textAsset.mime }
-        }));
+    if (/\s/.test(ch)) {
+      p += 1;
+      continue;
+    }
+    if (ch === "/" && src[p + 1] === "/") {
+      const nl = src.indexOf("\n", p + 2);
+      p = nl === -1 ? src.length : nl + 1;
+      continue;
+    }
+    if (ch === "/" && src[p + 1] === "*") {
+      const endC = src.indexOf("*/", p + 2);
+      p = endC === -1 ? src.length : endC + 2;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      p = skipQuoted(p, ch);
+      lastSig = { kind: "literal", value: ch };
+      continue;
+    }
+    if (ch === "`") {
+      tplDepthStack.push(0);
+      p += 1;
+      continue;
+    }
+    if (ch === "/" && canRegex()) {
+      p = skipRegex(p);
+      lastSig = { kind: "literal", value: "/" };
+      continue;
+    }
+    if (ch === "{") {
+      if (tplDepthStack.length > 0) {
+        tplDepthStack[tplDepthStack.length - 1] += 1;
       }
-      var dataUrl = resolveUrl(reqUrl);
-      if (dataUrl) {
-        return origFetch(dataUrl, init);
+      lastSig = { kind: "op", value: "{" };
+      p += 1;
+      continue;
+    }
+    if (ch === "}") {
+      if (tplDepthStack.length > 0) {
+        tplDepthStack[tplDepthStack.length - 1] -= 1;
       }
-      return origFetch(input, init);
-    };
+      lastSig = { kind: "close", value: "}" };
+      p += 1;
+      continue;
+    }
+    if (/[A-Za-z_$]/.test(ch)) {
+      let j = p + 1;
+      while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
+      lastSig = { kind: "ident", value: src.slice(p, j) };
+      p = j;
+      continue;
+    }
+    if (/[0-9]/.test(ch)) {
+      let j = p + 1;
+      while (j < src.length && /[0-9A-Za-z._]/.test(src[j])) j += 1;
+      lastSig = { kind: "literal", value: "0" };
+      p = j;
+      continue;
+    }
+    if (ch === ")" || ch === "]") {
+      lastSig = { kind: "close", value: ch };
+      p += 1;
+    } else if ((ch === "+" && src[p + 1] === "+") || (ch === "-" && src[p + 1] === "-")) {
+      lastSig = { kind: "op", value: ch + ch };
+      p += 2;
+    } else {
+      lastSig = { kind: "op", value: ch };
+      p += 1;
+    }
   }
-
-  if (typeof XMLHttpRequest === "function") {
-    var origXhrOpen = XMLHttpRequest.prototype.open;
-    var origXhrSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url) {
-      this.__studioReqUrl = url;
-      return origXhrOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function () {
-      var textAsset = lookupFromMap(cfg.texts, textLower, this.__studioReqUrl);
-      if (textAsset) {
-        var xhr = this;
-        Promise.resolve().then(function () {
-          try {
-            Object.defineProperty(xhr, "readyState", { configurable: true, value: 4 });
-            Object.defineProperty(xhr, "status", { configurable: true, value: 200 });
-            Object.defineProperty(xhr, "responseText", { configurable: true, value: textAsset.content });
-            Object.defineProperty(xhr, "response", { configurable: true, value: textAsset.content });
-          } catch (_) {}
-          if (typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
-          if (typeof xhr.onload === "function") xhr.onload();
-          xhr.dispatchEvent(new Event("load"));
-        });
-        return;
-      }
-      var dataUrl = resolveUrl(this.__studioReqUrl);
-      if (dataUrl) {
-        origXhrOpen.call(this, "GET", dataUrl, true);
-      }
-      return origXhrSend.apply(this, arguments);
-    };
-  }
-})();
-</script>`;
+  return null;
 }
 
-export function extractTextAssetPaths(entryPath, rawText, allFiles = []) {
-  if (!rawText || typeof rawText !== "string") return [];
-  const dir = getParentFolder(entryPath);
-  const paths = new Set();
+function maskHtmlScripts(src) {
+  let prefix = "__STUDIO_SCRIPT_MASK_";
+  while (src.includes(prefix)) prefix += "X";
 
-  const knownByBase = new Map();
-  if (Array.isArray(allFiles)) {
-    for (const f of allFiles) {
-      if (!f || !f.path) continue;
-      const clean = normalizePath(f.path);
-      const base = clean.split("/").pop()?.toLowerCase();
-      if (!base) continue;
-      if (!knownByBase.has(base)) {
-        knownByBase.set(base, [clean]);
+  const entries = [];
+  const chunks = [];
+  let cursor = 0;
+
+  while (cursor < src.length) {
+    const ltIdx = src.indexOf("<", cursor);
+    if (ltIdx === -1) break;
+
+    if (src.startsWith("<!--", ltIdx)) {
+      const endComment = src.indexOf("-->", ltIdx + 4);
+      const nextPos = endComment === -1 ? src.length : endComment + 3;
+      chunks.push(src.slice(cursor, nextPos));
+      cursor = nextPos;
+      continue;
+    }
+
+    if (/^<script(?=[\s/>])/i.test(src.slice(ltIdx, ltIdx + 9))) {
+      const openEnd = scanScriptOpenTagEnd(src, ltIdx + 7);
+      if (openEnd === -1) break;
+
+      const attrs = src.slice(ltIdx + 7, openEnd);
+      const bodyStart = openEnd + 1;
+      const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
+      const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
+      const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+      const isJsLike =
+        !hasSrc &&
+        (!typeVal ||
+          typeVal === "module" ||
+          typeVal === "text/javascript" ||
+          typeVal === "application/javascript" ||
+          typeVal === "text/typescript" ||
+          typeVal === "application/typescript" ||
+          typeVal === "text/tsx" ||
+          typeVal === "text/jsx" ||
+          typeVal === "text/babel");
+
+      const closeRes = scanScriptCloseTag(src, bodyStart, isJsLike);
+      if (!closeRes) break;
+
+      const idx = entries.length;
+      entries.push({
+        fullTag: src.slice(ltIdx, closeRes.tagEnd),
+        attrs,
+        inlineCode: src.slice(bodyStart, closeRes.bodyEnd)
+      });
+      chunks.push(src.slice(cursor, ltIdx), `${prefix}${idx}__`);
+      cursor = closeRes.tagEnd;
+      continue;
+    }
+
+    // Saltar etiquetas HTML normales respetando comillas para no confundir "<!--" ni "<script>" en atributos
+    if (/^<[a-zA-Z!/]/.test(src.slice(ltIdx, ltIdx + 2))) {
+      const tagEnd = scanScriptOpenTagEnd(src, ltIdx + 1);
+      if (tagEnd === -1) {
+        chunks.push(src.slice(cursor, ltIdx + 1));
+        cursor = ltIdx + 1;
       } else {
-        knownByBase.get(base).push(clean);
+        chunks.push(src.slice(cursor, tagEnd + 1));
+        cursor = tagEnd + 1;
       }
+      continue;
     }
+
+    chunks.push(src.slice(cursor, ltIdx + 1));
+    cursor = ltIdx + 1;
   }
 
-  let match;
-  TEXT_REFERENCED_ASSET_RE.lastIndex = 0;
-  while ((match = TEXT_REFERENCED_ASSET_RE.exec(rawText)) !== null) {
-    const rawRef = match[2];
-    if (!rawRef || rawRef.includes("${")) continue;
-    const trimmed = rawRef.trim().split("?")[0].split("#")[0];
-    if (!trimmed || /^(https?:|data:|blob:|\/\/|#)/i.test(trimmed)) continue;
-
-    const candidates = [trimmed.replace(/\\/g, "/")];
-    const decoded = decodePreviewPathRef(rawRef);
-    if (decoded && decoded !== candidates[0]) {
-      candidates.push(decoded);
-    }
-    for (const clean of candidates) {
-      const resolved = resolveRelativePath(dir, clean);
-      if (resolved) paths.add(resolved);
-      const rootClean = normalizePath(clean);
-      if (rootClean) paths.add(rootClean);
-      const baseName = rootClean.split("/").pop()?.toLowerCase();
-      const sameBase = baseName ? knownByBase.get(baseName) : null;
-      if (sameBase && sameBase.length > 0 && sameBase.length <= 4) {
-        for (const candidatePath of sameBase) {
-          if (candidatePath.endsWith(`/${rootClean}`) || candidatePath === rootClean) {
-            paths.add(candidatePath);
-          }
-        }
-      }
-    }
-  }
-
-  return Array.from(paths);
+  chunks.push(src.slice(cursor));
+  return { maskedHtml: chunks.join(""), entries, prefix };
 }
 
 export function bundleHtmlWithFolderAssets(
@@ -1359,280 +423,6 @@ export function bundleHtmlWithFolderAssets(
   let inlinedActiveCss = false;
   const deferredScripts = [];
 
-  const SCRIPT_REGEX_KEYWORDS = new Set([
-    "return",
-    "throw",
-    "case",
-    "default",
-    "delete",
-    "void",
-    "typeof",
-    "await",
-    "yield",
-    "in",
-    "instanceof",
-    "of",
-    "new",
-    "else",
-    "do"
-  ]);
-
-  function scanScriptOpenTagEnd(src, fromIdx) {
-    let p = fromIdx;
-    let quote = null;
-    while (p < src.length) {
-      const ch = src[p];
-      if (quote) {
-        if (ch === quote) quote = null;
-        p += 1;
-        continue;
-      }
-      if (ch === '"' || ch === "'") {
-        quote = ch;
-        p += 1;
-        continue;
-      }
-      if (ch === ">") return p;
-      p += 1;
-    }
-    return -1;
-  }
-
-  function scanScriptCloseTag(src, bodyStart, isJsLike) {
-    if (!isJsLike) {
-      const rest = src.slice(bodyStart);
-      const m = /<\/script(?:\s[^>]*)?>/i.exec(rest);
-      if (!m) return null;
-      return { bodyEnd: bodyStart + m.index, tagEnd: bodyStart + m.index + m[0].length };
-    }
-
-    let p = bodyStart;
-    let lastSig = { kind: "start", value: "" };
-    const tplDepthStack = [];
-
-    const skipQuoted = (start, q) => {
-      let j = start + 1;
-      while (j < src.length) {
-        if (src[j] === "\\") {
-          j += 2;
-          continue;
-        }
-        if (src[j] === q) return j + 1;
-        j += 1;
-      }
-      return src.length;
-    };
-
-    const canRegex = () => {
-      if (lastSig.kind === "start") return true;
-      if (lastSig.kind === "op") return lastSig.value !== "++" && lastSig.value !== "--";
-      if (lastSig.kind === "ident") return SCRIPT_REGEX_KEYWORDS.has(lastSig.value);
-      return false;
-    };
-
-    const skipRegex = (start) => {
-      let j = start + 1;
-      let inClass = false;
-      while (j < src.length) {
-        const rc = src[j];
-        if (rc === "\\") {
-          j += 2;
-          continue;
-        }
-        if (rc === "[") inClass = true;
-        else if (rc === "]") inClass = false;
-        else if (rc === "/" && !inClass) {
-          j += 1;
-          break;
-        } else if (rc === "\n") {
-          break;
-        }
-        j += 1;
-      }
-      while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
-      return j;
-    };
-
-    while (p < src.length) {
-      if (tplDepthStack.length > 0 && tplDepthStack[tplDepthStack.length - 1] === 0) {
-        const tc = src[p];
-        if (tc === "\\") {
-          p += 2;
-          continue;
-        }
-        if (tc === "`") {
-          tplDepthStack.pop();
-          lastSig = { kind: "literal", value: "`" };
-          p += 1;
-          continue;
-        }
-        if (tc === "$" && src[p + 1] === "{") {
-          tplDepthStack[tplDepthStack.length - 1] = 1;
-          lastSig = { kind: "op", value: "{" };
-          p += 2;
-          continue;
-        }
-        p += 1;
-        continue;
-      }
-
-      const ch = src[p];
-      if (ch === "<" && src[p + 1] === "/" && tplDepthStack.length === 0) {
-        const closeMatch = /^<\/script(?:\s[^>]*)?>/i.exec(src.slice(p, Math.min(src.length, p + 256)));
-        if (closeMatch) {
-          return { bodyEnd: p, tagEnd: p + closeMatch[0].length };
-        }
-      }
-
-      if (/\s/.test(ch)) {
-        p += 1;
-        continue;
-      }
-      if (ch === "/" && src[p + 1] === "/") {
-        const nl = src.indexOf("\n", p + 2);
-        p = nl === -1 ? src.length : nl + 1;
-        continue;
-      }
-      if (ch === "/" && src[p + 1] === "*") {
-        const endC = src.indexOf("*/", p + 2);
-        p = endC === -1 ? src.length : endC + 2;
-        continue;
-      }
-      if (ch === "'" || ch === '"') {
-        p = skipQuoted(p, ch);
-        lastSig = { kind: "literal", value: ch };
-        continue;
-      }
-      if (ch === "`") {
-        tplDepthStack.push(0);
-        p += 1;
-        continue;
-      }
-      if (ch === "/" && canRegex()) {
-        p = skipRegex(p);
-        lastSig = { kind: "literal", value: "/" };
-        continue;
-      }
-      if (ch === "{") {
-        if (tplDepthStack.length > 0) {
-          tplDepthStack[tplDepthStack.length - 1] += 1;
-        }
-        lastSig = { kind: "op", value: "{" };
-        p += 1;
-        continue;
-      }
-      if (ch === "}") {
-        if (tplDepthStack.length > 0) {
-          tplDepthStack[tplDepthStack.length - 1] -= 1;
-        }
-        lastSig = { kind: "close", value: "}" };
-        p += 1;
-        continue;
-      }
-      if (/[A-Za-z_$]/.test(ch)) {
-        let j = p + 1;
-        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
-        lastSig = { kind: "ident", value: src.slice(p, j) };
-        p = j;
-        continue;
-      }
-      if (/[0-9]/.test(ch)) {
-        let j = p + 1;
-        while (j < src.length && /[0-9A-Za-z._]/.test(src[j])) j += 1;
-        lastSig = { kind: "literal", value: "0" };
-        p = j;
-        continue;
-      }
-      if (ch === ")" || ch === "]") {
-        lastSig = { kind: "close", value: ch };
-        p += 1;
-      } else if ((ch === "+" && src[p + 1] === "+") || (ch === "-" && src[p + 1] === "-")) {
-        lastSig = { kind: "op", value: ch + ch };
-        p += 2;
-      } else {
-        lastSig = { kind: "op", value: ch };
-        p += 1;
-      }
-    }
-    return null;
-  }
-
-  function maskHtmlScripts(src) {
-    let prefix = "__STUDIO_SCRIPT_MASK_";
-    while (src.includes(prefix)) prefix += "X";
-
-    const entries = [];
-    const chunks = [];
-    let cursor = 0;
-
-    while (cursor < src.length) {
-      const ltIdx = src.indexOf("<", cursor);
-      if (ltIdx === -1) break;
-
-      if (src.startsWith("<!--", ltIdx)) {
-        const endComment = src.indexOf("-->", ltIdx + 4);
-        const nextPos = endComment === -1 ? src.length : endComment + 3;
-        chunks.push(src.slice(cursor, nextPos));
-        cursor = nextPos;
-        continue;
-      }
-
-      if (/^<script(?=[\s/>])/i.test(src.slice(ltIdx, ltIdx + 9))) {
-        const openEnd = scanScriptOpenTagEnd(src, ltIdx + 7);
-        if (openEnd === -1) break;
-
-        const attrs = src.slice(ltIdx + 7, openEnd);
-        const bodyStart = openEnd + 1;
-        const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
-        const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
-        const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
-        const isJsLike =
-          !hasSrc &&
-          (!typeVal ||
-            typeVal === "module" ||
-            typeVal === "text/javascript" ||
-            typeVal === "application/javascript" ||
-            typeVal === "text/typescript" ||
-            typeVal === "application/typescript" ||
-            typeVal === "text/tsx" ||
-            typeVal === "text/jsx" ||
-            typeVal === "text/babel");
-
-        const closeRes = scanScriptCloseTag(src, bodyStart, isJsLike);
-        if (!closeRes) break;
-
-        const idx = entries.length;
-        entries.push({
-          fullTag: src.slice(ltIdx, closeRes.tagEnd),
-          attrs,
-          inlineCode: src.slice(bodyStart, closeRes.bodyEnd)
-        });
-        chunks.push(src.slice(cursor, ltIdx), `${prefix}${idx}__`);
-        cursor = closeRes.tagEnd;
-        continue;
-      }
-
-      // Saltar etiquetas HTML normales respetando comillas para no confundir "<!--" ni "<script>" en atributos
-      if (/^<[a-zA-Z!/]/.test(src.slice(ltIdx, ltIdx + 2))) {
-        const tagEnd = scanScriptOpenTagEnd(src, ltIdx + 1);
-        if (tagEnd === -1) {
-          chunks.push(src.slice(cursor, ltIdx + 1));
-          cursor = ltIdx + 1;
-        } else {
-          chunks.push(src.slice(cursor, tagEnd + 1));
-          cursor = tagEnd + 1;
-        }
-        continue;
-      }
-
-      chunks.push(src.slice(cursor, ltIdx + 1));
-      cursor = ltIdx + 1;
-    }
-
-    chunks.push(src.slice(cursor));
-    return { maskedHtml: chunks.join(""), entries, prefix };
-  }
-
   // Enmascarar <script>...</script> antes de transformar <style>/<link>/<img> para no alterar strings JS
   const { maskedHtml, entries: scriptEntries, prefix: scriptMaskPrefix } = maskHtmlScripts(rawHtml);
 
@@ -1650,12 +440,10 @@ export function bundleHtmlWithFolderAssets(
       inlinedActiveCss = true;
     }
 
-    // 1. Control de límite de tamaño por recurso individual
     if (asset.content.length > MAX_PREVIEW_ASSET_BYTES) {
       return `<!-- [Studio IDE]: stylesheet "${escapeAttr(asset.path)}" omitido: excede el límite de tamaño individual (${asset.content.length} bytes > ${MAX_PREVIEW_ASSET_BYTES} bytes) -->\n${tag}`;
     }
 
-    // 2. Control de presupuesto total acumulado de CSS inlined
     if (getTotalInlinedCssBytes() + asset.content.length > MAX_TOTAL_INLINED_CSS) {
       return `<!-- [Studio IDE]: stylesheet "${escapeAttr(asset.path)}" omitido: presupuesto total de CSS superado -->\n${tag}`;
     }
@@ -1694,37 +482,6 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
-  function getMediaMimeType(filePath) {
-    const ext = getFileExtension(filePath || "");
-    switch (ext) {
-      case "mp4":
-      case "m4v":
-        return "video/mp4";
-      case "webm":
-        return "video/webm";
-      case "mov":
-        return "video/quicktime";
-      case "avi":
-        return "video/x-msvideo";
-      case "mkv":
-        return "video/x-matroska";
-      case "ogv":
-        return "video/ogg";
-      case "mp3":
-        return "audio/mpeg";
-      case "wav":
-        return "audio/wav";
-      case "ogg":
-        return "audio/ogg";
-      case "m4a":
-        return "audio/mp4";
-      case "flac":
-        return "audio/flac";
-      default:
-        return getImageMimeType(filePath);
-    }
-  }
-
   function resolveEntryToDataUrl(rawUrl, baseDir = dir) {
     if (!rawUrl || typeof rawUrl !== "string") return null;
     const cleanUrl = rawUrl.trim();
@@ -1744,7 +501,6 @@ export function bundleHtmlWithFolderAssets(
     });
   }
 
-  // Incrustar imágenes locales (<img src="..."> o sin comillas) almacenadas en Base64 o SVG dentro del proyecto
   html = html.replace(/<img\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
     const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
@@ -1755,13 +511,11 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar srcset en <img> y <source>
   html = html.replace(/\bsrcset=(["'])([^"']+)\1/gi, (fullAttr, quote, rawSrcset) => {
     const inlined = inlineSrcsetString(rawSrcset);
     return `srcset=${quote}${inlined}${quote}`;
   });
 
-  // Incrustar fuentes alternativas <source src="...">, <video src="..."> y <audio src="...">
   html = html.replace(/<(source|video|audio)\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\3|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, tagName, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
     const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
@@ -1772,7 +526,6 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar iconos favoritos (<link rel="icon|apple-touch-icon" href="...">)
   html = html.replace(/<link\b([^>]*?)\bhref=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeHref, quote, rawHref, afterHref) => {
     if (!/\brel=(["'])(?:shortcut\s+icon|icon|apple-touch-icon)\1/i.test(fullTag)) {
       return fullTag;
@@ -1784,7 +537,6 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar posters de video (<video poster="...">)
   html = html.replace(/<video\b([^>]*?)\bposter=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforePoster, quote, rawPoster, afterPoster) => {
     const dataUrl = resolveEntryToDataUrl(rawPoster);
     if (dataUrl) {
@@ -1793,7 +545,6 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar inputs de tipo imagen (<input type="image" src="...">)
   html = html.replace(/<input\b([^>]*?)\bsrc=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeSrc, quote, rawSrc, afterSrc) => {
     if (!/\btype=(["'])image\1/i.test(fullTag)) return fullTag;
     const dataUrl = resolveEntryToDataUrl(rawSrc);
@@ -1803,7 +554,6 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar imágenes SVG (<image href="..." xlink:href="...">)
   html = html.replace(/<image\b([^>]*?)\b(?:xlink:)?href=(["'])([^"']+)\2([^>]*)>/gi, (fullTag, beforeHref, quote, rawHref, afterHref) => {
     const dataUrl = resolveEntryToDataUrl(rawHref);
     if (dataUrl) {
@@ -1812,7 +562,6 @@ export function bundleHtmlWithFolderAssets(
     return fullTag;
   });
 
-  // Incrustar imágenes en atributos de estilo inline: style="...url('...')..."
   html = html.replace(/\bstyle=(["'])([\s\S]*?)\1/gi, (fullAttr, quote, styleBody) => {
     if (!styleBody || !styleBody.includes("url(")) return fullAttr;
     const inlined = inlineCssUrls(styleBody, dir);
@@ -1848,16 +597,6 @@ export function bundleHtmlWithFolderAssets(
     }
     const rendered = typeof transformJs === "function" ? transformJs(executable, isModule) : executable;
     return escapeCloseScript(rendered);
-  }
-
-  function hasRelativeDepsInUsage(usage) {
-    for (const spec of usage.staticImports) {
-      if (isRelativeModuleSpecifier(spec)) return true;
-    }
-    for (const spec of usage.dynamicLocalImports) {
-      if (isRelativeModuleSpecifier(spec)) return true;
-    }
-    return false;
   }
 
   function tryBundleLocalModules(rawCode, sourcePath, pretranspiled = null) {
@@ -2025,480 +764,10 @@ export function bundleHtmlWithFolderAssets(
     html = `${combinedHeadBridge}\n${html}`;
   }
 
-  // Desenmascarar los <script> después de inyectar <head>/</body> para que literales dentro de JS no alteren el HTML
   if (processedScripts.length > 0) {
     const maskRe = new RegExp(`${scriptMaskPrefix}(\\d+)__`, "g");
     html = html.replace(maskRe, (_, idxStr) => processedScripts[Number(idxStr)] ?? "");
   }
 
   return html;
-}
-
-export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code, options = {}) {
-  const exactMap = options?.prebuiltExactMap || buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
-  const ext = getFileExtension(tsFile?.path || "");
-  const isJsx = ext === "tsx" || ext === "jsx";
-  const compiled = transpileTypeScriptAndJsx(tsFile?.content || "", {
-    jsx: isJsx,
-    fileName: tsFile?.path || "main.ts"
-  });
-  const precomputedUsage = inspectModuleUsage(compiled.code);
-  return buildStandaloneJsPreview(
-    {
-      ...tsFile,
-      content: compiled.code
-    },
-    transformJs,
-    {
-      ...options,
-      prebuiltExactMap: exactMap,
-      precompiledEntryCode: compiled.code,
-      precomputedUsage
-    }
-  );
-}
-
-export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, options = {}) {
-  const bridge = buildConsoleBridgeScript(true);
-  const exactMap = options?.prebuiltExactMap || buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
-  const allowParentTraversal = options?.allowParentTraversal !== false;
-  const entryCode = typeof options?.precompiledEntryCode === "string"
-    ? options.precompiledEntryCode
-    : String(jsFile?.content || "");
-  const entryExt = getFileExtension(jsFile?.path || "");
-  const needsEntryTranspile =
-    typeof options?.precompiledEntryCode !== "string" && (TS_EXTENSIONS.has(entryExt) || entryExt === "jsx");
-  const normalizedJsCode = needsEntryTranspile
-    ? transpileTypeScriptAndJsx(entryCode, {
-        jsx: entryExt === "tsx" || entryExt === "jsx",
-        fileName: jsFile?.path || "main.ts"
-      }).code
-    : entryCode;
-
-  const moduleUsage = options?.precomputedUsage || inspectModuleUsage(normalizedJsCode);
-  let usesLocalModules = false;
-  if (exactMap.size > 0) {
-    for (const spec of moduleUsage.staticImports) {
-      if (isRelativeModuleSpecifier(spec)) {
-        usesLocalModules = true;
-        break;
-      }
-    }
-    if (!usesLocalModules) {
-      for (const spec of moduleUsage.dynamicLocalImports) {
-        if (isRelativeModuleSpecifier(spec)) {
-          usesLocalModules = true;
-          break;
-        }
-      }
-    }
-  }
-  const isModule = Boolean(!usesLocalModules && (moduleUsage.hasModuleSyntax || moduleUsage.hasTopLevelAwait));
-  const safeName = escapeHtmlText(String(jsFile?.path || "script.js"));
-
-  let scriptSnippet = "";
-  if (usesLocalModules) {
-    const cssAssetMap =
-      options?.assetMap instanceof Map
-        ? options.assetMap
-        : Array.isArray(options?.companionFiles)
-          ? buildWorkspaceAssetMap(options.companionFiles)
-          : exactMap;
-    const { inlineCssImports } = createProjectAssetHelpers(
-      getParentFolder(jsFile?.path || ""),
-      cssAssetMap,
-      allowParentTraversal
-    );
-    const bundle = buildVirtualModuleBundle({
-      entryPath: jsFile.path,
-      entryCode: jsFile.content,
-      exactMap,
-      transformJs,
-      transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
-      allowParentTraversal,
-      precompiledEntryCode: normalizedJsCode,
-      precomputedEntryUsage: moduleUsage
-    });
-    const exec = formatVirtualModuleExecution(bundle);
-    const statusFooter = `
-      var st = document.getElementById("__js_status");
-      if (st && st.dataset.failed !== "1") {
-        st.textContent = "Ejecutado correctamente (Módulos ES)";
-      }
-      var out = document.getElementById("__js_screen_log");
-      if (out && out.children.length === 0) {
-        var note = document.createElement("div");
-        note.className = "js-empty";
-        note.textContent = "El grafo de módulos se ejecutó sin errores. Usá console.log(...) para mostrar resultados acá.";
-        out.appendChild(note);
-      }`;
-    const openTag = exec.isModuleTag ? '<script type="module">' : "<script>";
-    const preamble = exec.extImportPreamble ? `${exec.extImportPreamble}\n` : "";
-    scriptSnippet = `${openTag}
-${preamble}try {
-${exec.scriptBodyCode}
-${statusFooter}
-} catch (err) {
-  var stErr = document.getElementById("__js_status");
-  if (stErr) {
-    stErr.dataset.failed = "1";
-    stErr.style.color = "var(--err)";
-    stErr.textContent = "Error en ejecución: " + (err && err.message ? err.message : String(err));
-  }
-  console.error(err);
-}
-</script>`;
-  } else {
-    const safeJs = transformJs(normalizedJsCode, isModule).replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
-    scriptSnippet = isModule
-      ? `<script type="module">
-${safeJs}
-</script>
-<script type="module">
-  window.addEventListener("load", function () {
-    setTimeout(function () {
-      var st = document.getElementById("__js_status");
-      if (st && st.dataset.failed !== "1") {
-        st.textContent = "Ejecutado correctamente (Módulo ES)";
-      }
-      var out = document.getElementById("__js_screen_log");
-      if (out && out.children.length === 0) {
-        var note = document.createElement("div");
-        note.className = "js-empty";
-        note.textContent = "El módulo JS se cargó sin errores. Usá console.log(...) para mostrar resultados acá.";
-        out.appendChild(note);
-      }
-    }, 40);
-  });
-</script>`
-      : `<script>
-    try {
-${safeJs}
-      var st = document.getElementById("__js_status");
-      if (st && st.dataset.failed !== "1") {
-        st.textContent = "Ejecutado correctamente";
-      }
-      var out = document.getElementById("__js_screen_log");
-      if (out && out.children.length === 0) {
-        var note = document.createElement("div");
-        note.className = "js-empty";
-        note.textContent = "El archivo se ejecutó sin errores. Usá console.log(...) para mostrar resultados acá.";
-        out.appendChild(note);
-      }
-    } catch (err) {
-      var stErr = document.getElementById("__js_status");
-      if (stErr) {
-        stErr.dataset.failed = "1";
-        stErr.style.color = "var(--err)";
-        stErr.textContent = "Error en ejecución: " + (err && err.message ? err.message : String(err));
-      }
-      console.error(err);
-    }
-</script>`;
-  }
-
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>Vista previa de JS: ${safeName}</title>
-  <style>
-    :root {
-      --bg: oklch(15% 0.011 255);
-      --card: oklch(20.5% 0.014 255);
-      --surface-input: oklch(16.5% 0.012 255);
-      --border: oklch(33% 0.016 255 / 0.65);
-      --ink: oklch(94.5% 0.007 255);
-      --muted: oklch(67% 0.014 255);
-      --accent: oklch(74% 0.13 252);
-      --ok: oklch(66% 0.14 152);
-      --warn: oklch(74% 0.14 75);
-      --err: oklch(62% 0.18 25);
-      --font-ui: system-ui, -apple-system, sans-serif;
-      --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 20px;
-      background: var(--bg);
-      color: var(--ink);
-      font-family: var(--font-ui);
-    }
-    .js-runner-card {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--card);
-      overflow: hidden;
-    }
-    .js-runner-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--border);
-      font-size: 13px;
-    }
-    .js-runner-file {
-      font-family: var(--font-mono);
-      color: var(--accent);
-      font-weight: 500;
-    }
-    .js-runner-status {
-      color: var(--ok);
-      font-size: 12px;
-    }
-    .js-screen-log {
-      padding: 12px 14px;
-      font-family: var(--font-mono);
-      font-size: 13px;
-      line-height: 1.6;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .js-line {
-      white-space: pre-wrap;
-      word-break: break-word;
-      padding: 4px 8px;
-      border-radius: 4px;
-      background: var(--surface-input);
-    }
-    .js-line-warn { color: var(--warn); }
-    .js-line-error { color: var(--err); }
-    .js-empty {
-      color: var(--muted);
-      font-style: italic;
-    }
-  </style>
-  ${bridge}
-</head>
-<body>
-  <div class="js-runner-card">
-    <div class="js-runner-head">
-      <span class="js-runner-file">${safeName}</span>
-      <span id="__js_status" class="js-runner-status">Ejecutando…</span>
-    </div>
-    <div id="__js_screen_log" class="js-screen-log"></div>
-  </div>
-  ${scriptSnippet}
-</body>
-</html>`;
-}
-
-export { IMAGE_EXTENSIONS };
-
-/**
- * Genera el documento HTML interactivo para la previsualización directa de imágenes.
- * Soporta PNG, JPEG, GIF, WebP, SVG, AVIF, BMP e ICO con cuadrícula de transparencia y controles de zoom.
- */
-export function buildStandaloneImagePreview(imageFile) {
-  const ext = getFileExtension(imageFile?.path || "");
-  const mime = getImageMimeType(imageFile?.path || "");
-  const safeName = escapeHtmlText(imageFile?.shortName || imageFile?.path || "Imagen");
-  const safeExtLabel = escapeHtmlText(ext || "IMG");
-  const rawB64 = typeof imageFile?.base64 === "string" && imageFile.base64.length > 0
-    ? imageFile.base64
-    : imageFile?.isBinary && typeof imageFile.content === "string" && imageFile.content.length > 0
-      ? imageFile.content
-      : null;
-  const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
-  const b64 = compactB64 && /^[A-Za-z0-9+/_=-]+$/.test(compactB64) ? compactB64 : null;
-
-  let imgSrc = "";
-  if (b64) {
-    imgSrc = `data:${mime};base64,${b64}`;
-  } else if (ext === "svg" && typeof imageFile?.content === "string" && imageFile.content.trim().length > 0) {
-    const sanitizedSvg = sanitizeSvgMarkup(imageFile.content);
-    if (sanitizedSvg) {
-      const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
-        .replace(/'/g, "%27")
-        .replace(/"/g, "%22");
-      imgSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-    }
-  }
-
-  let sizeFormatted = "";
-  if (b64) {
-    sizeFormatted = formatStorageBytes(Math.floor((b64.length * 3) / 4));
-  } else if (ext === "svg" && typeof imageFile?.content === "string") {
-    sizeFormatted = formatStorageBytes(imageFile.content.length);
-  }
-
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-  <meta charset="UTF-8">
-  <title>${safeName}</title>
-  <style>
-    :root {
-      --bg: #0f1117;
-      --card: #181a20;
-      --border: #282c37;
-      --text: #e6edf3;
-      --text-muted: #8b949e;
-      --accent: #79c0ff;
-    }
-    * { box-sizing: border-box; }
-    html, body {
-      margin: 0;
-      padding: 0;
-      width: 100%;
-      height: 100%;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }
-    .img-toolbar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 14px;
-      background: var(--card);
-      border-bottom: 1px solid var(--border);
-      font-size: 13px;
-      gap: 12px;
-      flex-shrink: 0;
-      flex-wrap: wrap;
-    }
-    .img-meta-group {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .badge {
-      background: #21262d;
-      border: 1px solid var(--border);
-      padding: 2px 7px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      color: var(--accent);
-      text-transform: uppercase;
-    }
-    .img-dim, .img-size {
-      color: var(--text-muted);
-      font-size: 12px;
-    }
-    .img-controls {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .btn-ctrl {
-      background: #21262d;
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 3px 9px;
-      border-radius: 5px;
-      font-size: 12px;
-      cursor: pointer;
-      user-select: none;
-    }
-    .btn-ctrl:hover {
-      background: #30363d;
-    }
-    .btn-ctrl.is-active {
-      background: var(--accent);
-      color: #0d1117;
-      border-color: var(--accent);
-      font-weight: 600;
-    }
-    .img-canvas-wrap {
-      flex: 1;
-      width: 100%;
-      height: 100%;
-      overflow: auto;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      background: repeating-conic-gradient(#1c2128 0% 25%, #161b22 0% 50%) 50% / 20px 20px;
-    }
-    .preview-img {
-      max-width: 100%;
-      max-height: 100%;
-      object-fit: contain;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
-      border-radius: 4px;
-      transition: transform 0.15s ease;
-      cursor: zoom-in;
-    }
-    .preview-img.mode-100 {
-      max-width: none;
-      max-height: none;
-      cursor: zoom-out;
-    }
-    .preview-img.mode-200 {
-      max-width: none;
-      max-height: none;
-      transform: scale(2);
-      transform-origin: center;
-      cursor: zoom-out;
-    }
-    .empty-state {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 12px;
-      color: var(--text-muted);
-      font-size: 14px;
-      text-align: center;
-    }
-  </style>
-</head>
-<body>
-  <div class="img-toolbar">
-    <div class="img-meta-group">
-      <span class="badge">${safeExtLabel}</span>
-      <span class="img-name">${safeName}</span>
-      <span class="img-size">${escapeHtmlText(sizeFormatted)}</span>
-      <span id="dim-text" class="img-dim"></span>
-    </div>
-    <div class="img-controls">
-      <button type="button" class="btn-ctrl is-active" id="btn-fit">Ajustar</button>
-      <button type="button" class="btn-ctrl" id="btn-100">100%</button>
-      <button type="button" class="btn-ctrl" id="btn-200">200%</button>
-    </div>
-  </div>
-  <div class="img-canvas-wrap">
-    ${imgSrc ? `<img id="main-img" class="preview-img" src="${escapeAttr(imgSrc)}" alt="${safeName}">` : '<div class="empty-state">Esta imagen está vacía o no contiene datos binarios válidos.</div>'}
-  </div>
-  <script>
-    const img = document.getElementById("main-img");
-    const dim = document.getElementById("dim-text");
-    const btnFit = document.getElementById("btn-fit");
-    const btn100 = document.getElementById("btn-100");
-    const btn200 = document.getElementById("btn-200");
-    if (img && dim) {
-      img.addEventListener("load", () => {
-        dim.textContent = img.naturalWidth + " × " + img.naturalHeight + " px";
-      });
-      if (img.complete && img.naturalWidth) {
-        dim.textContent = img.naturalWidth + " × " + img.naturalHeight + " px";
-      }
-      function setMode(mode) {
-        img.classList.remove("mode-100", "mode-200");
-        btnFit?.classList.toggle("is-active", mode === "fit");
-        btn100?.classList.toggle("is-active", mode === "100");
-        btn200?.classList.toggle("is-active", mode === "200");
-        if (mode === "100") img.classList.add("mode-100");
-        if (mode === "200") img.classList.add("mode-200");
-      }
-      btnFit?.addEventListener("click", () => setMode("fit"));
-      btn100?.addEventListener("click", () => setMode("100"));
-      btn200?.addEventListener("click", () => setMode("200"));
-      img.addEventListener("click", () => {
-        if (img.classList.contains("mode-100")) setMode("fit");
-        else setMode("100");
-      });
-    }
-  </script>
-</body>
-</html>`;
 }

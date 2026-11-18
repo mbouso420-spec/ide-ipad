@@ -1,4 +1,5 @@
 import { getKeyStorageMode } from "../ai/providers.js";
+import { sanitizeRemoteRepoPath } from "../storage/db/dbCore.js";
 import { toFriendlyNetworkError } from "../net/networkErrors.js";
 import {
   AuthLockoutError,
@@ -206,7 +207,7 @@ export function getCachedGithubUserLogin() {
   }
 }
 
-export function saveCachedGithubUserLogin(login) {
+function saveCachedGithubUserLogin(login) {
   const clean = String(login || "").trim();
   try {
     window.localStorage.removeItem(GH_USER_CACHE_KEY);
@@ -798,22 +799,23 @@ export async function fetchRepoTreeIndex({ token, owner, repo, branch }) {
 
   const rawTree = Array.isArray(treeData?.tree) ? treeData.tree : [];
   const entries = rawTree
-    .filter((node) => {
-      if (node.type !== "blob" || !node.path || !node.sha) return false;
+    .map((node) => ({ node, safePath: sanitizeRemoteRepoPath(node?.path) }))
+    .filter(({ node, safePath }) => {
+      if (node.type !== "blob" || !safePath || !node.sha) return false;
       // Los enlaces simbólicos (120000) no son archivos de texto editables: editarlos los convertiría en archivos comunes.
       if (node.mode === "120000") return false;
-      if (node.path.startsWith("node_modules/") || node.path.startsWith(".git/")) return false;
-      const isBin = isBinaryFile(node.path);
+      if (safePath.startsWith("node_modules/") || safePath.startsWith(".git/")) return false;
+      const isBin = isBinaryFile(safePath);
       const maxSize = isBin ? MAX_IMPORT_FILE_BYTES : MAX_TEXT_FILE_BYTES;
       if (typeof node.size === "number" && node.size > maxSize) return false;
       return true;
     })
-    .map((node) => ({
-      path: node.path,
+    .map(({ node, safePath }) => ({
+      path: safePath,
       blobSha: node.sha,
       size: node.size || 0,
       mode: node.mode === "100755" ? "100755" : "100644",
-      isBinary: isBinaryFile(node.path)
+      isBinary: isBinaryFile(safePath)
     }));
 
   const isTruncated = Boolean(treeData?.truncated);
@@ -941,12 +943,19 @@ export async function compareRemoteCommits({ token, owner, repo, base, head }) {
     basehead: `${base}...${head}`
   });
   const files = Array.isArray(data?.files) ? data.files : [];
-  return files.map((f) => ({
-    path: f.filename,
-    previousPath: f.previous_filename || null,
-    status: f.status,
-    blobSha: f.status === "removed" ? null : f.sha || null
-  }));
+  return files
+    .map((f) => {
+      const safePath = sanitizeRemoteRepoPath(f?.filename);
+      if (!safePath) return null;
+      const safePrev = f?.previous_filename ? sanitizeRemoteRepoPath(f.previous_filename) || null : null;
+      return {
+        path: safePath,
+        previousPath: safePrev,
+        status: f.status,
+        blobSha: f.status === "removed" ? null : f.sha || null
+      };
+    })
+    .filter(Boolean);
 }
 
 /**
@@ -1237,7 +1246,11 @@ export async function saveProjectToGist(token, { projectName, entries, existingG
     });
 
   const description = `[Studio IDE Backup] ${cleanName}`;
-  const serializedSize = new TextEncoder().encode(JSON.stringify({ description, files: filesPayload })).length;
+  const encoder = new TextEncoder();
+  let serializedSize = encoder.encode(description).byteLength + 256;
+  for (const [k, v] of Object.entries(filesPayload)) {
+    serializedSize += encoder.encode(k).byteLength + encoder.encode(String(v?.content || "")).byteLength + 32;
+  }
   if (serializedSize > MAX_GIST_PAYLOAD_BYTES) {
     throw new Error("El respaldo supera el límite máximo permitido (9 MB) para subir a GitHub Gist.");
   }

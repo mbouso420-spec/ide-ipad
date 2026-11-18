@@ -171,13 +171,20 @@ describe("Bóveda Cifrada de Credenciales (AES-GCM 256 + PBKDF2-SHA256)", () => 
       return el;
     };
 
+    const waitUntil = async (pred, timeoutMs = 1500) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!pred() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 15));
+      }
+    };
+
     try {
       initSettingsModal({ editor: null });
 
       passphraseInput.value = "MiClaveFuerte99";
       btnExport.click();
       // Esperar promesa PBKDF2/AES-GCM dentro del listener
-      await new Promise((r) => setTimeout(r, 250));
+      await waitUntil(() => Boolean(capturedBlob) && /descargada correctamente/i.test(vaultStatus.textContent));
 
       assert.ok(capturedBlob, "Debe haber generado el Blob cifrado");
       const exportedVaultText = await capturedBlob.text();
@@ -197,7 +204,7 @@ describe("Bóveda Cifrada de Credenciales (AES-GCM 256 + PBKDF2-SHA256)", () => 
         }
       ];
       fileInput.dispatchEvent(new Event("change"));
-      await new Promise((r) => setTimeout(r, 250));
+      await waitUntil(() => /restauraron 1 credencial/i.test(vaultStatus.textContent));
 
       assert.equal(getApiKey("mistral"), "mistral_secret_test_1234567890abcdef");
       assert.equal(passphraseInput.value, "", "Debe limpiar la contraseña tras importar");

@@ -160,7 +160,6 @@ export function createTabManager({
     persistTabsState,
     renderTabs,
     updateTabDirtyBadge,
-    revealActiveTab,
     renderEmptyQuickList
   };
 }

@@ -21,6 +21,7 @@ import {
 import {
   applyRemotePullPlan,
   countPendingGithubChanges,
+  discardEntryChange,
   getPendingGithubChanges,
   getProjectEntries,
   hydrateGithubProject,
@@ -32,7 +33,7 @@ import {
 } from "../storage/workspaceDb.js";
 import { classifyRemotePullChanges, buildRemotePullPlan } from "./githubMerge.js";
 import { initGithubLocalBackupPanel, setGithubStatus as setStatus } from "./githubLocalBackupPanel.js";
-import { exportKeysBundle, getKeyStorageMode, hasStoredCredentials } from "../ai/providers.js";
+import { getSyncCredentialsBackupPayload } from "../ai/providers.js";
 import {
   checkAuthLockout,
   formatRemainingCooldown,
@@ -51,12 +52,18 @@ export function initGithubController({
   onFlushPendingSaves,
   onProjectClonedOrSynced,
   onReposListChanged,
-  onOpenDiff
+  onOpenDiff,
+  onOpenMultiDiff,
+  onDiscardLocalChange,
+  onRequestConfirm
 }) {
   const openDialogBtn = document.getElementById("btn-open-github");
   const topbarRepoLabel = document.getElementById("topbar-repo-label");
   const dialog = document.getElementById("github-dialog");
   const closeDialogBtn = document.getElementById("btn-close-github");
+  const selectedCommitPaths = new Set();
+  let knownCommitPaths = new Set();
+  let renderedSyncProjectId = null;
 
   const tokenInput = document.getElementById("gh-token-input");
   const connectBtn = document.getElementById("btn-gh-connect");
@@ -225,6 +232,7 @@ export function initGithubController({
 
   let lockoutUiTimer = 0;
   let isOpeningDialog = false;
+  let authConnectSeq = 0;
 
   function isSyncBusy() {
     return isPulling || isPushing || isSwitchingBranch;
@@ -232,11 +240,7 @@ export function initGithubController({
 
   function syncCredentialsBackupFromGithub() {
     try {
-      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
-        void saveCredentialsBackup("");
-      } else {
-        void saveCredentialsBackup(exportKeysBundle());
-      }
+      void saveCredentialsBackup(getSyncCredentialsBackupPayload());
     } catch {
       /* ignorar error al respaldar credenciales */
     }
@@ -340,10 +344,14 @@ export function initGithubController({
     }
 
     // Se verifica ANTES de guardar: un token inválido no debe quedar guardado.
+    const connectSeq = ++authConnectSeq;
     connectBtn.disabled = true;
     setStatus(authMsgEl, "Verificando el token con GitHub…", "neutral");
     try {
       const check = await verifyGithubToken(token);
+      if (connectSeq !== authConnectSeq) {
+        return;
+      }
 
       if (check.status === "locked") {
         if (tokenInput) tokenInput.value = "";
@@ -367,13 +375,14 @@ export function initGithubController({
         setStatus(authMsgEl, `${redactSensitiveTokens(check.message, [token])} El token quedó guardado.`, "error");
         return;
       }
-      await connectAndLoadRepos(token);
+      await connectAndLoadRepos(token, connectSeq);
     } finally {
       connectBtn.disabled = checkAuthLockout("github").locked;
     }
   }, listenOpts);
 
   clearTokenBtn?.addEventListener("click", () => {
+    authConnectSeq += 1;
     clearGithubToken();
     hideTokenWarning();
     cleanupDialogTransientState();
@@ -637,14 +646,24 @@ export function initGithubController({
         return;
       }
 
-      changes = await getPendingGithubChanges(project.id);
-      if (changes.length === 0) {
+      const allChanges = await getPendingGithubChanges(project.id);
+      if (allChanges.length === 0) {
         setStatus(pushStatusEl, "No hay cambios pendientes frente al repositorio.", "neutral");
+        return;
+      }
+
+      const enforceCheckSelection = renderedSyncProjectId === project.id && knownCommitPaths.size > 0;
+      changes = enforceCheckSelection
+        ? allChanges.filter((c) => selectedCommitPaths.has(c.path))
+        : allChanges;
+      if (changes.length === 0) {
+        setStatus(pushStatusEl, "Seleccioná al menos un archivo para incluir en el commit.", "error");
         return;
       }
 
       setStatus(pushStatusEl, `Enviando commit con ${changes.length} archivo(s) a ${project.github.branch}…`, "neutral");
 
+      const prevCommitSha = project.github.commitSha || null;
       const { commitSha } = await pushAtomicCommit({
         token,
         owner: project.github.owner,
@@ -652,13 +671,35 @@ export function initGithubController({
         branch: project.github.branch,
         message,
         changes,
-        expectedBaseSha: project.github.commitSha || null,
+        expectedBaseSha: prevCommitSha,
         force
       });
 
       hideConflictBox();
       // Solo se consolida lo que viajó en este commit: lo editado mientras tanto sigue pendiente.
       await markProjectSynced(project.id, commitSha, changes);
+      if (force) {
+        // Al forzar push, conciliar entradas remotas intermedias para evitar desincronización silenciosa.
+        try {
+          const remoteSnapshot = await fetchRepoTreeIndex({
+            token,
+            owner: project.github.owner,
+            repo: project.github.repo,
+            branch: project.github.branch
+          });
+          if (remoteSnapshot && !remoteSnapshot.isEmptyRepo) {
+            await hydrateLazyGithubProject({
+              owner: project.github.owner,
+              repo: project.github.repo,
+              branch: project.github.branch,
+              commitSha: remoteSnapshot.commitSha || commitSha,
+              entries: remoteSnapshot.entries
+            });
+          }
+        } catch {
+          /* si falla re-hidratación best-effort, mantener estado consolidado del commit */
+        }
+      }
       if (commitMsgInput) commitMsgInput.value = "";
       isPushing = false;
       await onProjectClonedOrSynced(project.id);
@@ -784,17 +825,17 @@ export function initGithubController({
   commitMsgInput?.addEventListener("keydown", (event) => {
     if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
       event.preventDefault();
-      if (isSyncBusy()) return;
+      if (isSyncBusy() || pushBtn?.disabled) return;
       void executePush(false);
     }
   }, listenOpts);
 
   pushBtn?.addEventListener("click", () => {
-    if (!isSyncBusy()) void executePush(false);
+    if (!isSyncBusy() && !pushBtn.disabled) void executePush(false);
   }, listenOpts);
 
   conflictForceBtn?.addEventListener("click", () => {
-    if (!isSyncBusy()) void executePush(true);
+    if (!isSyncBusy() && !conflictForceBtn.disabled) void executePush(true);
   }, listenOpts);
 
   conflictViewBtn?.addEventListener("click", async () => {
@@ -976,12 +1017,39 @@ export function initGithubController({
     try {
       const targetProject = activeConflict.project;
       const remoteSha = activeConflict.remoteSha;
-      const localEntries = await getProjectEntries(targetProject.id);
+      const priorChoices = new Map(
+        (activeMergeClassification.conflicts || []).map((c) => [c.path, c.resolution || "keep-local"])
+      );
+      const [diffFiles, localEntries, freshPendingChanges] = await Promise.all([
+        compareRemoteCommits({
+          token: targetToken,
+          owner: targetProject.github.owner,
+          repo: targetProject.github.repo,
+          base: activeConflict.expectedSha,
+          head: remoteSha
+        }),
+        getProjectEntries(targetProject.id),
+        getPendingGithubChanges(targetProject.id)
+      ]);
+      const freshClassification = classifyRemotePullChanges({
+        localEntries,
+        localPendingChanges: freshPendingChanges,
+        remoteDiffFiles: diffFiles
+      });
+      for (const c of freshClassification.conflicts) {
+        if (priorChoices.has(c.path)) {
+          c.resolution = priorChoices.get(c.path);
+        } else if (freshClassification.conflicts.length > (activeMergeClassification.conflicts || []).length) {
+          activeMergeClassification = freshClassification;
+          setStatus(pushStatusEl, "Hubo ediciones locales nuevas en conflicto: revisá la clasificación antes de aplicar.", "error");
+          return;
+        }
+      }
 
       const plan = await buildRemotePullPlan({
         project: targetProject,
         localEntries,
-        classification: activeMergeClassification,
+        classification: freshClassification,
         newCommitSha: remoteSha,
         fetchBlob: (blobSha, filePath) =>
           fetchSingleRepoBlob({
@@ -1064,6 +1132,7 @@ export function initGithubController({
       return;
     }
 
+    isSwitchingBranch = true;
     if (btnCreateBranch) btnCreateBranch.disabled = true;
     if (branchStatusEl) {
       branchStatusEl.hidden = false;
@@ -1090,6 +1159,7 @@ export function initGithubController({
         if (newBranchInput) newBranchInput.value = "";
       }
       hideConflictBox();
+      isSwitchingBranch = false;
       await onProjectClonedOrSynced?.(migrated.id);
       if (branchStatusEl) {
         branchStatusEl.hidden = false;
@@ -1102,6 +1172,7 @@ export function initGithubController({
         branchStatusEl.textContent = formatSafeErrorMessage(err, [token], "Error al crear la rama");
       }
     } finally {
+      isSwitchingBranch = false;
       if (btnCreateBranch) btnCreateBranch.disabled = false;
     }
   }, listenOpts);
@@ -1165,12 +1236,14 @@ export function initGithubController({
     }
   }, listenOpts);
 
-  async function connectAndLoadRepos(token) {
+  async function connectAndLoadRepos(token, expectedSeq = authConnectSeq) {
     if (connectBtn) connectBtn.disabled = true;
     setStatus(authMsgEl, "Verificando cuenta y repositorios en GitHub…", "neutral");
     try {
       const user = await fetchGithubUser(token);
+      if (expectedSeq !== authConnectSeq || getGithubToken() !== token) return;
       const repos = await fetchUserRepositories(token);
+      if (expectedSeq !== authConnectSeq || getGithubToken() !== token) return;
       reposCache = Array.isArray(repos) ? repos : [];
       connectedUserLogin = user?.login || connectedUserLogin || "";
       isSessionConnected = true;
@@ -1251,6 +1324,8 @@ export function initGithubController({
         syncBranchSelect.appendChild(opt);
       };
 
+      // Limpiar inmediatamente las ramas de un repo anterior mientras llegan las nuevas
+      renderFallbackBranchOption();
       const token = getGithubToken();
       if (token && project.github.owner && project.github.repo) {
         fetchRepositoryBranches(token, project.github.owner, project.github.repo)
@@ -1275,13 +1350,82 @@ export function initGithubController({
             if (seq !== syncPanelRequestSeq) return;
             renderFallbackBranchOption();
           });
-      } else {
-        renderFallbackBranchOption();
       }
     }
 
     const changes = await getPendingGithubChanges(project.id);
     if (seq !== syncPanelRequestSeq) return;
+
+    if (renderedSyncProjectId !== project.id) {
+      selectedCommitPaths.clear();
+      knownCommitPaths = new Set();
+      renderedSyncProjectId = project.id;
+    }
+
+    const currentPathSet = new Set(changes.map((c) => c.path));
+    for (const existing of [...selectedCommitPaths]) {
+      if (!currentPathSet.has(existing)) selectedCommitPaths.delete(existing);
+    }
+    for (const c of changes) {
+      if (!knownCommitPaths.has(c.path)) {
+        selectedCommitPaths.add(c.path);
+      }
+    }
+    knownCommitPaths = currentPathSet;
+
+    const updatePushButtonState = () => {
+      const selectedCount = changes.filter((c) => selectedCommitPaths.has(c.path)).length;
+      if (pushBtn) {
+        pushBtn.disabled = selectedCount === 0;
+        const labelSpan = pushBtn.querySelector("span:last-child");
+        if (labelSpan) {
+          labelSpan.textContent =
+            changes.length > 0 && selectedCount < changes.length
+              ? `Commit y Push (${selectedCount}/${changes.length})`
+              : "Commit y Push a GitHub";
+        }
+      }
+      if (conflictForceBtn) {
+        conflictForceBtn.disabled = selectedCount === 0 || isSyncBusy();
+      }
+    };
+
+    const statusMap = {
+      added: { label: "Nuevo", cls: "is-added" },
+      modified: { label: "Editado", cls: "is-modified" },
+      deleted: { label: "Borrado", cls: "is-deleted" }
+    };
+
+    const openChangesDiff = (initialIndex = 0) => {
+      const diffItems = changes.map((item) => {
+        const meta = statusMap[item.status] || statusMap.modified;
+        return {
+          path: item.path,
+          badge: meta.label,
+          oldCode: item.isBinary ? `[Archivo binario]` : (item.baseContent || ""),
+          newCode: item.status === "deleted"
+            ? ""
+            : (item.isBinary ? `[Archivo binario]` : (item.content || ""))
+        };
+      });
+      if (typeof onOpenMultiDiff === "function" && diffItems.length > 0) {
+        onOpenMultiDiff({
+          title: "Revisión pre-commit",
+          items: diffItems,
+          initialIndex
+        });
+      } else {
+        const target = diffItems[initialIndex] || diffItems[0];
+        if (target) {
+          onOpenDiff?.({
+            title: `Cambios en ${target.path}`,
+            oldCode: target.oldCode,
+            newCode: target.newCode
+          });
+        }
+      }
+    };
+
     if (changesListEl) {
       changesListEl.innerHTML = "";
       if (changes.length === 0) {
@@ -1290,19 +1434,72 @@ export function initGithubController({
         emptyLi.textContent = "Todo al día con el último commit descargado.";
         changesListEl.appendChild(emptyLi);
       } else {
-        const statusMap = {
-          added: { label: "Nuevo", cls: "is-added" },
-          modified: { label: "Editado", cls: "is-modified" },
-          deleted: { label: "Borrado", cls: "is-deleted" }
-        };
-        for (const ch of changes) {
+        if (changes.length > 1) {
+          const summaryLi = document.createElement("li");
+          summaryLi.className = "gh-change-item gh-change-summary";
+          const selectAllLabel = document.createElement("label");
+          selectAllLabel.className = "gh-change-select-label";
+          const selectAllCb = document.createElement("input");
+          selectAllCb.type = "checkbox";
+          selectAllCb.className = "gh-change-check";
+          selectAllCb.checked = selectedCommitPaths.size === changes.length;
+          selectAllCb.indeterminate = selectedCommitPaths.size > 0 && selectedCommitPaths.size < changes.length;
+          const selectAllText = document.createElement("span");
+          selectAllText.textContent = `Seleccionar todo (${selectedCommitPaths.size}/${changes.length})`;
+          selectAllCb.addEventListener("change", () => {
+            if (selectAllCb.checked) {
+              changes.forEach((c) => selectedCommitPaths.add(c.path));
+            } else {
+              selectedCommitPaths.clear();
+            }
+            refreshSyncPanel();
+          });
+          selectAllLabel.append(selectAllCb, selectAllText);
+
+          const reviewAllBtn = document.createElement("button");
+          reviewAllBtn.type = "button";
+          reviewAllBtn.className = "btn btn-ghost btn-sm";
+          reviewAllBtn.innerHTML = `${icon("gitCompare")}<span>Revisar todo</span>`;
+          reviewAllBtn.addEventListener("click", () => openChangesDiff(0));
+
+          summaryLi.append(selectAllLabel, reviewAllBtn);
+          changesListEl.appendChild(summaryLi);
+        }
+
+        changes.forEach((ch, idx) => {
           const li = document.createElement("li");
           li.className = "gh-change-item";
           const st = statusMap[ch.status] || statusMap.modified;
 
+          const leftWrap = document.createElement("label");
+          leftWrap.className = "gh-change-select-label";
+          const checkbox = document.createElement("input");
+          checkbox.type = "checkbox";
+          checkbox.className = "gh-change-check";
+          checkbox.checked = selectedCommitPaths.has(ch.path);
+          checkbox.setAttribute("aria-label", `Incluir ${ch.path} en el commit`);
+          checkbox.addEventListener("change", () => {
+            if (checkbox.checked) {
+              selectedCommitPaths.add(ch.path);
+            } else {
+              selectedCommitPaths.delete(ch.path);
+            }
+            updatePushButtonState();
+            const masterCb = changesListEl.querySelector(".gh-change-summary .gh-change-check");
+            const masterTxt = changesListEl.querySelector(".gh-change-summary .gh-change-select-label span");
+            if (masterCb) {
+              masterCb.checked = selectedCommitPaths.size === changes.length;
+              masterCb.indeterminate = selectedCommitPaths.size > 0 && selectedCommitPaths.size < changes.length;
+            }
+            if (masterTxt) {
+              masterTxt.textContent = `Seleccionar todo (${selectedCommitPaths.size}/${changes.length})`;
+            }
+          });
+
           const pathSpan = document.createElement("span");
           pathSpan.className = "code-font gh-change-path";
           pathSpan.textContent = ch.path;
+          leftWrap.append(checkbox, pathSpan);
 
           const rightWrap = document.createElement("div");
           rightWrap.className = "gh-change-actions";
@@ -1311,28 +1508,55 @@ export function initGithubController({
           diffBtn.type = "button";
           diffBtn.className = "btn btn-ghost btn-sm";
           diffBtn.innerHTML = `${icon("gitCompare")}<span>Diff</span>`;
-          diffBtn.addEventListener("click", () => {
-            onOpenDiff?.({
-              title: `Cambios en ${ch.path}`,
-              oldCode: ch.baseContent || "",
-              newCode: ch.status === "deleted" ? "" : ch.content || ""
-            });
+          diffBtn.addEventListener("click", () => openChangesDiff(idx));
+
+          const discardBtn = document.createElement("button");
+          discardBtn.type = "button";
+          discardBtn.className = "btn btn-ghost btn-sm gh-discard-btn";
+          discardBtn.title = `Descartar cambios locales de ${ch.path}`;
+          discardBtn.innerHTML = `${icon("undo")}<span>Descartar</span>`;
+          discardBtn.addEventListener("click", async () => {
+            const msg = ch.status === "added"
+              ? `¿Eliminar el archivo nuevo "${ch.path}"? Esta acción no se puede deshacer.`
+              : `¿Descartar los cambios locales en "${ch.path}" y volver al estado del último commit?`;
+            const confirmed = typeof onRequestConfirm === "function"
+              ? await onRequestConfirm({
+                  title: "Descartar cambios locales",
+                  message: msg,
+                  confirmText: "Descartar",
+                  danger: true
+                })
+              : (typeof window !== "undefined" && typeof window.confirm === "function" ? window.confirm(msg) : false);
+            if (!confirmed) return;
+            discardBtn.disabled = true;
+            try {
+              await onFlushPendingSaves?.();
+              const res = await discardEntryChange(project.id, ch.path);
+              if (res?.discarded) {
+                selectedCommitPaths.delete(ch.path);
+                await onDiscardLocalChange?.(project.id, ch.path, ch.status);
+                await refreshSyncPanel();
+                setStatus(pushStatusEl, `Cambios descartados en ${ch.path}.`, "ok");
+              }
+            } catch (err) {
+              setStatus(pushStatusEl, formatSafeErrorMessage(err, [], "No se pudieron descartar los cambios."), "error");
+            } finally {
+              discardBtn.disabled = false;
+            }
           });
 
           const tagSpan = document.createElement("span");
           tagSpan.className = `gh-change-tag ${st.cls}`;
           tagSpan.textContent = st.label;
 
-          rightWrap.append(diffBtn, tagSpan);
-          li.append(pathSpan, rightWrap);
+          rightWrap.append(diffBtn, discardBtn, tagSpan);
+          li.append(leftWrap, rightWrap);
           changesListEl.appendChild(li);
-        }
+        });
       }
     }
 
-    if (pushBtn) {
-      pushBtn.disabled = changes.length === 0;
-    }
+    updatePushButtonState();
 
     await refreshTopbarBadge(changes.length);
   }

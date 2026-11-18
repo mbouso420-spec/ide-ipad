@@ -122,7 +122,7 @@ export function createSplitEditorController({
       }
     }
 
-    if (reqId !== openRequestSeq || !isSplitOpen || !editorSplit) {
+    if (reqId !== openRequestSeq || isDestroyed || !isSplitOpen || !editorSplit) {
       return;
     }
 
@@ -273,7 +273,6 @@ export function createSplitEditorController({
   return {
     toggle,
     openFile,
-    populateSelect,
     refreshIfOpen() {
       if (isSplitOpen) {
         populateSelect();
@@ -305,6 +304,7 @@ export function createSplitEditorController({
       }
     },
     dropFileState(filePath, isFolder = false) {
+      openRequestSeq += 1;
       if (isFolder) {
         const prefix = `${filePath}/`;
         for (const f of getFilesOnly()) {
@@ -326,6 +326,22 @@ export function createSplitEditorController({
       }
       if (isSplitOpen) {
         populateSelect();
+      }
+    },
+    syncOrDropPath(filePath, nextContent, { markDirty = false } = {}) {
+      if (!editorSplit) return;
+      if (markDirty) {
+        if (editorSplit.getActiveFileId() === filePath) {
+          editorSplit.replaceEntireDocument(nextContent);
+        } else {
+          editorSplit.dropFileState(filePath);
+        }
+        return;
+      }
+      if (typeof nextContent === "string") {
+        editorSplit.syncDoc(filePath, nextContent);
+      } else {
+        editorSplit.dropFileState(filePath);
       }
     },
     replaceIfActive(fileId, code) {

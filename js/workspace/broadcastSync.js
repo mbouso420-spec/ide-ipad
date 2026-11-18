@@ -33,6 +33,7 @@ export function initBroadcastSync({
   statusBar,
   tabManager,
   renderWorkspaceView,
+  openOrFocusFile,
   getSplitController,
   github,
   onKeyStorageModeBroadcast
@@ -216,7 +217,13 @@ export function initBroadcastSync({
       await persistTabsState();
     }
     if (destroyed) return;
-    renderWorkspaceView();
+    const nextActiveId = getActiveFileId();
+    const nextActiveFile = nextActiveId ? getFilesOnly().find((f) => f.id === nextActiveId) : null;
+    if (nextActiveFile && nextActiveFile.contentLoaded === false && typeof openOrFocusFile === "function") {
+      await openOrFocusFile(nextActiveId);
+    } else {
+      renderWorkspaceView();
+    }
     await github.refreshTopbarBadge();
   }
 

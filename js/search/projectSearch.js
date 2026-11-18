@@ -349,6 +349,47 @@ function atomMatchesChar(atom, ch, caseSensitive = true) {
   return true;
 }
 
+function parseCharClassProbeChars(rawClass) {
+  const probes = [];
+  if (!rawClass || rawClass.length < 3 || rawClass[0] !== "[") return probes;
+  let body = rawClass.slice(1, rawClass.endsWith("]") ? -1 : rawClass.length);
+  if (body.startsWith("^")) body = body.slice(1);
+  const readCharCode = (str, idx) => {
+    if (str[idx] !== "\\") return { cp: str.codePointAt(idx), next: idx + (str.codePointAt(idx) > 0xffff ? 2 : 1) };
+    const esc = str[idx + 1] ?? "";
+    if (esc === "u" && str[idx + 2] === "{") {
+      const m = /^\{([0-9a-fA-F]+)\}/.exec(str.slice(idx + 2));
+      if (m) return { cp: Number.parseInt(m[1], 16), next: idx + 2 + m[0].length };
+    } else if (esc === "u") {
+      const m = /^[0-9a-fA-F]{4}/.exec(str.slice(idx + 2));
+      if (m) return { cp: Number.parseInt(m[0], 16), next: idx + 6 };
+    } else if (esc === "x") {
+      const m = /^[0-9a-fA-F]{2}/.exec(str.slice(idx + 2));
+      if (m) return { cp: Number.parseInt(m[0], 16), next: idx + 4 };
+    } else if (esc in ESCAPE_CONTROL_CHARS) {
+      return { cp: ESCAPE_CONTROL_CHARS[esc].codePointAt(0), next: idx + 2 };
+    }
+    return { cp: esc ? esc.codePointAt(0) : -1, next: idx + 2 };
+  };
+  let pos = 0;
+  while (pos < body.length && probes.length < 48) {
+    const first = readCharCode(body, pos);
+    pos = first.next;
+    if (first.cp >= 0 && first.cp <= 0x10ffff) {
+      probes.push(String.fromCodePoint(first.cp));
+      if (body[pos] === "-" && pos + 1 < body.length) {
+        const second = readCharCode(body, pos + 1);
+        pos = second.next;
+        if (second.cp >= first.cp && second.cp <= 0x10ffff) {
+          const mid = Math.floor((first.cp + second.cp) / 2);
+          probes.push(String.fromCodePoint(mid), String.fromCodePoint(second.cp));
+        }
+      }
+    }
+  }
+  return probes;
+}
+
 function atomsCanOverlap(a, b, caseSensitive = true) {
   if (!a || !b) return false;
   if (a.type === "alt-group") {
@@ -363,9 +404,13 @@ function atomsCanOverlap(a, b, caseSensitive = true) {
   if (a.kind === "lit") return atomMatchesChar(b, a.value, effectiveCaseB);
   if (b.kind === "lit") return atomMatchesChar(a, b.value, effectiveCaseA);
   if (a.kind === b.kind && a.value === b.value && effectiveCaseA === effectiveCaseB) return true;
-  return SAMPLE_OVERLAP_CHARS.some(
-    (ch) => atomMatchesChar(a, ch, effectiveCaseA) && atomMatchesChar(b, ch, effectiveCaseB)
-  );
+  if (SAMPLE_OVERLAP_CHARS.some((ch) => atomMatchesChar(a, ch, effectiveCaseA) && atomMatchesChar(b, ch, effectiveCaseB))) {
+    return true;
+  }
+  const extraProbes = [];
+  if (a.kind === "class" && a.value) extraProbes.push(...parseCharClassProbeChars(a.value));
+  if (b.kind === "class" && b.value) extraProbes.push(...parseCharClassProbeChars(b.value));
+  return extraProbes.some((ch) => atomMatchesChar(a, ch, effectiveCaseA) && atomMatchesChar(b, ch, effectiveCaseB));
 }
 
 function anyAtomOverlaps(listA, listB, caseSensitive = true) {
@@ -528,6 +573,7 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
       if (group.isAssertion) {
         if (group.hasBackref) parent.hasBackref = true;
         if (group.hasAlternationOverlap) parent.hasAlternationOverlap = true;
+        if (group.hasQuantifier) parent.hasQuantifier = true;
         continue;
       }
 

@@ -1,0 +1,593 @@
+/**
+ * Operaciones CRUD de archivos y carpetas del espacio de trabajo en IndexedDB.
+ */
+
+import {
+  STORE_FILES,
+  openDb,
+  normalizePath,
+  makeFileKey,
+  getRecord,
+  resolveEntryBaselineBase64,
+  broadcastWorkspaceChange
+} from "./dbCore.js";
+
+export async function getAllRawProjectEntries(projectId) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readonly");
+    const idx = tx.objectStore(STORE_FILES).index("byProject");
+    const req = idx.getAll(projectId);
+    req.onsuccess = () => resolve(Array.isArray(req.result) ? req.result : []);
+    req.onerror = () => reject(req.error);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción getAllRawProjectEntries se canceló."));
+  });
+}
+
+export async function getProjectEntries(projectId) {
+  const all = await getAllRawProjectEntries(projectId);
+  return all.filter((e) => !e.deleted);
+}
+
+export async function entryExists(projectId, rawPath) {
+  const cleanPath = normalizePath(rawPath);
+  if (!cleanPath) return false;
+  const record = await getRecord(STORE_FILES, makeFileKey(projectId, cleanPath));
+  return Boolean(record && !record.deleted);
+}
+
+export async function getEntryRecord(projectId, rawPath) {
+  const cleanPath = normalizePath(rawPath);
+  if (!cleanPath) return null;
+  const record = await getRecord(STORE_FILES, makeFileKey(projectId, cleanPath));
+  return record && !record.deleted ? record : null;
+}
+
+export async function upsertEntry(
+  projectId,
+  path,
+  {
+    isFolder = false,
+    content = "",
+    baseContent = null,
+    fromGithub = false,
+    allowOverwrite = true,
+    blobSha = null,
+    contentLoaded = true,
+    mode = null,
+    isBinary = false,
+    base64 = undefined,
+    baseBase64 = undefined,
+    skipIfDeleted = false,
+    silent = false
+  } = {}
+) {
+  const cleanPath = normalizePath(path);
+  if (!cleanPath) {
+    throw new Error("La ruta no puede estar vacía.");
+  }
+
+  const key = makeFileKey(projectId, cleanPath);
+  const parts = cleanPath.split("/");
+  const db = await openDb();
+  let writtenRecord = null;
+  let skippedDeleted = false;
+  let txErr = null;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const abortWith = (message) => {
+      txErr = new Error(message);
+      tx.abort();
+    };
+
+    const writeTarget = (latestExisting) => {
+      const resolvedIsBinary = !isFolder && Boolean(isBinary);
+      const resolvedBase = resolvedIsBinary
+        ? (typeof baseContent === "string" ? baseContent : "")
+        : (baseContent !== null
+            ? baseContent
+            : fromGithub
+              ? content
+              : latestExisting && !latestExisting.isBinary && typeof latestExisting.baseContent === "string"
+                ? latestExisting.baseContent
+                : "");
+
+      const recreatedOverUnloaded = Boolean(
+        !isFolder &&
+          !fromGithub &&
+          latestExisting &&
+          latestExisting.trackedInGithub &&
+          (latestExisting.contentLoaded === false || Boolean(latestExisting.isBinary) !== resolvedIsBinary)
+      );
+
+      const resolvedBase64 = resolvedIsBinary
+        ? (base64 !== undefined
+            ? base64
+            : (latestExisting && !latestExisting.deleted ? latestExisting.base64 : null) ?? null)
+        : null;
+      const resolvedBaseBase64 = isFolder || !resolvedIsBinary
+        ? null
+        : baseBase64 !== undefined
+          ? baseBase64
+          : fromGithub
+            ? resolvedBase64
+            : resolveEntryBaselineBase64(latestExisting);
+
+      writtenRecord = {
+        key,
+        projectId,
+        path: cleanPath,
+        isFolder,
+        content: isFolder ? "" : content,
+        baseContent: isFolder ? "" : resolvedBase,
+        blobSha: isFolder ? null : blobSha ?? latestExisting?.blobSha ?? null,
+        mode: isFolder ? null : mode ?? latestExisting?.mode ?? null,
+        contentLoaded: isFolder ? true : Boolean(contentLoaded),
+        trackedInGithub: Boolean(fromGithub || latestExisting?.trackedInGithub),
+        forceModified: recreatedOverUnloaded || Boolean(!fromGithub && latestExisting?.forceModified),
+        isBinary: resolvedIsBinary,
+        base64: resolvedBase64,
+        baseBase64: resolvedBaseBase64,
+        deleted: false,
+        updatedAt: Date.now()
+      };
+      store.put(writtenRecord);
+    };
+
+    const ensureParentAt = (idx, prefixAcc, latestExisting) => {
+      if (idx >= parts.length - 1) {
+        writeTarget(latestExisting);
+        return;
+      }
+      const nextPrefix = prefixAcc ? `${prefixAcc}/${parts[idx]}` : parts[idx];
+      const folderKey = makeFileKey(projectId, nextPrefix);
+      const fReq = store.get(folderKey);
+      fReq.onsuccess = () => {
+        const existingFolder = fReq.result || null;
+        if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
+          abortWith(`No se puede crear dentro de "${nextPrefix}" porque es un archivo.`);
+          return;
+        }
+        if (!existingFolder || existingFolder.deleted) {
+          store.put({
+            key: folderKey,
+            projectId,
+            path: nextPrefix,
+            isFolder: true,
+            content: "",
+            baseContent: "",
+            contentLoaded: true,
+            deleted: false,
+            updatedAt: Date.now()
+          });
+        }
+        ensureParentAt(idx + 1, nextPrefix, latestExisting);
+      };
+      fReq.onerror = () => reject(fReq.error);
+    };
+
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const latestExisting = req.result || null;
+      if (skipIfDeleted && latestExisting?.deleted) {
+        writtenRecord = latestExisting;
+        skippedDeleted = true;
+        return;
+      }
+      if (!allowOverwrite && latestExisting && !latestExisting.deleted) {
+        abortWith(`Ya existe "${cleanPath}" en este proyecto.`);
+        return;
+      }
+      if (latestExisting && !latestExisting.deleted && Boolean(latestExisting.isFolder) !== Boolean(isFolder)) {
+        abortWith(
+          latestExisting.isFolder
+            ? `Ya existe una carpeta llamada "${cleanPath}" en este proyecto.`
+            : `Ya existe un archivo llamado "${cleanPath}" en este proyecto.`
+        );
+        return;
+      }
+
+      if (!isFolder) {
+        const prefixKey = makeFileKey(projectId, `${cleanPath}/`);
+        const cursorReq = store.openCursor(IDBKeyRange.bound(prefixKey, `${prefixKey}\uffff`, false, true));
+        cursorReq.onsuccess = () => {
+          const cursor = cursorReq.result;
+          if (!cursor) {
+            ensureParentAt(0, "", latestExisting);
+            return;
+          }
+          if (!cursor.value?.deleted) {
+            abortWith(`Ya existe una carpeta llamada "${cleanPath}" con contenido adentro.`);
+            return;
+          }
+          cursor.continue();
+        };
+        cursorReq.onerror = () => reject(cursorReq.error);
+        return;
+      }
+
+      ensureParentAt(0, "", latestExisting);
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de guardado se canceló."));
+  });
+
+  if (!silent && !skippedDeleted) {
+    broadcastWorkspaceChange({ type: "ENTRY_UPSERTED", projectId, path: cleanPath, isFolder });
+  }
+  return writtenRecord;
+}
+
+export async function updateFileContent(projectId, path, newContent) {
+  const cleanPath = normalizePath(path);
+  if (!cleanPath) {
+    throw new Error("La ruta no puede estar vacía.");
+  }
+  const key = makeFileKey(projectId, cleanPath);
+  const db = await openDb();
+  let updatedRecord = null;
+  let needsUpsert = false;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const existing = req.result;
+      if (!existing) {
+        if (!cleanPath.includes("/")) {
+          updatedRecord = {
+            key,
+            projectId,
+            path: cleanPath,
+            isFolder: false,
+            content: newContent,
+            baseContent: "",
+            blobSha: null,
+            mode: null,
+            contentLoaded: true,
+            trackedInGithub: false,
+            forceModified: false,
+            isBinary: false,
+            base64: null,
+            baseBase64: null,
+            deleted: false,
+            updatedAt: Date.now()
+          };
+          store.put(updatedRecord);
+          return;
+        }
+        needsUpsert = true;
+        return;
+      }
+      if (existing.deleted || existing.isFolder) {
+        updatedRecord = existing;
+        return;
+      }
+      existing.content = newContent;
+      existing.contentLoaded = true;
+      existing.deleted = false;
+      existing.updatedAt = Date.now();
+      updatedRecord = existing;
+      store.put(existing);
+    };
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error("La transacción de guardado se canceló."));
+  });
+
+  if (needsUpsert) {
+    return upsertEntry(projectId, cleanPath, {
+      isFolder: false,
+      content: newContent,
+      skipIfDeleted: true
+    });
+  }
+  if (updatedRecord && !updatedRecord.deleted && !updatedRecord.isFolder) {
+    broadcastWorkspaceChange({ type: "FILE_UPDATED", projectId, path: cleanPath });
+  }
+  return updatedRecord;
+}
+
+export async function renameProjectEntry(projectId, oldPath, newPath, isFolder) {
+  const fromPath = normalizePath(oldPath);
+  const toPath = normalizePath(newPath);
+  if (!fromPath || !toPath || fromPath === toPath) {
+    return;
+  }
+
+  if (isFolder && toPath.startsWith(`${fromPath}/`)) {
+    throw new Error("No se puede mover una carpeta dentro de sí misma.");
+  }
+
+  const db = await openDb();
+  let didRename = false;
+  let resolvedIsFolder = Boolean(isFolder);
+  let txErr = null;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const abortWith = (message) => {
+      txErr = new Error(message);
+      tx.abort();
+    };
+
+    const req = store.index("byProject").getAll(projectId);
+    req.onsuccess = () => {
+      const all = Array.isArray(req.result) ? req.result : [];
+      const targetEntry = all.find((e) => !e.deleted && e.path === fromPath);
+      if (!targetEntry) {
+        return;
+      }
+      resolvedIsFolder = Boolean(targetEntry.isFolder);
+      if (resolvedIsFolder && toPath.startsWith(`${fromPath}/`)) {
+        abortWith("No se puede mover una carpeta dentro de sí misma.");
+        return;
+      }
+      const targetConflict = all.find(
+        (e) =>
+          !e.deleted &&
+          e.path !== fromPath &&
+          !(resolvedIsFolder && e.path.startsWith(`${fromPath}/`)) &&
+          (e.path === toPath || e.path.startsWith(`${toPath}/`) || (!e.isFolder && toPath.startsWith(`${e.path}/`)))
+      );
+      if (targetConflict) {
+        abortWith(`Ya existe "${targetConflict.path}" en esa ubicación.`);
+        return;
+      }
+
+      const rawByPath = new Map(all.map((e) => [e.path, e]));
+      const affected = all.filter(
+        (e) => !e.deleted && (e.path === fromPath || (resolvedIsFolder && e.path.startsWith(`${fromPath}/`)))
+      );
+
+      if (affected.length === 0) {
+        return;
+      }
+
+      for (const item of affected) {
+        const suffix = item.path.slice(fromPath.length);
+        const targetPath = `${toPath}${suffix}`;
+        const parts = targetPath.split("/");
+        if (parts.length > 1) {
+          let prefix = "";
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+            const existingFolder = rawByPath.get(prefix);
+            if (existingFolder && !existingFolder.deleted && !existingFolder.isFolder) {
+              abortWith(`No se puede crear dentro de "${prefix}" porque es un archivo.`);
+              return;
+            }
+          }
+        }
+      }
+
+      didRename = true;
+      const now = Date.now();
+      const ensuredFolders = new Set();
+
+      for (const item of affected) {
+        const suffix = item.path.slice(fromPath.length);
+        const targetPath = `${toPath}${suffix}`;
+        const parts = targetPath.split("/");
+        if (parts.length > 1) {
+          let prefix = "";
+          for (let i = 0; i < parts.length - 1; i += 1) {
+            prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+            if (ensuredFolders.has(prefix)) continue;
+            const existingFolder = rawByPath.get(prefix);
+            if (!existingFolder || existingFolder.deleted) {
+              const folderKey = makeFileKey(projectId, prefix);
+              store.put({
+                key: folderKey,
+                projectId,
+                path: prefix,
+                isFolder: true,
+                content: "",
+                baseContent: "",
+                contentLoaded: true,
+                deleted: false,
+                updatedAt: now
+              });
+            }
+            ensuredFolders.add(prefix);
+          }
+        }
+
+        const prevTarget = rawByPath.get(targetPath);
+        const preserveTargetBase =
+          prevTarget && prevTarget.trackedInGithub ? prevTarget.baseContent : item.trackedInGithub ? "" : item.baseContent;
+        const preserveTargetBaseBase64 =
+          !item.isFolder && prevTarget && prevTarget.trackedInGithub
+            ? resolveEntryBaselineBase64(prevTarget)
+            : null;
+        const recreatedOverUnloaded = Boolean(
+          !item.isFolder && prevTarget && prevTarget.trackedInGithub && prevTarget.contentLoaded === false
+        );
+        const targetKey = makeFileKey(projectId, targetPath);
+        const targetIsBinary = !item.isFolder && Boolean(item.isBinary);
+        const targetBase64 = targetIsBinary ? (item.base64 ?? null) : null;
+
+        store.put({
+          key: targetKey,
+          projectId,
+          path: targetPath,
+          isFolder: item.isFolder,
+          content: item.isFolder ? "" : item.content,
+          baseContent: item.isFolder ? "" : preserveTargetBase,
+          blobSha: item.isFolder ? null : prevTarget?.blobSha ?? null,
+          mode: item.isFolder ? null : item.mode ?? prevTarget?.mode ?? null,
+          contentLoaded: item.isFolder ? true : Boolean(item.contentLoaded ?? true),
+          trackedInGithub: Boolean(prevTarget?.trackedInGithub),
+          forceModified: recreatedOverUnloaded || Boolean(prevTarget?.forceModified),
+          isBinary: targetIsBinary,
+          base64: targetBase64,
+          baseBase64: preserveTargetBaseBase64,
+          deleted: false,
+          updatedAt: now
+        });
+
+        if (item.trackedInGithub && !item.isFolder) {
+          item.deleted = true;
+          item.content = "";
+          item.base64 = null;
+          item.updatedAt = now;
+          store.put(item);
+        } else {
+          store.delete(item.key);
+        }
+      }
+    };
+
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error);
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de renombrado se canceló."));
+  });
+
+  if (didRename) {
+    broadcastWorkspaceChange({ type: "ENTRY_RENAMED", projectId, oldPath: fromPath, newPath: toPath, isFolder: resolvedIsFolder });
+  }
+}
+
+export async function deleteProjectEntry(projectId, targetPath, isFolder) {
+  const cleanPath = normalizePath(targetPath);
+  if (!cleanPath) return;
+
+  const db = await openDb();
+  let deletedAny = false;
+  let resolvedIsFolder = Boolean(isFolder);
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const idx = store.index("byProject");
+    const req = idx.getAll(projectId);
+    req.onsuccess = () => {
+      const all = Array.isArray(req.result) ? req.result : [];
+      const targetEntry = all.find((e) => !e.deleted && e.path === cleanPath);
+      resolvedIsFolder = targetEntry ? Boolean(targetEntry.isFolder) : Boolean(isFolder);
+      const affected = all.filter(
+        (e) => !e.deleted && (e.path === cleanPath || (resolvedIsFolder && e.path.startsWith(`${cleanPath}/`)))
+      );
+      if (affected.length === 0) return;
+
+      deletedAny = true;
+      const now = Date.now();
+      for (const item of affected) {
+        if (!item.isFolder) {
+          item.deleted = true;
+          item.content = "";
+          item.base64 = null;
+          item.updatedAt = now;
+          store.put(item);
+        } else {
+          store.delete(item.key);
+        }
+      }
+    };
+    req.onerror = () => reject(req.error || new Error("Error leyendo entradas para borrar."));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("Error borrando entrada."));
+    tx.onabort = () => reject(tx.error || new Error("La transacción de borrado se canceló."));
+  });
+
+  if (deletedAny) {
+    broadcastWorkspaceChange({ type: "ENTRY_DELETED", projectId, path: cleanPath, isFolder: resolvedIsFolder });
+  }
+}
+
+/**
+ * Descarta cambios locales pendientes de un archivo frente a su estado base de GitHub:
+ * elimina archivos nuevos no trackeados, revierte modificaciones a `baseContent`/`baseBase64`
+ * o restaura archivos borrados localmente.
+ */
+export async function discardEntryChange(projectId, targetPath) {
+  const cleanPath = normalizePath(targetPath);
+  if (!cleanPath) return { discarded: false, action: null };
+
+  const key = makeFileKey(projectId, cleanPath);
+  const db = await openDb();
+  let action = null;
+  let txErr = null;
+
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_FILES, "readwrite");
+    const store = tx.objectStore(STORE_FILES);
+    const req = store.get(key);
+    req.onsuccess = () => {
+      const item = req.result;
+      if (!item || item.isFolder) return;
+      const now = Date.now();
+
+      if (!item.trackedInGithub) {
+        store.delete(key);
+        action = "removed";
+        return;
+      }
+
+      const restoredBase64 = resolveEntryBaselineBase64(item);
+      const wasDeleted = Boolean(item.deleted);
+      const hadLoadedBase = item.contentLoaded !== false || Boolean(item.baseContent) || Boolean(restoredBase64) || !item.blobSha;
+
+      item.deleted = false;
+      item.content = item.isBinary ? "" : (item.baseContent || "");
+      item.base64 = item.isBinary ? restoredBase64 : null;
+      item.forceModified = false;
+      item.contentLoaded = hadLoadedBase;
+      item.updatedAt = now;
+      store.put(item);
+      action = wasDeleted ? "restored" : "reverted";
+
+      if (wasDeleted && cleanPath.includes("/")) {
+        const parts = cleanPath.split("/");
+        let prefix = "";
+        for (let i = 0; i < parts.length - 1; i += 1) {
+          prefix = prefix ? `${prefix}/${parts[i]}` : parts[i];
+          const folderKey = makeFileKey(projectId, prefix);
+          const fReq = store.get(folderKey);
+          fReq.onsuccess = () => {
+            const folder = fReq.result;
+            if (!folder || folder.deleted) {
+              store.put({
+                key: folderKey,
+                projectId,
+                path: prefix,
+                isFolder: true,
+                content: "",
+                baseContent: "",
+                contentLoaded: true,
+                deleted: false,
+                updatedAt: now
+              });
+            }
+          };
+        }
+      }
+    };
+    req.onerror = () => {
+      txErr = req.error;
+      tx.abort();
+    };
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(txErr || tx.error || new Error("No se pudo descartar el cambio local."));
+    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de descarte se canceló."));
+  });
+
+  if (action) {
+    broadcastWorkspaceChange({
+      type: action === "removed" ? "ENTRY_DELETED" : "ENTRY_UPSERTED",
+      projectId,
+      path: cleanPath,
+      isFolder: false
+    });
+  }
+  return { discarded: Boolean(action), action };
+}

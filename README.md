@@ -6,10 +6,10 @@
 
 **Studio IDE** es un entorno de desarrollo web ligero, modular y 100% offline-first sin servidores intermedios, diseñado específicamente para programar con fluidez desde un **iPad** (instalado como PWA a pantalla completa en Safari y adaptable a ventanas de **Stage Manager**) así como desde una **PC de escritorio**.
 
-- **Versión actual:** `1.2.0`
+- **Versión actual:** `1.4.0`
 - **Aplicación web (GitHub Pages):** https://mbouso420-spec.github.io/ide-ipad/
 - **Manual de Usuario paso a paso:** [Ver Manual de Usuario completo (`MANUAL_DE_USUARIO.md`)](./MANUAL_DE_USUARIO.md)
-- **Suite de pruebas automáticas:** 599 pruebas automatizadas en 140 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
+- **Suite de pruebas automáticas:** 655 pruebas automatizadas en 154 suites + suites E2E en Chromium (`npm --prefix tests run test:e2e`) y WebKit/Safari (`npm --prefix tests run test:e2e:webkit`) (tests unitarios, bundler de módulos ES offline, lazy loading de runtimes, integridad PWA SW v31, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening* y pruebas E2E en navegadores reales, 0 fallos en la suite rápida).
 
 ---
 
@@ -96,9 +96,9 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v30` y `studio-ide-runtime-v2`):**
-   - Estrategia **Network-First** para el App Shell propio con reintento/fallback en precacheo, soporte `{ ignoreSearch: true }`, y protección contra respuestas HTTP 5xx sobre caché válido.
-   - Pre-cacheo completo de los módulos vigentes (incluyendo `js/preview/moduleBundler.js`, `js/security/credentialGuard.js`, `js/security/keyVaultCrypto.js`, `js/github/githubMerge.js`, `js/editor/codeFormatter.js`, `js/preview/tsTranspiler.js`, `js/preview/htmlBundler.js`, el analizador sintáctico Acorn, las 16 dependencias CDN del importmap CodeMirror/Octokit con precalentamiento acotado de sub-chunks de `esm.sh` y Pyodide en best-effort) durante el evento `install`, y revalidación SWR CDN con `event.waitUntil` sin almacenar respuestas `opaque`.
+2. **Service Worker (`studio-ide-shell-v31` y `studio-ide-runtime-v2`):**
+   - Estrategia **Network-First** para el App Shell propio con reintentos exponenciales en precacheo, soporte `{ ignoreSearch: true }`, y protección contra respuestas HTTP 5xx sobre caché válido.
+   - Pre-cacheo completo de los módulos y submódulos vigentes (incluyendo el sistema modular de `tsTranspiler` (`js/preview/ts/`), `moduleBundler` (`js/preview/bundler/`), `htmlBundler` (`js/preview/html/`), `workspaceDb` (`js/storage/db/`), `liveLinter.js`, `mentionPopover.js`, `markdownRenderer.js`, `projectModal.js`, `wasiRunner.js`, `clangWorker.js`, `githubBlobCache.js`, `credentialGuard.js`, `keyVaultCrypto.js`, `githubMerge.js`, `codeFormatter.js`, el analizador sintáctico Acorn, las 16 dependencias CDN del importmap CodeMirror/Octokit con precalentamiento acotado de sub-chunks de `esm.sh` y caché bajo demanda de `@yowasp/clang` WASM con timeout extendido de 60 s).
 3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js` y `js/security/keyVaultCrypto.js`):**
    - **Lockout progresivo y persistente (*Exponential Backoff & Lockout*):** ante intentos fallidos consecutivos (umbral de 4 fallos en `LOCKOUT_THRESHOLD`), bloquea nuevas peticiones por *scope* aislado (`github` y `ai:<providerId>`) con ventanas progresivas de `30s -> 2m -> 5m` (`LOCKOUT_DURATIONS_MS`) persistidas entre recargas (`localStorage` / `sessionStorage`).
    - **Validación pre-vuelo de formato y entropía:** inspecciona localmente longitud, ausencia de espacios internos, prefijos esperados y entropía antes de ejecutar `fetch()`, bloqueando caracteres de control e inyecciones CRLF (`\r`/`\n`) en cabeceras HTTP.
@@ -118,7 +118,7 @@
 .
 ├── index.html                  # Shell principal, CSP, diálogos modales accesibles y maquetación
 ├── manifest.json               # Manifiesto Web App (PWA standalone para iPadOS y escritorio)
-├── sw.js                       # Service Worker v30 (App Shell + Runtime Cache v2 de Acorn/Importmap/CDNs)
+├── sw.js                       # Service Worker v31 (App Shell modular + Runtime Cache v2 de Acorn/Importmap/WASM)
 ├── .github/workflows/ci.yml    # CI en GitHub Actions (lint, Node QA, Chromium E2E y WebKit E2E)
 ├── .nojekyll                   # Desactiva el procesamiento de Jekyll en GitHub Pages
 ├── README.md                   # Documentación técnica y arquitectura de la solución
@@ -142,17 +142,21 @@
 │   │   ├── smartReplace.js     # Reemplazo inteligente de fragmentos IA por similitud estructural
 │   │   ├── autocompleteCatalog.js # Vocabulario por lenguaje y barra táctil de sugerencias
 │   │   ├── splitEditorController.js # Vista dividida paralela con redimensionamiento sincronizado
+│   │   ├── liveLinter.js       # Diagnóstico / linting en vivo (500ms) para JS (Acorn lazy), JSON y HTML
 │   │   ├── minimap.js          # Minimapa lateral de código
 │   │   └── codeFormatter.js    # Formateador offline determinista (Shift+Alt+F)
 │   ├── storage/
-│   │   ├── workspaceDb.js      # Persistencia IndexedDB y modelo de diferencias locales
+│   │   ├── db/                 # Submódulos DB: núcleo, plantillas (5 presets), entradas, proyectos y sync GitHub
+│   │   ├── workspaceDb.js      # Fachada unificada IndexedDB, diferencias locales y descarte de cambios
 │   │   ├── emergencyBackup.js  # Respaldo síncrono para suspensiones de Safari
 │   │   ├── fileImport.js       # Decodificación segura de archivos con límite de 5 MB
 │   │   ├── storageQuota.js     # Monitor de cuota y uso (navigator.storage.estimate)
 │   │   └── zipExporter.js      # Exportador ZIP nativo (PKZIP 2.0 y CRC-32)
 │   ├── ai/
 │   │   ├── providers.js        # Adaptadores de proveedores de IA y bóveda de claves
-│   │   └── chatController.js   # Chat contextual, contador de tokens y saneamiento
+│   │   ├── markdownRenderer.js # Renderizado Markdown seguro para respuestas IA y bloques multi-archivo
+│   │   ├── mentionPopover.js   # Autocompletado `@archivo` (hasta 8 adjuntos) en el chat IA
+│   │   └── chatController.js   # Orquestador del chat contextual, contador de tokens y saneamiento
 │   ├── github/
 │   │   ├── githubService.js    # Cliente REST GitHub (árboles, ramas, blobs y push atómico)
 │   │   ├── githubMerge.js      # Pull 3-way seguro y resolución selectiva de conflictos
@@ -162,14 +166,19 @@
 │   │   └── networkErrors.js    # Manejo amigable y categorización de fallas de red
 │   ├── preview/
 │   │   ├── previewUtils.js     # Utilidades compartidas de rutas, extensiones y escape seguro
-│   │   ├── htmlBundler.js      # Empaquetado multi-archivo HTML/CSS/JS/TS y Mini-REPL
-│   │   ├── moduleBundler.js    # Compilador y resolver offline de módulos ES para iframe sandbox
+│   │   ├── html/               # Submódulos del bundler HTML: assets, entrypoints, console bridge y vistas previas
+│   │   ├── htmlBundler.js      # Fachada de empaquetado multi-archivo HTML/CSS/JS/TS y Mini-REPL
+│   │   ├── bundler/            # Submódulos del bundler ES: resolución de rutas, AST scanner, live bindings y runtime
+│   │   ├── moduleBundler.js    # Fachada offline de módulos ES para iframe sandbox
 │   │   ├── markdownPreview.js  # Renderizado sanitizado de vistas previas Markdown
 │   │   ├── pythonRunner.js     # Ejecutor aislado de Python 3 (Pyodide Web Worker) con entrada inline
-│   │   ├── tsTranspiler.js     # Transpilador ligero 100% offline para TypeScript y JSX/TSX
+│   │   ├── ts/                 # Submódulos TS/JSX: tokenizador léxico, expansor JSX y extractor de tipos
+│   │   ├── tsTranspiler.js     # Fachada del transpilador 100% offline para TypeScript y JSX/TSX
 │   │   ├── loopGuard.js        # Protección contra bucles infinitos en JS/HTML vía AST
 │   │   ├── sqlRunner.js        # Motor de bases de datos SQLite interactivo con sql.js (WebAssembly)
-│   │   └── cRunner.js          # Compilador y ejecutor interactivo multi-archivo de C y C++ (Wandbox)
+│   │   ├── wasiRunner.js       # Runtime WASI preview1 puro en navegador/Worker (stdin/stdout/proc_exit)
+│   │   ├── clangWorker.js      # Web Worker módulo ES bajo demanda con @yowasp/clang WASM (~23 MB lazy)
+│   │   └── cRunner.js          # Compilador C/C++ (Wandbox online + fallback automático/manual a Clang WASM)
 │   ├── security/
 │   │   ├── credentialGuard.js  # Bloqueo anti-fuerza bruta, validación pre-vuelo, huellas y redacción
 │   │   └── keyVaultCrypto.js   # Cifrado portátil AES-GCM 256 + PBKDF2-SHA256 de credenciales
@@ -182,10 +191,11 @@
 │       ├── globalSearchModal.js # Modal de búsqueda y reemplazo global en proyecto
 │       ├── settingsModal.js    # Gestión segura de claves, idioma de interfaz y ajustes
 │       ├── keyboardRouter.js   # Enrutador global de atajos de teclado (Cmd/Ctrl)
-│       ├── diffModal.js        # Visor de diferencias LCS línea por línea
+│       ├── diffModal.js        # Visor de diferencias LCS por archivo y multi-archivo con selección/navegación
+│       ├── projectModal.js     # Modal selector de 5 plantillas al crear proyectos locales nuevos
 │       ├── livePreviewModal.js # Previsualización multi-página, selector de páginas, REPL y medidas
 │       └── icons.js            # Iconografía SVG optimizada
-└── tests/                      # Suite automatizada con 590 pruebas en 139 suites + E2E Chromium y WebKit
+└── tests/                      # Suite automatizada con 655 pruebas en 154 suites + E2E Chromium y WebKit
 ```
 
 ---
@@ -203,8 +213,8 @@ npm --prefix tests run test:e2e:webkit
 
 Resultado actual:
 - **1/1 verificación de análisis estático (ESLint)** limpia sobre `js/**/*.js`, `sw.js`, `scripts/*.js` y `tests/*.{js,mjs}` (`no-undef` + `no-unused-vars`).
-- **590 pruebas automatizadas en Node** distribuidas en **139 suites** (`npm --prefix tests test`: unitarias, regresiones de auditoría y ronda 2, bundler ES Modules multi-archivo offline, lazy loading y aislamiento QA, integridad PWA SW v30, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX), **0 fallos, 0 pruebas canceladas**.
-- **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v30, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless (ejecutada en CI fuera de sandbox).
+- **655 pruebas automatizadas en Node** distribuidas en **154 suites** (`npm --prefix tests test`: unitarias, regresiones de auditoría, bundler ES Modules multi-archivo offline, `@archivo` + diff multi-archivo, WASI + fallback C/C++ WASM, pre-commit selectivo y descarte, 5 plantillas de proyecto, linting en vivo JS/JSON/HTML, lazy loading y aislamiento QA, integridad PWA SW v31, concurrencia multi-pestaña, *Soak & Endurance*, *AppSec Auth Hardening*, bóveda WebCrypto, merge 3-way, formateador y TS/JSX), **0 fallos, 0 pruebas canceladas**.
+- **Suite E2E en navegador real Chromium (`tests/browser.e2e.mjs`):** arranque, SW v31, IndexedDB, formateador + Undo, TSX/ES Modules multi-archivo en `iframe srcdoc` bajo CSP, Mini-REPL, AES-GCM WebCrypto y rotación iPadOS verificados en Chromium headless.
 - **Suite E2E Cross-Engine en WebKit (`tests/webkit.e2e.mjs`):** render táctil iPadOS portrait/landscape sin desbordes, IndexedDB, formateador, ES Modules multi-archivo en CSP y WebCrypto verificados en motor WebKit (Playwright, ejecutada en CI fuera de sandbox).
 
 ---

@@ -1,11 +1,11 @@
+import { ACORN_CDN_URL } from "../editor/liveLinter.js";
 import { normalizePath } from "../storage/workspaceDb.js";
 import { redactSensitiveTokens } from "../security/credentialGuard.js";
 import { instrumentLoops } from "../preview/loopGuard.js";
-import { isBlockedPreviewUrlScheme } from "../preview/previewUtils.js";
+import { isBlockedPreviewUrlScheme, isIgnoredPreviewPath } from "../preview/previewUtils.js";
 import { buildSqlRunnerPreview } from "../preview/sqlRunner.js";
 import { mountCRunnerView } from "../preview/cRunner.js";
 
-const ACORN_URL = "https://esm.sh/acorn@8.14.0";
 let acornModule = null;
 let acornLoading = null;
 
@@ -14,7 +14,7 @@ function loadAcorn() {
   if (!acornLoading) {
     let timeoutId = null;
     acornLoading = Promise.race([
-      import(ACORN_URL),
+      import(ACORN_CDN_URL),
       new Promise((_, reject) => {
         timeoutId = window.setTimeout(() => reject(new Error("timeout")), 5000);
       })
@@ -57,7 +57,6 @@ import {
   JAVA_EXTENSIONS,
   CSHARP_EXTENSIONS,
   TS_EXTENSIONS,
-  IGNORED_PREVIEW_DIRS,
   getFileExtension,
   getParentFolder,
   filterFolderScopeFiles,
@@ -132,8 +131,6 @@ export function initLivePreviewModal({
   let consoleVisible = true;
   let hasControlledSrcdoc = false;
   let expectingControlledLoad = false;
-  let idleAcornHandle = null;
-  let idleAcornUsesIdleApi = false;
   let previewRunSeq = 0;
   let renderSeq = 0;
   let destroyed = false;
@@ -166,11 +163,7 @@ export function initLivePreviewModal({
     if (!pageSelect) return;
     const validHtmlFiles = (allFiles || []).filter((f) => {
       if (!f || !f.path) return false;
-      const clean = normalizePath(f.path);
-      const parts = clean.split("/");
-      for (const part of parts) {
-        if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) return false;
-      }
+      if (isIgnoredPreviewPath(normalizePath(f.path))) return false;
       const ext = getFileExtension(f.path);
       return HTML_EXTENSIONS.has(ext);
     });
@@ -419,17 +412,6 @@ export function initLivePreviewModal({
       }
     }, listenOpts);
   });
-
-  // Precargar el analizador Acorn en segundo plano para tener el guardián listo de inmediato
-  if (typeof window !== "undefined") {
-    if (typeof window.requestIdleCallback === "function") {
-      idleAcornUsesIdleApi = true;
-      idleAcornHandle = window.requestIdleCallback(() => void loadAcorn());
-    } else {
-      idleAcornUsesIdleApi = false;
-      idleAcornHandle = window.setTimeout(() => void loadAcorn(), 1500);
-    }
-  }
 
   openBtn?.addEventListener("click", async () => {
     if (destroyed) return;
@@ -1147,14 +1129,6 @@ export function initLivePreviewModal({
     destroy() {
       destroyed = true;
       renderSeq += 1;
-      if (idleAcornHandle !== null && typeof window !== "undefined") {
-        if (idleAcornUsesIdleApi && typeof window.cancelIdleCallback === "function") {
-          window.cancelIdleCallback(idleAcornHandle);
-        } else {
-          window.clearTimeout(idleAcornHandle);
-        }
-        idleAcornHandle = null;
-      }
       stopIframe();
       controller?.abort();
     }

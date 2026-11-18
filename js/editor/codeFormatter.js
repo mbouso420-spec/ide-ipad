@@ -176,6 +176,7 @@ function formatBraceCode(code, lang, indentSize) {
   const rawLineIndices = new Set();
   let braceDepth = 0;
   const caseStack = [];
+  let activeCaseCount = 0;
   let inBlockComment = false;
   let inGoRawString = false;
   let cSharpRawDelim = "";
@@ -197,7 +198,7 @@ function formatBraceCode(code, lang, indentSize) {
       if (!trimmed) {
         out.push("");
       } else {
-        const extraCase = caseStack.filter(Boolean).length;
+        const extraCase = activeCaseCount;
         const pad = unit.repeat(Math.max(0, braceDepth + extraCase));
         out.push(trimmed.startsWith("*") ? `${pad} ${trimmed}` : `${pad}${trimmed}`);
       }
@@ -230,7 +231,7 @@ function formatBraceCode(code, lang, indentSize) {
         let displayDepth = braceDepth - leadingCloseCount;
         if (displayDepth < 0) displayDepth = 0;
 
-        let activeCasesBeforeLine = caseStack.filter(Boolean).length;
+        let activeCasesBeforeLine = activeCaseCount;
         if (leadingCloseCount > 0) {
           for (let k = 0; k < leadingCloseCount && k < caseStack.length; k += 1) {
             if (caseStack[caseStack.length - 1 - k]) {
@@ -485,7 +486,7 @@ function formatBraceCode(code, lang, indentSize) {
           templateStack[templateStack.length - 1].exprDepth -= 1;
           if (templateStack[templateStack.length - 1].exprDepth === 0) {
             if (braceDepth > 0) braceDepth -= 1;
-            if (caseStack.length > 0) caseStack.pop();
+            if (caseStack.length > 0 && caseStack.pop()) activeCaseCount -= 1;
             prevNonSpace = "";
             prevWord = "";
             continue;
@@ -510,7 +511,7 @@ function formatBraceCode(code, lang, indentSize) {
         caseStack.push(false);
       } else if (ch === "}") {
         if (braceDepth > 0) braceDepth -= 1;
-        if (caseStack.length > 0) caseStack.pop();
+        if (caseStack.length > 0 && caseStack.pop()) activeCaseCount -= 1;
       } else if (hasRegexLiterals && ((ch === "+" && next === "+") || (ch === "-" && next === "-"))) {
         // Postfix/prefix ++ y -- terminan o preceden un operando, nunca un literal /regex/
         i += 1;
@@ -526,7 +527,11 @@ function formatBraceCode(code, lang, indentSize) {
     }
 
     if (startsCase && caseTopIdxBeforeLine >= 0 && caseTopIdxBeforeLine < caseStack.length) {
-      caseStack[caseTopIdxBeforeLine] = braceDepth <= braceDepthBeforeLine;
+      const nextCaseVal = braceDepth <= braceDepthBeforeLine;
+      if (caseStack[caseTopIdxBeforeLine] !== nextCaseVal) {
+        caseStack[caseTopIdxBeforeLine] = nextCaseVal;
+        activeCaseCount += nextCaseVal ? 1 : -1;
+      }
     }
   }
 
@@ -910,7 +915,7 @@ function formatHtml(code, indentSize) {
 
 function formatSql(code) {
   const src = normalizeLineEndings(code);
-  let out = "";
+  const out = [];
   let quote = "";
   let inBlockComment = false;
   let inLineComment = false;
@@ -920,24 +925,24 @@ function formatSql(code) {
     const next = src[i + 1] || "";
 
     if (inLineComment) {
-      out += ch;
+      out.push(ch);
       if (ch === "\n") inLineComment = false;
       continue;
     }
     if (inBlockComment) {
-      out += ch;
+      out.push(ch);
       if (ch === "*" && next === "/") {
-        out += "/";
+        out.push("/");
         inBlockComment = false;
         i += 1;
       }
       continue;
     }
     if (quote) {
-      out += ch;
+      out.push(ch);
       if (ch === quote) {
         if (next === quote) {
-          out += next;
+          out.push(next);
           i += 1;
         } else {
           quote = "";
@@ -948,19 +953,19 @@ function formatSql(code) {
 
     if (ch === "-" && next === "-") {
       inLineComment = true;
-      out += "--";
+      out.push("--");
       i += 1;
       continue;
     }
     if (ch === "/" && next === "*") {
       inBlockComment = true;
-      out += "/*";
+      out.push("/*");
       i += 1;
       continue;
     }
     if (ch === "'" || ch === '"' || ch === "`") {
       quote = ch;
-      out += ch;
+      out.push(ch);
       continue;
     }
 
@@ -972,15 +977,15 @@ function formatSql(code) {
       const word = src.slice(i, j);
       const upper = word.toUpperCase();
       const prevChar = i > 0 ? src[i - 1] : "";
-      out += prevChar !== "." && SQL_KEYWORDS.has(upper) ? upper : word;
+      out.push(prevChar !== "." && SQL_KEYWORDS.has(upper) ? upper : word);
       i = j - 1;
       continue;
     }
 
-    out += ch;
+    out.push(ch);
   }
 
-  return finalizeOutput(out.split("\n").map((line) => line.replace(/[ \t]+$/, "")));
+  return finalizeOutput(out.join("").split("\n").map((line) => line.replace(/[ \t]+$/, "")));
 }
 
 function formatPythonSafe(code) {

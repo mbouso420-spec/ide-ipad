@@ -3,7 +3,9 @@
  */
 
 import { normalizePath } from "../storage/workspaceDb.js";
+import { getImageMimeType } from "../storage/fileImport.js";
 import { escapeHtml } from "../utils/dom.js";
+import { base64ToBytes } from "../utils/encoding.js";
 
 export { normalizePath, escapeHtml };
 
@@ -39,6 +41,20 @@ export const IGNORED_PREVIEW_DIRS = new Set([
   ".turbo",
   "out"
 ]);
+
+/**
+ * Indica si alguna carpeta de la ruta pertenece a directorios de artefactos/dependencias ignorados.
+ * @param {string} filePath
+ * @returns {boolean}
+ */
+export function isIgnoredPreviewPath(filePath) {
+  for (const part of String(filePath || "").split("/")) {
+    if (IGNORED_PREVIEW_DIRS.has(part.toLowerCase())) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export function getFileExtension(path) {
   const base = String(path || "").split(/[/\\]/).pop() || "";
@@ -132,6 +148,12 @@ const SVG_DANGEROUS_TAG_NAMES = new Set([
 
 const SVG_URI_ATTR_NAMES = new Set(["href", "xlink:href", "src", "action", "formaction"]);
 
+function getSvgLocalName(rawName) {
+  const lower = String(rawName || "").toLowerCase();
+  const colonIdx = lower.lastIndexOf(":");
+  return colonIdx !== -1 ? lower.slice(colonIdx + 1) : lower;
+}
+
 function decodeSvgAttrValue(val) {
   let out = String(val || "");
   for (let pass = 0; pass < 2; pass += 1) {
@@ -211,12 +233,13 @@ function sanitizeSvgOpeningTag(tagSource) {
   while (i < len && !/[\s/>]/.test(tagSource[i])) i += 1;
   const tagName = tagSource.slice(nameStart, i);
   const tagLower = tagName.toLowerCase();
+  const tagLocal = getSvgLocalName(tagLower);
   const isTagSelfClosing = !isClose && /\/\s*>$/.test(tagSource);
-  if (!tagName || SVG_DANGEROUS_TAG_NAMES.has(tagLower)) {
-    return { removed: true, tagLower, isClose, isSelfClosing: isTagSelfClosing, html: "" };
+  if (!tagName || SVG_DANGEROUS_TAG_NAMES.has(tagLower) || SVG_DANGEROUS_TAG_NAMES.has(tagLocal)) {
+    return { removed: true, tagLower, tagLocal, isClose, isSelfClosing: isTagSelfClosing, html: "" };
   }
   if (isClose) {
-    return { removed: false, tagLower, isClose: true, isSelfClosing: false, html: `</${tagName}>` };
+    return { removed: false, tagLower, tagLocal, isClose: true, isSelfClosing: false, html: `</${tagName}>` };
   }
 
   let selfClosing = false;
@@ -263,10 +286,15 @@ function sanitizeSvgOpeningTag(tagSource) {
     }
 
     const attrLower = attrName.toLowerCase();
-    if (attrLower.startsWith("on")) {
+    const attrLocal = getSvgLocalName(attrLower);
+    if (attrLower.startsWith("on") || attrLocal.startsWith("on")) {
       continue;
     }
-    if (rawAttrVal !== null && SVG_URI_ATTR_NAMES.has(attrLower) && isDangerousSvgUri(rawAttrVal)) {
+    if (
+      rawAttrVal !== null &&
+      (SVG_URI_ATTR_NAMES.has(attrLower) || SVG_URI_ATTR_NAMES.has(attrLocal)) &&
+      isDangerousSvgUri(rawAttrVal)
+    ) {
       keptAttrs.push(`${attrName}="#"`);
       continue;
     }
@@ -283,7 +311,9 @@ function sanitizeSvgOpeningTag(tagSource) {
   const closeSlash = selfClosing ? " /" : "";
   return {
     removed: false,
+    tagName,
     tagLower,
+    tagLocal,
     isClose: false,
     isSelfClosing: selfClosing,
     html: `<${tagName}${attrStr}${closeSlash}>`
@@ -374,7 +404,7 @@ export function sanitizeSvgMarkup(svgMarkup) {
       const parsed = sanitizeSvgOpeningTag(rawTag);
 
       if (skipDepthTag) {
-        if (parsed.isClose && parsed.tagLower === skipDepthTag) {
+        if (parsed.isClose && (parsed.tagLocal === skipDepthTag || parsed.tagLower === skipDepthTag)) {
           skipDepthTag = null;
         }
         i = j;
@@ -383,17 +413,17 @@ export function sanitizeSvgMarkup(svgMarkup) {
 
       if (parsed.removed) {
         if (!parsed.isClose && !parsed.isSelfClosing) {
-          skipDepthTag = parsed.tagLower;
+          skipDepthTag = parsed.tagLocal || parsed.tagLower;
         }
         i = j;
         continue;
       }
 
-      if (parsed.tagLower === "style" && !parsed.isClose && !parsed.isSelfClosing) {
+      if (parsed.tagLocal === "style" && !parsed.isClose && !parsed.isSelfClosing) {
         const restAfterStyle = input.slice(j);
-        const closeStyleMatch = /<\/style\s*>/i.exec(restAfterStyle);
+        const closeStyleMatch = /<\/(?:[a-z0-9_-]+:)?style\s*>/i.exec(restAfterStyle);
         const cssBody = closeStyleMatch ? restAfterStyle.slice(0, closeStyleMatch.index) : restAfterStyle;
-        out.push(parsed.html, sanitizeSvgStyleBlock(cssBody), "</style>");
+        out.push(parsed.html, sanitizeSvgStyleBlock(cssBody), `</${parsed.tagName}>`);
         i = closeStyleMatch ? j + closeStyleMatch.index + closeStyleMatch[0].length : len;
         continue;
       }
@@ -416,4 +446,92 @@ export function sanitizeSvgMarkup(svgMarkup) {
     return null;
   }
   return cleaned;
+}
+
+const PREVIEW_BASE64_RE = /^[A-Za-z0-9+/_=-]+$/;
+
+/**
+ * Escapa cierres `</script` para inyectar JS seguro dentro de etiquetas `<script>`.
+ */
+export const escapeCloseScript = (js) => String(js ?? "").replace(/<\/script(?=[\s>/]|$)/gi, "<\\/script");
+
+/**
+ * Serializa datos JSON de forma segura para embeber dentro de `<script>`,
+ * neutralizando tanto `</script` como secuencias HTML5 `<!-- <script>`.
+ * @param {any} value
+ * @returns {string}
+ */
+export function escapeJsonForInlineScript(value) {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+/**
+ * Construye una URL `data:` segura para una imagen o SVG del workspace.
+ * Siempre sanea SVG incluso cuando se almacenó con `base64` o `isBinary: true`.
+ *
+ * @param {object} entry
+ * @param {string} [refPath=""]
+ * @param {{ mimeResolver?: (p: string) => string, budgetCheck?: (bytesLen: number, isSvg: boolean) => boolean }} [options]
+ * @returns {{ src: string, isSvg: boolean, byteLength: number } | null}
+ */
+export function buildSafeImageDataUrl(
+  entry,
+  refPath = "",
+  { mimeResolver = getImageMimeType, budgetCheck = null } = {}
+) {
+  if (!entry) return null;
+  const targetPath = entry.path || refPath || "";
+  const ext = getFileExtension(targetPath);
+  const rawB64 =
+    typeof entry.base64 === "string" && entry.base64.length > 0
+      ? entry.base64
+      : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
+        ? entry.content
+        : null;
+  const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
+  const safeB64 = compactB64 && PREVIEW_BASE64_RE.test(compactB64) ? compactB64 : null;
+
+  if (ext === "svg") {
+    let svgText = typeof entry.content === "string" && entry.content.trim().length > 0 && !entry.isBinary
+      ? entry.content
+      : "";
+    if (!svgText && safeB64) {
+      try {
+        const stdB64 = safeB64.replace(/-/g, "+").replace(/_/g, "/");
+        svgText = new TextDecoder("utf-8", { fatal: false }).decode(base64ToBytes(stdB64));
+      } catch {
+        svgText = "";
+      }
+    }
+    if (!svgText.trim()) return null;
+    if (typeof budgetCheck === "function" && !budgetCheck(svgText.length, true)) return null;
+    const sanitizedSvg = sanitizeSvgMarkup(svgText);
+    if (!sanitizedSvg) return null;
+    try {
+      const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
+        .replace(/'/g, "%27")
+        .replace(/"/g, "%22");
+      return {
+        src: `data:image/svg+xml;charset=utf-8,${encodedSvg}`,
+        isSvg: true,
+        byteLength: sanitizedSvg.length
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  if (safeB64) {
+    if (typeof budgetCheck === "function" && !budgetCheck(safeB64.length, false)) return null;
+    const mime = mimeResolver(targetPath);
+    return {
+      src: `data:${mime};base64,${safeB64}`,
+      isSvg: false,
+      byteLength: Math.floor((safeB64.length * 3) / 4)
+    };
+  }
+  return null;
 }

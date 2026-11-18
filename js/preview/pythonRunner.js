@@ -311,14 +311,15 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
     }
     function writeFiles(py, job) {
-      if (typeof job.code === "string") {
+      var entrySource = typeof job.entryCode === "string" ? job.entryCode : job.code;
+      if (typeof entrySource === "string") {
         if (job.entryName) {
           ensureParentDirs(py.FS, job.entryName);
-          try { py.FS.writeFile(job.entryName, job.code, { encoding: "utf8" }); } catch (_) {}
+          try { py.FS.writeFile(job.entryName, entrySource, { encoding: "utf8" }); } catch (_) {}
         }
         if (job.entryPath && job.entryPath !== job.entryName) {
           ensureParentDirs(py.FS, job.entryPath);
-          try { py.FS.writeFile(job.entryPath, job.code, { encoding: "utf8" }); } catch (_) {}
+          try { py.FS.writeFile(job.entryPath, entrySource, { encoding: "utf8" }); } catch (_) {}
         }
       }
       var mods = Array.isArray(job.modules) ? job.modules : [];
@@ -565,6 +566,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         runner.post({
           type: "eval",
           code: code,
+          entryCode: payload.code,
           entryName: payload.entryName,
           entryPath: payload.entryPath,
           modules: payload.modules

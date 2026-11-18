@@ -6,7 +6,7 @@
  * cuerpo de cada bucle. El guardián mide cuánto tiempo seguido estuvo bloqueada la página (sin que el
  * navegador pudiera atender otras tareas) y, si supera el límite, corta la ejecución con un error claro.
  */
-export const LOOP_GUARD_LIMIT_MS = 2500;
+const LOOP_GUARD_LIMIT_MS = 2500;
 
 const LOOP_TYPES = new Set([
   "WhileStatement",

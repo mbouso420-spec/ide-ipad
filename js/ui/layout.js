@@ -235,8 +235,6 @@ export function initLayoutController() {
     isRightPanelOpen: () => rightOpen,
     toggleLeftPanel: () => setLeftOpen(!leftOpen),
     toggleRightPanel: () => setRightOpen(!rightOpen),
-    setLeftOpen,
-    setRightOpen,
     isZenMode: () => isZenActive,
     toggleZenMode: (force) => toggleZenMode(force),
     closeLeftOnCompactSelect() {

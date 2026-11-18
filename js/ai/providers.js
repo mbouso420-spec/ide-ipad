@@ -156,7 +156,7 @@ export const AI_PROVIDERS = {
  * @returns {number}
  */
 export function getModelContextWindow(providerId, modelId) {
-  const provider = AI_PROVIDERS[providerId];
+  const provider = Object.hasOwn(AI_PROVIDERS, providerId) ? AI_PROVIDERS[providerId] : null;
   if (!provider) return 16000;
   if (modelId) {
     const models = getProviderModels(providerId);
@@ -340,6 +340,12 @@ export function exportKeysBundle() {
   return JSON.stringify(bundle);
 }
 
+export function getSyncCredentialsBackupPayload() {
+  return getKeyStorageMode() === "session" || !hasStoredCredentials()
+    ? ""
+    : exportKeysBundle();
+}
+
 function isValidImportedSecretString(raw) {
   if (typeof raw !== "string" || CONTROL_CHARS_RE.test(raw) || NON_BYTE_STRING_RE.test(raw)) {
     return false;
@@ -363,7 +369,12 @@ export function importKeysBundle(rawJson) {
       count += 1;
     }
   }
-  const ghVal = parsed.githubPat || parsed.github || parsed.ghToken || parsed.token;
+  const ghVal =
+    (Object.hasOwn(parsed, "githubPat") && parsed.githubPat) ||
+    (Object.hasOwn(parsed, "github") && parsed.github) ||
+    (Object.hasOwn(parsed, "ghToken") && parsed.ghToken) ||
+    (Object.hasOwn(parsed, "token") && parsed.token) ||
+    null;
   if (isValidImportedSecretString(ghVal)) {
     try {
       const cleanPat = ghVal.trim();
@@ -476,7 +487,7 @@ const KEY_CHECK_ENDPOINTS = {
  */
 export async function validateApiKey(providerId, apiKey, signal) {
   const scope = aiScope(providerId);
-  const check = KEY_CHECK_ENDPOINTS[providerId];
+  const check = Object.hasOwn(KEY_CHECK_ENDPOINTS, providerId) ? KEY_CHECK_ENDPOINTS[providerId] : null;
   const label = providerLabel(providerId);
 
   const lockState = checkAuthLockout(scope);
@@ -788,7 +799,7 @@ export async function streamAiCompletion({
   onModelsSynced,
   signal
 }) {
-  const provider = AI_PROVIDERS[providerId] ?? AI_PROVIDERS.gemini;
+  const provider = (Object.hasOwn(AI_PROVIDERS, providerId) ? AI_PROVIDERS[providerId] : null) ?? AI_PROVIDERS.gemini;
   const scope = aiScope(provider.id);
 
   // 1. Verificar bloqueo progresivo por fuerza bruta antes de cualquier llamada de red

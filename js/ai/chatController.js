@@ -1,6 +1,5 @@
 import { icon } from "../ui/icons.js";
 import { escapeHtml } from "../utils/dom.js";
-import { splitMarkdownCodeFences } from "../preview/markdownPreview.js";
 import {
   AI_PROVIDERS,
   PROVIDER_SHORT_NAMES,
@@ -16,7 +15,7 @@ import {
   getProviderModels,
   getSavedModel,
   getSavedProviderId,
-  hasStoredCredentials,
+  getSyncCredentialsBackupPayload,
   importKeysBundle,
   isAbortError,
   saveApiKey,
@@ -35,14 +34,38 @@ import {
   validateCredentialFormat
 } from "../security/credentialGuard.js";
 import { broadcastWorkspaceChange, saveCredentialsBackup } from "../storage/workspaceDb.js";
+import {
+  cleanHistoryForAi,
+  truncateCodeContent,
+  detectFilePathFromCodeSegment,
+  parseMarkdownSegments,
+  parseMarkdownSegmentsIncremental,
+  formatProseHtml,
+  estimateTokens,
+  formatInlineMarkdown,
+  copyToClipboardSafe
+} from "./markdownRenderer.js";
+import { MAX_AI_ATTACHMENTS, createMentionPopover } from "./mentionPopover.js";
+
+export {
+  cleanHistoryForAi,
+  truncateCodeContent,
+  detectFilePathFromCodeSegment,
+  parseMarkdownSegments,
+  formatProseHtml,
+  estimateTokens,
+  formatInlineMarkdown,
+  MAX_AI_ATTACHMENTS
+};
 
 /**
  * Controlador del Asistente IA estilo Antigravity (depurado 100% para APIs gratuitas):
- * - Google Gemini Gratis (con respaldo automático si un modelo Flash está con alta demanda)
- * - Groq Gratis, GitHub Models Gratis, OpenRouter (:free) y Mistral/Codestral Gratis
+ * - Google Gemini Gratis, Groq Gratis, OpenRouter (:free) y Mistral/Codestral Gratis
+ * - Contexto multi-archivo mediante pestañas abiertas y menciones `@archivo` (hasta 8 adjuntos)
  */
 export function initChatController({
   getContextSnapshot,
+  onResolveFileContent,
   onInsertAtCursor,
   onReplaceSelection,
   onApplyWholeFile,
@@ -85,27 +108,16 @@ export function initChatController({
   let settingsOpen = false;
   let keyVisible = false;
   let currentStreamStatus = "";
+  let attachmentLimitNotice = "";
+  let attachmentNoticeTimer = 0;
 
-  /**
-   * Respuestas en curso por conversación (clave = id del proyecto). Una respuesta sigue en segundo plano
-   * si el usuario cambia de proyecto y se guarda en el proyecto donde se hizo la pregunta.
-   * @type {Map<string | null, { controller: AbortController, convo: Array<{ role: string, content: string }>, discarded: boolean }>}
-   */
   const activeStreams = new Map();
-  /** @type {string | null} */
   let conversationKey = null;
 
-  /**
-   * Resultado de la verificación de la clave por proveedor (solo en memoria; se re-verifica al abrir la app).
-   * @type {Map<string, { key: string, status: "checking" | "valid" | "invalid" | "offline" | "unknown", message: string }>}
-   */
   const keyChecks = new Map();
   let keyCheckTimer = 0;
-  /** @type {AbortController | null} */
   let keyCheckController = null;
-  /** @type {AbortController | null} */
   let liveModelsController = null;
-  let activeRafId = 0;
   let destroyed = false;
   const listenerAbort = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
@@ -113,9 +125,37 @@ export function initChatController({
 
   /** @type {Set<string>} */
   const attachedTabIds = new Set();
+  /** @type {Set<string>} */
+  const mentionedFileIds = new Set();
 
   /** @type {Array<{ role: "user" | "assistant", content: string }>} */
   let conversation = [];
+
+  function getTotalAttachedCount() {
+    const unique = new Set([...attachedTabIds, ...mentionedFileIds]);
+    return unique.size;
+  }
+
+  function showAttachmentNotice(message = `Máximo ${MAX_AI_ATTACHMENTS} archivos adjuntos`) {
+    attachmentLimitNotice = message;
+    renderExtraTabChips();
+    window.clearTimeout(attachmentNoticeTimer);
+    attachmentNoticeTimer = window.setTimeout(() => {
+      attachmentNoticeTimer = 0;
+      attachmentLimitNotice = "";
+      if (!destroyed) renderExtraTabChips();
+    }, 2600);
+  }
+
+  function tryAttachFileId(fileId, targetSet) {
+    const hasAlready = attachedTabIds.has(fileId) || mentionedFileIds.has(fileId);
+    if (!hasAlready && getTotalAttachedCount() >= MAX_AI_ATTACHMENTS) {
+      showAttachmentNotice();
+      return false;
+    }
+    targetSet.add(fileId);
+    return true;
+  }
 
   function syncKeyVisibilityButton(visible) {
     if (!toggleKeyVisBtn) return;
@@ -140,16 +180,38 @@ export function initChatController({
   populateProviderOptions();
   syncSettingsForm();
   renderConversation();
-  // La lista de modelos se pide recién cuando la clave resulta válida: con una clave inválida
-  // se hace una sola consulta (la verificación) en lugar de dos.
   scheduleKeyValidation(activeProviderId, 0, false);
 
-  /**
-   * Verifica la clave del proveedor con una consulta liviana y actualiza el indicador.
-   * @param {string} providerId
-   * @param {number} delayMs espera para no consultar en cada tecla
-   * @param {boolean} announce si mostrar el resultado en el texto de ayuda (cuando el usuario la acaba de pegar)
-   */
+  const mentionPopover = createMentionPopover({
+    promptInput,
+    composerForm,
+    getProjectFiles: () => getContextSnapshot()?.projectFiles || [],
+    getActiveFileId: () => getContextSnapshot()?.activeFile?.id || null,
+    async onSelectFile(file) {
+      if (!file || !file.id) return;
+      if (tryAttachFileId(file.id, mentionedFileIds)) {
+        if (file.contentLoaded === false && typeof onResolveFileContent === "function") {
+          try {
+            const resolved = await onResolveFileContent(file.id);
+            const latest = getContextSnapshot()?.projectFiles?.find((f) => f.id === file.id);
+            if (!resolved || latest?.contentLoaded === false) {
+              mentionedFileIds.delete(file.id);
+              showAttachmentNotice(`No se pudo cargar ${file.path || file.id} desde GitHub.`);
+            }
+          } catch {
+            mentionedFileIds.delete(file.id);
+            showAttachmentNotice(`No se pudo cargar ${file.path || file.id} desde GitHub.`);
+          }
+        }
+        if (!destroyed) {
+          renderExtraTabChips();
+          updateTokenEstimate();
+        }
+      }
+    },
+    listenOpts
+  });
+
   function scheduleKeyValidation(providerId, delayMs, announce) {
     window.clearTimeout(keyCheckTimer);
     keyCheckController?.abort();
@@ -171,7 +233,6 @@ export function initChatController({
       keyChecks.delete(providerId);
       updateModelStrip();
       if (providerId === "openrouter") {
-        // El catálogo de OpenRouter es público: se puede listar sin clave.
         void syncLiveModelsSilently(providerId);
       }
       return;
@@ -203,18 +264,17 @@ export function initChatController({
       try {
         result = await validateApiKey(providerId, key, controller.signal);
       } catch {
-        return; // Cancelada porque el usuario siguió escribiendo o cambió de proveedor
+        return;
       }
       if (keyCheckController === controller) {
         keyCheckController = null;
       }
       if (getApiKey(providerId) !== key) {
-        return; // La clave cambió mientras se verificaba: este resultado ya no aplica
+        return;
       }
       keyChecks.set(providerId, { key, ...result });
       updateModelStrip();
       if (result.status === "valid") {
-        // Limpiar el texto del input tras validar solo si el usuario no sigue editándolo ni inspeccionándolo
         if (providerId === activeProviderId && document.activeElement !== apiKeyInput) {
           syncApiKeyMaskPlaceholder(providerId);
         }
@@ -242,15 +302,13 @@ export function initChatController({
     try {
       const liveModels = await fetchLiveFreeModels(providerId, key, ctrl?.signal);
       if (destroyed) return;
-      if (liveModels.length > 0) {
-        if (activeProviderId === providerId) {
-          const stillValid = liveModels.some((m) => m.id === activeModelId);
-          if (!stillValid) {
-            activeModelId = liveModels[0].id;
-            saveModel(providerId, activeModelId);
-          }
-          syncSettingsForm();
+      if (liveModels.length > 0 && activeProviderId === providerId) {
+        const stillValid = liveModels.some((m) => m.id === activeModelId);
+        if (!stillValid) {
+          activeModelId = liveModels[0].id;
+          saveModel(providerId, activeModelId);
         }
+        syncSettingsForm();
       }
     } catch {
       // Silencioso en segundo plano
@@ -277,11 +335,18 @@ export function initChatController({
   settingsBtn?.addEventListener("click", () => toggleSettings(), listenOpts);
   keyStatusBtn?.addEventListener("click", () => toggleSettings(), listenOpts);
 
+  function cancelStreamRaf(stream) {
+    if (stream && stream.rafId && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(stream.rafId);
+      stream.rafId = 0;
+    }
+  }
+
   clearChatBtn?.addEventListener("click", () => {
     const running = activeStreams.get(conversationKey);
     if (running) {
-      // Se descarta: al cortarse no debe volver a guardar la conversación que el usuario acaba de limpiar.
       running.discarded = true;
+      cancelStreamRaf(running);
       running.controller.abort();
     }
     currentStreamStatus = "";
@@ -330,11 +395,7 @@ export function initChatController({
 
   function syncCredentialsBackup() {
     try {
-      if (getKeyStorageMode() === "session" || !hasStoredCredentials()) {
-        void saveCredentialsBackup("");
-      } else {
-        void saveCredentialsBackup(exportKeysBundle());
-      }
+      void saveCredentialsBackup(getSyncCredentialsBackupPayload());
     } catch {
       // Ignorar si falla el guardado asíncrono
     }
@@ -495,6 +556,32 @@ export function initChatController({
     }
   }, listenOpts);
 
+  function collectAttachedFiles(snapshot) {
+    const seen = new Set();
+    const result = [];
+    const activeId = snapshot?.activeFile?.id || null;
+
+    const addFile = (f, source) => {
+      if (!f || !f.id || f.id === activeId || seen.has(f.id)) return;
+      if (f.isBinary || f.contentLoaded === false) return;
+      seen.add(f.id);
+      result.push({ file: f, source });
+    };
+
+    for (const f of snapshot?.otherOpenFiles || []) {
+      if (attachedTabIds.has(f.id)) {
+        addFile(f, "tab");
+      }
+    }
+    const allProjectFiles = snapshot?.projectFiles || snapshot?.otherOpenFiles || [];
+    for (const f of allProjectFiles) {
+      if (mentionedFileIds.has(f.id)) {
+        addFile(f, "mention");
+      }
+    }
+    return result.slice(0, MAX_AI_ATTACHMENTS);
+  }
+
   function updateTokenEstimate() {
     if (!tokenCounterEl) return;
     const promptLen = promptInput ? promptInput.value.length : 0;
@@ -507,12 +594,8 @@ export function initChatController({
         contextLen += (snapshot.activeFile.content || "").length;
       }
     }
-    if (snapshot?.otherOpenFiles) {
-      for (const f of snapshot.otherOpenFiles) {
-        if (attachedTabIds.has(f.id)) {
-          contextLen += (f.content || "").length;
-        }
-      }
+    for (const item of collectAttachedFiles(snapshot)) {
+      contextLen += Math.min(6000, (item.file.content || "").length);
     }
     const totalChars = promptLen + contextLen;
     const usedTokens = estimateTokens(totalChars);
@@ -639,7 +722,7 @@ export function initChatController({
   }, listenOpts);
 
   promptInput?.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !mentionPopover.isOpen()) {
       event.preventDefault();
       composerForm?.requestSubmit();
     }
@@ -647,6 +730,7 @@ export function initChatController({
 
   composerForm?.addEventListener("submit", async (event) => {
     event.preventDefault();
+    mentionPopover.close();
 
     const running = activeStreams.get(conversationKey);
     if (running) {
@@ -671,32 +755,54 @@ export function initChatController({
     await sendPrompt(userText, apiKey);
   }, listenOpts);
 
-  async function sendPrompt(userText, apiKey) {
-    const snapshot = getContextSnapshot();
-    const systemPrompt = buildSystemPrompt(snapshot);
+  async function resolveExplicitMentionsInPrompt(userText, snapshot, signal = null) {
+    const mentionedRefs = userText.match(/@([^\s@"'`]+)/g);
+    if (!mentionedRefs || mentionedRefs.length === 0) return [];
+    const allProjectFiles = snapshot?.projectFiles || snapshot?.otherOpenFiles || [];
+    const byPath = new Map(allProjectFiles.map((f) => [f.path.toLowerCase(), f]));
+    const failedPaths = [];
 
-    let promptToSend = userText;
-    if (userText.startsWith("/fix")) {
-      const rest = userText.slice(4).trim();
-      promptToSend = `[COMANDO RÁPIDO /fix]: Revisá el código del archivo activo, detectá errores de sintaxis, compilación o ejecución, y devolvé la versión corregida con explicación concisa.${rest ? ` Detalle adicional: ${rest}` : ""}`;
-    } else if (userText.startsWith("/explain")) {
-      const rest = userText.slice(8).trim();
-      promptToSend = `[COMANDO RÁPIDO /explain]: Explicá de manera didáctica y detallada el funcionamiento de este código, su estructura y sus puntos clave.${rest ? ` Consulta: ${rest}` : ""}`;
-    } else if (userText.startsWith("/test")) {
-      const rest = userText.slice(5).trim();
-      promptToSend = `[COMANDO RÁPIDO /test]: Diseñá una suite completa de pruebas unitarias con casos normales, límites y de error para este código.${rest ? ` Requisitos: ${rest}` : ""}`;
+    for (const ref of mentionedRefs) {
+      if (signal?.aborted || destroyed) break;
+      const targetPath = ref.slice(1).trim().toLowerCase();
+      const matched = byPath.get(targetPath);
+      if (!matched || matched.isBinary) continue;
+      if (!tryAttachFileId(matched.id, mentionedFileIds)) continue;
+      if (matched.contentLoaded === false) {
+        let ok = false;
+        if (typeof onResolveFileContent === "function") {
+          try {
+            const resolved = await onResolveFileContent(matched.id);
+            const fresh = getContextSnapshot()?.projectFiles?.find((f) => f.id === matched.id);
+            ok = Boolean(resolved) && fresh?.contentLoaded !== false;
+          } catch {
+            ok = false;
+          }
+        }
+        if (!ok) {
+          mentionedFileIds.delete(matched.id);
+          failedPaths.push(matched.path || matched.id);
+        }
+      }
     }
+    if (failedPaths.length > 0 && !destroyed) {
+      showAttachmentNotice(`No se pudo cargar ${failedPaths[0]} desde GitHub.`);
+      updateTokenEstimate();
+    }
+    return failedPaths;
+  }
 
-    // La respuesta queda atada a ESTA conversación y proveedor aunque el usuario cambie en vuelo.
+  async function sendPrompt(userText, apiKey) {
     const key = conversationKey;
     const convo = conversation;
+    if (activeStreams.has(key)) return;
     const streamProviderId = activeProviderId;
     const streamModelId = activeModelId;
     convo.push({ role: "user", content: userText });
     const assistantEntry = { role: "assistant", content: "" };
     convo.push(assistantEntry);
 
-    const stream = { controller: new AbortController(), convo, discarded: false };
+    const stream = { controller: new AbortController(), convo, discarded: false, rafId: 0 };
     activeStreams.set(key, stream);
     const isVisible = () => conversationKey === key && conversation === convo;
 
@@ -711,16 +817,13 @@ export function initChatController({
     const cancelQueuedRender = () => {
       streamSettled = true;
       rafPending = false;
-      if (activeRafId && typeof window.cancelAnimationFrame === "function") {
-        window.cancelAnimationFrame(activeRafId);
-        activeRafId = 0;
-      }
+      cancelStreamRaf(stream);
     };
     const scheduleRender = () => {
       if (destroyed || streamSettled || rafPending || !isVisible()) return;
       rafPending = true;
-      activeRafId = window.requestAnimationFrame(() => {
-        activeRafId = 0;
+      stream.rafId = window.requestAnimationFrame(() => {
+        stream.rafId = 0;
         rafPending = false;
         if (destroyed || streamSettled || !isVisible()) return;
         updateLastAssistantMessage(assistantEntry.content, true);
@@ -728,10 +831,34 @@ export function initChatController({
       });
     };
 
-    const messagesForAi = cleanHistoryForAi(convo.slice(0, -2));
-    messagesForAi.push({ role: "user", content: promptToSend });
-
     try {
+      let snapshot = getContextSnapshot();
+      await resolveExplicitMentionsInPrompt(userText, snapshot, stream.controller.signal);
+      if (stream.controller.signal.aborted || stream.discarded || destroyed) {
+        const abortErr = new Error("AbortError");
+        abortErr.name = "AbortError";
+        throw abortErr;
+      }
+      if (isVisible()) {
+        snapshot = getContextSnapshot();
+      }
+      const systemPrompt = buildSystemPrompt(snapshot);
+
+      let promptToSend = userText;
+      if (userText.startsWith("/fix")) {
+        const rest = userText.slice(4).trim();
+        promptToSend = `[COMANDO RÁPIDO /fix]: Revisá el código del archivo activo, detectá errores de sintaxis, compilación o ejecución, y devolvé la versión corregida con explicación concisa.${rest ? ` Detalle adicional: ${rest}` : ""}`;
+      } else if (userText.startsWith("/explain")) {
+        const rest = userText.slice(8).trim();
+        promptToSend = `[COMANDO RÁPIDO /explain]: Explicá de manera didáctica y detallada el funcionamiento de este código, su estructura y sus puntos clave.${rest ? ` Consulta: ${rest}` : ""}`;
+      } else if (userText.startsWith("/test")) {
+        const rest = userText.slice(5).trim();
+        promptToSend = `[COMANDO RÁPIDO /test]: Diseñá una suite completa de pruebas unitarias con casos normales, límites y de error para este código.${rest ? ` Requisitos: ${rest}` : ""}`;
+      }
+
+      const messagesForAi = cleanHistoryForAi(convo.slice(0, -2));
+      messagesForAi.push({ role: "user", content: promptToSend });
+
       await streamAiCompletion({
         providerId: streamProviderId,
         model: streamModelId,
@@ -797,7 +924,6 @@ export function initChatController({
           }
         }
         if (assistantEntry.content.trim()) {
-          // Se conserva lo que ya llegó: perderlo sería peor que mostrarlo incompleto.
           assistantEntry.content += `\n\n*(Respuesta interrumpida: ${message})*`;
           if (isVisible()) {
             updateLastAssistantMessage(assistantEntry.content, false);
@@ -959,40 +1085,83 @@ export function initChatController({
 
   function renderExtraTabChips() {
     if (!extraTabsBar) return;
-    const { otherOpenFiles } = getContextSnapshot();
+    const snapshot = getContextSnapshot();
+    const otherOpenFiles = snapshot?.otherOpenFiles || [];
+    const allProjectFiles = snapshot?.projectFiles || otherOpenFiles;
 
-    const validIds = new Set(otherOpenFiles.map((f) => f.id));
+    const validOpenIds = new Set(otherOpenFiles.map((f) => f.id));
     for (const id of [...attachedTabIds]) {
-      if (!validIds.has(id)) {
+      if (!validOpenIds.has(id)) {
         attachedTabIds.delete(id);
       }
     }
+    const projectMap = new Map(
+      allProjectFiles
+        .filter((f) => f && !f.isBinary && f.contentLoaded !== false)
+        .map((f) => [f.id, f])
+    );
+    const activeId = snapshot?.activeFile?.id || null;
+    for (const id of [...mentionedFileIds]) {
+      if (!projectMap.has(id) || id === activeId) {
+        mentionedFileIds.delete(id);
+      }
+    }
 
-    if (otherOpenFiles.length === 0) {
+    const extraMentioned = [...mentionedFileIds]
+      .filter((id) => !validOpenIds.has(id))
+      .map((id) => projectMap.get(id))
+      .filter(Boolean);
+
+    if (otherOpenFiles.length === 0 && extraMentioned.length === 0 && !attachmentLimitNotice) {
       extraTabsBar.hidden = true;
       return;
     }
 
     extraTabsBar.hidden = false;
-    extraTabsBar.innerHTML = `<span class="chat-extra-label">Sumar pestaña:</span>`;
+    const totalCount = getTotalAttachedCount();
+    const countLabel = totalCount > 0 ? ` (${totalCount}/${MAX_AI_ATTACHMENTS})` : "";
+    extraTabsBar.innerHTML = `<span class="chat-extra-label">Adjuntar${countLabel}:</span>`;
 
     for (const file of otherOpenFiles) {
-      const attached = attachedTabIds.has(file.id);
+      const attached = attachedTabIds.has(file.id) || mentionedFileIds.has(file.id);
       const chip = document.createElement("button");
       chip.type = "button";
       chip.className = "context-chip";
       chip.setAttribute("aria-pressed", String(attached));
       chip.innerHTML = `${icon(attached ? "check" : "plus")}<span>${escapeHtml(file.shortName || file.name)}</span>`;
       chip.addEventListener("click", () => {
-        if (attachedTabIds.has(file.id)) {
+        if (attached) {
           attachedTabIds.delete(file.id);
+          mentionedFileIds.delete(file.id);
         } else {
-          attachedTabIds.add(file.id);
+          tryAttachFileId(file.id, attachedTabIds);
         }
         renderExtraTabChips();
         updateTokenEstimate();
       });
       extraTabsBar.appendChild(chip);
+    }
+
+    for (const file of extraMentioned) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "context-chip is-mention";
+      chip.setAttribute("aria-pressed", "true");
+      chip.title = `Quitar @${file.path}`;
+      chip.innerHTML = `${icon("check")}<span>@${escapeHtml(file.shortName || file.path)}</span>`;
+      chip.addEventListener("click", () => {
+        mentionedFileIds.delete(file.id);
+        renderExtraTabChips();
+        updateTokenEstimate();
+      });
+      extraTabsBar.appendChild(chip);
+    }
+
+    if (attachmentLimitNotice) {
+      const warn = document.createElement("span");
+      warn.className = "chat-extra-limit-warn";
+      warn.textContent = attachmentLimitNotice;
+      extraTabsBar.appendChild(warn);
     }
   }
 
@@ -1005,7 +1174,7 @@ export function initChatController({
       welcome.className = "chat-empty-welcome";
       welcome.innerHTML = `
         <div class="chat-empty-title">Asistente contextual listo</div>
-        <p>Configurado exclusivamente con proveedores y modelos gratuitos. Leo automáticamente el archivo abierto en el centro y las líneas que selecciones.</p>
+        <p>Configurado exclusivamente con proveedores y modelos gratuitos. Leo automáticamente el archivo abierto y podés sumar hasta ${MAX_AI_ATTACHMENTS} archivos con <code>@archivo</code>.</p>
         <div class="chat-quick-prompts">
           <button type="button" class="btn btn-sm" data-quick-prompt="Revisá este archivo y sugerí mejoras concretas.">Revisar archivo</button>
           <button type="button" class="btn btn-sm" data-quick-prompt="Explicame paso a paso cómo funciona este código.">Explicar código</button>
@@ -1048,7 +1217,7 @@ export function initChatController({
     if (!streamContainer) return;
     const nodes = streamContainer.querySelectorAll(".chat-ai-response");
     const lastNode = nodes[nodes.length - 1];
-    if (lastNode instanceof HTMLElement) {
+    if (lastNode && (typeof HTMLElement === "undefined" || lastNode instanceof HTMLElement)) {
       populateAssistantNode(lastNode, markdownText, isStreaming);
     }
   }
@@ -1067,10 +1236,10 @@ export function initChatController({
     const btnApplyAll = document.createElement("button");
     btnApplyAll.type = "button";
     btnApplyAll.className = "btn btn-primary btn-sm chat-multi-apply-all-btn";
-    btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+    btnApplyAll.innerHTML = `${icon("gitCompare")}<span>Revisar y aplicar cambios</span>`;
     btnApplyAll.addEventListener("click", async () => {
       btnApplyAll.disabled = true;
-      btnApplyAll.innerHTML = `${icon("refreshCw")}<span>Aplicando lote…</span>`;
+      btnApplyAll.innerHTML = `${icon("refreshCw")}<span>Revisando lote…</span>`;
       if (typeof onApplyMultiFile === "function") {
         try {
           const applied = await onApplyMultiFile(multiFiles.map((m) => ({ path: m.filePath, code: m.code, lang: m.lang })));
@@ -1079,17 +1248,23 @@ export function initChatController({
             btnApplyAll.innerHTML = `${icon("x")}<span>Sin cambios aplicados</span>`;
             window.setTimeout(() => {
               if (!btnApplyAll.isConnected) return;
-              btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+              btnApplyAll.innerHTML = `${icon("gitCompare")}<span>Revisar y aplicar cambios</span>`;
             }, 1500);
           } else {
-            btnApplyAll.innerHTML = `${icon("check")}<span>¡${multiFiles.length} archivos aplicados!</span>`;
+            const countLabel = typeof applied === "number" ? applied : multiFiles.length;
+            btnApplyAll.innerHTML = `${icon("check")}<span>¡${countLabel} archivo(s) aplicados!</span>`;
+            window.setTimeout(() => {
+              if (!btnApplyAll.isConnected) return;
+              btnApplyAll.disabled = false;
+              btnApplyAll.innerHTML = `${icon("gitCompare")}<span>Revisar y aplicar cambios</span>`;
+            }, 2500);
           }
         } catch {
           btnApplyAll.disabled = false;
           btnApplyAll.innerHTML = `${icon("x")}<span>Error al aplicar</span>`;
           window.setTimeout(() => {
             if (!btnApplyAll.isConnected) return;
-            btnApplyAll.innerHTML = `${icon("zap")}<span>Aplicar todos los cambios</span>`;
+            btnApplyAll.innerHTML = `${icon("gitCompare")}<span>Revisar y aplicar cambios</span>`;
           }, 1500);
         }
       } else {
@@ -1125,8 +1300,8 @@ export function initChatController({
     targetParent.insertBefore(block, insertBeforeNode);
   }
 
-  function appendClosedSegmentsUpTo(container, state, segments, targetCount) {
-    for (let i = state.closedCount; i < targetCount; i += 1) {
+  function appendClosedSegmentsRange(container, state, segments, targetCount) {
+    for (let i = 0; i < targetCount; i += 1) {
       const seg = segments[i];
       if (seg.type === "prose") {
         state.lastProseContent += (state.lastProseContent ? "\n" : "") + (seg.content || "");
@@ -1139,31 +1314,48 @@ export function initChatController({
         appendSegmentNodes(container, seg, contextHint, state.tailHost);
         state.previousCodeBlock = seg.code || "";
         state.lastProseContent = "";
+        if (seg.filePath) {
+          state.closedFileSegments.push(seg);
+        }
       }
+      state.closedCount += 1;
     }
-    state.closedCount = targetCount;
   }
 
-  /**
-   * Renderiza mensajes de asistente de forma incremental durante streaming (O(N) acumulado):
-   * congela en el DOM los nodos de segmentos ya cerrados y solo actualiza el último segmento abierto.
-   */
   function populateAssistantNode(container, markdownText, isStreaming) {
-    const segments = parseMarkdownSegments(markdownText);
+    let state = streamDomState.get(container);
+    const hasValidState =
+      Boolean(state) &&
+      state.tailHost.parentNode === container &&
+      markdownText.length >= state.closedOffset &&
+      (state.closedOffset === 0 ||
+        markdownText.slice(Math.max(0, state.closedOffset - 32), state.closedOffset) === state.closedAnchor);
 
-    if (segments.length === 0 && isStreaming) {
+    if (!hasValidState) {
       streamDomState.delete(container);
-      container.innerHTML = "";
-      const waiting = document.createElement("p");
-      waiting.className = "chat-streaming-note";
-      waiting.textContent = currentStreamStatus || "Generando respuesta…";
-      container.appendChild(waiting);
-      return;
+      state = null;
     }
 
-    let state = streamDomState.get(container);
     if (isStreaming) {
-      if (!state || segments.length - 1 < state.closedCount || state.tailHost.parentNode !== container) {
+      const parsed = parseMarkdownSegmentsIncremental(
+        markdownText,
+        state ? state.closedOffset : 0,
+        state ? state.lastProseContent : ""
+      );
+      const tailSegs = parsed.segments;
+      const tailOffsets = parsed.segmentOffsets;
+
+      if ((!state || state.closedCount === 0) && tailSegs.length === 0) {
+        streamDomState.delete(container);
+        container.innerHTML = "";
+        const waiting = document.createElement("p");
+        waiting.className = "chat-streaming-note";
+        waiting.textContent = currentStreamStatus || "Generando respuesta…";
+        container.appendChild(waiting);
+        return;
+      }
+
+      if (!state) {
         container.innerHTML = "";
         const tailHost = document.createElement("div");
         tailHost.className = "chat-streaming-tail";
@@ -1173,6 +1365,9 @@ export function initChatController({
         container.append(tailHost, indicator);
         state = {
           closedCount: 0,
+          closedOffset: 0,
+          closedAnchor: "",
+          closedFileSegments: [],
           lastProseContent: "",
           previousCodeBlock: "",
           tailHost,
@@ -1182,13 +1377,19 @@ export function initChatController({
         streamDomState.set(container, state);
       }
 
-      const newClosedCount = Math.max(0, segments.length - 1);
-      appendClosedSegmentsUpTo(container, state, segments, newClosedCount);
+      const localClosedCount = Math.max(0, tailSegs.length - 1);
+      if (localClosedCount > 0) {
+        appendClosedSegmentsRange(container, state, tailSegs, localClosedCount);
+        if (tailOffsets.length > localClosedCount) {
+          state.closedOffset = tailOffsets[localClosedCount];
+          state.closedAnchor = markdownText.slice(Math.max(0, state.closedOffset - 32), state.closedOffset);
+        }
+      }
 
-      const activeSeg = segments[segments.length - 1];
+      const activeSeg = tailSegs[tailSegs.length - 1];
       if (activeSeg) {
         if (activeSeg.type === "code") {
-          const tailKey = `code:${newClosedCount}:${activeSeg.lang || ""}:${activeSeg.filePath || ""}`;
+          const tailKey = `code:${state.closedCount}:${activeSeg.lang || ""}:${activeSeg.filePath || ""}`;
           const existingCodeEl =
             state.lastTailKey === tailKey ? state.tailHost.querySelector(".chat-code-pre code") : null;
           if (existingCodeEl) {
@@ -1204,27 +1405,31 @@ export function initChatController({
           }
         } else {
           state.tailHost.innerHTML = "";
-          state.lastTailKey = `prose:${newClosedCount}`;
+          state.lastTailKey = `prose:${state.closedCount}`;
           appendSegmentNodes(state.tailHost, activeSeg, null, null);
         }
       }
       return;
     }
 
-    // Render final (!isStreaming): si venía de streaming incremental, promocionar solo los pendientes sin reconstruir todo
-    if (state && state.tailHost.parentNode === container && segments.length >= state.closedCount) {
-      appendClosedSegmentsUpTo(container, state, segments, segments.length);
+    if (state) {
+      const parsed = parseMarkdownSegmentsIncremental(
+        markdownText,
+        state.closedOffset,
+        state.lastProseContent
+      );
+      appendClosedSegmentsRange(container, state, parsed.segments, parsed.segments.length);
       state.tailHost.remove();
       state.indicator.remove();
       streamDomState.delete(container);
 
-      const multiFiles = segments.filter((s) => s.type === "code" && s.filePath);
-      if (multiFiles.length >= 2) {
-        container.insertBefore(buildMultiFilePlanElement(multiFiles), container.firstChild);
+      if (state.closedFileSegments.length >= 2) {
+        container.insertBefore(buildMultiFilePlanElement(state.closedFileSegments), container.firstChild);
       }
       return;
     }
 
+    const segments = parseMarkdownSegments(markdownText);
     streamDomState.delete(container);
     container.innerHTML = "";
 
@@ -1403,10 +1608,6 @@ export function initChatController({
     }
   }
 
-  /**
-   * Genera un delimitador de backticks más largo que cualquier secuencia en `content` para evitar escapes de prompt.
-   * @param {string} content
-   */
   function getSafeBacktickFence(content) {
     const matches = String(content || "").match(/`+/g);
     let maxRun = 2;
@@ -1450,14 +1651,14 @@ export function initChatController({
       );
     }
 
-    const attachedFiles = snapshot.otherOpenFiles.filter((f) => attachedTabIds.has(f.id));
-    for (const extra of attachedFiles) {
+    for (const { file: extra, source } of collectAttachedFiles(snapshot)) {
       const safeExtraContent = truncateCodeContent(extra.content, 6000);
       const extraFence = getSafeBacktickFence(safeExtraContent);
       const extraLang = sanitizePromptLabel(extra.lang);
-      const extraName = sanitizePromptLabel(extra.name);
+      const extraName = sanitizePromptLabel(extra.path || extra.name);
+      const label = source === "mention" ? "ARCHIVO MENCIONADO (@archivo)" : "PESTAÑA ADJUNTA DE REFERENCIA";
       parts.push(
-        `\n--- PESTAÑA ADJUNTA DE REFERENCIA: ${extraName} (${extraLang}) ---\n${extraFence}${extraLang}\n${safeExtraContent}\n${extraFence}`
+        `\n--- ${label}: ${extraName} (${extraLang}) ---\n${extraFence}${extraLang}\n${safeExtraContent}\n${extraFence}`
       );
     }
 
@@ -1509,9 +1710,10 @@ export function initChatController({
     },
     setConversation(nextHistory, key = null) {
       conversationKey = key;
+      mentionedFileIds.clear();
+      mentionPopover.close();
       const live = activeStreams.get(key);
       if (live && !live.discarded) {
-        // Volvemos a un proyecto cuya respuesta sigue llegando: mostrar la conversación en vivo.
         conversation = live.convo;
         renderConversation();
         setStreamingUiState(true);
@@ -1550,6 +1752,10 @@ export function initChatController({
     },
     destroy() {
       destroyed = true;
+      if (attachmentNoticeTimer) {
+        window.clearTimeout(attachmentNoticeTimer);
+        attachmentNoticeTimer = 0;
+      }
       if (keyCheckTimer) {
         window.clearTimeout(keyCheckTimer);
         keyCheckTimer = 0;
@@ -1558,330 +1764,14 @@ export function initChatController({
       keyCheckController = null;
       liveModelsController?.abort();
       liveModelsController = null;
-      if (activeRafId && typeof window.cancelAnimationFrame === "function") {
-        window.cancelAnimationFrame(activeRafId);
-        activeRafId = 0;
-      }
       for (const stream of activeStreams.values()) {
         stream.discarded = true;
+        cancelStreamRaf(stream);
         stream.controller.abort();
       }
       activeStreams.clear();
+      mentionPopover.destroy();
       listenerAbort?.abort();
     }
   };
-}
-
-/**
- * Limpia anotaciones de interrupción o errores de transporte del historial antes de enviarlo a la API de IA.
- * @param {Array<{ role: string, content: string }>} rawConvo
- * @returns {Array<{ role: string, content: string }>}
- */
-export function cleanHistoryForAi(rawConvo) {
-  if (!Array.isArray(rawConvo)) return [];
-  return rawConvo
-    .map((m) => {
-      let content = String(m?.content || "");
-      content = content.split("\n\n*(Generación detenida)*").join("");
-      const marker = "\n\n*(Respuesta interrumpida:";
-      let idx = content.indexOf(marker);
-      while (idx !== -1) {
-        const closeIdx = content.indexOf(")*", idx + marker.length);
-        if (closeIdx === -1) break;
-        content = content.slice(0, idx) + content.slice(closeIdx + 2);
-        idx = content.indexOf(marker, idx);
-      }
-      return { role: m.role, content: content.trim() };
-    })
-    .filter((m) => Boolean(m.content));
-}
-
-/**
- * Trunca contenido de código extenso de forma equilibrada (conservando cabecera y pie)
- * para no desbordar el presupuesto de tokens de modelos gratuitos (TPM).
- * @param {string} content
- * @param {number} [maxChars]
- * @returns {string}
- */
-export function truncateCodeContent(content, maxChars = 16000) {
-  if (typeof content !== "string" || content.length <= maxChars) {
-    return typeof content === "string" ? content : "";
-  }
-  const headTarget = Math.floor(maxChars * 0.6);
-  const tailTarget = maxChars - headTarget;
-
-  const headEnd = content.lastIndexOf("\n", headTarget);
-  const headSlice = headEnd > 0 ? content.slice(0, headEnd) : content.slice(0, headTarget);
-
-  const tailStartOffset = content.length - tailTarget;
-  const tailStart = content.indexOf("\n", tailStartOffset);
-  const tailSlice = tailStart > 0 ? content.slice(tailStart + 1) : content.slice(tailStartOffset);
-
-  const middleText = content.slice(headSlice.length, content.length - tailSlice.length);
-  const omittedLines = Math.max(1, middleText.split("\n").length);
-
-  return `${headSlice}\n\n// ... [${omittedLines} líneas omitidas por límite de contexto de la API gratuita] ...\n\n${tailSlice}`;
-}
-
-const FORBIDDEN_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
-
-function sanitizeDetectedFilePath(rawCandidate) {
-  if (typeof rawCandidate !== "string") return null;
-  const trimmed = rawCandidate.trim();
-  if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed)) return null;
-  if (trimmed.startsWith("/") || trimmed.includes("\\") || trimmed.includes("://")) return null;
-  if (/^[a-zA-Z]:/.test(trimmed)) return null;
-
-  const rawParts = trimmed.split("/");
-  const cleanParts = [];
-  for (const part of rawParts) {
-    if (!part || part === ".") continue;
-    if (part === ".." || FORBIDDEN_PATH_SEGMENTS.has(part.toLowerCase())) {
-      return null;
-    }
-    cleanParts.push(part);
-  }
-  if (cleanParts.length === 0) return null;
-  const normalized = cleanParts.join("/");
-  return normalized.includes(".") ? normalized : null;
-}
-
-export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = "") {
-  if (rawHeader) {
-    if (rawHeader.includes(":")) {
-      const parts = rawHeader.split(":");
-      if (parts[1] && parts[1].trim()) {
-        const candidate = sanitizeDetectedFilePath(parts[1].trim().split(/\s+/)[0]);
-        if (candidate) return candidate;
-      }
-    }
-    const fileParamMatch = rawHeader.match(/(?:file|filepath|path)=["']?([^"'\s]+)["']?/i);
-    if (fileParamMatch) {
-      const candidate = sanitizeDetectedFilePath(fileParamMatch[1]);
-      if (candidate) return candidate;
-    }
-    const headerParts = rawHeader.split(/\s+/);
-    if (headerParts.length > 1) {
-      const candidate = sanitizeDetectedFilePath(headerParts[1]);
-      if (candidate) return candidate;
-    }
-  }
-
-  const firstLine = (code || "").trim().split(/\r?\n/)[0] || "";
-  const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s]+)/i);
-  if (commentMatch) {
-    const cleaned = commentMatch[1].replace(/(?:\*\/|-->)+$/g, "");
-    const candidate = sanitizeDetectedFilePath(cleaned);
-    if (candidate) {
-      return candidate;
-    }
-  }
-
-  if (precedingProse) {
-    const lines = precedingProse.trim().split(/\r?\n/);
-    const lastProseLine = lines[lines.length - 1] || "";
-    const proseMatch = lastProseLine.match(/(?:archivo|file|filepath):\s*[`*_]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`*_]?/i);
-    if (proseMatch) {
-      const candidate = sanitizeDetectedFilePath(proseMatch[1]);
-      if (candidate) {
-        return candidate;
-      }
-    }
-  }
-
-  return null;
-}
-
-/**
- * Segmenta Markdown respetando longitud y cierre de fences por línea para soportar bloques anidados.
- * @param {string} raw
- */
-export function parseMarkdownSegments(raw) {
-  const segments = [];
-  const source = String(raw || "");
-  if (!source) {
-    return segments;
-  }
-
-  const blocks = splitMarkdownCodeFences(source);
-  let lastProseContent = "";
-  for (const block of blocks) {
-    if (block.type === "prose") {
-      const prose = block.text.trim();
-      if (prose) {
-        lastProseContent = prose;
-        segments.push({ type: "prose", content: prose });
-      } else if (segments.length > 0 && segments[segments.length - 1].type === "prose") {
-        lastProseContent = segments[segments.length - 1].content;
-      } else {
-        lastProseContent = "";
-      }
-    } else {
-      const filePath = detectFilePathFromCodeSegment(block.rawHeader, block.code, lastProseContent);
-      const segment = {
-        type: "code",
-        lang: block.lang,
-        code: block.code
-      };
-      if (filePath) {
-        segment.filePath = filePath;
-      }
-      segments.push(segment);
-    }
-  }
-
-  return segments;
-}
-
-export function formatProseHtml(text) {
-  const lines = String(text || "").split("\n");
-  const out = [];
-  let paragraphLines = [];
-  let listType = null;
-  let listItems = [];
-
-  const flushParagraph = () => {
-    if (paragraphLines.length > 0) {
-      out.push(`<p>${paragraphLines.map(formatInlineMarkdown).join("<br>")}</p>`);
-      paragraphLines = [];
-    }
-  };
-
-  const flushList = () => {
-    if (listType && listItems.length > 0) {
-      out.push(`<${listType}>${listItems.join("")}</${listType}>`);
-      listType = null;
-      listItems = [];
-    }
-  };
-
-  for (const rawLine of lines) {
-    const trimmed = rawLine.trim();
-    if (!trimmed) {
-      flushParagraph();
-      flushList();
-      continue;
-    }
-
-    const hrMatch = trimmed.match(/^(-{3,}|\*{3,}|_{3,})$/);
-    if (hrMatch) {
-      flushParagraph();
-      flushList();
-      out.push('<hr class="chat-md-hr">');
-      continue;
-    }
-
-    const headingMatch = trimmed.match(/^(#{1,6})\s+(.+)$/);
-    if (headingMatch) {
-      flushParagraph();
-      flushList();
-      out.push(`<h3 class="chat-md-heading">${formatInlineMarkdown(headingMatch[2])}</h3>`);
-      continue;
-    }
-
-    const quoteMatch = trimmed.match(/^>\s?(.*)$/);
-    if (quoteMatch) {
-      flushParagraph();
-      flushList();
-      out.push(`<blockquote class="chat-md-quote">${formatInlineMarkdown(quoteMatch[1])}</blockquote>`);
-      continue;
-    }
-
-    const ulMatch = rawLine.match(/^\s*[-*]\s+(.+)$/);
-    if (ulMatch) {
-      flushParagraph();
-      if (listType && listType !== "ul") {
-        flushList();
-      }
-      listType = "ul";
-      listItems.push(`<li>${formatInlineMarkdown(ulMatch[1])}</li>`);
-      continue;
-    }
-
-    const olMatch = rawLine.match(/^\s*\d+\.\s+(.+)$/);
-    if (olMatch) {
-      flushParagraph();
-      if (listType && listType !== "ol") {
-        flushList();
-      }
-      listType = "ol";
-      listItems.push(`<li>${formatInlineMarkdown(olMatch[1])}</li>`);
-      continue;
-    }
-
-    flushList();
-    paragraphLines.push(rawLine);
-  }
-
-  flushParagraph();
-  flushList();
-  return out.join("");
-}
-
-/**
- * Estima la cantidad de tokens según la cantidad de caracteres (regla estándar de ~4 caracteres por token).
- * @param {number} charCount
- * @returns {number}
- */
-export function estimateTokens(charCount) {
-  const count = Math.max(0, Number(charCount) || 0);
-  return Math.ceil(count / 4);
-}
-
-export function formatInlineMarkdown(str) {
-  const codeTokens = [];
-  const linkTokens = [];
-  const cleanStr = String(str ?? "").replace(/\u0000/g, "");
-  const withPlaceholders = cleanStr.replace(/`([^`]+)`/g, (_, code) => {
-    const idx = codeTokens.length;
-    codeTokens.push(`<code class="chat-inline-code">${escapeHtml(code)}</code>`);
-    return `\u0000CODE${idx}\u0000`;
-  });
-
-  const applyEmphasis = (text) =>
-    text
-      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
-
-  let safe = escapeHtml(withPlaceholders);
-  safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
-    (_, label, url) => {
-      const idx = linkTokens.length;
-      linkTokens.push(
-        `<a href="${url}" target="_blank" rel="noopener noreferrer" class="chat-link">${applyEmphasis(label)}</a>`
-      );
-      return `\u0000LINK${idx}\u0000`;
-    }
-  );
-  safe = applyEmphasis(safe);
-  safe = safe.replace(/\u0000LINK(\d+)\u0000/g, (_, idx) => linkTokens[Number(idx)] || "");
-  safe = safe.replace(/\u0000CODE(\d+)\u0000/g, (_, idx) => codeTokens[Number(idx)] || "");
-  return safe;
-}
-
-async function copyToClipboardSafe(text) {
-  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // Respaldo con textarea temporal
-    }
-  }
-  try {
-    const temp = document.createElement("textarea");
-    temp.value = text;
-    temp.setAttribute("readonly", "");
-    temp.style.position = "fixed";
-    temp.style.opacity = "0";
-    temp.style.pointerEvents = "none";
-    document.body.appendChild(temp);
-    temp.select();
-    const ok = document.execCommand("copy");
-    temp.remove();
-    return Boolean(ok);
-  } catch {
-    return false;
-  }
 }

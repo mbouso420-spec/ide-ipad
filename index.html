@@ -842,6 +842,7 @@
       </div>
 
       <div class="dialog-body diff-dialog-body">
+        <div id="diff-multi-bar" class="diff-multi-bar" hidden></div>
         <div id="diff-lines-view" class="diff-lines-view code-font" role="region" aria-label="Comparación de líneas"></div>
       </div>
 
@@ -1145,6 +1146,44 @@
         </div>
       </div>
     </div>
+  </dialog>
+
+  <!-- Selector de Plantillas para Proyecto Nuevo -->
+  <dialog id="project-template-dialog" class="ide-dialog" aria-modal="true" aria-labelledby="project-template-title">
+    <form method="dialog" id="project-template-form" class="dialog-shell">
+      <div class="dialog-header">
+        <div class="panel-title-group">
+          <span data-icon="folderPlus"></span>
+          <h2 id="project-template-title" class="dialog-title">Nuevo proyecto</h2>
+        </div>
+        <button type="button" id="btn-close-project-template" class="btn btn-ghost btn-sm btn-icon" aria-label="Cerrar selector de proyecto">
+          <span data-icon="x"></span>
+        </button>
+      </div>
+      <div class="dialog-body template-dialog-body">
+        <div class="field-group">
+          <label for="project-template-name" class="field-label">Nombre del proyecto</label>
+          <input
+            type="text"
+            id="project-template-name"
+            class="field-control"
+            placeholder="ej. mi-proyecto"
+            maxlength="80"
+            autocomplete="off"
+            spellcheck="false"
+            required
+          >
+        </div>
+        <div class="field-group">
+          <span class="field-label">Plantilla inicial</span>
+          <div id="project-template-grid" class="template-grid" role="radiogroup" aria-label="Plantilla inicial"></div>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button type="button" id="btn-cancel-project-template" class="btn">Cancelar</button>
+        <button type="submit" id="btn-submit-project-template" class="btn btn-primary">Crear proyecto</button>
+      </div>
+    </form>
   </dialog>
 
   <!-- Apertura Rápida de Archivos (Cmd/Ctrl + P) -->

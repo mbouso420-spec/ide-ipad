@@ -278,7 +278,6 @@ export async function buildRemotePullPlan({
       keepLocalRebases.push(target);
       if (
         conflict.blobSha &&
-        conflict.localStatus !== "deleted" &&
         typeof fetchBlob === "function"
       ) {
         blobTasks.push({

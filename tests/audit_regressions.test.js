@@ -308,7 +308,7 @@ describe("Regresiones de Auditoría Integral", () => {
       assert.equal(html.includes('inputmode="none"'), false);
 
       const dialogMatches = html.match(/<dialog\b[^>]*>/g) || [];
-      assert.equal(dialogMatches.length, 7);
+      assert.equal(dialogMatches.length, 8);
       for (const tag of dialogMatches) {
         assert.match(tag, /aria-modal="true"/, `Diálogo sin aria-modal="true": ${tag}`);
       }
@@ -833,7 +833,7 @@ describe("Regresiones de Auditoría Integral", () => {
     });
   });
 
-  describe("5. Storage, Emergency Backup y Service Worker v30", () => {
+  describe("5. Storage, Emergency Backup y Service Worker v31", () => {
     beforeEach(() => {
       localStorage.clear();
     });
@@ -999,7 +999,7 @@ describe("Regresiones de Auditoría Integral", () => {
       await assert.rejects(installPromise, /crítico/);
 
       // 2. Fallback navigate offline y 503 offline limpio
-      const shellCache = await ctx.caches.open("studio-ide-shell-v30");
+      const shellCache = await ctx.caches.open("studio-ide-shell-v31");
       await shellCache.put("./index.html", new ctx.Response("<html>cached</html>", { status: 200 }));
 
       let navPromise = null;

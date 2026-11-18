@@ -1442,7 +1442,7 @@ describe("Ronda 2 — Parte 3: Editor, UI, CSS, A11y y PWA", () => {
     assert.ok(/role="tabpanel"[^>]*aria-labelledby="settings-tab-appearance"/i.test(html));
 
     const sw = fs.readFileSync(path.join(ROOT_DIR, "sw.js"), "utf8");
-    assert.ok(sw.includes('SHELL_CACHE = "studio-ide-shell-v30"'));
+    assert.ok(sw.includes('SHELL_CACHE = "studio-ide-shell-v31"'));
     assert.ok(sw.includes('RUNTIME_CACHE = "studio-ide-runtime-v2"'));
     assert.ok(sw.includes('response.type !== "opaque"'));
     assert.ok(sw.includes("ignoreSearch: true"));

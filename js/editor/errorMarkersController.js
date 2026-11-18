@@ -13,7 +13,7 @@ const DEFAULT_MAX_TRACKED_FILES = 50;
  * @param {number} totalLines
  * @param {(lineNum: number) => void} onJump
  */
-export function renderErrorRuler(markers, totalLines, onJump) {
+function renderErrorRuler(markers, totalLines, onJump) {
   const rulerEl = typeof document !== "undefined" ? document.getElementById("editor-error-ruler") : null;
   if (!rulerEl) return;
   if (!markers || markers.length === 0) {

@@ -35,7 +35,28 @@ export function hasNewlineBetween(tokens, fromIdx, toIdx) {
   return false;
 }
 
+const PAIR_MAP_CACHE = new WeakMap();
+const STANDARD_CLOSE_BY_OPEN = { "{": "}", "(": ")", "[": "]" };
+
 export function findMatchingDelimiter(tokens, openIdx, openChar = "{", closeChar = "}") {
+  if (
+    tokens &&
+    tokens.length >= 64 &&
+    openIdx >= 0 &&
+    openIdx < tokens.length &&
+    STANDARD_CLOSE_BY_OPEN[openChar] === closeChar &&
+    tokens[openIdx]?.type === "punct" &&
+    tokens[openIdx].value === openChar
+  ) {
+    let pairs = PAIR_MAP_CACHE.get(tokens);
+    if (!pairs || pairs.length !== tokens.length) {
+      pairs = buildBracketPairMap(tokens);
+      PAIR_MAP_CACHE.set(tokens, pairs);
+    }
+    const paired = pairs[openIdx];
+    return paired >= openIdx ? paired : Math.max(0, tokens.length - 1);
+  }
+
   let depth = 0;
   for (let i = openIdx; i < tokens.length; i += 1) {
     const t = tokens[i];
@@ -47,4 +68,44 @@ export function findMatchingDelimiter(tokens, openIdx, openChar = "{", closeChar
     }
   }
   return Math.max(0, tokens.length - 1);
+}
+
+/**
+ * Precalcula en O(T) los índices pareados de `( )`, `[ ]` y `{ }` para saltos O(1).
+ * @param {Array<{ type: string, value: string }>} tokens
+ * @returns {Int32Array}
+ */
+export function buildBracketPairMap(tokens) {
+  const len = tokens ? tokens.length : 0;
+  const pairs = new Int32Array(len);
+  pairs.fill(-1);
+  const parenStack = [];
+  const bracketStack = [];
+  const braceStack = [];
+
+  for (let i = 0; i < len; i += 1) {
+    const t = tokens[i];
+    if (!t || t.type !== "punct") continue;
+    const v = t.value;
+    if (v === "(") {
+      parenStack.push(i);
+    } else if (v === ")" && parenStack.length > 0) {
+      const openIdx = parenStack.pop();
+      pairs[openIdx] = i;
+      pairs[i] = openIdx;
+    } else if (v === "[") {
+      bracketStack.push(i);
+    } else if (v === "]" && bracketStack.length > 0) {
+      const openIdx = bracketStack.pop();
+      pairs[openIdx] = i;
+      pairs[i] = openIdx;
+    } else if (v === "{") {
+      braceStack.push(i);
+    } else if (v === "}" && braceStack.length > 0) {
+      const openIdx = braceStack.pop();
+      pairs[openIdx] = i;
+      pairs[i] = openIdx;
+    }
+  }
+  return pairs;
 }

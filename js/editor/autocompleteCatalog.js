@@ -1,7 +1,7 @@
 /**
  * Diccionario de vocabulario y funciones estándar por lenguaje para autocompletado instantáneo.
  */
-export const LANGUAGE_COMPLETIONS = {
+const LANGUAGE_COMPLETIONS = {
   c: [
     { label: "printf", detail: "stdio.h · imprimir con formato", type: "function" },
     { label: "fprintf", detail: "stdio.h · imprimir en stream", type: "function" },
@@ -399,7 +399,8 @@ export function extractWordBeforeCursor(docText, cursorOffset) {
   if (pos < safeDoc.length && /[A-Za-z0-9_]/.test(safeDoc[pos])) {
     return { word: "", from: pos, to: pos };
   }
-  const before = safeDoc.slice(0, pos);
+  const beforeStart = Math.max(0, pos - 128);
+  const before = safeDoc.slice(beforeStart, pos);
   const match = before.match(/(^|[^A-Za-z0-9_])(#?[A-Za-z_][A-Za-z0-9_:.!-]*)$/);
   if (!match) {
     return { word: "", from: pos, to: pos };

@@ -69,7 +69,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     if (ext === "svg") {
       const reader = new FileReader();
       reader.onload = () => {
-        if (currentActiveFile && currentActiveFile.id !== targetFileId) return;
+        if (!currentActiveFile || currentActiveFile.id !== targetFileId) return;
         const text = String(reader.result || "");
         if (/^\s*(?:<!doctype\s+html\b|<html\b)/i.test(text)) {
           showInlineUploadError("El archivo contiene marcado HTML disfrazado de SVG y fue rechazado.");
@@ -89,7 +89,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     } else {
       const reader = new FileReader();
       reader.onload = () => {
-        if (currentActiveFile && currentActiveFile.id !== targetFileId) return;
+        if (!currentActiveFile || currentActiveFile.id !== targetFileId) return;
         const res = String(reader.result || "");
         const commaIdx = res.indexOf(",");
         const base64 = commaIdx !== -1 ? res.slice(commaIdx + 1) : res;

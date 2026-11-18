@@ -51,6 +51,7 @@ export function initExplorerController({
   onDownloadFile,
   onSwitchProject,
   onCreateProject,
+  onRequestNewProject,
   onDeleteCurrentProject,
   onImportFiles,
   onDownloadActiveFile,
@@ -250,6 +251,10 @@ export function initExplorerController({
   }, listenOpts);
 
   btnNewProject?.addEventListener("click", () => {
+    if (typeof onRequestNewProject === "function") {
+      onRequestNewProject();
+      return;
+    }
     openInlineCreator({
       placeholder: "nombre-del-proyecto",
       initialValue: "",
@@ -318,9 +323,9 @@ export function initExplorerController({
       ariaLabel: "Ruta de la nueva carpeta",
       onSubmit: async (val) => {
         const clean = validateUserPath(val);
+        await onCreateEntry(clean, true);
         collapsedFolders.delete(clean);
         selectedFolderPath = clean;
-        await onCreateEntry(clean, true);
       }
     });
   }, listenOpts);

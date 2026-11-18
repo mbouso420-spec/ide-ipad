@@ -1,4 +1,4 @@
-const SHELL_CACHE = "studio-ide-shell-v30";
+const SHELL_CACHE = "studio-ide-shell-v31";
 const RUNTIME_CACHE = "studio-ide-runtime-v2";
 const CORE_SHELL_URLS = new Set(["./", "./index.html", "./manifest.json", "./js/app.js"]);
 const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";
@@ -29,71 +29,94 @@ const APP_SHELL_URLS = [
   "./",
   "./index.html",
   "./manifest.json",
-  "./assets/icon.svg",
   "./assets/apple-touch-icon.png",
   "./assets/icon-512.png",
-  "./css/tokens.css",
-  "./css/base.css",
-  "./css/layout.css",
-  "./css/editor.css",
-  "./css/chat.css",
-  "./css/workspace.css",
+  "./assets/icon.svg",
   "./css/app.css",
+  "./css/base.css",
+  "./css/chat.css",
+  "./css/editor.css",
+  "./css/layout.css",
+  "./css/tokens.css",
+  "./css/workspace.css",
+  "./js/ai/chatController.js",
+  "./js/ai/markdownRenderer.js",
+  "./js/ai/mentionPopover.js",
+  "./js/ai/providers.js",
   "./js/app.js",
-  "./js/utils/encoding.js",
-  "./js/utils/dom.js",
-  "./js/utils/storage.js",
-  "./js/preview/previewUtils.js",
-  "./js/preview/jsTokenUtils.js",
-  "./js/preview/loopGuard.js",
-  "./js/preview/tsTranspiler.js",
-  "./js/preview/moduleBundler.js",
-  "./js/preview/markdownPreview.js",
-  "./js/preview/pythonRunner.js",
-  "./js/preview/htmlBundler.js",
-  "./js/preview/cRunner.js",
-  "./js/preview/sqlRunner.js",
+  "./js/editor/autocompleteCatalog.js",
+  "./js/editor/codeFormatter.js",
   "./js/editor/editorManager.js",
-  "./js/editor/languageConfig.js",
   "./js/editor/errorMarkersController.js",
   "./js/editor/fallbackEditor.js",
+  "./js/editor/languageConfig.js",
+  "./js/editor/liveLinter.js",
   "./js/editor/minimap.js",
-  "./js/editor/codeFormatter.js",
   "./js/editor/smartReplace.js",
-  "./js/editor/autocompleteCatalog.js",
   "./js/editor/splitEditorController.js",
-  "./js/workspace/autosaveManager.js",
-  "./js/workspace/tabManager.js",
-  "./js/workspace/githubLazySync.js",
-  "./js/workspace/broadcastSync.js",
-  "./js/ui/icons.js",
-  "./js/ui/layout.js",
-  "./js/ui/symbolBar.js",
-  "./js/ui/explorerController.js",
-  "./js/ui/quickOpenModal.js",
-  "./js/ui/globalSearchModal.js",
-  "./js/ui/settingsModal.js",
-  "./js/ui/keyboardRouter.js",
-  "./js/ui/diffModal.js",
-  "./js/ui/confirmDialog.js",
-  "./js/ui/statusBarController.js",
-  "./js/ui/livePreviewModal.js",
-  "./js/ui/binaryPreview.js",
+  "./js/github/githubController.js",
+  "./js/github/githubLocalBackupPanel.js",
+  "./js/github/githubMerge.js",
+  "./js/github/githubService.js",
+  "./js/net/networkErrors.js",
+  "./js/preview/bundler/liveBindingsRewriter.js",
+  "./js/preview/bundler/moduleAstScanner.js",
+  "./js/preview/bundler/modulePathResolver.js",
+  "./js/preview/bundler/virtualRuntime.js",
+  "./js/preview/clangWorker.js",
+  "./js/preview/cRunner.js",
+  "./js/preview/html/assetResolver.js",
+  "./js/preview/html/consoleBridge.js",
+  "./js/preview/html/entrypointResolver.js",
+  "./js/preview/html/standalonePreviews.js",
+  "./js/preview/htmlBundler.js",
+  "./js/preview/jsTokenUtils.js",
+  "./js/preview/loopGuard.js",
+  "./js/preview/markdownPreview.js",
+  "./js/preview/moduleBundler.js",
+  "./js/preview/previewUtils.js",
+  "./js/preview/pythonRunner.js",
+  "./js/preview/sqlRunner.js",
+  "./js/preview/ts/jsxExpander.js",
+  "./js/preview/ts/tsTokenizer.js",
+  "./js/preview/ts/typeStripper.js",
+  "./js/preview/tsTranspiler.js",
+  "./js/preview/wasiRunner.js",
   "./js/search/projectSearch.js",
-  "./js/ai/providers.js",
-  "./js/ai/chatController.js",
-  "./js/storage/workspaceDb.js",
+  "./js/security/credentialGuard.js",
+  "./js/security/keyVaultCrypto.js",
+  "./js/storage/db/dbCore.js",
+  "./js/storage/db/projectTemplates.js",
+  "./js/storage/db/workspaceEntries.js",
+  "./js/storage/db/workspaceGithubSync.js",
+  "./js/storage/db/workspaceProjects.js",
   "./js/storage/emergencyBackup.js",
   "./js/storage/fileImport.js",
   "./js/storage/storageQuota.js",
+  "./js/storage/workspaceDb.js",
   "./js/storage/zipExporter.js",
-  "./js/net/networkErrors.js",
-  "./js/github/githubService.js",
-  "./js/github/githubMerge.js",
-  "./js/github/githubLocalBackupPanel.js",
-  "./js/github/githubController.js",
-  "./js/security/credentialGuard.js",
-  "./js/security/keyVaultCrypto.js"
+  "./js/ui/binaryPreview.js",
+  "./js/ui/confirmDialog.js",
+  "./js/ui/diffModal.js",
+  "./js/ui/explorerController.js",
+  "./js/ui/globalSearchModal.js",
+  "./js/ui/icons.js",
+  "./js/ui/keyboardRouter.js",
+  "./js/ui/layout.js",
+  "./js/ui/livePreviewModal.js",
+  "./js/ui/projectModal.js",
+  "./js/ui/quickOpenModal.js",
+  "./js/ui/settingsModal.js",
+  "./js/ui/statusBarController.js",
+  "./js/ui/symbolBar.js",
+  "./js/utils/dom.js",
+  "./js/utils/encoding.js",
+  "./js/utils/storage.js",
+  "./js/workspace/autosaveManager.js",
+  "./js/workspace/broadcastSync.js",
+  "./js/workspace/githubBlobCache.js",
+  "./js/workspace/githubLazySync.js",
+  "./js/workspace/tabManager.js"
 ];
 
 const CACHEABLE_CDN_HOSTS = new Set([
@@ -222,7 +245,10 @@ function hasSafeRedirectOrigin(response, originalUrl) {
 
 async function precacheShellUrl(cache, url, limitFetch = (fn) => fn()) {
   let lastError = null;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 180 : 450));
+    }
     try {
       const res = await limitFetch(() =>
         fetchWithTimeout(new Request(url, { cache: "reload" }), 12000)
@@ -405,9 +431,13 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Cachear módulos ESM (CodeMirror 6, Octokit) y tipografías para uso rápido y offline en el iPad
+  // Cachear módulos ESM (CodeMirror 6, Octokit, Acorn) y binarios WASM (Clang) en caché runtime
   if (isCacheableCdnUrl(url)) {
     const isImmutable = isImmutableVersionedCdnUrl(url);
+    const isHeavyWasmAsset =
+      /\.(?:wasm|tar|data)(?:$|\?)/i.test(url.pathname) || url.hostname === "cdn.jsdelivr.net";
+    const cdnTimeoutMs = isHeavyWasmAsset ? 60000 : 15000;
+
     event.respondWith(
       caches.open(RUNTIME_CACHE).then(async (cache) => {
         const cached = await cache.match(request);
@@ -415,7 +445,24 @@ self.addEventListener("fetch", (event) => {
           return cached;
         }
 
-        const networkPromise = fetchWithTimeout(request, 15000)
+        const fetchCdnWithRetry = async () => {
+          let lastErr = null;
+          const attempts = cached ? 1 : 2;
+          for (let i = 0; i < attempts; i += 1) {
+            try {
+              const res = await fetchWithTimeout(request, cdnTimeoutMs);
+              if (res && res.status >= 500 && i + 1 < attempts) {
+                continue;
+              }
+              return res;
+            } catch (err) {
+              lastErr = err;
+            }
+          }
+          throw lastErr || new Error("Fallo de red CDN");
+        };
+
+        const networkPromise = fetchCdnWithRetry()
           .then(async (response) => {
             if (isCacheableResponse(response) && hasSafeRedirectOrigin(response, request.url)) {
               await safeCachePut(cache, request, response);

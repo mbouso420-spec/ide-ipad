@@ -7,11 +7,9 @@ import {
   isBlockedPreviewUrlScheme,
   normalizePreviewUrlRef,
   resolveRelativePath,
-  sanitizeSvgMarkup,
-  safeEncodeURIComponent
+  buildSafeImageDataUrl
 } from "./previewUtils.js";
 import { normalizePath } from "../storage/workspaceDb.js";
-import { getImageMimeType } from "../storage/fileImport.js";
 
 export function buildMarkdownPreview(mdFile, assetMap = null) {
   const baseDir = mdFile?.path ? mdFile.path.split("/").slice(0, -1).join("/") : "";
@@ -139,18 +137,24 @@ export function buildMarkdownPreview(mdFile, assetMap = null) {
  * Divide un documento Markdown en bloques alternos de prosa y cercos de código
  * con longitud variable de backticks (```, ````, etc.) para soportar bloques anidados.
  */
-export function splitMarkdownCodeFences(rawMd) {
-  const lines = String(rawMd || "").replace(/\r\n/g, "\n").split("\n");
+export function splitMarkdownCodeFences(rawMd, options = {}) {
+  const includeOffsets = options?.includeOffsets === true;
+  const source = String(rawMd || "");
+  const len = source.length;
   const blocks = [];
   let proseLines = [];
+  let proseStart = 0;
   let inFence = false;
   let fenceLen = 0;
   let rawHeader = "";
   let codeLines = [];
+  let codeStart = 0;
 
   const flushProse = () => {
     if (proseLines.length === 0) return;
-    blocks.push({ type: "prose", text: proseLines.join("\n") });
+    const block = { type: "prose", text: proseLines.join("\n") };
+    if (includeOffsets) block.startOffset = proseStart;
+    blocks.push(block);
     proseLines = [];
   };
 
@@ -163,16 +167,26 @@ export function splitMarkdownCodeFences(rawMd) {
     if (unclosed) {
       code = code.replace(/\n$/, "");
     }
-    blocks.push({
+    const block = {
       type: "code",
       rawHeader,
       lang,
       code,
       unclosed
-    });
+    };
+    if (includeOffsets) block.startOffset = codeStart;
+    blocks.push(block);
   };
 
-  for (const line of lines) {
+  let pos = 0;
+  while (true) {
+    const nl = source.indexOf("\n", pos);
+    const rawLineEnd = nl === -1 ? len : nl;
+    const lineEnd = rawLineEnd > pos && source.charCodeAt(rawLineEnd - 1) === 13 ? rawLineEnd - 1 : rawLineEnd;
+    const line = source.slice(pos, lineEnd);
+    const lineStart = pos;
+    const nextPos = nl === -1 ? len : nl + 1;
+
     if (!inFence) {
       const openMatch = line.match(/^ {0,3}(`{3,})([^`]*)$/);
       if (openMatch) {
@@ -181,9 +195,13 @@ export function splitMarkdownCodeFences(rawMd) {
         fenceLen = openMatch[1].length;
         rawHeader = openMatch[2].trim();
         codeLines = [];
-        continue;
+        codeStart = lineStart;
+      } else {
+        if (proseLines.length === 0) {
+          proseStart = lineStart;
+        }
+        proseLines.push(line);
       }
-      proseLines.push(line);
     } else {
       const closeMatch = line.match(/^ {0,3}(`{3,})[ \t]*$/);
       if (closeMatch && closeMatch[1].length >= fenceLen) {
@@ -192,10 +210,13 @@ export function splitMarkdownCodeFences(rawMd) {
         fenceLen = 0;
         rawHeader = "";
         codeLines = [];
-        continue;
+      } else {
+        codeLines.push(line);
       }
-      codeLines.push(line);
     }
+
+    if (nl === -1) break;
+    pos = nextPos;
   }
 
   if (inFence) {
@@ -362,29 +383,9 @@ export function formatMdInline(str, options = {}) {
         const normRef = normalizePath(cleanRef);
         const entry = assetMap.get(relPath) || assetMap.get(normRef) || assetMap.get(cleanRef) || null;
         if (entry) {
-          const ext = (entry.path || cleanRef).split(".").pop().toLowerCase();
-          const rawB64 = typeof entry.base64 === "string" && entry.base64.length > 0
-            ? entry.base64
-            : entry.isBinary && typeof entry.content === "string" && entry.content.length > 0
-              ? entry.content
-              : null;
-          const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
-          const b64 = compactB64 && /^[A-Za-z0-9+/_=-]+$/.test(compactB64) ? compactB64 : null;
-          if (b64) {
-            const mime = getImageMimeType(entry.path || cleanRef);
-            resolvedSrc = `data:${mime};base64,${b64}`;
-          } else if (ext === "svg" && typeof entry.content === "string") {
-            const sanitizedSvg = sanitizeSvgMarkup(entry.content);
-            if (sanitizedSvg) {
-              try {
-                const encodedSvg = safeEncodeURIComponent(sanitizedSvg)
-                  .replace(/'/g, "%27")
-                  .replace(/"/g, "%22");
-                resolvedSrc = `data:image/svg+xml;charset=utf-8,${encodedSvg}`;
-              } catch {
-                /* ignorar fallo de codificación */
-              }
-            }
+          const built = buildSafeImageDataUrl(entry, cleanRef);
+          if (built) {
+            resolvedSrc = built.src;
           }
         }
       }

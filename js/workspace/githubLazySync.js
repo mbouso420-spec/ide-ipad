@@ -1,4 +1,6 @@
 import { isImageFile } from "../storage/fileImport.js";
+import { cacheBatchGithubFileContents } from "../storage/workspaceDb.js";
+import { applyCachedBlobRecordToFile } from "./githubBlobCache.js";
 
 const PREVIEWABLE_LANGS = new Set([
   "html",
@@ -39,6 +41,7 @@ export function createGithubLazySync({
   editor,
   getSplitController,
   cacheAndSyncGithubFileFn,
+  cacheBatchFn = cacheBatchGithubFileContents,
   getGithubToken,
   fetchSingleRepoBlob,
   downloadBatchBlobs,
@@ -221,19 +224,42 @@ export function createGithubLazySync({
       const byPath = new Map((Array.isArray(loadedItems) ? loadedItems : []).map((item) => [item.path, item]));
       const syncedFiles = [];
       let hasDeleted = false;
-      for (const fileObj of unloaded) {
-        const hit = byPath.get(fileObj.path);
-        if (!hit) continue;
-        const { deleted } = await cacheAndSyncGithubFileFn({
-          projectId: sourceProjectId,
-          fileObj,
-          remotePayload: hit,
-          blobSha: hit.blobSha || fileObj.blobSha
-        });
-        if (deleted) {
-          hasDeleted = true;
+
+      if (typeof cacheBatchFn === "function") {
+        const matchedEntries = [];
+        for (const fileObj of unloaded) {
+          const hit = byPath.get(fileObj.path);
+          if (!hit) continue;
+          matchedEntries.push({
+            fileObj,
+            hit,
+            batchItem: { path: fileObj.path, payload: hit, blobSha: hit.blobSha || fileObj.blobSha }
+          });
         }
-        syncedFiles.push(fileObj);
+        const savedList = await cacheBatchFn(
+          sourceProjectId,
+          matchedEntries.map((m) => m.batchItem)
+        );
+        matchedEntries.forEach((m, idx) => {
+          const { deleted } = applyCachedBlobRecordToFile(m.fileObj, savedList?.[idx], m.hit);
+          if (deleted) hasDeleted = true;
+          syncedFiles.push(m.fileObj);
+        });
+      } else {
+        for (const fileObj of unloaded) {
+          const hit = byPath.get(fileObj.path);
+          if (!hit) continue;
+          const { deleted } = await cacheAndSyncGithubFileFn({
+            projectId: sourceProjectId,
+            fileObj,
+            remotePayload: hit,
+            blobSha: hit.blobSha || fileObj.blobSha
+          });
+          if (deleted) {
+            hasDeleted = true;
+          }
+          syncedFiles.push(fileObj);
+        }
       }
 
       if (getActiveProject()?.id !== sourceProjectId) {
@@ -325,7 +351,6 @@ export function createGithubLazySync({
     syncOfflineButtonState,
     ensureFileContentLoaded,
     ensureFilesLoaded,
-    finalizeLoadedProjectFiles,
     preloadForPreview
   };
 }

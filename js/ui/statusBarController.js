@@ -131,7 +131,6 @@ export function createStatusBarController({
 
   return {
     updateStatusBar,
-    updateNetworkIndicator,
     updateAssistantContextLabel,
     syncToolbarState,
     setEditorToolbarDisabled,

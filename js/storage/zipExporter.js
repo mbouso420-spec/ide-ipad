@@ -29,7 +29,7 @@ export function computeCrc32(bytes) {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
-export const MAX_SAFE_ZIP_BYTES = 250 * 1024 * 1024; // 250 MB para prevenir picos OOM en el navegador
+const MAX_SAFE_ZIP_BYTES = 250 * 1024 * 1024; // 250 MB para prevenir picos OOM en el navegador
 
 /**
  * Convierte un objeto Date en la representación de fecha y hora MS-DOS usada en PKZIP.

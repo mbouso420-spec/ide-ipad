@@ -4,11 +4,12 @@ import { initSymbolBar } from "./ui/symbolBar.js";
 import { generateDuplicatePath, initExplorerController } from "./ui/explorerController.js";
 import { buildZipBlob, downloadZip } from "./storage/zipExporter.js";
 import { initDiffModal } from "./ui/diffModal.js";
+import { initProjectModal } from "./ui/projectModal.js";
 import { initLivePreviewModal } from "./ui/livePreviewModal.js";
 import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
-import { showConfirmDialog } from "./ui/confirmDialog.js";
+import { confirmDialogAsync, showConfirmDialog } from "./ui/confirmDialog.js";
 import { createStatusBarController } from "./ui/statusBarController.js";
 import {
   applyDocumentEdit,
@@ -28,14 +29,14 @@ import {
   saveProjectToGist
 } from "./github/githubService.js";
 import {
-  exportKeysBundle,
   getKeyStorageMode,
+  getSyncCredentialsBackupPayload,
   hasStoredCredentials,
   importKeysBundle,
   setKeyStorageMode
 } from "./ai/providers.js";
 import {
-  cacheSingleGithubFileContent,
+  cacheBatchGithubFileContents,
   closeWorkspaceBroadcast,
   createLocalProject,
   deleteProject,
@@ -65,9 +66,11 @@ import {
   upsertEntry,
   validateUserPath
 } from "./storage/workspaceDb.js";
+import { formatSafeErrorMessage } from "./security/credentialGuard.js";
 import { keyboardRouter } from "./ui/keyboardRouter.js";
 import { restoreEmergencyBackup } from "./storage/emergencyBackup.js";
 import { base64ToUint8Array, isBinaryFile, isImageFile } from "./storage/fileImport.js";
+import { cacheAndSyncGithubFile } from "./workspace/githubBlobCache.js";
 import { downloadBlob } from "./utils/dom.js";
 import { readStoredValue, removeStoredValue, saveStoredValue } from "./utils/storage.js";
 import { createAutosaveManager } from "./workspace/autosaveManager.js";
@@ -106,7 +109,7 @@ async function initApp() {
         importKeysBundle(backupJson);
       }
     } else {
-      void saveCredentialsBackup(exportKeysBundle());
+      void saveCredentialsBackup(getSyncCredentialsBackupPayload());
     }
   } catch {
     // Continuar con el arranque normal si falla la lectura de respaldo
@@ -144,18 +147,21 @@ async function initApp() {
     onDownloadFile: downloadCurrentActiveFile,
     async onUpdateFileContent(file, payload) {
       if (!activeProject || !file) return;
+      const sourceProjectId = activeProject.id;
       await autosaveManager.flushPendingSaves();
+      if (activeProject?.id !== sourceProjectId) return;
       const isSvgText = typeof payload?.text === "string";
       const base64 = isSvgText ? null : (payload?.base64 || null);
       const content = isSvgText ? payload.text : "";
       const isBinary = !isSvgText;
 
-      await upsertEntry(activeProject.id, file.path, {
+      await upsertEntry(sourceProjectId, file.path, {
         isFolder: false,
         content,
         isBinary,
         base64
       });
+      if (activeProject?.id !== sourceProjectId) return;
 
       file.content = content;
       file.base64 = base64;
@@ -163,7 +169,9 @@ async function initApp() {
       file.contentLoaded = true;
 
       editor.dropFileState(file.path);
+      splitController?.dropFileState(file.path);
       await reloadProjectEntries();
+      if (activeProject?.id !== sourceProjectId) return;
       const updated = filesOnly.find((f) => f.id === file.id);
       if (updated) {
         binaryPreview.render(updated);
@@ -291,6 +299,7 @@ async function initApp() {
     editor,
     getSplitController: () => splitController,
     cacheAndSyncGithubFileFn: cacheAndSyncGithubFile,
+    cacheBatchFn: cacheBatchGithubFileContents,
     getGithubToken,
     fetchSingleRepoBlob,
     downloadBatchBlobs,
@@ -509,11 +518,22 @@ async function initApp() {
       .filter((id) => id !== activeFileId)
       .map((id) => filesOnly.find((f) => f.id === id))
       .filter((f) => Boolean(f) && f.contentLoaded !== false && !isBinaryFile(f));
+    const projectFiles = filesOnly
+      .filter((f) => !isBinaryFile(f))
+      .map((f) => ({
+        id: f.id,
+        path: f.path,
+        shortName: f.shortName,
+        lang: f.lang,
+        contentLoaded: f.contentLoaded !== false,
+        content: f.contentLoaded !== false ? (f.content ?? "") : ""
+      }));
 
     return {
       activeFile,
       selection: activeSelection,
-      otherOpenFiles
+      otherOpenFiles,
+      projectFiles
     };
   };
 
@@ -596,6 +616,27 @@ async function initApp() {
 
   let pendingProjectSelectSeq = 0;
 
+  async function createNewLocalProject(name, templateId = null) {
+    const selectSeq = ++pendingProjectSelectSeq;
+    try {
+      await autosaveManager.flushPendingSaves();
+      if (selectSeq !== pendingProjectSelectSeq) return;
+      const created = await createLocalProject(name, templateId);
+      if (selectSeq !== pendingProjectSelectSeq) return;
+      projects = await listProjects();
+      if (selectSeq !== pendingProjectSelectSeq) return;
+      await switchProject(created.id);
+    } catch (error) {
+      explorer.setAutosaveStatus(
+        error instanceof Error ? error.message : "No se pudo crear el espacio"
+      );
+    }
+  }
+
+  const projectModal = initProjectModal({
+    onCreateProject: createNewLocalProject
+  });
+
   explorer = initExplorerController({
     onSelectFile(path) {
       openOrFocusFile(path);
@@ -629,6 +670,7 @@ async function initApp() {
             error instanceof Error ? error.message : "No se pudo crear el elemento"
           );
         }
+        throw error;
       }
     },
     async onRenameEntry(oldPath, newPath, isFolder) {
@@ -681,6 +723,7 @@ async function initApp() {
             error instanceof Error ? error.message : "No se pudo renombrar el elemento"
           );
         }
+        throw error;
       }
     },
     async onDeleteEntry(path, isFolder) {
@@ -711,7 +754,12 @@ async function initApp() {
         if (activeProject?.id !== sourceProjectId) return;
         await reloadProjectEntries();
         if (activeProject?.id !== sourceProjectId) return;
-        renderWorkspaceView();
+        const nextActive = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
+        if (nextActive && nextActive.contentLoaded === false) {
+          await openOrFocusFile(nextActive.id);
+        } else {
+          renderWorkspaceView();
+        }
         await github.refreshTopbarBadge();
       } catch (error) {
         if (activeProject?.id === sourceProjectId) {
@@ -774,22 +822,8 @@ async function initApp() {
 
       await switchProject(selectedValue);
     },
-    async onCreateProject(name) {
-      const selectSeq = ++pendingProjectSelectSeq;
-      try {
-        await autosaveManager.flushPendingSaves();
-        if (selectSeq !== pendingProjectSelectSeq) return;
-        const created = await createLocalProject(name);
-        if (selectSeq !== pendingProjectSelectSeq) return;
-        projects = await listProjects();
-        if (selectSeq !== pendingProjectSelectSeq) return;
-        await switchProject(created.id);
-      } catch (error) {
-        explorer.setAutosaveStatus(
-          error instanceof Error ? error.message : "No se pudo crear el espacio"
-        );
-      }
-    },
+    onRequestNewProject: () => projectModal.open(),
+    onCreateProject: createNewLocalProject,
     async onDeleteCurrentProject() {
       if (projects.length <= 1) return;
       const selectSeq = ++pendingProjectSelectSeq;
@@ -1029,7 +1063,7 @@ async function initApp() {
         }
       } catch (err) {
         if (activeProject?.id === sourceProjectId) {
-          const msg = err?.message || "al respaldar en Gist";
+          const msg = formatSafeErrorMessage(err, [token], "al respaldar en Gist");
           if (
             msg.includes("Resource not accessible") ||
             msg.includes("permiso para Gists") ||
@@ -1144,9 +1178,31 @@ async function initApp() {
 
   chat = initChatController({
     getContextSnapshot,
+    async onResolveFileContent(targetPath) {
+      const sourceProjectId = activeProject?.id;
+      const norm = normalizePath(String(targetPath || "").trim());
+      if (!norm) return null;
+      const match = filesOnly.find((f) => normalizePath(f.path) === norm);
+      if (!match || isBinaryFile(match)) return null;
+      if (match.contentLoaded === false) {
+        await githubLazySync.ensureFilesLoaded([match]);
+        if (activeProject?.id !== sourceProjectId) return null;
+      }
+      const fresh = filesOnly.find((f) => normalizePath(f.path) === norm);
+      if (!fresh || isBinaryFile(fresh) || fresh.contentLoaded === false) return null;
+      return {
+        path: fresh.path,
+        lang: fresh.lang,
+        content: fresh.content ?? ""
+      };
+    },
     async onInsertAtCursor(code, lang) {
       await ensureAnOpenFile(lang);
       if (!activeFileId) {
+        return false;
+      }
+      const targetFile = filesOnly.find((f) => f.id === activeFileId);
+      if (!targetFile || isBinaryFile(targetFile) || targetFile.contentLoaded === false) {
         return false;
       }
       editor.insertAtCursor(code, 0);
@@ -1155,6 +1211,10 @@ async function initApp() {
     },
     async onReplaceSelection(code, contextHint = null) {
       if (!activeFileId) {
+        return false;
+      }
+      const targetFile = filesOnly.find((f) => f.id === activeFileId);
+      if (!targetFile || isBinaryFile(targetFile) || targetFile.contentLoaded === false) {
         return false;
       }
       editor.replaceSelection(code, contextHint);
@@ -1230,7 +1290,7 @@ async function initApp() {
           await updateFileContent(sourceProjectId, freshTarget.path, code);
           if (activeProject?.id !== sourceProjectId) return false;
           editor.dropFileState(freshTarget.id);
-          splitController?.replaceIfActive(freshTarget.id, code);
+          splitController?.syncOrDropPath(freshTarget.id, code, { markDirty: false });
           tabManager.renderTabs();
         }
       }
@@ -1239,11 +1299,13 @@ async function initApp() {
     async onApplyMultiFile(filesToApply) {
       if (!Array.isArray(filesToApply) || filesToApply.length === 0) return false;
       const sourceProjectId = activeProject?.id;
+      if (!sourceProjectId) return false;
+
       await autosaveManager.flushPendingSaves();
       if (activeProject?.id !== sourceProjectId) return false;
-      let firstValidNorm = null;
+
+      const deduped = new Map();
       for (const item of filesToApply) {
-        if (activeProject?.id !== sourceProjectId) return false;
         const rawPath = String(item?.path || "").trim().replace(/^(?:\.\/)+/, "");
         let norm;
         try {
@@ -1253,42 +1315,142 @@ async function initApp() {
         }
         if (!norm) continue;
         const existing = filesOnly.find((f) => normalizePath(f.path) === norm);
-        if (existing && isBinaryFile(existing)) {
-          continue;
+        if (existing && isBinaryFile(existing)) continue;
+        deduped.set(norm, { path: norm, code: String(item?.code ?? ""), existing });
+      }
+      if (deduped.size === 0) return false;
+
+      const lazyToLoad = [];
+      for (const entry of deduped.values()) {
+        if (entry.existing && entry.existing.contentLoaded === false) {
+          lazyToLoad.push(entry.existing);
         }
-        if (!firstValidNorm) firstValidNorm = norm;
-        autosaveManager.clearTimersForProject(sourceProjectId, (p) => normalizePath(p) === norm);
-        if (existing) {
-          existing.content = item.code;
-          existing.contentLoaded = true;
-          await updateFileContent(sourceProjectId, norm, item.code);
-          if (activeProject?.id !== sourceProjectId) return false;
-          if (activeFileId === existing.id) {
-            editor.replaceEntireDocument(item.code);
-          } else {
-            editor.dropFileState(existing.id);
+      }
+      if (lazyToLoad.length > 0) {
+        try {
+          await githubLazySync.ensureFilesLoaded(lazyToLoad);
+        } catch {
+          if (activeProject?.id === sourceProjectId) {
+            explorer.setAutosaveStatus("No se pudieron cargar archivos de GitHub para comparar cambios");
           }
-          splitController?.replaceIfActive(existing.id, item.code);
-        } else {
-          await upsertEntry(sourceProjectId, norm, {
-            content: item.code,
-            isFolder: false,
-            allowOverwrite: true
-          });
-          if (activeProject?.id !== sourceProjectId) return false;
+          return false;
         }
+        if (activeProject?.id !== sourceProjectId) return false;
       }
-      if (activeProject?.id !== sourceProjectId) return false;
-      await reloadProjectEntries();
-      if (activeProject?.id !== sourceProjectId) return false;
-      if (!firstValidNorm) return false;
-      const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
-      if (firstTarget) {
-        await openOrFocusFile(firstTarget.id);
+
+      const diffItems = [];
+      for (const entry of deduped.values()) {
+        const fresh = filesOnly.find((f) => normalizePath(f.path) === entry.path);
+        if (fresh && fresh.contentLoaded === false) continue;
+        diffItems.push({
+          path: entry.path,
+          oldCode: fresh ? (fresh.content ?? "") : "",
+          newCode: entry.code,
+          isNew: !fresh,
+          lang: fresh?.lang || inferFileMeta(entry.path).lang
+        });
       }
-      if (activeProject?.id !== sourceProjectId) return false;
-      tabManager.renderTabs();
-      return true;
+      if (diffItems.length === 0) return false;
+
+      return new Promise((resolve) => {
+        diffModal.openMultiFileApplyDiff({
+          files: diffItems,
+          onCancel: () => resolve(false),
+          onConfirm: async (selectedItems) => {
+            const rollbackLog = [];
+            try {
+              if (!Array.isArray(selectedItems) || selectedItems.length === 0) {
+                resolve(false);
+                return;
+              }
+              if (activeProject?.id !== sourceProjectId) {
+                resolve(false);
+                return;
+              }
+              let firstValidNorm = null;
+              for (const item of selectedItems) {
+                if (activeProject?.id !== sourceProjectId) {
+                  throw new Error("El proyecto cambió durante la aplicación multiarchivo.");
+                }
+                const norm = normalizePath(item.path);
+                if (!firstValidNorm) firstValidNorm = norm;
+                const existing = filesOnly.find((f) => normalizePath(f.path) === norm);
+                if (existing && (isBinaryFile(existing) || existing.contentLoaded === false)) continue;
+                autosaveManager.clearTimersForProject(sourceProjectId, (p) => normalizePath(p) === norm);
+                if (existing) {
+                  const prevContent = existing.content ?? "";
+                  await updateFileContent(sourceProjectId, norm, item.newCode);
+                  rollbackLog.push({ kind: "update", path: norm, existingId: existing.id, prevContent });
+                  existing.content = item.newCode;
+                  existing.contentLoaded = true;
+                  if (activeProject?.id !== sourceProjectId) {
+                    throw new Error("El proyecto cambió durante la aplicación multiarchivo.");
+                  }
+                  if (activeFileId === existing.id) {
+                    editor.replaceEntireDocument(item.newCode);
+                  } else {
+                    editor.dropFileState(existing.id);
+                  }
+                  splitController?.syncOrDropPath(existing.id, item.newCode, { markDirty: false });
+                } else {
+                  await upsertEntry(sourceProjectId, norm, {
+                    content: item.newCode,
+                    isFolder: false,
+                    allowOverwrite: true
+                  });
+                  rollbackLog.push({ kind: "create", path: norm });
+                  if (activeProject?.id !== sourceProjectId) {
+                    throw new Error("El proyecto cambió durante la aplicación multiarchivo.");
+                  }
+                }
+              }
+              await reloadProjectEntries();
+              if (activeProject?.id !== sourceProjectId || !firstValidNorm) {
+                resolve(false);
+                return;
+              }
+              const firstTarget = filesOnly.find((f) => normalizePath(f.path) === firstValidNorm);
+              if (firstTarget) {
+                await openOrFocusFile(firstTarget.id);
+              }
+              if (activeProject?.id !== sourceProjectId) {
+                resolve(false);
+                return;
+              }
+              tabManager.renderTabs();
+              await github.refreshTopbarBadge();
+              layout.closeRightOnCompactAction();
+              resolve(true);
+            } catch {
+              for (let r = rollbackLog.length - 1; r >= 0; r -= 1) {
+                const entry = rollbackLog[r];
+                try {
+                  if (entry.kind === "create") {
+                    await deleteProjectEntry(sourceProjectId, entry.path, false);
+                  } else {
+                    await updateFileContent(sourceProjectId, entry.path, entry.prevContent);
+                  }
+                  editor.dropFileState(entry.existingId || entry.path);
+                  splitController?.dropFileState(entry.existingId || entry.path);
+                } catch {
+                  // Continuar intentando revertir los demás archivos del lote
+                }
+              }
+              if (activeProject?.id === sourceProjectId) {
+                try {
+                  await reloadProjectEntries();
+                  renderWorkspaceView();
+                  await github.refreshTopbarBadge();
+                } catch {
+                  // Ignorar si falla la recarga tras rollback
+                }
+                explorer.setAutosaveStatus("No se pudo aplicar todo el lote; cambios locales revertidos.");
+              }
+              resolve(false);
+            }
+          }
+        });
+      });
     },
     onConversationChange(history, projectId) {
       const targetId = projectId || activeProject.id;
@@ -1308,12 +1470,43 @@ async function initApp() {
     onOpenDiff({ title, oldCode, newCode }) {
       diffModal.openReadOnlyDiff({ title, oldCode, newCode });
     },
+    onOpenMultiDiff({ title, items, initialIndex }) {
+      diffModal.openMultiFileReadOnlyDiff({ title, items, initialIndex });
+    },
+    onRequestConfirm: confirmDialogAsync,
+    async onDiscardLocalChange(projectId, targetPath) {
+      if (activeProject?.id !== projectId) return;
+      const norm = normalizePath(targetPath);
+      autosaveManager.clearTimersForProject(projectId, (p) => normalizePath(p) === norm);
+      await reloadProjectEntries();
+      if (activeProject?.id !== projectId) return;
+      const fresh = filesOnly.find((f) => normalizePath(f.path) === norm);
+      if (!fresh) {
+        if (openTabIds.includes(norm)) {
+          await closeTab(norm);
+        } else {
+          renderWorkspaceView();
+        }
+      } else {
+        editor.dropFileState(fresh.id);
+        splitController?.syncOrDropPath(fresh.id, fresh.content ?? "", { markDirty: false });
+        if (activeFileId === fresh.id) {
+          await openOrFocusFile(fresh.id);
+        } else {
+          renderWorkspaceView();
+        }
+      }
+      await github.refreshTopbarBadge();
+    },
     onReposListChanged(remoteRepos) {
       explorer.renderProjects(projects, activeProject.id, remoteRepos);
     },
     async onProjectClonedOrSynced(projectId) {
+      const capturedSwitchSeq = switchProjectSeq;
       await autosaveManager.flushPendingSaves();
+      if (capturedSwitchSeq !== switchProjectSeq) return;
       projects = await listProjects();
+      if (capturedSwitchSeq !== switchProjectSeq) return;
       await switchProject(projectId);
     }
   });
@@ -1321,8 +1514,10 @@ async function initApp() {
   // Atajo universal Cmd+S / Ctrl+S y Cmd+W / Ctrl+W / Alt+W enrutados vía keyboardRouter
   const triggerManualSave = () => {
     void (async () => {
-      await autosaveManager.flushPendingSaves();
-      explorer.setAutosaveStatus("Guardado en IndexedDB");
+      const ok = await autosaveManager.flushPendingSaves();
+      if (ok) {
+        explorer.setAutosaveStatus("Guardado en IndexedDB");
+      }
     })();
   };
   keyboardRouter.registerGlobalShortcut("ctrl+s", triggerManualSave);
@@ -1360,6 +1555,7 @@ async function initApp() {
     statusBar,
     tabManager,
     renderWorkspaceView,
+    openOrFocusFile,
     getSplitController: () => splitController,
     github,
     onKeyStorageModeBroadcast: (mode) => {
@@ -1507,8 +1703,20 @@ async function initApp() {
     await github.refreshTopbarBadge();
   }
 
+  let reloadEntriesSeq = 0;
+
   async function reloadProjectEntries() {
-    const rawEntries = await getProjectEntries(activeProject.id);
+    const seq = ++reloadEntriesSeq;
+    const targetProjectId = activeProject?.id;
+    if (!targetProjectId) {
+      treeEntries = [];
+      filesOnly = [];
+      return;
+    }
+    const rawEntries = await getProjectEntries(targetProjectId);
+    if (seq !== reloadEntriesSeq || activeProject?.id !== targetProjectId) {
+      return;
+    }
     treeEntries = rawEntries.map((e) => ({
       path: e.path,
       isFolder: Boolean(e.isFolder)
@@ -1627,6 +1835,11 @@ async function initApp() {
     }
     await tabManager.persistTabsState();
     if (activeProject?.id !== sourceProjectId) return;
+    const nextActive = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
+    if (nextActive && nextActive.contentLoaded === false) {
+      await openOrFocusFile(nextActive.id);
+      return;
+    }
     renderWorkspaceView();
   }
 
@@ -1704,6 +1917,7 @@ async function initApp() {
       splitController?.destroy?.();
       symbolBar?.destroy?.();
       diffModal?.destroy?.();
+      projectModal?.destroy?.();
       binaryPreview?.destroy?.();
       editor?.destroy?.();
       chat?.destroy?.();
@@ -1799,80 +2013,7 @@ function registerPwaServiceWorker() {
   }
 }
 
-/**
- * Sincroniza un objeto de archivo en memoria con el registro persistido en IndexedDB tras cachear un blob.
- */
-export function applyCachedBlobRecordToFile(fileObj, saved, remotePayload) {
-  if (!fileObj || typeof fileObj !== "object") {
-    return { deleted: false };
-  }
-  const isRemoteObj = Boolean(remotePayload && typeof remotePayload === "object");
-  const fallbackIsBinary = isRemoteObj && Boolean(remotePayload.isBinary);
-  const fallbackContent = fallbackIsBinary
-    ? ""
-    : String(isRemoteObj ? (remotePayload.content ?? "") : (remotePayload ?? ""));
-  const fallbackBase64 = fallbackIsBinary ? (remotePayload.base64 ?? null) : null;
-  const fallbackBaseBase64 = fallbackIsBinary
-    ? (remotePayload.baseBase64 ?? remotePayload.base64 ?? null)
-    : null;
-
-  if (saved && typeof saved === "object") {
-    if (saved.deleted) {
-      fileObj.deleted = true;
-      fileObj.content = typeof saved.content === "string" ? saved.content : "";
-      fileObj.baseContent = typeof saved.baseContent === "string" ? saved.baseContent : "";
-      fileObj.isBinary = Boolean(saved.isBinary);
-      fileObj.base64 = saved.base64 ?? null;
-      fileObj.baseBase64 = saved.baseBase64 ?? null;
-      fileObj.contentLoaded = saved.contentLoaded !== false;
-      return { deleted: true };
-    }
-
-    const nextIsBinary = typeof saved.isBinary === "boolean" ? saved.isBinary : fallbackIsBinary;
-    fileObj.deleted = false;
-    fileObj.isBinary = nextIsBinary;
-    fileObj.content = nextIsBinary
-      ? ""
-      : (typeof saved.content === "string" ? saved.content : fallbackContent);
-    fileObj.baseContent = nextIsBinary
-      ? ""
-      : (typeof saved.baseContent === "string" ? saved.baseContent : fileObj.content);
-    fileObj.base64 = nextIsBinary ? (saved.base64 ?? null) : null;
-    fileObj.baseBase64 = nextIsBinary ? (saved.baseBase64 ?? fileObj.base64 ?? null) : null;
-    fileObj.contentLoaded = saved.contentLoaded !== false;
-    if (saved.blobSha) {
-      fileObj.blobSha = saved.blobSha;
-    }
-    return { deleted: false };
-  }
-
-  fileObj.deleted = false;
-  fileObj.isBinary = fallbackIsBinary;
-  fileObj.content = fallbackContent;
-  fileObj.baseContent = fallbackContent;
-  fileObj.base64 = fallbackBase64;
-  fileObj.baseBase64 = fallbackBaseBase64;
-  fileObj.contentLoaded = true;
-  return { deleted: false };
-}
-
-/**
- * Persiste el payload descargado de GitHub (texto o binario) y reconcilia `fileObj` con el registro guardado.
- */
-export async function cacheAndSyncGithubFile({
-  projectId,
-  fileObj,
-  remotePayload,
-  blobSha = null,
-  cacheFn = cacheSingleGithubFileContent
-}) {
-  const payload = remotePayload && typeof remotePayload === "object"
-    ? remotePayload
-    : String(remotePayload ?? "");
-  const saved = await cacheFn(projectId, fileObj.path, payload, blobSha ?? fileObj.blobSha ?? null);
-  const status = applyCachedBlobRecordToFile(fileObj, saved, payload);
-  return { saved, ...status };
-}
+export { applyCachedBlobRecordToFile, cacheAndSyncGithubFile } from "./workspace/githubBlobCache.js";
 
 if (typeof document !== "undefined") {
   const startApp = () => {

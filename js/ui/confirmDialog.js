@@ -11,7 +11,8 @@ export function showConfirmDialog({
   message,
   confirmText = "Confirmar",
   confirmVariant = "btn-primary",
-  onConfirm
+  onConfirm,
+  onCancel: onCancelCb
 }) {
   const dialog = typeof document !== "undefined" ? document.getElementById("confirm-dialog") : null;
   const titleEl = typeof document !== "undefined" ? document.getElementById("confirm-dialog-title") : null;
@@ -23,6 +24,8 @@ export function showConfirmDialog({
   if (!dialog) {
     if (typeof window !== "undefined" && typeof window.confirm === "function" && window.confirm(message)) {
       onConfirm?.();
+    } else {
+      onCancelCb?.();
     }
     return;
   }
@@ -61,13 +64,20 @@ export function showConfirmDialog({
   };
   activeConfirmCleanup = cleanup;
 
+  let settled = false;
+
   const onCancel = () => {
     cleanup();
     if (dialog.open) dialog.close();
+    if (!settled) {
+      settled = true;
+      onCancelCb?.();
+    }
   };
 
   const onProceed = () => {
     cleanup();
+    settled = true;
     if (dialog.open) dialog.close();
     onConfirm?.();
   };
@@ -75,6 +85,10 @@ export function showConfirmDialog({
   const onDialogClose = () => {
     if (dialog.open) return;
     cleanup();
+    if (!settled) {
+      settled = true;
+      onCancelCb?.();
+    }
   };
 
   cancelBtn?.addEventListener("click", onCancel, listenOpts);
@@ -99,5 +113,21 @@ export function showConfirmDialog({
       onProceed();
       return true;
     }
+  });
+}
+
+/**
+ * Variante basada en Promesa del diálogo de confirmación accesible (#confirm-dialog).
+ */
+export function confirmDialogAsync({ title, message, confirmText = "Confirmar", danger = false }) {
+  return new Promise((resolve) => {
+    showConfirmDialog({
+      title,
+      message,
+      confirmText,
+      confirmVariant: danger ? "btn-danger" : "btn-primary",
+      onConfirm: () => resolve(true),
+      onCancel: () => resolve(false)
+    });
   });
 }

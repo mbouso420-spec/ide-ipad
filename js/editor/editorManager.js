@@ -11,11 +11,10 @@ import {
 import { getIndentSize } from "./languageConfig.js";
 import { createErrorMarkersController } from "./errorMarkersController.js";
 import { createFallbackEditor } from "./fallbackEditor.js";
+import { isLiveLintablePath, lintDocument, LIVE_LINT_DEBOUNCE_MS } from "./liveLinter.js";
 
-export { getIndentSize } from "./languageConfig.js";
 export { scoreLineSimilarity, computeSmartReplacement } from "./smartReplace.js";
 export {
-  LANGUAGE_COMPLETIONS,
   extractWordBeforeCursor,
   scoreCompletionMatch,
   getLanguageCompletions
@@ -90,7 +89,7 @@ export function buildContentAttributes(hardwareKeyboard = true) {
  * @param {boolean} hardwareKeyboard
  * @param {HTMLElement|null} [targetEl]
  */
-export function applyHardwareKeyboardAttributes(hardwareKeyboard, targetEl = null, includeGlobal = true) {
+function applyHardwareKeyboardAttributes(hardwareKeyboard, targetEl = null, includeGlobal = true) {
   const attrs = buildContentAttributes(hardwareKeyboard);
   if (targetEl && typeof targetEl.setAttribute === "function") {
     for (const [k, v] of Object.entries(attrs)) {
@@ -305,7 +304,7 @@ export async function createEditorManager({
     Decoration?.line
       ? Decoration.line({
           attributes: {
-            class: "cm-error-line",
+            class: /warning/i.test(String(msg || "")) ? "cm-error-line cm-warning-line" : "cm-error-line",
             title: msg || "Error de compilación"
           }
         })
@@ -346,6 +345,50 @@ export async function createEditorManager({
     enableGlobalRuler,
     onJump: goToLine
   });
+
+  let liveLintTimer = null;
+  let liveLintSeq = 0;
+
+  function cancelLiveLint() {
+    liveLintSeq += 1;
+    if (liveLintTimer) {
+      clearTimeout(liveLintTimer);
+      liveLintTimer = null;
+    }
+  }
+
+  function scheduleLiveLint(targetFileId = activeFileId, delayMs = LIVE_LINT_DEBOUNCE_MS) {
+    cancelLiveLint();
+    if (!targetFileId || !isLiveLintablePath(targetFileId)) return;
+    const seq = liveLintSeq;
+    liveLintTimer = setTimeout(async () => {
+      liveLintTimer = null;
+      if (seq !== liveLintSeq || targetFileId !== activeFileId || !view) return;
+      const docText = view.state.doc.toString();
+      try {
+        const issues = await lintDocument(targetFileId, docText);
+        if (seq !== liveLintSeq || targetFileId !== activeFileId || !view) return;
+        setLiveMarkers(targetFileId, issues);
+      } catch (_) {
+        /* diagnóstico en vivo nunca debe interrumpir al usuario */
+      }
+    }, delayMs);
+  }
+
+  function setLiveMarkers(fileId, issues = []) {
+    if (!fileId || fileId !== activeFileId) return;
+    errorMarkers.clearFile(fileId);
+    if (view && clearErrorEffect) {
+      view.dispatch({ effects: clearErrorEffect.of(null) });
+    }
+    if (Array.isArray(issues)) {
+      for (const issue of issues) {
+        if (!issue || !(issue.line > 0)) continue;
+        addErrorMarker(issue.line, issue.message || "Error de sintaxis", { jumpToLine: false });
+      }
+    }
+    syncErrorRuler(view?.state?.doc?.lines || 1);
+  }
 
   function syncErrorRuler(totalLines = view?.state?.doc?.lines || 1) {
     errorMarkers.syncRuler(activeFileId, totalLines);
@@ -630,6 +673,9 @@ export async function createEditorManager({
             onDocChange(activeFileId, update.state.doc.toString());
             minimap?.render();
             refreshAutocompleteBar(update.state);
+            if (isLiveLintablePath(activeFileId)) {
+              scheduleLiveLint(activeFileId);
+            }
           } else if (update.docChanged && isSyncingExternal) {
             minimap?.render();
             autocompleteBar.hide();
@@ -720,6 +766,11 @@ export async function createEditorManager({
     minimap?.render();
     minimap?.updateSlider();
     emitSelection(view.state);
+    if (isLiveLintablePath(file.id)) {
+      scheduleLiveLint(file.id, 180);
+    } else {
+      cancelLiveLint();
+    }
   }
 
   function purgeViewDocument() {
@@ -738,6 +789,7 @@ export async function createEditorManager({
   }
 
   function clearActiveFile() {
+    cancelLiveLint();
     autocompleteBar.hide();
     clearErrorMarkers();
     activeFileId = null;
@@ -769,6 +821,7 @@ export async function createEditorManager({
       docVocabHasComputed = false;
     }
     if (activeFileId === fileId) {
+      cancelLiveLint();
       autocompleteBar.hide();
       clearErrorMarkers();
       activeFileId = null;
@@ -938,14 +991,14 @@ export async function createEditorManager({
     replaceSelection(text, contextHint);
   }
 
-  function addErrorMarker(lineNum, errorMessage) {
+  function addErrorMarker(lineNum, errorMessage, { jumpToLine = true } = {}) {
     const { marker, isFirstForFile } = errorMarkers.addMarker(activeFileId, lineNum, errorMessage);
 
     if (view && addErrorEffect) {
       view.dispatch({
         effects: addErrorEffect.of({ lineNum: marker.lineNum, errorMessage: marker.errorMessage })
       });
-      if (isFirstForFile) {
+      if (jumpToLine && isFirstForFile) {
         goToLine(marker.lineNum);
       }
     }
@@ -1092,8 +1145,10 @@ export async function createEditorManager({
     },
     acceptTopCompletion: () => autocompleteBar.acceptCurrent(),
     syncDoc,
+    setLiveMarkers,
     focus: () => view?.focus(),
     destroy() {
+      cancelLiveLint();
       if (docVocabTimer) {
         clearTimeout(docVocabTimer);
         docVocabTimer = null;

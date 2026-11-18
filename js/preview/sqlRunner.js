@@ -22,19 +22,27 @@ export function convertResultsToCsv(results, maxRows = Infinity) {
 
   for (const res of results) {
     if (!res || !Array.isArray(res.columns)) continue;
-    const lines = [];
+    const rowCount = Array.isArray(res.values) ? Math.min(res.values.length, limit) : 0;
+    const lines = new Array(rowCount + 1);
+    let lineIdx = 0;
 
     // Cabeceras
-    lines.push(res.columns.map(escapeCsvField).join(","));
+    lines[lineIdx++] = res.columns.map(escapeCsvField).join(",");
 
-    // Filas con protección de volumen
+    // Filas con protección de volumen sin asignar un arreglo temporal .map() por fila
     if (Array.isArray(res.values)) {
-      const rowLimit = Math.min(res.values.length, limit);
-      for (let i = 0; i < rowLimit; i++) {
+      const cells = [];
+      for (let i = 0; i < rowCount; i++) {
         const row = res.values[i];
         if (!Array.isArray(row)) continue;
-        lines.push(row.map(escapeCsvField).join(","));
+        const cols = row.length;
+        cells.length = cols;
+        for (let c = 0; c < cols; c++) {
+          cells[c] = escapeCsvField(row[c]);
+        }
+        lines[lineIdx++] = cells.join(",");
       }
+      lines.length = lineIdx;
     }
 
     sections.push(lines.join("\r\n"));
@@ -43,17 +51,31 @@ export function convertResultsToCsv(results, maxRows = Infinity) {
   return sections.join("\r\n\r\n");
 }
 
+const CSV_NEG_NUM_RE = /^-\d+(?:\.\d+)?$/;
+
 function escapeCsvField(val) {
   if (val === null || val === undefined) return "";
+  if (typeof val === "number") return String(val);
   let str = String(val);
+  if (str.length === 0) return "";
+  const firstCode = str.charCodeAt(0);
   const needsFormulaNeutralization =
-    typeof val !== "number" &&
-    str.length > 0 &&
-    (/^[=+\t\r@]/.test(str) || (/^-/.test(str) && !/^-\d+(?:\.\d+)?$/.test(str)));
+    firstCode === 61 || // '='
+    firstCode === 43 || // '+'
+    firstCode === 9 || // '\t'
+    firstCode === 13 || // '\r'
+    firstCode === 64 || // '@'
+    (firstCode === 45 && !CSV_NEG_NUM_RE.test(str)); // '-' no numérico
   if (needsFormulaNeutralization) {
     str = `'${str}`;
   }
-  if (needsFormulaNeutralization || str.includes(",") || str.includes('"') || str.includes("\n") || str.includes("\r")) {
+  if (
+    needsFormulaNeutralization ||
+    str.indexOf(",") !== -1 ||
+    str.indexOf('"') !== -1 ||
+    str.indexOf("\n") !== -1 ||
+    str.indexOf("\r") !== -1
+  ) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;

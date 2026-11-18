@@ -1341,6 +1341,182 @@
   font-style: italic;
 }
 
+/* Botón destructivo para descartar cambios en confirmDialog */
+.btn-danger {
+  background: oklch(56% 0.2 25);
+  border-color: oklch(64% 0.18 25);
+  color: oklch(98% 0.01 25);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: oklch(62% 0.2 25);
+}
+
+/* Barra multi-archivo en Diff Modal (IA multi-archivo & pre-commit navegable) */
+.diff-multi-bar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  margin-bottom: var(--space-xs);
+  border-radius: var(--radius-card);
+  border: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-2);
+}
+
+.diff-multi-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-xs);
+}
+
+.diff-multi-counter {
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+}
+
+.diff-multi-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs);
+  max-height: 92px;
+  overflow-y: auto;
+}
+
+.diff-multi-file-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: 2px var(--space-xs);
+  border-radius: var(--radius-control);
+  border: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper);
+  font-size: var(--text-xs);
+}
+
+.diff-multi-file-pill.is-active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.diff-multi-file-btn {
+  border: none;
+  background: transparent;
+  color: var(--color-ink);
+  font-size: var(--text-xs);
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.diff-multi-file-pill.is-active .diff-multi-file-btn {
+  color: var(--color-accent-text);
+  font-weight: 600;
+}
+
+/* Pre-commit selectivo y descarte en #github-dialog */
+.gh-change-summary {
+  background: var(--color-paper-3);
+  border-bottom: var(--rule-hair) solid var(--color-rule);
+}
+
+.gh-change-select-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-width: 0;
+  flex: 1;
+  cursor: pointer;
+}
+
+.gh-change-check {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--color-accent);
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.gh-discard-btn {
+  color: var(--color-error);
+}
+
+/* Selector de motor C/C++ (Auto / Wandbox / Clang WASM offline) */
+.c-runner-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  flex-wrap: wrap;
+}
+
+.c-compiler-select {
+  min-height: var(--control-height-sm);
+  font-size: var(--text-xs);
+  width: auto;
+  min-width: 185px;
+}
+
+/* Modal de plantillas de proyecto nuevo */
+.template-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: var(--space-xs);
+}
+
+.template-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: var(--space-sm);
+  border-radius: var(--radius-card);
+  border: var(--rule-hair) solid var(--color-rule);
+  background: var(--color-paper-2);
+  color: var(--color-ink);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--dur-micro) var(--ease-out), background-color var(--dur-micro) var(--ease-out);
+}
+
+.template-card:hover {
+  border-color: var(--color-rule-strong);
+  background: var(--color-paper-3);
+}
+
+.template-card.is-selected {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.template-card-title {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.template-card.is-selected .template-card-title {
+  color: var(--color-accent-text);
+}
+
+.template-card-desc {
+  font-size: var(--text-xs);
+  color: var(--color-muted);
+  line-height: 1.35;
+}
+
+.template-card-files {
+  font-size: var(--text-xs);
+  color: var(--color-ink-2);
+  opacity: 0.9;
+  margin-top: 2px;
+}
+
 @media (pointer: coarse) {
   .tree-node-actions {
     gap: var(--space-2xs);
@@ -1354,6 +1530,15 @@
   .tree-icon-btn .icon-svg {
     width: 15px;
     height: 15px;
+  }
+
+  .gh-change-check {
+    width: 20px;
+    height: 20px;
+  }
+
+  .template-card {
+    min-height: 76px;
   }
 
   .inline-edit-input,
