@@ -227,14 +227,15 @@ export function initLivePreviewModal({
   }, listenOpts);
 
   const MAX_TRANSITIVE_DEPS = 250;
+  const MAX_PROJECT_IMAGE_PRELOADS = 120;
 
   function isFileContentUnloaded(file) {
-    return Boolean(
-      file &&
-      (file.isLoaded === false ||
-        file.contentLoaded === false ||
-        (file.content === "" && Boolean(file.blobSha)))
-    );
+    if (!file) return false;
+    if (file.isLoaded === false || file.contentLoaded === false) return true;
+    if (file.isBinary) {
+      return !file.base64 && Boolean(file.blobSha);
+    }
+    return file.content === "" && Boolean(file.blobSha);
   }
 
   function buildFilesByNormPathMap(allFiles) {
@@ -348,7 +349,29 @@ export function initLivePreviewModal({
     await loadTransitiveDependencies([targetFile], allFiles);
     if (destroyed) return { html: "", assetMap: new Map() };
 
-    // 3. Construir mapa de assets del proyecto completo
+    // 3. Precargar imágenes restantes del proyecto para catálogos con rutas dinámicas en JS/JSON
+    const unloadedProjectImages = (allFiles || [])
+      .filter((f) => {
+        if (!f || !f.path || !isFileContentUnloaded(f)) return false;
+        const clean = normalizePath(f.path);
+        if (isIgnoredPreviewPath(clean)) return false;
+        return IMAGE_EXTENSIONS.has(getFileExtension(clean));
+      })
+      .slice(0, MAX_PROJECT_IMAGE_PRELOADS);
+    if (unloadedProjectImages.length > 0) {
+      try {
+        if (typeof ensureFilesLoaded === "function") {
+          await ensureFilesLoaded(unloadedProjectImages);
+        } else if (typeof ensureFileLoaded === "function") {
+          await Promise.all(unloadedProjectImages.map((f) => ensureFileLoaded(f)));
+        }
+      } catch (_) {
+        /* Continuar con los assets ya disponibles si alguna imagen falla */
+      }
+      if (destroyed) return { html: "", assetMap: new Map() };
+    }
+
+    // 4. Construir mapa de assets del proyecto completo
     const assetMap = buildWorkspaceAssetMap(allFiles);
     return {
       html: targetFile.content || "",

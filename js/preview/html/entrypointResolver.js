@@ -106,6 +106,18 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
 
   const currentFolder = currentPreviewPath ? getParentFolder(currentPreviewPath) : "";
 
+  // Enlaces a raíz ("/", "./", "../") o carpeta terminada en "/" resuelven a index.html
+  if (clean === "/" || clean === "./" || clean === "." || clean === ".." || clean.endsWith("/")) {
+    const dirTarget = clean === "/"
+      ? ""
+      : normalizePath(resolveRelativePath(currentFolder, clean));
+    const idxPath = dirTarget ? `${dirTarget}/index.html` : "index.html";
+    const matchDirIdx = htmlFiles.find((f) => normalizePath(f.path).toLowerCase() === idxPath.toLowerCase());
+    if (matchDirIdx) return matchDirIdx;
+    const rootIdx = htmlFiles.find((f) => normalizePath(f.path).toLowerCase() === "index.html");
+    if (rootIdx) return rootIdx;
+  }
+
   const relResolved = resolveRelativePath(currentFolder, clean);
   const match1 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(relResolved));
   if (match1) return match1;

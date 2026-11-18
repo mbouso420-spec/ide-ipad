@@ -77,6 +77,43 @@ ${buildLoopGuardRuntime()}
     }
     send("error", ["Promesa rechazada: " + reasonText]);
   });
+  // Shim seguro en memoria para localStorage/sessionStorage/history dentro de iframe sandbox (origin 'null')
+  (function () {
+    function createMemoryStorage() {
+      var store = Object.create(null);
+      return {
+        getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, String(k)) ? store[String(k)] : null; },
+        setItem: function (k, v) { store[String(k)] = String(v); },
+        removeItem: function (k) { delete store[String(k)]; },
+        clear: function () { store = Object.create(null); },
+        key: function (i) { var keys = Object.keys(store); return i >= 0 && i < keys.length ? keys[i] : null; },
+        get length() { return Object.keys(store).length; }
+      };
+    }
+    ["localStorage", "sessionStorage"].forEach(function (prop) {
+      try {
+        var testStorage = window[prop];
+        void testStorage.length;
+      } catch (_) {
+        try {
+          var mem = createMemoryStorage();
+          Object.defineProperty(window, prop, { configurable: true, get: function () { return mem; } });
+        } catch (_2) {}
+      }
+    });
+    try {
+      if (window.history) {
+        var origPush = window.history.pushState;
+        var origReplace = window.history.replaceState;
+        window.history.pushState = function () {
+          try { return origPush.apply(window.history, arguments); } catch (_) { return undefined; }
+        };
+        window.history.replaceState = function () {
+          try { return origReplace.apply(window.history, arguments); } catch (_) { return undefined; }
+        };
+      }
+    } catch (_) {}
+  })();
   // Mini-REPL interactivo conectado al panel Consola JS de Studio IDE
   window.addEventListener("message", function (ev) {
     var d = ev.data;

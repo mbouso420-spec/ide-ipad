@@ -553,7 +553,7 @@ const RUNTIME_DATA_EXT_MIMES = {
   csv: "text/csv; charset=utf-8",
   xml: "application/xml; charset=utf-8"
 };
-const MAX_RUNTIME_ASSET_MAP_CHARS = 16 * 1024 * 1024;
+const MAX_RUNTIME_ASSET_MAP_CHARS = 32 * 1024 * 1024;
 
 export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversal, buildEntryDataUrl, mimeResolver = getMediaMimeType) {
   if (!fileMap || fileMap.size === 0) return "";
@@ -572,7 +572,11 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
     }
     const ext = getFileExtension(normPath);
     if (Object.prototype.hasOwnProperty.call(RUNTIME_DATA_EXT_MIMES, ext) && typeof entry.content === "string") {
-      if (entry.content.length <= MAX_PREVIEW_ASSET_BYTES && totalChars + entry.content.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
+      if (
+        !Object.prototype.hasOwnProperty.call(textEntries, normPath) &&
+        entry.content.length <= MAX_PREVIEW_ASSET_BYTES &&
+        totalChars + entry.content.length <= MAX_RUNTIME_ASSET_MAP_CHARS
+      ) {
         textEntries[normPath] = { content: entry.content, mime: RUNTIME_DATA_EXT_MIMES[ext] };
         totalChars += entry.content.length;
         hasEntries = true;
@@ -580,6 +584,9 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
       continue;
     }
     if (IMAGE_EXTENSIONS.has(ext) || entry.isBinary) {
+      if (Object.prototype.hasOwnProperty.call(urlEntries, normPath)) {
+        continue;
+      }
       const dataUrl = buildEntryDataUrl(entry, normPath, mimeResolver);
       if (dataUrl && totalChars + dataUrl.length <= MAX_RUNTIME_ASSET_MAP_CHARS) {
         urlEntries[normPath] = dataUrl;
@@ -607,7 +614,19 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
   };
   var urlLower = Object.create(null);
   var textLower = Object.create(null);
-  Object.keys(cfg.urls).forEach(function (k) { urlLower[normNfc(k).toLowerCase()] = cfg.urls[k]; });
+  var urlBaseCounts = Object.create(null);
+  var urlByBase = Object.create(null);
+  var urlKeysLower = [];
+  Object.keys(cfg.urls).forEach(function (k) {
+    var lk = normNfc(k).toLowerCase();
+    urlLower[lk] = cfg.urls[k];
+    urlKeysLower.push(lk);
+    var base = lk.split("/").pop();
+    if (base) {
+      urlBaseCounts[base] = (urlBaseCounts[base] || 0) + 1;
+      urlByBase[base] = { src: cfg.urls[k], path: lk };
+    }
+  });
   Object.keys(cfg.texts).forEach(function (k) { textLower[normNfc(k).toLowerCase()] = cfg.texts[k]; });
 
   function cleanNormPath(p) {
@@ -630,7 +649,7 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
     try { return decodeURIComponent(noHash); } catch (_) { return noHash; }
   }
 
-  function lookupFromMap(exactMap, lowerMap, rawRef) {
+  function lookupFromMap(exactMap, lowerMap, rawRef, allowImageFallbacks) {
     if (!rawRef || typeof rawRef !== "string") return null;
     var trimmed = rawRef.trim();
     if (!trimmed || /^(https?:|data:|blob:|#|javascript:|vbscript:|file:)/i.test(trimmed)) return null;
@@ -661,11 +680,34 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
       var nfcLower = normNfc(cand).toLowerCase();
       if (Object.prototype.hasOwnProperty.call(lowerMap, nfcLower)) return lowerMap[nfcLower];
     }
+
+    if (allowImageFallbacks) {
+      var relNorm = cleanNormPath(clean.replace(/^\\/+/, ""));
+      if (relNorm) {
+        var relLower = normNfc(relNorm).toLowerCase();
+        var suffix = "/" + relLower;
+        for (var j = 0; j < urlKeysLower.length; j++) {
+          var k = urlKeysLower[j];
+          if (k === relLower || (k.length > suffix.length && k.slice(-suffix.length) === suffix)) {
+            if (cfg.allowParent || !cfg.baseDir || k === cfg.baseDir.toLowerCase() || k.indexOf(cfg.baseDir.toLowerCase() + "/") === 0) {
+              return lowerMap[k];
+            }
+          }
+        }
+        var baseName = relLower.split("/").pop();
+        if (baseName && urlBaseCounts[baseName] === 1) {
+          var baseHit = urlByBase[baseName];
+          if (baseHit && (cfg.allowParent || !cfg.baseDir || baseHit.path === cfg.baseDir.toLowerCase() || baseHit.path.indexOf(cfg.baseDir.toLowerCase() + "/") === 0)) {
+            return baseHit.src;
+          }
+        }
+      }
+    }
     return null;
   }
 
   function resolveUrl(rawRef) {
-    return lookupFromMap(cfg.urls, urlLower, rawRef);
+    return lookupFromMap(cfg.urls, urlLower, rawRef, true);
   }
 
   function resolveSrcset(rawSrcset) {

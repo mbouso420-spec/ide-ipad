@@ -15,7 +15,8 @@ import {
   escapeJsonForInlineScript,
   isIgnoredPreviewPath
 } from "../js/preview/previewUtils.js";
-import { buildWorkspaceAssetMap, bundleHtmlWithFolderAssets, buildMarkdownPreview } from "../js/preview/htmlBundler.js";
+import { buildWorkspaceAssetMap, bundleHtmlWithFolderAssets, buildMarkdownPreview, findTargetHtmlFile } from "../js/preview/htmlBundler.js";
+import { buildConsoleBridgeScript } from "../js/preview/html/consoleBridge.js";
 import { runWasiModule } from "../js/preview/wasiRunner.js";
 import { sanitizeVirtualSourcePath } from "../js/preview/clangWorker.js";
 import { buildStandalonePythonPreview } from "../js/preview/pythonRunner.js";
@@ -744,6 +745,28 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
       assert.equal(all.find((e) => e.path === "src/f_0.js")?.content, "// remote 0");
       assert.equal(all.find((e) => e.path === "src/f_7.js")?.content, "// local edit stays");
       assert.equal(all.filter((e) => !e.isFolder && e.contentLoaded).length, 50);
+    });
+
+    test("Live Preview multipágina: resuelve '/', './', '../' hacia index.html, shim localStorage/history y fotos de catálogo por sufijo/shortName", () => {
+      const files = [
+        { path: "index.html", content: "<html><body><h1>Inicio</h1></body></html>" },
+        { path: "pages/catalogo.html", content: "<html><head></head><body><img src=\"../img/logo.png\"><script src=\"../js/cat.js\"></script></body></html>" },
+        { path: "js/cat.js", content: "const prod = { img: 'productos/zapato.png' };" },
+        { path: "img/logo.png", isBinary: true, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8XkAAAAASUVORK5CYII=" },
+        { path: "img/productos/zapato.png", isBinary: true, base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a8XkAAAAASUVORK5CYII=" }
+      ];
+      assert.equal(findTargetHtmlFile(files, "pages/catalogo.html", "/")?.path, "index.html");
+      assert.equal(findTargetHtmlFile(files, "pages/catalogo.html", "../")?.path, "index.html");
+      assert.equal(findTargetHtmlFile(files, "catalogo.html", "./")?.path, "index.html");
+
+      const bridge = buildConsoleBridgeScript(false);
+      assert.match(bridge, /createMemoryStorage/);
+      assert.match(bridge, /window\.history\.pushState/);
+
+      const assetMap = buildWorkspaceAssetMap(files);
+      const compiled = bundleHtmlWithFolderAssets("pages/catalogo.html", files[1].content, assetMap, null, (c) => c, null, true);
+      assert.match(compiled, /img\/productos\/zapato\.png/);
+      assert.match(compiled, /urlBaseCounts/);
     });
   });
 });
