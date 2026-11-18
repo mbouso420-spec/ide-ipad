@@ -298,14 +298,14 @@ export function createGithubLazySync({
           // Se muestra con el estado actual en memoria
         }
       }
-      if (activeIsImage || getActiveProject()?.id !== sourceProjectId) {
+      if (getActiveProject()?.id !== sourceProjectId) {
         return;
       }
     }
 
     const lastSlash = activeFile.path.lastIndexOf("/");
     const folderPrefix = lastSlash === -1 ? "" : `${activeFile.path.slice(0, lastSlash + 1)}`;
-    const isWeb = isWebScriptOrMarkupFile(activeFile);
+    const isWeb = isWebScriptOrMarkupFile(activeFile) || activeIsImage;
 
     const needed = getFilesOnly().filter((f) => {
       if (f.contentLoaded !== false || !f.blobSha) return false;
@@ -329,7 +329,12 @@ export function createGithubLazySync({
       if (activeFile.lang === "sql") {
         return f.lang === "sql";
       }
-      return isWebScriptOrMarkupFile(f) || f.path.toLowerCase().endsWith(".json") || isImageFile(f);
+      const lowerP = f.path.toLowerCase();
+      return (
+        isWebScriptOrMarkupFile(f) ||
+        /\.(?:json|csv|xml|txt|woff2?|ttf|otf)$/i.test(lowerP) ||
+        isImageFile(f)
+      );
     });
 
     if (needed.length > 0) {

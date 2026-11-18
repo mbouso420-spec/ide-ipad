@@ -59,8 +59,11 @@ function scanRegexLiteral(src, start) {
   return start + 1;
 }
 
-function canPrecedeRegex(prevChar, prevWord) {
+function canPrecedeRegex(prevChar, prevWord, prevPrevChar) {
   if (!prevChar) return true;
+  if ((prevChar === "+" && prevPrevChar === "+") || (prevChar === "-" && prevPrevChar === "-")) {
+    return false;
+  }
   if ("([\{,;=:?!&|^~+-*%<>".includes(prevChar)) return true;
   return Boolean(prevWord && REGEX_PRECEDING_KEYWORDS.has(prevWord));
 }
@@ -70,7 +73,9 @@ function scanRhsExpressionEnd(src, start) {
   let paren = 0;
   let bracket = 0;
   let brace = 0;
+  let ternaryDepth = 0;
   let prevChar = "=";
+  let prevPrevChar = "";
   let prevWord = "";
   const tplStack = [];
 
@@ -80,7 +85,7 @@ function scanRhsExpressionEnd(src, start) {
 
     if (tplStack.length > 0 && tplStack[tplStack.length - 1] === brace) {
       if (ch === "\\") { i += 2; continue; }
-      if (ch === "`") { tplStack.pop(); i++; prevChar = "`"; prevWord = ""; continue; }
+      if (ch === "`") { tplStack.pop(); i++; prevPrevChar = prevChar; prevChar = "`"; prevWord = ""; continue; }
       if (ch === "$" && next === "{") { i += 2; brace++; continue; }
       i++;
       continue;
@@ -88,6 +93,7 @@ function scanRhsExpressionEnd(src, start) {
 
     if (ch === "'" || ch === "\"") {
       i = scanQuotedString(src, i, ch);
+      prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
       continue;
@@ -107,8 +113,9 @@ function scanRhsExpressionEnd(src, start) {
       i = end === -1 ? src.length : end + 2;
       continue;
     }
-    if (ch === "/" && canPrecedeRegex(prevChar, prevWord)) {
+    if (ch === "/" && canPrecedeRegex(prevChar, prevWord, prevPrevChar)) {
       i = scanRegexLiteral(src, i);
+      prevPrevChar = prevChar;
       prevChar = "/";
       prevWord = "";
       continue;
@@ -132,7 +139,12 @@ function scanRhsExpressionEnd(src, start) {
       }
     } else if (paren === 0 && bracket === 0 && brace === 0) {
       if (ch === ";" || ch === ",") break;
-      if (ch === "\n" || ch === "\r") {
+      if (ch === "?" && next !== "." && next !== "?") {
+        ternaryDepth++;
+      } else if (ch === ":") {
+        if (ternaryDepth === 0) break;
+        ternaryDepth--;
+      } else if (ch === "\n" || ch === "\r") {
         const afterWs = skipWs(src, i);
         const nextTok = src[afterWs] || "";
         const continues =
@@ -149,10 +161,12 @@ function scanRhsExpressionEnd(src, start) {
         let j = i + 1;
         while (j < src.length && isIdentPart(src[j])) j++;
         prevWord = src.slice(i, j);
+        prevPrevChar = "";
         prevChar = src[j - 1];
         i = j;
         continue;
       }
+      prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
     }
@@ -163,8 +177,8 @@ function scanRhsExpressionEnd(src, start) {
 
 /**
  * Reescribe asignaciones y llamadas a `location` (`location.href = ...`, `location.assign(...)`,
- * `location.replace(...)`, `window.location = ...`) hacia `window.__ideNavigate(...)` para evitar
- * que `<iframe srcdoc>` navegue fuera del sandbox hacia la URL del IDE padre.
+ * `location.replace(...)`, `location.reload()`, `window.location = ...`) hacia `window.__ideNavigate(...)` /
+ * `window.__ideReload(...)` para evitar que `<iframe srcdoc>` navegue fuera del sandbox hacia el IDE padre.
  */
 export function rewriteProgrammaticNavigation(code) {
   const src = String(code || "");
@@ -174,9 +188,11 @@ export function rewriteProgrammaticNavigation(code) {
   let i = 0;
   let lastCopied = 0;
   let prevChar = "";
+  let prevPrevChar = "";
   let prevWord = "";
   let braceDepth = 0;
   const tplStack = [];
+  const braceKindStack = [];
 
   while (i < src.length) {
     const ch = src[i];
@@ -184,14 +200,20 @@ export function rewriteProgrammaticNavigation(code) {
 
     if (tplStack.length > 0 && tplStack[tplStack.length - 1] === braceDepth) {
       if (ch === "\\") { i += 2; continue; }
-      if (ch === "`") { tplStack.pop(); i++; prevChar = "`"; prevWord = ""; continue; }
-      if (ch === "$" && next === "{") { i += 2; braceDepth++; continue; }
+      if (ch === "`") { tplStack.pop(); i++; prevPrevChar = prevChar; prevChar = "`"; prevWord = ""; continue; }
+      if (ch === "$" && next === "{") {
+        i += 2;
+        braceDepth++;
+        braceKindStack.push("tpl");
+        continue;
+      }
       i++;
       continue;
     }
 
     if (ch === "'" || ch === "\"") {
       i = scanQuotedString(src, i, ch);
+      prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
       continue;
@@ -211,8 +233,9 @@ export function rewriteProgrammaticNavigation(code) {
       i = end === -1 ? src.length : end + 2;
       continue;
     }
-    if (ch === "/" && canPrecedeRegex(prevChar, prevWord)) {
+    if (ch === "/" && canPrecedeRegex(prevChar, prevWord, prevPrevChar)) {
       i = scanRegexLiteral(src, i);
+      prevPrevChar = prevChar;
       prevChar = "/";
       prevWord = "";
       continue;
@@ -251,6 +274,16 @@ export function rewriteProgrammaticNavigation(code) {
             out += src.slice(lastCopied, i) + "window.__ideNavigate(";
             i = afterProp + 1;
             lastCopied = i;
+            prevPrevChar = prevChar;
+            prevChar = "(";
+            prevWord = "";
+            continue;
+          }
+          if (prop === "reload" && src[afterProp] === "(") {
+            out += src.slice(lastCopied, i) + "window.__ideReload(";
+            i = afterProp + 1;
+            lastCopied = i;
+            prevPrevChar = prevChar;
             prevChar = "(";
             prevWord = "";
             continue;
@@ -263,43 +296,64 @@ export function rewriteProgrammaticNavigation(code) {
               out += src.slice(lastCopied, i) + `window.__ideNavigate(${rhsExpr})`;
               i = rhsEnd;
               lastCopied = i;
+              prevPrevChar = prevChar;
               prevChar = ")";
               prevWord = "";
               continue;
             }
           }
-        } else if (
-          src[k] === "=" &&
-          src[k + 1] !== "=" &&
-          src[k + 1] !== ">" &&
-          (!isBareLoc || !prevChar || ";})".includes(prevChar) || prevWord === "else")
-        ) {
-          const rhsStart = skipWs(src, k + 1);
-          const rhsEnd = scanRhsExpressionEnd(src, rhsStart);
-          const rhsExpr = src.slice(rhsStart, rhsEnd).trim();
-          if (rhsExpr) {
-            out += src.slice(lastCopied, i) + `window.__ideNavigate(${rhsExpr})`;
-            i = rhsEnd;
-            lastCopied = i;
-            prevChar = ")";
-            prevWord = "";
-            continue;
+        } else if (src[k] === "=" && src[k + 1] !== "=" && src[k + 1] !== ">") {
+          const currentBraceKind = braceKindStack.length > 0 ? braceKindStack[braceKindStack.length - 1] : "block";
+          const inClassMemberScope = currentBraceKind === "class";
+          const inDestructuringPattern = isBareLoc && (prevChar === "{" || prevChar === ",") && currentBraceKind !== "block";
+          const allowedBareBoundary =
+            !isBareLoc ||
+            (!inClassMemberScope &&
+              !inDestructuringPattern &&
+              (!prevChar || ";{}".includes(prevChar) || prevWord === "else" || prevWord === "return"));
+          if (allowedBareBoundary) {
+            const rhsStart = skipWs(src, k + 1);
+            const rhsEnd = scanRhsExpressionEnd(src, rhsStart);
+            const rhsExpr = src.slice(rhsStart, rhsEnd).trim();
+            if (rhsExpr) {
+              out += src.slice(lastCopied, i) + `window.__ideNavigate(${rhsExpr})`;
+              i = rhsEnd;
+              lastCopied = i;
+              prevPrevChar = prevChar;
+              prevChar = ")";
+              prevWord = "";
+              continue;
+            }
           }
         }
       }
 
       prevWord = word;
+      prevPrevChar = "";
       prevChar = src[j - 1];
       i = j;
       continue;
     }
 
-    if (ch === "{") braceDepth++;
-    else if (ch === "}") {
+    if (ch === "{") {
+      braceDepth++;
+      let kind = "block";
+      const lookback = src.slice(Math.max(0, i - 180), i);
+      if (/\bclass\b[^{};]*$/.test(lookback)) {
+        kind = "class";
+      } else if (prevChar === ")" || prevWord === "else" || prevWord === "try" || prevWord === "finally" || prevWord === "do" || !prevChar || prevChar === ";") {
+        kind = "block";
+      } else if (DECL_KEYWORDS.has(prevWord) || "=([,:?".includes(prevChar)) {
+        kind = "expr";
+      }
+      braceKindStack.push(kind);
+    } else if (ch === "}") {
       if (braceDepth > 0) braceDepth--;
+      if (braceKindStack.length > 0) braceKindStack.pop();
     }
 
     if (!/\s/.test(ch)) {
+      prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
     }
@@ -407,6 +461,27 @@ ${buildLoopGuardRuntime()}
       }
     });
     try {
+      void document.cookie;
+    } catch (_) {
+      try {
+        var memCookies = Object.create(null);
+        Object.defineProperty(document, "cookie", {
+          configurable: true,
+          get: function () {
+            return Object.keys(memCookies).map(function (k) { return k + "=" + memCookies[k]; }).join("; ");
+          },
+          set: function (val) {
+            var str = String(val || "");
+            var eqIdx = str.indexOf("=");
+            if (eqIdx === -1) return;
+            var name = str.slice(0, eqIdx).trim();
+            var rest = str.slice(eqIdx + 1).split(";")[0].trim();
+            if (name) memCookies[name] = rest;
+          }
+        });
+      } catch (_3) {}
+    }
+    try {
       if (window.history) {
         var origPush = window.history.pushState;
         var origReplace = window.history.replaceState;
@@ -415,6 +490,20 @@ ${buildLoopGuardRuntime()}
         };
         window.history.replaceState = function () {
           try { return origReplace.apply(window.history, arguments); } catch (_) { return undefined; }
+        };
+        window.history.back = function () {
+          parent.postMessage({ source: "studio-ide-preview", action: "history", delta: -1 }, "*");
+        };
+        window.history.forward = function () {
+          parent.postMessage({ source: "studio-ide-preview", action: "history", delta: 1 }, "*");
+        };
+        window.history.go = function (delta) {
+          var n = typeof delta === "number" ? delta : Number(delta || 0);
+          if (!n) {
+            parent.postMessage({ source: "studio-ide-preview", action: "reload" }, "*");
+          } else {
+            parent.postMessage({ source: "studio-ide-preview", action: "history", delta: n }, "*");
+          }
         };
       }
     } catch (_) {}
@@ -442,33 +531,76 @@ ${buildLoopGuardRuntime()}
   function isBlockedNavScheme(normRef) {
     return /^(javascript:|vbscript:|data:|file:|filesystem:)/.test(normRef);
   }
-  // Interceptor total de navegación local en enlaces
+  function isExternalNavRef(normRef) {
+    return normRef.indexOf("//") === 0 || /^(https?:|mailto:|tel:|blob:)/.test(normRef);
+  }
+  function findClickedAnchor(e) {
+    if (typeof e.composedPath === "function") {
+      var path = e.composedPath();
+      for (var p = 0; p < path.length; p++) {
+        var node = path[p];
+        if (!node || !node.tagName || typeof node.getAttribute !== "function") continue;
+        var tag = String(node.tagName).toLowerCase();
+        if (tag === "a" || tag === "area") return node;
+      }
+    }
+    var rawTarget = e.target && e.target.nodeType === 3 ? (e.target.parentElement || e.target.parentNode) : e.target;
+    return rawTarget && rawTarget.closest ? rawTarget.closest("a, area") : null;
+  }
+  function readAnchorHref(a) {
+    if (!a || typeof a.getAttribute !== "function") return null;
+    var h = a.getAttribute("href");
+    if (h != null) return h;
+    h = a.getAttribute("xlink:href");
+    if (h != null) return h;
+    if (typeof a.getAttributeNS === "function") {
+      h = a.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+      if (h != null) return h;
+    }
+    return null;
+  }
+  // Fase de captura: bloqueo estricto de esquemas peligrosos (sin romper tabs SPA con click en burbuja)
   document.addEventListener("click", function (e) {
-    var rawTarget = e.target && e.target.nodeType === 3 ? e.target.parentElement : e.target;
-    var a = rawTarget && rawTarget.closest ? rawTarget.closest("a[href], area[href], a[xlink\\:href]") : null;
+    var a = findClickedAnchor(e);
     if (!a) return;
-    var href = a.getAttribute("href") || a.getAttribute("xlink:href") || "";
-    if (!href) return;
+    var href = readAnchorHref(a);
+    if (href == null) return;
     var normHref = normalizeNavRef(href);
     if (isBlockedNavScheme(normHref)) {
       e.preventDefault();
       e.stopPropagation();
+    }
+  }, true);
+  // Fase de burbuja en window: permite que SPAs/tabs usen e.preventDefault() y evita escapes nativos de srcdoc
+  window.addEventListener("click", function (e) {
+    if (e.defaultPrevented) return;
+    var a = findClickedAnchor(e);
+    if (!a) return;
+    var href = readAnchorHref(a);
+    if (href == null) return;
+    var normHref = normalizeNavRef(href);
+    if (isBlockedNavScheme(normHref)) {
+      e.preventDefault();
+      return;
+    }
+    if (!normHref) {
+      e.preventDefault();
+      parent.postMessage({ source: "studio-ide-preview", action: "navigate", href: "./" }, "*");
       return;
     }
     if (normHref.startsWith("#")) return;
-    if (/^(https?:|mailto:|tel:|blob:)/.test(normHref)) {
+    if (isExternalNavRef(normHref)) {
       a.setAttribute("target", "_blank");
       a.setAttribute("rel", "noopener noreferrer");
       return;
     }
     e.preventDefault();
-    e.stopPropagation();
     parent.postMessage({
       source: "studio-ide-preview",
       action: "navigate",
       href: href
     }, "*");
-  }, true);
+  }, false);
 
   // Interceptor de envíos de formularios locales
   document.addEventListener("submit", function (e) {
@@ -487,7 +619,7 @@ ${buildLoopGuardRuntime()}
       e.stopPropagation();
       return;
     }
-    if (normAction.startsWith("#") || /^(https?:|mailto:|tel:)/.test(normAction)) return;
+    if (normAction.startsWith("#") || isExternalNavRef(normAction)) return;
     e.preventDefault();
     e.stopPropagation();
     parent.postMessage({
@@ -509,7 +641,7 @@ ${buildLoopGuardRuntime()}
       window.location.hash = rawTarget;
       return;
     }
-    if (/^(https?:|mailto:|tel:|blob:)/.test(normTarget)) {
+    if (isExternalNavRef(normTarget)) {
       if (origOpen) origOpen(rawTarget, "_blank", "noopener,noreferrer");
       return;
     }
@@ -519,6 +651,9 @@ ${buildLoopGuardRuntime()}
       href: rawTarget || "/"
     }, "*");
   };
+  var triggerReload = function () {
+    parent.postMessage({ source: "studio-ide-preview", action: "reload" }, "*");
+  };
   try {
     Object.defineProperty(window, "__ideNavigate", {
       value: triggerNav,
@@ -526,16 +661,22 @@ ${buildLoopGuardRuntime()}
       writable: true,
       enumerable: false
     });
+    Object.defineProperty(window, "__ideReload", {
+      value: triggerReload,
+      configurable: true,
+      writable: true,
+      enumerable: false
+    });
   } catch (_) {
     window.__ideNavigate = triggerNav;
+    window.__ideReload = triggerReload;
   }
   try {
     if (origOpen) {
       window.open = function (url, target, features) {
-        var tgt = String(target || "").trim().toLowerCase();
         var raw = url == null ? "" : String(url);
         var norm = normalizeNavRef(raw);
-        if (raw && (!tgt || tgt === "_self" || tgt === "_parent" || tgt === "_top") && !/^(https?:|mailto:|tel:|blob:)/.test(norm)) {
+        if (raw && !isExternalNavRef(norm)) {
           triggerNav(raw);
           return null;
         }

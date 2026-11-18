@@ -131,6 +131,7 @@ export function initLivePreviewModal({
   let consoleVisible = true;
   let hasControlledSrcdoc = false;
   let expectingControlledLoad = false;
+  let expectingBlankUnload = false;
   let previewRunSeq = 0;
   let renderSeq = 0;
   let destroyed = false;
@@ -232,6 +233,12 @@ export function initLivePreviewModal({
   function isFileContentUnloaded(file) {
     if (!file) return false;
     if (file.isLoaded === false || file.contentLoaded === false) return true;
+    if (file.contentLoaded === true || file.isLoaded === true) {
+      if (file.isBinary) {
+        return !file.base64 && Boolean(file.blobSha);
+      }
+      return false;
+    }
     if (file.isBinary) {
       return !file.base64 && Boolean(file.blobSha);
     }
@@ -390,10 +397,14 @@ export function initLivePreviewModal({
 
   async function navigateToHtml(targetPath, pushHistory = true) {
     if (destroyed) return;
-    const seq = ++renderSeq;
     const { files, projectId } = getWorkspaceSnapshot();
     const targetFile = files.find((f) => normalizePath(f.path) === normalizePath(targetPath));
     if (!targetFile) return;
+
+    const seq = ++renderSeq;
+    await loadAcorn().catch(() => {});
+    const { html, assetMap } = await prepareHtmlForPreview(targetFile, files);
+    if (destroyed || seq !== renderSeq) return;
 
     currentPreviewPath = targetFile.path;
     savePreviewHtml(projectId, targetFile.path);
@@ -408,8 +419,6 @@ export function initLivePreviewModal({
     updateNavButtons();
     syncPageSelect(files, targetFile.path);
 
-    const { html, assetMap } = await prepareHtmlForPreview(targetFile, files);
-    if (destroyed || seq !== renderSeq) return;
     const compiledHtml = bundleHtmlWithFolderAssets(targetFile.path, html, assetMap, null, guardJs, null, true);
 
     showRunnableIframe({
@@ -536,6 +545,12 @@ export function initLivePreviewModal({
   iframe?.addEventListener("load", () => {
     if (expectingControlledLoad) {
       expectingControlledLoad = false;
+      expectingBlankUnload = false;
+      return;
+    }
+    if (expectingBlankUnload) {
+      expectingBlankUnload = false;
+      hasControlledSrcdoc = false;
       return;
     }
     // Navegación inesperada dentro del sandbox: invalidar confianza en el documento activo
@@ -557,6 +572,22 @@ export function initLivePreviewModal({
       clearConsoleOutput();
       return;
     }
+    if (data.action === "reload") {
+      if (currentPreviewPath) {
+        void navigateToHtml(currentPreviewPath, false);
+      } else {
+        void renderActiveTabPreview();
+      }
+      return;
+    }
+    if (data.action === "history" && typeof data.delta === "number") {
+      const targetIdx = historyIndex + Math.trunc(data.delta);
+      if (targetIdx >= 0 && targetIdx < historyStack.length && targetIdx !== historyIndex) {
+        historyIndex = targetIdx;
+        void navigateToHtml(historyStack[historyIndex], false);
+      }
+      return;
+    }
     if (data.action === "navigate" && typeof data.href === "string") {
       handlePreviewNavigation(data.href);
       return;
@@ -569,6 +600,11 @@ export function initLivePreviewModal({
       appendConsoleLine("warn", "Navegación bloqueada por política de seguridad.");
       return;
     }
+    const trimmedHref = href.trim();
+    if ((trimmedHref.startsWith("?") || trimmedHref === "#") && currentPreviewPath) {
+      navigateToHtml(currentPreviewPath, false);
+      return;
+    }
     const { files } = getWorkspaceSnapshot();
     const targetFile = findTargetHtmlFile(files, currentPreviewPath, href);
     if (!targetFile) {
@@ -579,11 +615,14 @@ export function initLivePreviewModal({
     navigateToHtml(targetFile.path, true);
   }
 
-  function stopIframe() {
+  function stopIframe({ resetSrcdoc = true } = {}) {
     hasControlledSrcdoc = false;
-    expectingControlledLoad = false;
-    if (iframe) {
-      iframe.srcdoc = "";
+    if (resetSrcdoc && iframe) {
+      expectingControlledLoad = false;
+      if (iframe.getAttribute("srcdoc")) {
+        expectingBlankUnload = true;
+        iframe.srcdoc = "";
+      }
     }
     if (activeCRunnerDestroy && typeof activeCRunnerDestroy === "function") {
       activeCRunnerDestroy();
@@ -632,18 +671,21 @@ export function initLivePreviewModal({
 
   async function openPreview() {
     if (!dialog || destroyed) return;
+    const openSeq = ++renderSeq;
     jsRunOverride = "auto";
     tsRunOverride = "auto";
     imageRunOverride = "auto";
-    void loadAcorn();
+    const acornPromise = loadAcorn().catch(() => {});
     if (typeof onBeforePreview === "function") {
       try {
         await onBeforePreview();
       } catch (_) {
         /* guardado previo opcional antes de previsualizar */
       }
-      if (destroyed) return;
+      if (destroyed || openSeq !== renderSeq) return;
     }
+    await acornPromise;
+    if (destroyed || openSeq !== renderSeq) return;
     if (!dialog.open) {
       dialog.showModal();
     }
@@ -685,7 +727,7 @@ export function initLivePreviewModal({
     hasRepl = true,
     modeLabel = null
   }) {
-    stopIframe();
+    stopIframe({ resetSrcdoc: false });
     clearConsoleOutput();
     if (cRunnerContainer) cRunnerContainer.hidden = true;
     if (iframeWrapper) iframeWrapper.hidden = false;

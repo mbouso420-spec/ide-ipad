@@ -34,7 +34,7 @@ export function savePreviewHtml(projectId, htmlPath) {
  */
 export function findBestHtmlEntrypoint(allFiles, activeFile, preferredHtmlPath = null) {
   const htmlFiles = (allFiles || []).filter((f) => {
-    if (!f || !f.path) return false;
+    if (!f || !f.path || f.contentLoaded === false) return false;
     if (isIgnoredPreviewPath(normalizePath(f.path))) return false;
     const ext = getFileExtension(f.path);
     return HTML_EXTENSIONS.has(ext) && typeof f.content === "string";
@@ -46,8 +46,8 @@ export function findBestHtmlEntrypoint(allFiles, activeFile, preferredHtmlPath =
   const activeFolder = getParentFolder(activePath);
   const escapedName = activeShort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-  const scriptRegex = new RegExp(`<script[^>]+src=["'][^"']*${escapedName}["']`, "i");
-  const linkRegex = new RegExp(`<link[^>]+href=["'][^"']*${escapedName}["']`, "i");
+  const scriptRegex = new RegExp(`<script[^>]+\\bsrc\\s*=\\s*["'][^"']*(?:^|[\\/"'])${escapedName}(?:[?#][^"']*)?["']`, "i");
+  const linkRegex = new RegExp(`<link[^>]+\\bhref\\s*=\\s*["'][^"']*(?:^|[\\/"'])${escapedName}(?:[?#][^"']*)?["']`, "i");
 
   const directRefs = htmlFiles.filter((f) => {
     const content = f.content || "";
@@ -94,6 +94,11 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
   if (!requestedHref || typeof requestedHref !== "string") return null;
 
   let clean = requestedHref.trim().split("?")[0].split("#")[0];
+  try {
+    clean = decodeURIComponent(clean);
+  } catch (_) {
+    /* Mantener cadena original ante % inválido */
+  }
   if (!clean) return null;
 
   const htmlFiles = (allFiles || []).filter((f) => {
@@ -104,6 +109,14 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
   });
   if (htmlFiles.length === 0) return null;
 
+  const findByNormPath = (targetPath) => {
+    const normTarget = normalizePath(targetPath);
+    const exact = htmlFiles.find((f) => normalizePath(f.path) === normTarget);
+    if (exact) return exact;
+    const lowerTarget = normTarget.toLowerCase();
+    return htmlFiles.find((f) => normalizePath(f.path).toLowerCase() === lowerTarget) || null;
+  };
+
   const currentFolder = currentPreviewPath ? getParentFolder(currentPreviewPath) : "";
 
   // Enlaces a raíz ("/", "./", "../") o carpeta terminada en "/" resuelven a index.html
@@ -112,28 +125,30 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
       ? ""
       : normalizePath(resolveRelativePath(currentFolder, clean));
     const idxPath = dirTarget ? `${dirTarget}/index.html` : "index.html";
-    const matchDirIdx = htmlFiles.find((f) => normalizePath(f.path).toLowerCase() === idxPath.toLowerCase());
+    const matchDirIdx = findByNormPath(idxPath);
     if (matchDirIdx) return matchDirIdx;
-    const rootIdx = htmlFiles.find((f) => normalizePath(f.path).toLowerCase() === "index.html");
+    const rootIdx = findByNormPath("index.html");
     if (rootIdx) return rootIdx;
   }
 
   const relResolved = resolveRelativePath(currentFolder, clean);
-  const match1 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(relResolved));
+  const match1 = findByNormPath(relResolved);
   if (match1) return match1;
 
-  if (!clean.includes(".")) {
+  const relLastSeg = relResolved.split("/").pop() || "";
+  if (relLastSeg && !relLastSeg.includes(".")) {
     const relHtml = resolveRelativePath(currentFolder, `${clean}.html`);
-    const match2 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(relHtml));
+    const match2 = findByNormPath(relHtml);
     if (match2) return match2;
   }
 
   const rootClean = clean.replace(/^\/+/, "");
-  const match3 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(rootClean));
+  const match3 = findByNormPath(rootClean);
   if (match3) return match3;
 
-  if (!rootClean.includes(".")) {
-    const match4 = htmlFiles.find((f) => normalizePath(f.path) === normalizePath(`${rootClean}.html`));
+  const rootLastSeg = rootClean.split("/").pop() || "";
+  if (rootLastSeg && !rootLastSeg.includes(".")) {
+    const match4 = findByNormPath(`${rootClean}.html`);
     if (match4) return match4;
   }
 
@@ -143,7 +158,7 @@ export function findTargetHtmlFile(allFiles, currentPreviewPath, requestedHref) 
   );
   if (match5) return match5;
 
-  if (!targetBase.includes(".")) {
+  if (targetBase && !targetBase.includes(".")) {
     const match6 = htmlFiles.find(
       (f) => (f.shortName || f.path.split("/").pop()).toLowerCase() === `${targetBase.toLowerCase()}.html`
     );

@@ -758,15 +758,22 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
       assert.equal(findTargetHtmlFile(files, "pages/catalogo.html", "/")?.path, "index.html");
       assert.equal(findTargetHtmlFile(files, "pages/catalogo.html", "../")?.path, "index.html");
       assert.equal(findTargetHtmlFile(files, "catalogo.html", "./")?.path, "index.html");
+      assert.equal(findTargetHtmlFile(files, "pages/x.html", "./catalogo")?.path, "pages/catalogo.html");
 
       const bridge = buildConsoleBridgeScript(false);
       assert.match(bridge, /createMemoryStorage/);
       assert.match(bridge, /window\.history\.pushState/);
+      assert.doesNotMatch(bridge, /xlink\\?:href\]/, "No debe inyectar selector CSS [xlink:href] inválido en closest()");
+      assert.match(bridge, /composedPath/);
 
-      const assetMap = buildWorkspaceAssetMap(files);
+      const assetMap = buildWorkspaceAssetMap([
+        ...files,
+        { path: "data/productos.json", content: '[{"img":"zapato.png"}]' }
+      ]);
       const compiled = bundleHtmlWithFolderAssets("pages/catalogo.html", files[1].content, assetMap, null, (c) => c, null, true);
       assert.match(compiled, /img\/productos\/zapato\.png/);
-      assert.match(compiled, /urlBaseCounts/);
+      assert.match(compiled, /buildIndexInfo/);
+      assert.match(compiled, /lookupFromMap\(cfg\.texts,\s*textIdx,\s*reqUrl,\s*true\)/);
     });
 
     test("rewriteProgrammaticNavigation intercepta location.href/assign/replace, onclick y neutraliza <base>/<meta refresh>", () => {
@@ -776,6 +783,13 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
         "document.location.assign('productos.html');",
         "location.replace('./');",
         "window.location = 'inicio.html';",
+        "if (ok) { location = 'ok.html'; }",
+        "const go = x ? location.href = 'a.html' : location.href = 'b.html';",
+        "class Card { m() {} location = 'AR'; }",
+        "class Foo extends getBase('a') { location = 'AR'; }",
+        "function foo(location = 'AR') { return location; }",
+        "const setLoc = (location = 'AR') => location;",
+        "let z = x++ / 2;",
         "const { location = 'AR' } = cfg;",
         "const txt = \"window.location.href = 'no-tocar.html'\";",
         "if (window.location.href === 'x') { console.log('ok'); }"
@@ -786,6 +800,13 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
       assert.match(rewritten, /window\.__ideNavigate\('productos\.html'\);/);
       assert.match(rewritten, /window\.__ideNavigate\('\.\/'\);/);
       assert.match(rewritten, /window\.__ideNavigate\('inicio\.html'\);/);
+      assert.match(rewritten, /if \(ok\) \{ window\.__ideNavigate\('ok\.html'\); \}/);
+      assert.match(rewritten, /const go = x \? window\.__ideNavigate\('a\.html'\)\s*:\s*window\.__ideNavigate\('b\.html'\);/);
+      assert.match(rewritten, /class Card \{ m\(\) \{\} location = 'AR'; \}/);
+      assert.match(rewritten, /class Foo extends getBase\('a'\) \{ location = 'AR'; \}/);
+      assert.match(rewritten, /function foo\(location = 'AR'\) \{ return location; \}/);
+      assert.match(rewritten, /const setLoc = \(location = 'AR'\) => location;/);
+      assert.match(rewritten, /let z = x\+\+ \/ 2;/);
       assert.match(rewritten, /const \{ location = 'AR' \} = cfg;/);
       assert.match(rewritten, /"window\.location\.href = 'no-tocar\.html'"/);
       assert.match(rewritten, /if \(window\.location\.href === 'x'\)/);
@@ -794,13 +815,25 @@ describe("Auditoría Integral 12 Agentes v1.3.0 — Verificación Cruzada y Regr
       assert.match(bridge, /__ideNavigate/);
       assert.match(bridge, /window\.open\s*=/);
 
-      const html = `<html><head><base href="/"><meta http-equiv="refresh" content="0;url=index.html"></head><body><button onclick="location.href='index.html'">Inicio</button><script>window.location.href='index.html';</script></body></html>`;
-      const files = [{ path: "productos.html", content: html }];
+      const html = `<html><!-- <head> --><head><base href = "/"><meta http-equiv = "refresh" content="0;url=index.html"></head><body><button onclick="location.href=&quot;index.html&quot;">Inicio</button><script src = app.js></script></body></html>`;
+      const files = [
+        { path: "productos.html", content: html },
+        { path: "app.js", content: "window.location.href='index.html';" }
+      ];
       const bundled = bundleHtmlWithFolderAssets("productos.html", html, buildWorkspaceAssetMap(files), null, (c) => c, null, true);
-      assert.doesNotMatch(bundled, /<base\s+href=/i);
-      assert.doesNotMatch(bundled, /http-equiv=["']?refresh/i);
-      assert.match(bundled, /onclick="window\.__ideNavigate\('index\.html'\)"/);
+      assert.doesNotMatch(bundled, /<base\b/i);
+      assert.doesNotMatch(bundled, /http-equiv\s*=\s*["']?refresh/i);
+      assert.match(bundled, /onclick="window\.__ideNavigate\(&quot;index\.html&quot;\)"/);
       assert.match(bundled, /window\.__ideNavigate\('index\.html'\);/);
+      assert.ok(bundled.indexOf("<head>") < bundled.indexOf("__studioLoopGuard"));
+
+      // AppSec: <base href="/"> con allowParentTraversal=false NO debe filtrar archivos fuera del subdirectorio
+      const scopedFiles = [
+        { path: "secret.js", content: "console.log('SECRET_LEAK');" },
+        { path: "sub/index.html", content: '<html><head><base href="/"></head><body><script src="secret.js"></script></body></html>' }
+      ];
+      const isolated = bundleHtmlWithFolderAssets("sub/index.html", scopedFiles[1].content, buildWorkspaceAssetMap(scopedFiles), null, (c) => c, null, false);
+      assert.doesNotMatch(isolated, /SECRET_LEAK/);
     });
   });
 });

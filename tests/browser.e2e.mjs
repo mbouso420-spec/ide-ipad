@@ -146,15 +146,15 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
       "En arranque frío no debe descargarse ningún runtime pesado (Pyodide/SQLite/tsc)"
     );
 
-    // Verificar sw.js accesible, versión v31 y API de Cache Storage activa en localhost
+    // Verificar sw.js accesible, versión v32 y API de Cache Storage activa en localhost
     const swAssetOk = await page.evaluate(async () => {
       if (!("serviceWorker" in navigator) || !("caches" in window)) return false;
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v31");
+      return text.includes("studio-ide-shell-v32");
     });
-    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v31");
+    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v32");
 
     // 2. Crear archivos E2E vía IndexedDB, recargar, abrir desde árbol, formatear y comprobar persistencia
     await page.evaluate(async () => {
@@ -348,6 +348,180 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
       () => document.getElementById("preview-console-list")?.textContent || ""
     );
     assert.match(htmlModConsole, /HTML_MOD_OK \[DOM_READY\]/);
+    await page.click("#btn-close-preview");
+    await new Promise((r) => setTimeout(r, 300));
+
+    // 3c. Tienda multipágina real en #preview-iframe: navegación A / location.href, SPA tab, catálogo JSON + imágenes, cero Script error y layout visible
+    const samplePngB64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await page.evaluate(async (pngB64) => {
+      const dbMod = await import("./js/storage/workspaceDb.js");
+      await dbMod.upsertEntry("espacio-local", "tienda/img/logo.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/img/productos/zapato.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/img/productos/campera.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/data/productos.json", {
+        isFolder: false,
+        content: JSON.stringify([
+          { name: "Zapato", img: "productos/zapato.png" },
+          { name: "Campera", img: "img/productos/campera.png" }
+        ])
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/js/catalogo.js", {
+        isFolder: false,
+        content:
+          'fetch("productos.json").then(function(r){return r.json();}).then(function(items){' +
+          'var grid=document.getElementById("catalog-grid");' +
+          'grid.innerHTML=items.map(function(p){return "<article><img class=\\"prod-img\\" src=\\""+p.img+"\\" alt=\\""+p.name+"\\"></article>";}).join("");' +
+          'console.log("CATALOG_LOADED", items.length);' +
+          '});'
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/index.html", {
+        isFolder: false,
+        content:
+          '<!DOCTYPE html><html><head><title>Inicio</title></head><body>' +
+          '<header><img id="logo-home" src="img/logo.png"><nav>' +
+          '<a id="go-catalog" href="productos.html">Catálogo</a>' +
+          '<a id="go-spa-tab" href="productos.html">Tab SPA</a>' +
+          '</nav></header><h1 id="home-title">BIENVENIDO_TIENDA</h1><div id="spa-msg"></div>' +
+          '<script>document.getElementById("go-spa-tab").addEventListener("click",function(e){e.preventDefault();document.getElementById("spa-msg").textContent="SPA_OK";});</script>' +
+          '</body></html>'
+      });
+      await dbMod.upsertEntry("espacio-local", "tienda/productos.html", {
+        isFolder: false,
+        content:
+          '<!DOCTYPE html><html><head><title>Catálogo</title></head><body>' +
+          '<header><img id="logo-prod" src="img/logo.png"><nav>' +
+          '<a id="go-home-link" href="./">Inicio A</a>' +
+          '<button id="go-home-btn" onclick="location.href=\'index.html\'">Inicio Btn</button>' +
+          '</nav></header><h1 id="cat-title">CATALOGO_TIENDA</h1><div id="catalog-grid"></div>' +
+          '<script src="js/catalogo.js" defer></script></body></html>'
+      });
+    }, samplePngB64);
+
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+
+    const tiendaExpanded = await page.evaluate(() => {
+      const folderBtn = document.querySelector('.tree-row[data-path="tienda"] .tree-node-btn');
+      if (folderBtn && folderBtn.getAttribute("aria-expanded") === "false") {
+        folderBtn.click();
+      }
+      return Boolean(folderBtn);
+    });
+    assert.equal(tiendaExpanded, true, "Carpeta tienda debe aparecer en el Explorador");
+    await new Promise((r) => setTimeout(r, 250));
+
+    const openedTiendaHome = await page.evaluate(() => {
+      const btn = document.querySelector('.tree-row[data-path="tienda/index.html"] .tree-node-btn');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    assert.equal(openedTiendaHome, true, "tienda/index.html debe abrirse en el Explorador");
+    await new Promise((r) => setTimeout(r, 400));
+
+    await page.click("#btn-live-preview");
+    await page.waitForSelector("#preview-dialog[open]", { timeout: 10000 });
+
+    const getPreviewFrame = async () => {
+      const handle = await page.$("#preview-iframe");
+      return handle ? handle.contentFrame() : null;
+    };
+
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("tienda/index.html"),
+      { timeout: 8000 }
+    );
+    let pFrame = await getPreviewFrame();
+    assert.ok(pFrame, "Debe existir contentFrame del preview");
+    await pFrame.waitForSelector("#home-title", { timeout: 8000 });
+
+    // Comprobar que el iframe no colapsa con la consola abierta en iPad
+    await page.setViewport({ width: 820, height: 1180 });
+    await new Promise((r) => setTimeout(r, 200));
+    const iframeRect = await page.evaluate(() => {
+      const r = document.getElementById("preview-iframe")?.getBoundingClientRect();
+      return r ? { width: r.width, height: r.height } : { width: 0, height: 0 };
+    });
+    assert.ok(iframeRect.height >= 200 && iframeRect.width >= 300, `Iframe colapsado: ${JSON.stringify(iframeRect)}`);
+    await page.setViewport({ width: 1280, height: 820 });
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Tab SPA con e.preventDefault() NO debe navegar fuera de tienda/index.html
+    await pFrame.click("#go-spa-tab");
+    await pFrame.waitForFunction(() => document.getElementById("spa-msg")?.textContent === "SPA_OK", { timeout: 5000 });
+    assert.equal(
+      await page.evaluate(() => document.getElementById("preview-file-badge")?.textContent || ""),
+      "tienda/index.html"
+    );
+
+    // Navegar a productos.html mediante <a href="productos.html">
+    await pFrame.click("#go-catalog");
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("tienda/productos.html"),
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(
+      () => (document.getElementById("preview-console-list")?.textContent || "").includes("CATALOG_LOADED 2"),
+      { timeout: 10000 }
+    );
+
+    pFrame = await getPreviewFrame();
+    await pFrame.waitForSelector(".prod-img", { timeout: 8000 });
+    await pFrame.waitForFunction(
+      () => {
+        const imgs = Array.from(document.querySelectorAll("img"));
+        return imgs.length === 3 && imgs.every((im) => im.complete && im.naturalWidth > 0);
+      },
+      { timeout: 8000 }
+    );
+
+    // Volver a inicio vía <a href="./">
+    await pFrame.click("#go-home-link");
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("tienda/index.html"),
+      { timeout: 10000 }
+    );
+    pFrame = await getPreviewFrame();
+    await pFrame.waitForSelector("#home-title", { timeout: 8000 });
+    assert.equal(await pFrame.$("#btn-live-preview"), null, "Studio IDE nunca debe cargarse dentro de #preview-iframe");
+
+    // Volver al catálogo y probar retorno vía button onclick="location.href='index.html'"
+    await pFrame.click("#go-catalog");
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("tienda/productos.html"),
+      { timeout: 10000 }
+    );
+    pFrame = await getPreviewFrame();
+    await pFrame.waitForSelector("#go-home-btn", { timeout: 8000 });
+    await pFrame.click("#go-home-btn");
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("tienda/index.html"),
+      { timeout: 10000 }
+    );
+    pFrame = await getPreviewFrame();
+    await pFrame.waitForSelector("#home-title", { timeout: 8000 });
+
+    const storeConsoleErrors = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("#preview-console-list .is-error")).map((el) => el.textContent)
+    );
+    assert.deepEqual(storeConsoleErrors, [], `Consola JS reportó errores inesperados: ${storeConsoleErrors.join("; ")}`);
+
     await page.click("#btn-close-preview");
     await new Promise((r) => setTimeout(r, 300));
 

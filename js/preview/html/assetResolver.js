@@ -33,6 +33,7 @@ export function filterFolderScopeFiles(allFiles, baseFolder) {
     if (!f || !f.path) return false;
     const clean = normalizePath(f.path);
     if (isIgnoredPreviewPath(clean)) return false;
+    if (f.contentLoaded === false) return false;
     if (f.content === null || f.content === undefined) return false;
     if (prefix && !clean.startsWith(prefix)) return false;
 
@@ -409,8 +410,9 @@ export function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversa
     if (!asset && cleanRef.startsWith("/") && baseDir && (allowParentTraversal || !scopeDir)) {
       asset = lookupEntry(resolveRelativePath(baseDir, cleanRef.replace(/^\/+/, "")));
     }
-    if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("./") && !cleanRef.startsWith("../")) {
-      const candidate = lookupEntry(normalizePath(cleanRef));
+    if (!asset && !cleanRef.startsWith("/") && !cleanRef.startsWith("../")) {
+      const bareRef = cleanRef.startsWith("./") ? cleanRef.slice(2) : cleanRef;
+      const candidate = bareRef ? lookupEntry(normalizePath(bareRef)) : null;
       if (candidate) {
         const candPath = normalizePath(candidate.path || "");
         if (!scopeDir || allowParentTraversal || candPath.startsWith(`${scopeDir}/`)) {
@@ -495,7 +497,7 @@ export function createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversa
           const safeRefComment = escapeCommentBody(cleanRef);
           const importedAsset = resolveEntryFromDir(importUrl, cssDir);
 
-          if (!importedAsset || typeof importedAsset.content !== "string") {
+          if (!importedAsset || importedAsset.contentLoaded === false || typeof importedAsset.content !== "string") {
             return match;
           }
 
@@ -564,7 +566,7 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
   let hasEntries = false;
 
   for (const [rawKey, entry] of fileMap.entries()) {
-    if (!entry || !entry.path) continue;
+    if (!entry || !entry.path || entry.contentLoaded === false) continue;
     const normPath = normalizePath(entry.path || rawKey);
     if (!normPath) continue;
     if (!allowParentTraversal && scopeDir && normPath !== scopeDir && !normPath.startsWith(`${scopeDir}/`)) {
@@ -612,22 +614,25 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
     var str = String(s == null ? "" : s);
     return typeof str.normalize === "function" ? str.normalize("NFC") : str;
   };
-  var urlLower = Object.create(null);
-  var textLower = Object.create(null);
-  var urlBaseCounts = Object.create(null);
-  var urlByBase = Object.create(null);
-  var urlKeysLower = [];
-  Object.keys(cfg.urls).forEach(function (k) {
-    var lk = normNfc(k).toLowerCase();
-    urlLower[lk] = cfg.urls[k];
-    urlKeysLower.push(lk);
-    var base = lk.split("/").pop();
-    if (base) {
-      urlBaseCounts[base] = (urlBaseCounts[base] || 0) + 1;
-      urlByBase[base] = { src: cfg.urls[k], path: lk };
-    }
-  });
-  Object.keys(cfg.texts).forEach(function (k) { textLower[normNfc(k).toLowerCase()] = cfg.texts[k]; });
+  function buildIndexInfo(map) {
+    var lower = Object.create(null);
+    var keysLower = [];
+    var baseCounts = Object.create(null);
+    var byBase = Object.create(null);
+    Object.keys(map).forEach(function (k) {
+      var lk = normNfc(k).toLowerCase();
+      lower[lk] = map[k];
+      keysLower.push(lk);
+      var base = lk.split("/").pop();
+      if (base) {
+        baseCounts[base] = (baseCounts[base] || 0) + 1;
+        byBase[base] = { val: map[k], path: lk };
+      }
+    });
+    return { lower: lower, keysLower: keysLower, baseCounts: baseCounts, byBase: byBase };
+  }
+  var urlIdx = buildIndexInfo(cfg.urls);
+  var textIdx = buildIndexInfo(cfg.texts);
 
   function cleanNormPath(p) {
     var parts = String(p || "").replace(/\\\\/g, "/").split("/");
@@ -649,10 +654,20 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
     try { return decodeURIComponent(noHash); } catch (_) { return noHash; }
   }
 
-  function lookupFromMap(exactMap, lowerMap, rawRef, allowImageFallbacks) {
+  function inAllowedScope(lowerPath) {
+    if (cfg.allowParent || !cfg.baseDir) return true;
+    var baseLow = cfg.baseDir.toLowerCase();
+    return lowerPath === baseLow || lowerPath.indexOf(baseLow + "/") === 0;
+  }
+
+  function lookupFromMap(exactMap, idxInfo, rawRef, allowFallbacks) {
     if (!rawRef || typeof rawRef !== "string") return null;
     var trimmed = rawRef.trim();
-    if (!trimmed || /^(https?:|data:|blob:|#|javascript:|vbscript:|file:)/i.test(trimmed)) return null;
+    var lowerTrim = trimmed.toLowerCase();
+    if (lowerTrim.indexOf("https://studio.local/") === 0 || lowerTrim.indexOf("http://studio.local/") === 0) {
+      trimmed = "/" + trimmed.slice(lowerTrim.indexOf("studio.local/") + 13).replace(/^\\/+/, "");
+    }
+    if (!trimmed || trimmed.indexOf("//") === 0 || /^(https?:|data:|blob:|#|javascript:|vbscript:|file:|filesystem:)/i.test(trimmed)) return null;
     var clean = decodeRef(trimmed);
     if (!clean) return null;
 
@@ -678,27 +693,25 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
       }
       if (Object.prototype.hasOwnProperty.call(exactMap, cand)) return exactMap[cand];
       var nfcLower = normNfc(cand).toLowerCase();
-      if (Object.prototype.hasOwnProperty.call(lowerMap, nfcLower)) return lowerMap[nfcLower];
+      if (Object.prototype.hasOwnProperty.call(idxInfo.lower, nfcLower)) return idxInfo.lower[nfcLower];
     }
 
-    if (allowImageFallbacks) {
+    if (allowFallbacks) {
       var relNorm = cleanNormPath(clean.replace(/^\\/+/, ""));
       if (relNorm) {
         var relLower = normNfc(relNorm).toLowerCase();
         var suffix = "/" + relLower;
-        for (var j = 0; j < urlKeysLower.length; j++) {
-          var k = urlKeysLower[j];
-          if (k === relLower || (k.length > suffix.length && k.slice(-suffix.length) === suffix)) {
-            if (cfg.allowParent || !cfg.baseDir || k === cfg.baseDir.toLowerCase() || k.indexOf(cfg.baseDir.toLowerCase() + "/") === 0) {
-              return lowerMap[k];
-            }
+        for (var j = 0; j < idxInfo.keysLower.length; j++) {
+          var k = idxInfo.keysLower[j];
+          if ((k === relLower || (k.length > suffix.length && k.slice(-suffix.length) === suffix)) && inAllowedScope(k)) {
+            return idxInfo.lower[k];
           }
         }
         var baseName = relLower.split("/").pop();
-        if (baseName && urlBaseCounts[baseName] === 1) {
-          var baseHit = urlByBase[baseName];
-          if (baseHit && (cfg.allowParent || !cfg.baseDir || baseHit.path === cfg.baseDir.toLowerCase() || baseHit.path.indexOf(cfg.baseDir.toLowerCase() + "/") === 0)) {
-            return baseHit.src;
+        if (baseName && idxInfo.baseCounts[baseName] === 1) {
+          var baseHit = idxInfo.byBase[baseName];
+          if (baseHit && inAllowedScope(baseHit.path)) {
+            return baseHit.val;
           }
         }
       }
@@ -707,7 +720,7 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
   }
 
   function resolveUrl(rawRef) {
-    return lookupFromMap(cfg.urls, urlLower, rawRef, true);
+    return lookupFromMap(cfg.urls, urlIdx, rawRef, true);
   }
 
   function resolveSrcset(rawSrcset) {
@@ -843,8 +856,10 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
   if (typeof window.fetch === "function") {
     var origFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
-      var reqUrl = typeof input === "string" ? input : (input && typeof input.url === "string" ? input.url : "");
-      var textAsset = lookupFromMap(cfg.texts, textLower, reqUrl);
+      var reqUrl = typeof input === "string"
+        ? input
+        : (input && typeof input.href === "string" ? input.href : (input && typeof input.url === "string" ? input.url : ""));
+      var textAsset = lookupFromMap(cfg.texts, textIdx, reqUrl, true);
       if (textAsset) {
         return Promise.resolve(new Response(textAsset.content, {
           status: 200,
@@ -867,25 +882,35 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
       return origXhrOpen.apply(this, arguments);
     };
     XMLHttpRequest.prototype.send = function () {
-      var textAsset = lookupFromMap(cfg.texts, textLower, this.__studioReqUrl);
+      var textAsset = lookupFromMap(cfg.texts, textIdx, this.__studioReqUrl, true);
       if (textAsset) {
         var xhr = this;
+        var respVal = textAsset.content;
+        if (xhr.responseType === "json") {
+          try { respVal = JSON.parse(String(textAsset.content || "").replace(/^\\uFEFF/, "")); } catch (_) { respVal = null; }
+        }
         Promise.resolve().then(function () {
           try {
             Object.defineProperty(xhr, "readyState", { configurable: true, value: 4 });
             Object.defineProperty(xhr, "status", { configurable: true, value: 200 });
             Object.defineProperty(xhr, "responseText", { configurable: true, value: textAsset.content });
-            Object.defineProperty(xhr, "response", { configurable: true, value: textAsset.content });
+            Object.defineProperty(xhr, "response", { configurable: true, value: respVal });
           } catch (_) {}
-          if (typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
-          if (typeof xhr.onload === "function") xhr.onload();
-          xhr.dispatchEvent(new Event("load"));
+          try { xhr.dispatchEvent(new Event("readystatechange")); } catch (_) {
+            if (typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
+          }
+          try { xhr.dispatchEvent(new Event("load")); } catch (_) {
+            if (typeof xhr.onload === "function") xhr.onload();
+          }
+          try { xhr.dispatchEvent(new Event("loadend")); } catch (_) {}
         });
         return;
       }
       var dataUrl = resolveUrl(this.__studioReqUrl);
       if (dataUrl) {
+        var prevRespType = this.responseType;
         origXhrOpen.call(this, "GET", dataUrl, true);
+        try { if (prevRespType) this.responseType = prevRespType; } catch (_) {}
       }
       return origXhrSend.apply(this, arguments);
     };

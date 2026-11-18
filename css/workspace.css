@@ -296,6 +296,7 @@
 
 .dialog-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-sm);
@@ -710,8 +711,10 @@
 }
 
 .preview-iframe {
+  display: block;
   flex: 1;
   width: 100%;
+  height: 100%;
   max-width: 100%;
   min-height: 0;
   border: 0;
@@ -742,6 +745,7 @@
 
 .preview-console-panel {
   height: 168px;
+  max-height: 36%;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

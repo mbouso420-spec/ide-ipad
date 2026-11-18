@@ -314,6 +314,24 @@ function scanScriptCloseTag(src, bodyStart, isJsLike) {
   return null;
 }
 
+function readHtmlAttr(attrs, attrName) {
+  const re = new RegExp("(?:^|\\s)" + attrName + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s\"'=<>\\x60]+))", "i");
+  const m = String(attrs || "").match(re);
+  if (!m) return null;
+  return m[1] ?? m[2] ?? m[3] ?? "";
+}
+
+function maskHtmlComments(html, seedPrefix) {
+  const comments = [];
+  const prefix = `${seedPrefix}CMT_`;
+  const masked = String(html || "").replace(/<!--[\s\S]*?-->/g, (comment) => {
+    const idx = comments.length;
+    comments.push(comment);
+    return `${prefix}${idx}__`;
+  });
+  return { maskedHtml: masked, comments, prefix };
+}
+
 function maskHtmlScripts(src) {
   let prefix = "__STUDIO_SCRIPT_MASK_";
   while (src.includes(prefix)) prefix += "X";
@@ -340,9 +358,10 @@ function maskHtmlScripts(src) {
 
       const attrs = src.slice(ltIdx + 7, openEnd);
       const bodyStart = openEnd + 1;
-      const hasSrc = /\bsrc\s*=\s*["'][^"']+["']/i.test(attrs);
-      const typeMatch = attrs.match(/\btype\s*=\s*["']([^"']*)["']/i);
-      const typeVal = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+      const srcAttr = readHtmlAttr(attrs, "src");
+      const hasSrc = Boolean(srcAttr && srcAttr.trim());
+      const typeRaw = readHtmlAttr(attrs, "type");
+      const typeVal = typeRaw ? typeRaw.trim().toLowerCase() : "";
       const isJsLike =
         !hasSrc &&
         (!typeVal ||
@@ -401,7 +420,33 @@ export function bundleHtmlWithFolderAssets(
 ) {
   const baseTransformJs = typeof transformJs === "function" ? transformJs : (code) => code;
   const safeTransformJs = (code, isModule) => baseTransformJs(rewriteProgrammaticNavigation(code), isModule);
-  const dir = getParentFolder(entryPath);
+
+  // Enmascarar <script>...</script> y <!-- ... --> antes de leer <base> o transformar etiquetas HTML
+  const { maskedHtml: scriptMaskedHtml, entries: scriptEntries, prefix: scriptMaskPrefix } = maskHtmlScripts(rawHtml);
+  const { maskedHtml, comments: htmlComments, prefix: commentMaskPrefix } = maskHtmlComments(scriptMaskedHtml, scriptMaskPrefix);
+
+  const scopeDir = getParentFolder(entryPath);
+  let assetBaseDir = scopeDir;
+  const baseTagMatch = maskedHtml.match(/<base\b([^>]*)>/i);
+  if (baseTagMatch) {
+    const rawBaseHref = readHtmlAttr(baseTagMatch[1], "href");
+    if (rawBaseHref != null) {
+      const trimmedBase = rawBaseHref.trim();
+      if (trimmedBase && !/^(?:https?:)?\/\//i.test(trimmedBase)) {
+        const cleanBase = trimmedBase.split("?")[0].split("#")[0];
+        const candDir = cleanBase === "/"
+          ? ""
+          : cleanBase.startsWith("/")
+            ? normalizePath(cleanBase.replace(/^\/+/, ""))
+            : resolveRelativePath(scopeDir, cleanBase);
+        if (allowParentTraversal || candDir === scopeDir || (scopeDir && candDir.startsWith(`${scopeDir}/`))) {
+          assetBaseDir = candDir;
+        }
+      }
+    }
+  }
+  const dir = assetBaseDir;
+
   const {
     resolveEntryFromDir,
     buildEntryDataUrl,
@@ -409,13 +454,27 @@ export function bundleHtmlWithFolderAssets(
     inlineCssImports,
     getTotalInlinedCssBytes,
     addInlinedCssBytes
-  } = createProjectAssetHelpers(dir, fileMap, allowParentTraversal);
+  } = createProjectAssetHelpers(scopeDir, fileMap, allowParentTraversal);
 
   const resolveRawEntry = (rawHref) => resolveEntryFromDir(rawHref, dir);
 
   const resolveAsset = (rawHref) => {
-    const asset = resolveRawEntry(rawHref);
-    if (!asset || typeof asset.content !== "string") {
+    let asset = resolveRawEntry(rawHref);
+    if (!asset && typeof rawHref === "string") {
+      const cleanRef = rawHref.trim().split("?")[0].split("#")[0];
+      if (/\.(?:js|mjs|jsx)$/i.test(cleanRef)) {
+        const stem = cleanRef.replace(/\.(?:js|mjs|jsx)$/i, "");
+        const suffix = rawHref.trim().slice(cleanRef.length);
+        for (const ext of [".ts", ".tsx", ".jsx"]) {
+          const cand = resolveRawEntry(`${stem}${ext}${suffix}`);
+          if (cand && cand.contentLoaded !== false && typeof cand.content === "string") {
+            asset = cand;
+            break;
+          }
+        }
+      }
+    }
+    if (!asset || asset.contentLoaded === false || typeof asset.content !== "string") {
       return null;
     }
     return asset;
@@ -424,9 +483,6 @@ export function bundleHtmlWithFolderAssets(
   let inlinedActiveJs = false;
   let inlinedActiveCss = false;
   const deferredScripts = [];
-
-  // Enmascarar <script>...</script> antes de transformar <style>/<link>/<img> para no alterar strings JS
-  const { maskedHtml, entries: scriptEntries, prefix: scriptMaskPrefix } = maskHtmlScripts(rawHtml);
 
   let html = maskedHtml.replace(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi, (_fullTag, attrs, cssBody) => {
     const safeCss = escapeCloseStyle(inlineCssImports(cssBody, entryPath));
@@ -629,10 +685,11 @@ export function bundleHtmlWithFolderAssets(
   }
 
   function processScannedScript({ fullTag, attrs, inlineCode }) {
-    const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
-    if (!srcMatch) {
-      const typeMatch = attrs.match(/\btype=["']([^"']*)["']/i);
-      const type = typeMatch ? typeMatch[1].trim().toLowerCase() : "";
+    const rawSrcAttr = readHtmlAttr(attrs, "src");
+    const srcHref = rawSrcAttr ? rawSrcAttr.trim() : "";
+    if (!srcHref) {
+      const rawTypeAttr = readHtmlAttr(attrs, "type");
+      const type = rawTypeAttr ? rawTypeAttr.trim().toLowerCase() : "";
       const isJsOrTs =
         !type ||
         type === "module" ||
@@ -664,13 +721,18 @@ export function bundleHtmlWithFolderAssets(
       const bundledExec = tryBundleLocalModules(inlineCode, virtualPath, precompiled);
       if (bundledExec) {
         const modAttr = bundledExec.isModuleTag ? ' type="module"' : "";
-        return `<script${modAttr}>\n${bundledExec.scriptCode}\n</script>`;
+        const scriptTag = `<script${modAttr}>\n${bundledExec.scriptCode}\n</script>`;
+        if (isMod) {
+          deferredScripts.push(scriptTag);
+          return "";
+        }
+        return scriptTag;
       }
       const safeInline = compileScriptContent(inlineCode, virtualPath, type, isMod, precompiled);
-      const outAttrs = type && type !== "module" ? attrs.replace(/\btype=["'][^"']*["']/i, "").trim() : attrs.trim();
+      const outAttrs = type && type !== "module" ? attrs.replace(/(?:^|\s)type\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+)/i, "").trim() : attrs.trim();
       return `<script${outAttrs ? " " + outAttrs : ""}>${safeInline}</script>`;
     }
-    const asset = resolveAsset(srcMatch[1]);
+    const asset = resolveAsset(srcHref);
     if (!asset) return fullTag;
     if (asset.content.length > MAX_PREVIEW_ASSET_BYTES) {
       return fullTag;
@@ -680,8 +742,9 @@ export function bundleHtmlWithFolderAssets(
       inlinedActiveJs = true;
     }
 
-    const isModule = /\btype=["']module["']/i.test(attrs);
-    const hasDefer = /\bdefer\b/i.test(attrs);
+    const attrType = (readHtmlAttr(attrs, "type") || "").trim().toLowerCase();
+    const isModule = attrType === "module";
+    const hasDefer = /(?:^|\s)defer(?:\s|$|=)/i.test(attrs);
     const ext = getFileExtension(asset.path || "");
     const precompiled =
       TS_EXTENSIONS.has(ext) || ext === "jsx"
@@ -749,21 +812,29 @@ export function bundleHtmlWithFolderAssets(
     }
   }
 
-  // Neutralizar <meta http-equiv="refresh"> y <base href="..."> locales para evitar escapes fuera del srcdoc
-  html = html.replace(/<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*>/gi, "");
-  html = html.replace(/<base\b[^>]*href=["'](?!(?:https?:)?\/\/)[^"']*["'][^>]*>/gi, "");
+  // Neutralizar <meta http-equiv="refresh"> y <base ...> para evitar escapes fuera del srcdoc
+  html = html.replace(/<meta\b[^>]*\bhttp-equiv\s*=\s*["']?refresh["']?[^>]*>/gi, "");
+  html = html.replace(/<base\b[^>]*>/gi, "");
 
   // Reescribir location.href / location.assign / location.replace en atributos on* inline (ej. onclick="location.href='index.html'")
-  html = html.replace(/(\bon[a-z]+\s*=\s*)(["'])([\s\S]*?)\2/gi, (full, prefix, quote, handlerCode) => {
-    if (!handlerCode.includes("location")) return full;
-    const rewritten = rewriteProgrammaticNavigation(handlerCode);
-    return rewritten === handlerCode ? full : `${prefix}${quote}${rewritten}${quote}`;
+  const hasInlineHandlers = /(^|[\s<])on[a-z]+\s*=/i.test(html);
+  html = html.replace(/(^|[\s<])(on[a-z]+\s*=\s*)(["'])([\s\S]*?)\3/gi, (full, lead, prefix, quote, rawHandler) => {
+    if (!rawHandler.includes("location")) return full;
+    const decoded = rawHandler
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;|&apos;/gi, "'");
+    const rewritten = rewriteProgrammaticNavigation(decoded);
+    if (rewritten === decoded) return full;
+    const safeAttrBody = quote === "\""
+      ? rewritten.replace(/"/g, "&quot;")
+      : rewritten.replace(/'/g, "&#39;");
+    return `${lead}${prefix}${quote}${safeAttrBody}${quote}`;
   });
 
   const bridge = buildConsoleBridgeScript(false);
-  const runtimeAssetsBridge = (processedScripts.length > 0 || ensureJsFile)
+  const runtimeAssetsBridge = (processedScripts.length > 0 || ensureJsFile || hasInlineHandlers)
     ? buildRuntimeAssetsBridgeScript(
-        dir,
+        scopeDir,
         fileMap,
         allowParentTraversal,
         buildEntryDataUrl,
@@ -775,6 +846,11 @@ export function bundleHtmlWithFolderAssets(
     html = html.replace(/<head\b[^>]*>/i, (m) => `${m}\n${combinedHeadBridge}`);
   } else {
     html = `${combinedHeadBridge}\n${html}`;
+  }
+
+  if (htmlComments.length > 0) {
+    const cmtRe = new RegExp(`${commentMaskPrefix}(\\d+)__`, "g");
+    html = html.replace(cmtRe, (_, idxStr) => htmlComments[Number(idxStr)] ?? "");
   }
 
   if (processedScripts.length > 0) {

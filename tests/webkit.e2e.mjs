@@ -71,7 +71,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
     await new Promise((resolve) => server?.close(resolve));
   });
 
-  test("Render iPadOS táctil, IndexedDB, SW v31, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
+  test("Render iPadOS táctil, IndexedDB, SW v32, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
     const page = await context.newPage();
     const pageErrors = [];
     const coldBootRequests = [];
@@ -93,14 +93,14 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
       "WebKit no debe descargar runtimes pesados (Pyodide/SQLite/tsc) durante el arranque en frío"
     );
 
-    // 1. Verificar Service Worker v31 accesible y sin desborde horizontal en iPad vertical (820x1180)
+    // 1. Verificar Service Worker v32 accesible y sin desborde horizontal en iPad vertical (820x1180)
     const swAssetOk = await page.evaluate(async () => {
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v31");
+      return text.includes("studio-ide-shell-v32");
     });
-    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v31 en WebKit");
+    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v32 en WebKit");
 
     const portraitOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth > window.innerWidth
@@ -204,6 +204,161 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
       null,
       { timeout: 8000 }
     );
+    await page.click("#btn-close-preview");
+    await page.waitForTimeout(250);
+
+    // 4b. Tienda multipágina en WebKit real (iPadOS): clic en <a href>, location.href, catálogo JSON/imágenes y cero Script error
+    const samplePngB64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+    await page.evaluate(async (pngB64) => {
+      const dbMod = await import("./js/storage/workspaceDb.js");
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/img/logo.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/img/productos/zapato.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/img/productos/campera.png", {
+        isFolder: false,
+        isBinary: true,
+        content: "",
+        base64: pngB64
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/data/productos.json", {
+        isFolder: false,
+        content: JSON.stringify([
+          { name: "Zapato", img: "productos/zapato.png" },
+          { name: "Campera", img: "img/productos/campera.png" }
+        ])
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/js/catalogo.js", {
+        isFolder: false,
+        content:
+          'fetch("productos.json").then(function(r){return r.json();}).then(function(items){' +
+          'var grid=document.getElementById("catalog-grid");' +
+          'grid.innerHTML=items.map(function(p){return "<article><img class=\\"prod-img\\" src=\\""+p.img+"\\" alt=\\""+p.name+"\\"></article>";}).join("");' +
+          'console.log("WK_CATALOG_OK", items.length);' +
+          '});'
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/index.html", {
+        isFolder: false,
+        content:
+          '<!DOCTYPE html><html><head><title>Inicio</title></head><body>' +
+          '<header><img id="logo-home" src="img/logo.png"><nav>' +
+          '<a id="go-catalog" href="productos.html">Catálogo</a>' +
+          '<a id="go-spa-tab" href="productos.html">Tab SPA</a>' +
+          '</nav></header><h1 id="home-title">WK_INICIO</h1><div id="spa-msg"></div>' +
+          '<script>document.getElementById("go-spa-tab").addEventListener("click",function(e){e.preventDefault();document.getElementById("spa-msg").textContent="SPA_OK";});</script>' +
+          '</body></html>'
+      });
+      await dbMod.upsertEntry("espacio-local", "wk_tienda/productos.html", {
+        isFolder: false,
+        content:
+          '<!DOCTYPE html><html><head><title>Catálogo</title></head><body>' +
+          '<header><img id="logo-prod" src="img/logo.png"><nav>' +
+          '<a id="go-home-link" href="./">Inicio A</a>' +
+          '<button id="go-home-btn" onclick="location.href=\'index.html\'">Inicio Btn</button>' +
+          '</nav></header><h1 id="cat-title">WK_CATALOGO</h1><div id="catalog-grid"></div>' +
+          '<script src="js/catalogo.js" defer></script></body></html>'
+      });
+    }, samplePngB64);
+
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
+    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+
+    const wkTiendaExpanded = await page.evaluate(() => {
+      const folderBtn = document.querySelector('.tree-row[data-path="wk_tienda"] .tree-node-btn');
+      if (folderBtn && folderBtn.getAttribute("aria-expanded") === "false") {
+        folderBtn.click();
+      }
+      return Boolean(folderBtn);
+    });
+    assert.equal(wkTiendaExpanded, true, "Carpeta wk_tienda debe aparecer en el Explorador WebKit");
+    await page.waitForTimeout(250);
+
+    const openedWkTienda = await page.evaluate(() => {
+      const btn = document.querySelector('.tree-row[data-path="wk_tienda/index.html"] .tree-node-btn');
+      if (!btn) return false;
+      btn.click();
+      return true;
+    });
+    assert.equal(openedWkTienda, true, "wk_tienda/index.html debe abrirse en WebKit");
+    await page.waitForTimeout(350);
+
+    await page.click("#btn-live-preview");
+    await page.waitForSelector("#preview-dialog[open]", { timeout: 10000 });
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("wk_tienda/index.html"),
+      null,
+      { timeout: 10000 }
+    );
+
+    const wkFrame = page.frameLocator("#preview-iframe");
+    await wkFrame.locator("#home-title").waitFor({ state: "visible", timeout: 8000 });
+
+    const wkIframeBox = await page.locator("#preview-iframe").boundingBox();
+    assert.ok(wkIframeBox && wkIframeBox.height >= 200 && wkIframeBox.width >= 300, `Iframe WebKit colapsado: ${JSON.stringify(wkIframeBox)}`);
+
+    // SPA tab con preventDefault en WebKit
+    await wkFrame.locator("#go-spa-tab").click();
+    await wkFrame.locator("#spa-msg").waitFor({ state: "visible", timeout: 5000 });
+    assert.equal(await wkFrame.locator("#spa-msg").textContent(), "SPA_OK");
+
+    // Ir a catálogo con <a href="productos.html">
+    await wkFrame.locator("#go-catalog").click();
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("wk_tienda/productos.html"),
+      null,
+      { timeout: 10000 }
+    );
+    await page.waitForFunction(
+      () => (document.getElementById("preview-console-list")?.textContent || "").includes("WK_CATALOG_OK 2"),
+      null,
+      { timeout: 10000 }
+    );
+    await wkFrame.locator(".prod-img").first().waitFor({ state: "visible", timeout: 8000 });
+    const wkImgsOk = await wkFrame.locator("img").evaluateAll((imgs) =>
+      imgs.length === 3 && imgs.every((im) => im.complete && im.naturalWidth > 0)
+    );
+    assert.equal(wkImgsOk, true, "En WebKit deben cargarse el logo y las 2 imágenes del catálogo");
+
+    // Volver al inicio vía <a href="./">
+    await wkFrame.locator("#go-home-link").click();
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("wk_tienda/index.html"),
+      null,
+      { timeout: 10000 }
+    );
+    await wkFrame.locator("#home-title").waitFor({ state: "visible", timeout: 8000 });
+    assert.equal(await wkFrame.locator("#btn-live-preview").count(), 0, "Studio IDE no debe cargarse dentro de #preview-iframe en WebKit");
+
+    // Ir a catálogo y volver por button onclick="location.href='index.html'"
+    await wkFrame.locator("#go-catalog").click();
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("wk_tienda/productos.html"),
+      null,
+      { timeout: 10000 }
+    );
+    await wkFrame.locator("#go-home-btn").waitFor({ state: "visible", timeout: 8000 });
+    await wkFrame.locator("#go-home-btn").click();
+    await page.waitForFunction(
+      () => (document.getElementById("preview-file-badge")?.textContent || "").includes("wk_tienda/index.html"),
+      null,
+      { timeout: 10000 }
+    );
+    await wkFrame.locator("#home-title").waitFor({ state: "visible", timeout: 8000 });
+
+    const wkConsoleErrors = await page.evaluate(() =>
+      Array.from(document.querySelectorAll("#preview-console-list .is-error")).map((el) => el.textContent)
+    );
+    assert.deepEqual(wkConsoleErrors, [], `Consola JS en WebKit reportó errores: ${wkConsoleErrors.join("; ")}`);
+
     await page.click("#btn-close-preview");
     await page.waitForTimeout(250);
 

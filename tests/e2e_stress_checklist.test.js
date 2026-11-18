@@ -334,14 +334,14 @@ app.c:12:3: error: unknown type name 'intt'; did you mean 'int'?
 });
 
 describe("BLOQUE 6 — PWA, Service Worker y Responsividad", () => {
-  test("6.1 Caché Offline: versión vigente studio-ide-shell-v31 y 100% de módulos js/css/assets + importmap precacheados en sw.js", async () => {
+  test("6.1 Caché Offline: versión vigente studio-ide-shell-v32 y 100% de módulos js/css/assets + importmap precacheados en sw.js", async () => {
     const fs = await import("node:fs/promises");
     const path = await import("node:path");
     const { fileURLToPath } = await import("node:url");
     const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
     const swContent = await fs.readFile(path.join(rootDir, "sw.js"), "utf-8");
     const htmlContent = await fs.readFile(path.join(rootDir, "index.html"), "utf-8");
-    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v31"'));
+    assert.ok(swContent.includes('SHELL_CACHE = "studio-ide-shell-v32"'));
     assert.ok(swContent.includes("credentialGuard.js"));
     assert.ok(swContent.includes("keyVaultCrypto.js"));
     assert.ok(swContent.includes("githubMerge.js"));

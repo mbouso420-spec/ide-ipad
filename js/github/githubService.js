@@ -864,7 +864,7 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
   const CONCURRENCY = 6;
   for (let i = 0; i < items.length; i += CONCURRENCY) {
     const batch = items.slice(i, i + CONCURRENCY);
-    const batchResults = await Promise.all(
+    const settled = await Promise.allSettled(
       batch.map(async (item) => {
         const blob = await client.request("GET /repos/{owner}/{repo}/git/blobs/{file_sha}", {
           owner,
@@ -872,9 +872,9 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
           file_sha: item.blobSha,
           signal
         });
+        const parsed = parseGithubBlobPayload(blob, { path: item.path, isBinary: item.isBinary });
         completed += 1;
         onProgress?.(completed, total);
-        const parsed = parseGithubBlobPayload(blob, { path: item.path, isBinary: item.isBinary });
         return {
           path: item.path,
           blobSha: item.blobSha,
@@ -885,7 +885,14 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
         };
       })
     );
-    results.push(...batchResults);
+    for (const outcome of settled) {
+      if (outcome.status === "fulfilled" && outcome.value) {
+        results.push(outcome.value);
+      } else if (outcome.status === "rejected") {
+        completed += 1;
+        onProgress?.(completed, total);
+      }
+    }
   }
   return results;
 }

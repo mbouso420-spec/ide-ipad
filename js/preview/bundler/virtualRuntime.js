@@ -301,7 +301,8 @@ export function buildVirtualModuleBundle({
     if (node.kind === "json") {
       let jsonLiteral = "null";
       try {
-        jsonLiteral = JSON.stringify(JSON.parse(node.content)).replace(/</g, "\\u003c");
+        const cleanJson = String(node.content || "").replace(/^\uFEFF/, "");
+        jsonLiteral = JSON.stringify(JSON.parse(cleanJson)).replace(/</g, "\\u003c");
       } catch {
         jsonLiteral = JSON.stringify(node.content).replace(/</g, "\\u003c");
       }

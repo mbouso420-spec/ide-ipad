@@ -1996,6 +1996,13 @@ function registerPwaServiceWorker() {
 
   if (window.location.protocol === "https:" || (isLocalDev && allowLocalSw)) {
     const startRegistration = () => {
+      const hadController = Boolean(navigator.serviceWorker.controller);
+      let swReloading = false;
+      navigator.serviceWorker.addEventListener("controllerchange", () => {
+        if (!hadController || swReloading) return;
+        swReloading = true;
+        window.location.reload();
+      });
       navigator.serviceWorker
         .register("./sw.js")
         .then((reg) => {
