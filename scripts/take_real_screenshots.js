@@ -253,16 +253,31 @@ try {
   // 4. CAPTURE AI ASSISTANT IN ACTION
   console.log("Preparing AI Assistant chat panel...");
   await page.evaluate(() => {
+    const extraTabBtn = document.querySelector("#chat-extra-tabs .chat-extra-tab-chip");
+    if (extraTabBtn && !extraTabBtn.classList.contains("is-attached")) {
+      extraTabBtn.click();
+    }
     const chatInput = document.getElementById("chat-prompt-input");
     if (chatInput) {
-      chatInput.value = "¿Podrías optimizar este código en C++ para que use memoria dinámica eficientemente?";
+      chatInput.focus();
+      chatInput.value = "Optimizá este código usando @";
+      chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
       chatInput.dispatchEvent(new Event("input", { bubbles: true }));
     }
   });
-  await new Promise((r) => setTimeout(r, 800));
+  await new Promise((r) => setTimeout(r, 900));
 
   console.log("Capturing 04-ai-assistant.png...");
   await page.screenshot({ path: path.join(OUT_DIR, "04-ai-assistant.png") });
+
+  await page.evaluate(() => {
+    const chatInput = document.getElementById("chat-prompt-input");
+    if (chatInput) {
+      chatInput.value = "";
+      chatInput.dispatchEvent(new Event("input", { bubbles: true }));
+      chatInput.blur();
+    }
+  });
 
   // 5. CAPTURE GITHUB DIALOG
   console.log("Opening GitHub dialog...");
