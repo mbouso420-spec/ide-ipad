@@ -317,6 +317,8 @@ export function initSymbolBar({ onInsert, onToggle }) {
     }
   }
 
+  let lastLangKey = null;
+
   /**
    * Actualiza las teclas rápidas según la extensión o lenguaje del archivo activo.
    * @param {string} langKey
@@ -326,7 +328,12 @@ export function initSymbolBar({ onInsert, onToggle }) {
       langKey === "c" ? "cpp"
       : langKey === "tsx" || langKey === "typescript" ? "ts"
       : langKey;
-    const config = LANGUAGE_SYMBOLS[normalized] ?? LANGUAGE_SYMBOLS.js;
+    const resolvedKey = Object.prototype.hasOwnProperty.call(LANGUAGE_SYMBOLS, normalized) ? normalized : "js";
+    if (resolvedKey === lastLangKey && track && track.children.length > 0) {
+      return;
+    }
+    lastLangKey = resolvedKey;
+    const config = LANGUAGE_SYMBOLS[resolvedKey];
     if (langPill) {
       langPill.textContent = config.label;
     }
@@ -355,7 +362,6 @@ export function initSymbolBar({ onInsert, onToggle }) {
 
   return {
     setLanguage,
-    isVisible: () => visible,
     destroy() {
       listenerController?.abort();
     }

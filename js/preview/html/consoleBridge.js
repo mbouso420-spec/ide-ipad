@@ -70,6 +70,7 @@ function canPrecedeRegex(prevChar, prevWord, prevPrevChar) {
 
 function scanRhsExpressionEnd(src, start) {
   let i = start;
+  let lastSigEnd = start;
   let paren = 0;
   let bracket = 0;
   let brace = 0;
@@ -84,15 +85,17 @@ function scanRhsExpressionEnd(src, start) {
     const next = src[i + 1];
 
     if (tplStack.length > 0 && tplStack[tplStack.length - 1] === brace) {
-      if (ch === "\\") { i += 2; continue; }
-      if (ch === "`") { tplStack.pop(); i++; prevPrevChar = prevChar; prevChar = "`"; prevWord = ""; continue; }
-      if (ch === "$" && next === "{") { i += 2; brace++; continue; }
+      if (ch === "\\") { i += 2; lastSigEnd = Math.min(src.length, i); continue; }
+      if (ch === "`") { tplStack.pop(); i++; lastSigEnd = i; prevPrevChar = prevChar; prevChar = "`"; prevWord = ""; continue; }
+      if (ch === "$" && next === "{") { i += 2; lastSigEnd = i; brace++; continue; }
       i++;
+      lastSigEnd = i;
       continue;
     }
 
     if (ch === "'" || ch === "\"") {
       i = scanQuotedString(src, i, ch);
+      lastSigEnd = i;
       prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
@@ -101,6 +104,7 @@ function scanRhsExpressionEnd(src, start) {
     if (ch === "`") {
       tplStack.push(brace);
       i++;
+      lastSigEnd = i;
       continue;
     }
     if (ch === "/" && next === "/") {
@@ -115,6 +119,7 @@ function scanRhsExpressionEnd(src, start) {
     }
     if (ch === "/" && canPrecedeRegex(prevChar, prevWord, prevPrevChar)) {
       i = scanRegexLiteral(src, i);
+      lastSigEnd = i;
       prevPrevChar = prevChar;
       prevChar = "/";
       prevWord = "";
@@ -135,6 +140,7 @@ function scanRhsExpressionEnd(src, start) {
       brace--;
       if (tplStack.length > 0 && tplStack[tplStack.length - 1] === brace) {
         i++;
+        lastSigEnd = i;
         continue;
       }
     } else if (paren === 0 && bracket === 0 && brace === 0) {
@@ -147,8 +153,14 @@ function scanRhsExpressionEnd(src, start) {
       } else if (ch === "\n" || ch === "\r") {
         const afterWs = skipWs(src, i);
         const nextTok = src[afterWs] || "";
+        const nextNextTok = src[afterWs + 1] || "";
         const continues =
-          nextTok === "." || nextTok === "?" || nextTok === ":" || nextTok === "+" ||
+          nextTok === "." ||
+          nextTok === "?" ||
+          nextTok === ":" ||
+          nextTok === "+" ||
+          (nextTok === "|" && nextNextTok === "|") ||
+          (nextTok === "&" && nextNextTok === "&") ||
           "+?:=,&|".includes(prevChar);
         if (!continues) break;
         i = afterWs;
@@ -164,15 +176,17 @@ function scanRhsExpressionEnd(src, start) {
         prevPrevChar = "";
         prevChar = src[j - 1];
         i = j;
+        lastSigEnd = i;
         continue;
       }
       prevPrevChar = prevChar;
       prevChar = ch;
       prevWord = "";
+      lastSigEnd = i + 1;
     }
     i++;
   }
-  return i;
+  return lastSigEnd;
 }
 
 /**
@@ -310,7 +324,11 @@ export function rewriteProgrammaticNavigation(code) {
             !isBareLoc ||
             (!inClassMemberScope &&
               !inDestructuringPattern &&
-              (!prevChar || ";{}".includes(prevChar) || prevWord === "else" || prevWord === "return"));
+              (!prevChar ||
+                ";{})".includes(prevChar) ||
+                (prevPrevChar === "=" && prevChar === ">") ||
+                prevWord === "else" ||
+                prevWord === "return"));
           if (allowedBareBoundary) {
             const rhsStart = skipWs(src, k + 1);
             const rhsEnd = scanRhsExpressionEnd(src, rhsStart);
@@ -368,8 +386,9 @@ export function buildConsoleBridgeScript(mirrorOnScreen) {
 ${buildLoopGuardRuntime()}
 (function () {
   var mirror = ${mirrorOnScreen ? "true" : "false"};
+  var MAX_LOG_CHARS = 16384;
   function formatArgs(args) {
-    return Array.prototype.slice.call(args).map(function (item) {
+    var out = Array.prototype.slice.call(args).map(function (item) {
       if (typeof item === "string") return item;
       if (item === undefined) return "undefined";
       if (item === null) return "null";
@@ -386,6 +405,10 @@ ${buildLoopGuardRuntime()}
         return String(item);
       }
     }).join(" ");
+    if (out.length > MAX_LOG_CHARS) {
+      return out.slice(0, MAX_LOG_CHARS) + "… [truncado]";
+    }
+    return out;
   }
   function send(level, args) {
     try {
@@ -602,32 +625,43 @@ ${buildLoopGuardRuntime()}
     }, "*");
   }, false);
 
-  // Interceptor de envíos de formularios locales
+  // Interceptor de envíos de formularios: bloqueo estricto de esquemas peligrosos en captura
   document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!form || !form.getAttribute) return;
+    var submitter = e.submitter;
+    var action = (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) || form.getAttribute("action");
+    if (!action) return;
+    var normAction = normalizeNavRef(action);
+    if (isBlockedNavScheme(normAction)) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+  // Navegación local de formularios en fase de burbuja (respeta e.preventDefault() de SPAs/React)
+  window.addEventListener("submit", function (e) {
+    if (e.defaultPrevented) return;
     var form = e.target;
     if (!form || !form.getAttribute) return;
     var submitter = e.submitter;
     var action = (submitter && submitter.getAttribute && submitter.getAttribute("formaction")) || form.getAttribute("action");
     if (!action) {
       e.preventDefault();
-      e.stopPropagation();
       return;
     }
     var normAction = normalizeNavRef(action);
     if (isBlockedNavScheme(normAction)) {
       e.preventDefault();
-      e.stopPropagation();
       return;
     }
     if (normAction.startsWith("#") || isExternalNavRef(normAction)) return;
     e.preventDefault();
-    e.stopPropagation();
     parent.postMessage({
       source: "studio-ide-preview",
       action: "navigate",
       href: action
     }, "*");
-  }, true);
+  }, false);
 
   // Interceptor de llamadas programáticas de navegación (incluyendo rewrite de location.*)
   var origOpen = typeof window.open === "function" ? window.open.bind(window) : null;

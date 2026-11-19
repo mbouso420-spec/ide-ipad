@@ -10,7 +10,7 @@ import {
   convertLocalProjectToGithub,
   createProjectFromGistBackup,
   getProjectEntries,
-  saveProjectState
+  saveProjectGistId
 } from "../storage/workspaceDb.js";
 import { slugifyName } from "../utils/encoding.js";
 
@@ -53,6 +53,7 @@ export function initGithubLocalBackupPanel({
   const gistRestoreStatus = document.getElementById("gh-gist-restore-status");
 
   let gistRefreshSeq = 0;
+  let gistFetchController = null;
   let isPanelActionBusy = false;
   let destroyed = false;
   const listenerController = typeof AbortController === "function" ? new AbortController() : null;
@@ -108,7 +109,11 @@ export function initGithubLocalBackupPanel({
       gistSelect.innerHTML = '<option value="">Cargando respaldos en Gists…</option>';
       if (restoreGistBtn) restoreGistBtn.disabled = true;
 
-      fetchUserGistBackups(token)
+      gistFetchController?.abort();
+      gistFetchController = typeof AbortController === "function" ? new AbortController() : null;
+      const fetchSignal = gistFetchController ? gistFetchController.signal : null;
+
+      fetchUserGistBackups(token, { signal: fetchSignal })
         .then((backups) => {
           if (destroyed || seq !== gistRefreshSeq) return;
           gistSelect.innerHTML = "";
@@ -185,7 +190,8 @@ export function initGithubLocalBackupPanel({
       }
 
       project.gistId = result.id;
-      await saveProjectState(project);
+      await saveProjectGistId(sourceProjectId, result.id);
+      if (destroyed) return;
 
       setGithubStatus(
         localBackupStatus,
@@ -197,6 +203,7 @@ export function initGithubLocalBackupPanel({
       }
       void refresh(project);
     } catch (err) {
+      if (destroyed) return;
       const msg = formatSafeErrorMessage(err, [token], "No se pudo guardar el Gist.");
       if (msg.includes("Resource not accessible") || msg.includes("permiso para Gists")) {
         setGithubStatus(
@@ -208,7 +215,7 @@ export function initGithubLocalBackupPanel({
         setGithubStatus(localBackupStatus, `Error al respaldar en Gist: ${msg}`, "error");
       }
     } finally {
-      setActionBusy(false);
+      if (!destroyed) setActionBusy(false);
     }
   }, listenOpts);
 
@@ -288,14 +295,17 @@ export function initGithubLocalBackupPanel({
         owner: res.owner,
         repo: res.repo,
         branch: res.branch,
-        commitSha: res.commitSha || null
+        commitSha: res.commitSha || null,
+        publishedEntries: entries
       });
+      if (destroyed) return;
 
       hidePublishRepoBox();
       setGithubStatus(localBackupStatus, `¡Publicado con éxito como ${res.fullName} (${visibilityLabel})!`, "ok");
       await onProjectClonedOrSynced?.(converted?.id || project.id);
       await onRefreshSyncPanel?.();
     } catch (err) {
+      if (destroyed) return;
       const msg = formatSafeErrorMessage(err, [token], "No se pudo crear el repositorio en GitHub.");
       if (msg.includes("Resource not accessible")) {
         setGithubStatus(
@@ -307,7 +317,7 @@ export function initGithubLocalBackupPanel({
         setGithubStatus(localBackupStatus, `Error al publicar repositorio: ${msg}`, "error");
       }
     } finally {
-      setActionBusy(false);
+      if (!destroyed) setActionBusy(false);
     }
   }, listenOpts);
 
@@ -329,14 +339,16 @@ export function initGithubLocalBackupPanel({
     try {
       const gistData = await fetchGistBackupContent(token, gistId);
       const newProject = await createProjectFromGistBackup(gistData);
+      if (destroyed) return;
       setGithubStatus(gistRestoreStatus, `¡Proyecto '${newProject.name}' restaurado con éxito!`, "ok");
       await onProjectClonedOrSynced?.(newProject.id);
       dialog?.close();
     } catch (err) {
+      if (destroyed) return;
       const msg = formatSafeErrorMessage(err, [token], "No se pudo restaurar el Gist.");
       setGithubStatus(gistRestoreStatus, `Error al restaurar: ${msg}`, "error");
     } finally {
-      setActionBusy(false);
+      if (!destroyed) setActionBusy(false);
     }
   }, listenOpts);
 
@@ -347,6 +359,8 @@ export function initGithubLocalBackupPanel({
     destroy() {
       destroyed = true;
       gistRefreshSeq += 1;
+      gistFetchController?.abort();
+      gistFetchController = null;
       listenerController?.abort();
     }
   };

@@ -414,34 +414,121 @@ export function extractWordBeforeCursor(docText, cursorOffset) {
 }
 
 /**
- * Distancia de edición Damerau-Levenshtein acotada para detectar similitud en prefijos de 3+ letras.
+ * Distancia de edición Damerau-Levenshtein acotada con buffer plano Uint16Array y salida temprana.
  * @param {string} a
  * @param {string} b
+ * @param {number} [maxAllowed=Infinity]
  * @returns {number}
  */
-function computeEditDistance(a, b) {
+function computeEditDistance(a, b, maxAllowed = Infinity) {
   const m = a.length;
   const n = b.length;
   if (m === 0) return n;
   if (n === 0) return m;
-  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  if (Math.abs(m - n) > maxAllowed) return maxAllowed + 1;
+
+  const stride = n + 1;
+  const dp = new Uint16Array((m + 1) * stride);
+  for (let i = 0; i <= m; i++) dp[i * stride] = i;
+  for (let j = 0; j <= n; j++) dp[j] = j;
 
   for (let i = 1; i <= m; i++) {
+    const row = i * stride;
+    const prevRow = row - stride;
+    const prevPrevRow = prevRow - stride;
+    const ca = a.charCodeAt(i - 1);
+    let rowMin = 65535;
     for (let j = 1; j <= n; j++) {
-      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
-        dp[i][j] = Math.min(dp[i][j], dp[i - 2][j - 2] + 1);
+      const cb = b.charCodeAt(j - 1);
+      const cost = ca === cb ? 0 : 1;
+      let val = dp[prevRow + j] + 1;
+      const ins = dp[row + j - 1] + 1;
+      if (ins < val) val = ins;
+      const sub = dp[prevRow + j - 1] + cost;
+      if (sub < val) val = sub;
+      if (i > 1 && j > 1 && ca === b.charCodeAt(j - 2) && a.charCodeAt(i - 2) === cb) {
+        const trans = dp[prevPrevRow + j - 2] + 1;
+        if (trans < val) val = trans;
+      }
+      dp[row + j] = val;
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > maxAllowed) return maxAllowed + 1;
+  }
+  return dp[m * stride + n];
+}
+
+const COMPOUND_DELIM_RE = /[#:.<>\s]/;
+const SEGMENT_SPLIT_RE = /(?:::|\.|\s+|<|>)/;
+
+function scoreCompletionNormalized(q, candidateLabel) {
+  const c = String(candidateLabel || "").trim().toLowerCase();
+  if (!q || !c || q === c) return 0;
+
+  // 1. Coincidencia exacta de prefijo (ej: "prin" -> "printf")
+  if (c.startsWith(q)) {
+    return 100 - Math.min(25, c.length - q.length);
+  }
+
+  // 2. Coincidencia sin el "#" inicial o tras "::", ".", " " o "<" (solo si contiene delimitadores)
+  let stripped = c;
+  let targetWord = c;
+  if (COMPOUND_DELIM_RE.test(c)) {
+    stripped = c.charCodeAt(0) === 35 ? c.slice(1) : c;
+    if (stripped !== c && stripped.startsWith(q)) {
+      return 92 - Math.min(25, stripped.length - q.length);
+    }
+    const segments = c.split(SEGMENT_SPLIT_RE).filter(Boolean);
+    for (const seg of segments) {
+      if (seg !== q && seg.startsWith(q)) {
+        return 86 - Math.min(20, seg.length - q.length);
+      }
+    }
+    if (segments.length > 0) {
+      targetWord = segments[segments.length - 1];
+    } else {
+      targetWord = stripped;
+    }
+  }
+
+  // 3. Coincidencia de subcadena directa con 2+ letras (ej: "prin" dentro de "fprintf" o "sprintf")
+  if (q.length >= 2) {
+    const idx = c.indexOf(q);
+    if (idx !== -1) {
+      return 74 - Math.min(18, idx * 2) - Math.min(15, c.length - q.length);
+    }
+  }
+
+  // 4. A partir de 3 letras: subsecuencia en orden o similitud por distancia de edición (typos)
+  if (q.length >= 3) {
+    if (targetWord.charCodeAt(0) === q.charCodeAt(0)) {
+      // 4a. Subsecuencia ordenada con la misma inicial (ej: "prtf" -> "printf", "scnf" -> "scanf")
+      let qi = 0;
+      for (let ci = 0; ci < targetWord.length && qi < q.length; ci++) {
+        if (targetWord.charCodeAt(ci) === q.charCodeAt(qi)) qi++;
+      }
+      if (qi === q.length) {
+        return 62 - Math.min(20, targetWord.length - q.length);
+      }
+
+      // 4b. Similitud con el prefijo o palabra completa (ej: "prinf" -> "printf", "retrun" -> "return")
+      const maxAllowed = q.length >= 5 ? 2 : 1;
+      const prefixSlice = targetWord.slice(0, Math.min(targetWord.length, q.length + 1));
+      const distPrefix = Math.abs(q.length - prefixSlice.length) <= maxAllowed
+        ? computeEditDistance(q, prefixSlice, maxAllowed)
+        : maxAllowed + 1;
+      const distFull =
+        targetWord.length <= 40 && Math.abs(q.length - targetWord.length) <= maxAllowed
+          ? computeEditDistance(q, targetWord, maxAllowed)
+          : maxAllowed + 1;
+      const bestDist = Math.min(distPrefix, distFull);
+      if (bestDist <= maxAllowed) {
+        return 54 - bestDist * 10 - Math.min(12, Math.abs(targetWord.length - q.length));
       }
     }
   }
-  return dp[m][n];
+
+  return 0;
 }
 
 /**
@@ -456,70 +543,12 @@ function computeEditDistance(a, b) {
  */
 export function scoreCompletionMatch(query, candidateLabel) {
   const q = String(query || "").trim().toLowerCase();
-  const c = String(candidateLabel || "").trim().toLowerCase();
-  if (!q || !c || q === c) return 0;
-
-  // 1. Coincidencia exacta de prefijo (ej: "prin" -> "printf")
-  if (c.startsWith(q)) {
-    return 100 - Math.min(25, c.length - q.length);
-  }
-
-  // 2. Coincidencia sin el "#" inicial o tras "::", ".", " " o "<" (ej: "inc" -> "#include <stdio.h>", "cout" -> "std::cout")
-  const stripped = c.replace(/^#/, "");
-  if (stripped.startsWith(q)) {
-    return 92 - Math.min(25, stripped.length - q.length);
-  }
-
-  const segments = c.split(/(?:::|\.|\s+|<|>)/).filter(Boolean);
-  for (const seg of segments) {
-    if (seg !== q && seg.startsWith(q)) {
-      return 86 - Math.min(20, seg.length - q.length);
-    }
-  }
-
-  // 3. Coincidencia de subcadena directa con 2+ letras (ej: "prin" dentro de "fprintf" o "sprintf")
-  if (q.length >= 2) {
-    const idx = c.indexOf(q);
-    if (idx !== -1) {
-      return 74 - Math.min(18, idx * 2) - Math.min(15, c.length - q.length);
-    }
-  }
-
-  // 4. A partir de 3 letras: subsecuencia en orden o similitud por distancia de edición (typos)
-  if (q.length >= 3) {
-    const targetWord = segments[segments.length - 1] || stripped;
-    if (targetWord[0] === q[0]) {
-      // 4a. Subsecuencia ordenada con la misma inicial (ej: "prtf" -> "printf", "scnf" -> "scanf")
-      let qi = 0;
-      for (let ci = 0; ci < targetWord.length && qi < q.length; ci++) {
-        if (targetWord[ci] === q[qi]) qi++;
-      }
-      if (qi === q.length) {
-        return 62 - Math.min(20, targetWord.length - q.length);
-      }
-
-      // 4b. Similitud con el prefijo o palabra completa (ej: "prinf" -> "printf", "retrun" -> "return")
-      const maxAllowed = q.length >= 5 ? 2 : 1;
-      const prefixSlice = targetWord.slice(0, Math.min(targetWord.length, q.length + 1));
-      const distPrefix = Math.abs(q.length - prefixSlice.length) <= maxAllowed
-        ? computeEditDistance(q, prefixSlice)
-        : maxAllowed + 1;
-      const distFull =
-        targetWord.length <= 40 && Math.abs(q.length - targetWord.length) <= maxAllowed
-          ? computeEditDistance(q, targetWord)
-          : maxAllowed + 1;
-      const bestDist = Math.min(distPrefix, distFull);
-      if (bestDist <= maxAllowed) {
-        return 54 - bestDist * 10 - Math.min(12, Math.abs(targetWord.length - q.length));
-      }
-    }
-  }
-
-  return 0;
+  return scoreCompletionNormalized(q, candidateLabel);
 }
 
 const IDENTIFIER_SCAN_REGEX = /[A-Za-z_][A-Za-z0-9_]{2,50}/g;
 const MAX_IDENT_SCAN_CHARS = 120000;
+const MAX_DOC_IDENTIFIERS = 6000;
 const IDENT_CACHE_MAX_ENTRIES = 12;
 const docIdentifierCache = new Map();
 
@@ -541,11 +570,11 @@ export function extractDocumentIdentifiers(docText) {
   }
 
   const seenWords = new Set();
-  const matches = sample.match(IDENTIFIER_SCAN_REGEX);
-  if (matches) {
-    for (const w of matches) {
-      seenWords.add(w);
-    }
+  IDENTIFIER_SCAN_REGEX.lastIndex = 0;
+  let match;
+  while ((match = IDENTIFIER_SCAN_REGEX.exec(sample)) !== null) {
+    seenWords.add(match[0]);
+    if (seenWords.size >= MAX_DOC_IDENTIFIERS) break;
   }
   const words = Array.from(seenWords);
   if (docIdentifierCache.size >= IDENT_CACHE_MAX_ENTRIES) {
@@ -571,6 +600,7 @@ export function extractDocumentIdentifiers(docText) {
 export function getLanguageCompletions(lang, query, docTextOrWords = "", limit = 8) {
   const cleanQuery = String(query || "").trim();
   if (cleanQuery.length < 2) return [];
+  const normalizedQuery = cleanQuery.toLowerCase();
 
   const normalizedLang =
     lang === "tsx" || lang === "typescript" ? "ts"
@@ -592,7 +622,7 @@ export function getLanguageCompletions(lang, query, docTextOrWords = "", limit =
 
   for (const item of pool) {
     if (seen.has(item.label)) continue;
-    const score = scoreCompletionMatch(cleanQuery, item.label);
+    const score = scoreCompletionNormalized(normalizedQuery, item.label);
     if (score > 0) {
       seen.add(item.label);
       scored.push({
@@ -613,7 +643,7 @@ export function getLanguageCompletions(lang, query, docTextOrWords = "", limit =
   if (docWords) {
     for (const word of docWords) {
       if (seen.has(word) || word === cleanQuery) continue;
-      const score = scoreCompletionMatch(cleanQuery, word);
+      const score = scoreCompletionNormalized(normalizedQuery, word);
       if (score > 0) {
         seen.add(word);
         scored.push({

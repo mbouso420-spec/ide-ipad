@@ -35,6 +35,9 @@ export function initDiffModal() {
       multiBarEl.hidden = true;
       multiBarEl.innerHTML = "";
     }
+    if (bodyEl) {
+      bodyEl.innerHTML = "";
+    }
     if (typeof cancelCb === "function") {
       cancelCb();
     }
@@ -63,6 +66,9 @@ export function initDiffModal() {
     if (multiBarEl) {
       multiBarEl.hidden = true;
       multiBarEl.innerHTML = "";
+    }
+    if (bodyEl) {
+      bodyEl.innerHTML = "";
     }
     dialog?.close();
     if (typeof cancelCb === "function") {
@@ -360,6 +366,13 @@ export function initDiffModal() {
       pendingConfirmAction = null;
       pendingCancelAction = null;
       multiState = null;
+      if (multiBarEl) {
+        multiBarEl.hidden = true;
+        multiBarEl.innerHTML = "";
+      }
+      if (bodyEl) {
+        bodyEl.innerHTML = "";
+      }
       listenerController?.abort();
     }
   };

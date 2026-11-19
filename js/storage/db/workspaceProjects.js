@@ -9,7 +9,8 @@ import {
   SEED_PROJECT_ID,
   MAX_STORED_CHAT_TURNS,
   MAX_GIST_RESTORE_ENTRY_BYTES,
-  openDb,
+  openDbTransaction,
+  resolveTxError,
   validateUserPath,
   makeFileKey,
   putRecord,
@@ -17,11 +18,14 @@ import {
 } from "./dbCore.js";
 import { SEED_ENTRIES, buildProjectTemplatePayload } from "./projectTemplates.js";
 
+function makeUniqueIdSuffix() {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
 /**
  * Inicializa la base de datos y crea el proyecto semilla en la primera apertura.
  */
 export async function ensureInitialWorkspace() {
-  const db = await openDb();
   const now = Date.now();
   const seedProject = {
     id: SEED_PROJECT_ID,
@@ -34,82 +38,92 @@ export async function ensureInitialWorkspace() {
     updatedAt: now
   };
 
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
-    const projectsStore = tx.objectStore(STORE_PROJECTS);
-    const filesStore = tx.objectStore(STORE_FILES);
-    let resultProjects = null;
+  return openDbTransaction(
+    [STORE_PROJECTS, STORE_FILES],
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        const projectsStore = tx.objectStore(STORE_PROJECTS);
+        const filesStore = tx.objectStore(STORE_FILES);
+        let resultProjects = null;
 
-    const listReq = projectsStore.getAll();
-    listReq.onsuccess = () => {
-      const existing = (listReq.result || []).sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
-      if (existing.length > 0) {
-        resultProjects = existing;
-        return;
-      }
+        const listReq = projectsStore.getAll();
+        listReq.onsuccess = () => {
+          const existing = (listReq.result || []).sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
+          if (existing.length > 0) {
+            resultProjects = existing;
+            return;
+          }
 
-      projectsStore.put(seedProject);
-      const folders = ["src", "web", "scripts", "db"];
-      for (const folderPath of folders) {
-        filesStore.put({
-          key: makeFileKey(SEED_PROJECT_ID, folderPath),
-          projectId: SEED_PROJECT_ID,
-          path: folderPath,
-          isFolder: true,
-          content: "",
-          baseContent: "",
-          deleted: false,
-          updatedAt: now
-        });
-      }
+          projectsStore.put(seedProject);
+          const folders = ["src", "web", "scripts", "db"];
+          for (const folderPath of folders) {
+            filesStore.put({
+              key: makeFileKey(SEED_PROJECT_ID, folderPath),
+              projectId: SEED_PROJECT_ID,
+              path: folderPath,
+              isFolder: true,
+              content: "",
+              baseContent: "",
+              deleted: false,
+              updatedAt: now
+            });
+          }
 
-      for (const item of SEED_ENTRIES) {
-        filesStore.put({
-          key: makeFileKey(SEED_PROJECT_ID, item.path),
-          projectId: SEED_PROJECT_ID,
-          path: item.path,
-          isFolder: false,
-          content: item.content,
-          baseContent: item.content,
-          deleted: false,
-          updatedAt: now
-        });
-      }
-      resultProjects = [seedProject];
-    };
-    listReq.onerror = () => reject(listReq.error);
-    tx.oncomplete = () => resolve(resultProjects || [seedProject]);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción inicial de IndexedDB se canceló."));
-  });
+          for (const item of SEED_ENTRIES) {
+            filesStore.put({
+              key: makeFileKey(SEED_PROJECT_ID, item.path),
+              projectId: SEED_PROJECT_ID,
+              path: item.path,
+              isFolder: false,
+              content: item.content,
+              baseContent: item.content,
+              deleted: false,
+              updatedAt: now
+            });
+          }
+          resultProjects = [seedProject];
+        };
+        listReq.onerror = (ev) => reject(resolveTxError(ev, tx, "Error leyendo proyectos iniciales."));
+        tx.oncomplete = () => resolve(resultProjects || [seedProject]);
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción inicial de IndexedDB falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción inicial de IndexedDB se canceló."));
+      })
+  );
 }
 
 export async function listProjects() {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_PROJECTS, "readonly");
-    const req = tx.objectStore(STORE_PROJECTS).getAll();
-    req.onsuccess = () => {
-      const list = Array.isArray(req.result) ? req.result : [];
-      list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-      resolve(list);
-    };
-    req.onerror = () => reject(req.error);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción listProjects se canceló."));
-  });
+  return openDbTransaction(
+    STORE_PROJECTS,
+    "readonly",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        const req = tx.objectStore(STORE_PROJECTS).getAll();
+        req.onsuccess = () => {
+          const list = Array.isArray(req.result) ? req.result : [];
+          list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+          resolve(list);
+        };
+        req.onerror = (ev) => reject(resolveTxError(ev, tx, "Error listando proyectos."));
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción listProjects falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción listProjects se canceló."));
+      })
+  );
 }
 
 export async function getProject(projectId) {
-  const db = await openDb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_PROJECTS, "readonly");
-    const req = tx.objectStore(STORE_PROJECTS).get(projectId);
-    req.onsuccess = () => resolve(req.result || null);
-    req.onerror = () => reject(req.error);
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción getProject se canceló."));
-  });
+  return openDbTransaction(
+    STORE_PROJECTS,
+    "readonly",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        const req = tx.objectStore(STORE_PROJECTS).get(projectId);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = (ev) => reject(resolveTxError(ev, tx, "Error leyendo proyecto."));
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción getProject falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción getProject se canceló."));
+      })
+  );
 }
 
 export async function createLocalProject(name, templateId = null) {
@@ -118,7 +132,7 @@ export async function createLocalProject(name, templateId = null) {
     throw new Error("El nombre del proyecto no puede estar vacío ni contener caracteres de control.");
   }
   const slug = slugifyName(cleanName, { allowDots: false, collapse: true, fallback: "proyecto" });
-  const id = `${slug}-${Date.now().toString(36)}`;
+  const id = `${slug}-${makeUniqueIdSuffix()}`;
   const now = Date.now();
   const tpl = buildProjectTemplatePayload(id, cleanName, templateId, now);
 
@@ -133,18 +147,21 @@ export async function createLocalProject(name, templateId = null) {
     updatedAt: now
   };
 
-  const db = await openDb();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
-    tx.objectStore(STORE_PROJECTS).put(project);
-    const fileStore = tx.objectStore(STORE_FILES);
-    for (const rec of tpl.records) {
-      fileStore.put(rec);
-    }
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("No se pudo crear el proyecto."));
-  });
+  await openDbTransaction(
+    [STORE_PROJECTS, STORE_FILES],
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        tx.objectStore(STORE_PROJECTS).put(project);
+        const fileStore = tx.objectStore(STORE_FILES);
+        for (const rec of tpl.records) {
+          fileStore.put(rec);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "No se pudo crear el proyecto."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "No se pudo crear el proyecto."));
+      })
+  );
 
   return project;
 }
@@ -172,28 +189,31 @@ export async function saveProjectGistId(projectId, gistId) {
 }
 
 export async function updateProjectRecord(projectId, mutatorFn) {
-  const db = await openDb();
   let txErr = null;
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_PROJECTS, "readwrite");
-    const store = tx.objectStore(STORE_PROJECTS);
-    const req = store.get(projectId);
-    req.onsuccess = () => {
-      const project = req.result;
-      if (!project) return;
-      try {
-        mutatorFn(project);
-        store.put(project);
-      } catch (err) {
-        txErr = err;
-        try { tx.abort(); } catch (_) {}
-      }
-    };
-    req.onerror = () => reject(req.error || new Error("Error leyendo el registro del proyecto."));
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(txErr || tx.error || new Error("Error guardando el registro del proyecto."));
-    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción sobre el proyecto se canceló."));
-  });
+  return openDbTransaction(
+    STORE_PROJECTS,
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        const store = tx.objectStore(STORE_PROJECTS);
+        const req = store.get(projectId);
+        req.onsuccess = () => {
+          const project = req.result;
+          if (!project) return;
+          try {
+            mutatorFn(project);
+            store.put(project);
+          } catch (err) {
+            txErr = err;
+            try { tx.abort(); } catch (_) {}
+          }
+        };
+        req.onerror = (ev) => reject(resolveTxError(ev, tx, "Error leyendo el registro del proyecto."));
+        tx.oncomplete = () => resolve();
+        tx.onerror = (ev) => reject(txErr || resolveTxError(ev, tx, "Error guardando el registro del proyecto."));
+        tx.onabort = (ev) => reject(txErr || resolveTxError(ev, tx, "La transacción sobre el proyecto se canceló."));
+      })
+  );
 }
 
 /**
@@ -212,24 +232,26 @@ export async function saveProjectChatHistory(projectId, history) {
 }
 
 export async function deleteProject(projectId) {
-  const db = await openDb();
-
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
-    tx.objectStore(STORE_PROJECTS).delete(projectId);
-    const fileIdx = tx.objectStore(STORE_FILES).index("byProject");
-    const req = fileIdx.openCursor(projectId);
-    req.onsuccess = () => {
-      const cursor = req.result;
-      if (!cursor) return;
-      cursor.delete();
-      cursor.continue();
-    };
-    req.onerror = () => reject(req.error);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("No se pudo eliminar el proyecto."));
-  });
+  await openDbTransaction(
+    [STORE_PROJECTS, STORE_FILES],
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        tx.objectStore(STORE_PROJECTS).delete(projectId);
+        const fileIdx = tx.objectStore(STORE_FILES).index("byProject");
+        const req = fileIdx.openCursor(projectId);
+        req.onsuccess = () => {
+          const cursor = req.result;
+          if (!cursor) return;
+          cursor.delete();
+          cursor.continue();
+        };
+        req.onerror = (ev) => reject(resolveTxError(ev, tx, "Error eliminando archivos del proyecto."));
+        tx.oncomplete = () => resolve();
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "No se pudo eliminar el proyecto."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "No se pudo eliminar el proyecto."));
+      })
+  );
 }
 
 /**
@@ -240,7 +262,7 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
   const rawName = String(projectName || "proyecto-restaurado").replace(/[\x00-\x1f\x7f]/g, "").trim();
   const cleanName = rawName || "proyecto-restaurado";
   const slug = slugifyName(cleanName, { allowDots: false, collapse: true, fallback: "proyecto" });
-  const id = `${slug}-gist-${Date.now().toString(36)}`;
+  const id = `${slug}-gist-${makeUniqueIdSuffix()}`;
   const now = Date.now();
 
   const fileEntries = [];
@@ -354,98 +376,104 @@ export async function createProjectFromGistBackup({ projectName, entries }) {
     updatedAt: now
   };
 
-  const db = await openDb();
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
-    tx.objectStore(STORE_PROJECTS).put(project);
-    const store = tx.objectStore(STORE_FILES);
-    for (const record of records.values()) {
-      store.put(record);
-    }
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error || new Error("La transacción de restauración de Gist se canceló."));
-  });
+  await openDbTransaction(
+    [STORE_PROJECTS, STORE_FILES],
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        tx.objectStore(STORE_PROJECTS).put(project);
+        const store = tx.objectStore(STORE_FILES);
+        for (const record of records.values()) {
+          store.put(record);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción de restauración de Gist falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción de restauración de Gist se canceló."));
+      })
+  );
 
   return project;
 }
 
 export async function migrateProjectWithEntries(sourceProjectId, transformFn) {
-  const db = await openDb();
   let migratedProject = null;
   let txErr = null;
 
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_PROJECTS, STORE_FILES], "readwrite");
-    const projectStore = tx.objectStore(STORE_PROJECTS);
-    const fileStore = tx.objectStore(STORE_FILES);
+  await openDbTransaction(
+    [STORE_PROJECTS, STORE_FILES],
+    "readwrite",
+    (tx) =>
+      new Promise((resolve, reject) => {
+        const projectStore = tx.objectStore(STORE_PROJECTS);
+        const fileStore = tx.objectStore(STORE_FILES);
 
-    const projReq = projectStore.get(sourceProjectId);
-    projReq.onsuccess = () => {
-      const project = projReq.result || null;
-      if (!project) {
-        txErr = new Error("Proyecto no encontrado.");
-        tx.abort();
-        return;
-      }
-
-      const entriesReq = fileStore.index("byProject").getAll(sourceProjectId);
-      entriesReq.onsuccess = () => {
-        const entries = Array.isArray(entriesReq.result) ? entriesReq.result : [];
-        let transformed;
-        try {
-          transformed = transformFn(project, entries);
-        } catch (err) {
-          txErr = err;
-          tx.abort();
-          return;
-        }
-        const { nextProject, nextEntries } = transformed;
-
-        const applyWrites = () => {
-          if (nextProject.id !== sourceProjectId) {
-            projectStore.delete(sourceProjectId);
-            for (const old of entries) {
-              fileStore.delete(old.key);
-            }
+        const projReq = projectStore.get(sourceProjectId);
+        projReq.onsuccess = () => {
+          const project = projReq.result || null;
+          if (!project) {
+            txErr = new Error("Proyecto no encontrado.");
+            tx.abort();
+            return;
           }
-          projectStore.put(nextProject);
-          for (const nextEntry of nextEntries) {
-            fileStore.put(nextEntry);
-          }
-          migratedProject = nextProject;
-        };
 
-        if (nextProject.id !== sourceProjectId) {
-          const targetOldReq = fileStore.index("byProject").getAll(nextProject.id);
-          targetOldReq.onsuccess = () => {
-            const targetOld = Array.isArray(targetOldReq.result) ? targetOldReq.result : [];
-            for (const oldTargetEntry of targetOld) {
-              fileStore.delete(oldTargetEntry.key);
+          const entriesReq = fileStore.index("byProject").getAll(sourceProjectId);
+          entriesReq.onsuccess = () => {
+            const entries = Array.isArray(entriesReq.result) ? entriesReq.result : [];
+            let transformed;
+            try {
+              transformed = transformFn(project, entries);
+            } catch (err) {
+              txErr = err;
+              tx.abort();
+              return;
             }
-            applyWrites();
+            const { nextProject, nextEntries } = transformed;
+
+            const applyWrites = () => {
+              if (nextProject.id !== sourceProjectId) {
+                projectStore.delete(sourceProjectId);
+                for (const old of entries) {
+                  fileStore.delete(old.key);
+                }
+              }
+              projectStore.put(nextProject);
+              for (const nextEntry of nextEntries) {
+                fileStore.put(nextEntry);
+              }
+              migratedProject = nextProject;
+            };
+
+            if (nextProject.id !== sourceProjectId) {
+              const targetOldReq = fileStore.index("byProject").getAll(nextProject.id);
+              targetOldReq.onsuccess = () => {
+                const targetOld = Array.isArray(targetOldReq.result) ? targetOldReq.result : [];
+                for (const oldTargetEntry of targetOld) {
+                  fileStore.delete(oldTargetEntry.key);
+                }
+                applyWrites();
+              };
+              targetOldReq.onerror = (ev) => {
+                txErr = resolveTxError(ev, tx, "Error leyendo proyecto destino en migración.");
+                tx.abort();
+              };
+            } else {
+              applyWrites();
+            }
           };
-          targetOldReq.onerror = () => {
-            txErr = targetOldReq.error;
+          entriesReq.onerror = (ev) => {
+            txErr = resolveTxError(ev, tx, "Error leyendo archivos del proyecto en migración.");
             tx.abort();
           };
-        } else {
-          applyWrites();
-        }
-      };
-      entriesReq.onerror = () => {
-        txErr = entriesReq.error;
-        tx.abort();
-      };
-    };
-    projReq.onerror = () => {
-      txErr = projReq.error;
-      tx.abort();
-    };
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(txErr || tx.error);
-    tx.onabort = () => reject(txErr || tx.error || new Error("La transacción de migración se canceló."));
-  });
+        };
+        projReq.onerror = (ev) => {
+          txErr = resolveTxError(ev, tx, "Error leyendo proyecto origen en migración.");
+          tx.abort();
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = (ev) => reject(txErr || resolveTxError(ev, tx, "La transacción de migración falló."));
+        tx.onabort = (ev) => reject(txErr || resolveTxError(ev, tx, "La transacción de migración se canceló."));
+      })
+  );
 
   return migratedProject;
 }

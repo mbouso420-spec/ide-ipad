@@ -152,9 +152,9 @@ describe("Studio IDE — Pruebas E2E Reales en Navegador (Chromium/Edge)", () =>
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v32");
+      return text.includes("studio-ide-shell-v33");
     });
-    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v32");
+    assert.equal(swAssetOk, true, "sw.js debe responder HTTP 200 con studio-ide-shell-v33");
 
     // 2. Crear archivos E2E vía IndexedDB, recargar, abrir desde árbol, formatear y comprobar persistencia
     await page.evaluate(async () => {

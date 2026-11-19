@@ -135,7 +135,7 @@ export function extractReferencedAssetPaths(entryPath, rawHtml, options = {}) {
 
   if (includeMedia) {
     // 3. <img src="...">, <source src="...">, <input src="...">, <video src="...">, <audio src="...">
-    const mediaSrcRegex = /<(?:img|source|input|video|audio)\b[^>]*?(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\1|([^\s"'=<>`]+))[^>]*>/gi;
+    const mediaSrcRegex = /<(?:img|source|input|video|audio)\b[^>]*?[^-\w>]src\s*=\s*(?:(["'])([^"']+)\1|([^\s"'=<>`]+))[^>]*>/gi;
     while ((match = mediaSrcRegex.exec(rawHtml)) !== null) {
       const ref = match[2] || match[3];
       if (ref) addCandidateRef(ref);
@@ -725,132 +725,177 @@ export function buildRuntimeAssetsBridgeScript(dir, fileMap, allowParentTraversa
 
   function resolveSrcset(rawSrcset) {
     if (!rawSrcset || typeof rawSrcset !== "string") return rawSrcset;
-    return rawSrcset.replace(/([^\\s,]+)(\\s+[^\\s,]+)?/g, function (m, u, desc) {
+    return rawSrcset.replace(/(data:[^\\s,]+,[^\\s,]*|[^\\s,]+)(\\s+[^\\s,]+)?/gi, function (m, u, desc) {
       var resolved = resolveUrl(u);
       return resolved ? (desc ? resolved + desc : resolved) : m;
     });
   }
 
-  function patchElementMedia(el) {
-    if (!el || el.nodeType !== 1 || !el.getAttribute) return;
-    var tag = el.tagName;
-    if (tag === "IMG" || tag === "SOURCE" || tag === "VIDEO" || tag === "AUDIO" || tag === "INPUT") {
-      var curSrc = el.getAttribute("src");
-      if (curSrc) {
-        var resolvedSrc = resolveUrl(curSrc);
-        if (resolvedSrc && curSrc !== resolvedSrc) {
-          origSetAttr.call(el, "src", resolvedSrc);
+  if (urlIdx.keysLower.length > 0) {
+    var origSetAttr = Element.prototype.setAttribute;
+
+    function patchElementMedia(el, attrName) {
+      if (!el || el.nodeType !== 1 || !el.getAttribute) return;
+      var tag = el.tagName;
+      var checkAll = !attrName;
+      if ((checkAll || attrName === "src") && (tag === "IMG" || tag === "SOURCE" || tag === "VIDEO" || tag === "AUDIO" || tag === "INPUT")) {
+        var curSrc = el.getAttribute("src");
+        if (curSrc) {
+          var resolvedSrc = resolveUrl(curSrc);
+          if (resolvedSrc && curSrc !== resolvedSrc) {
+            origSetAttr.call(el, "src", resolvedSrc);
+          }
+        }
+      }
+      if ((checkAll || attrName === "srcset") && (tag === "IMG" || tag === "SOURCE")) {
+        var curSrcset = el.getAttribute("srcset");
+        if (curSrcset) {
+          var resolvedSet = resolveSrcset(curSrcset);
+          if (resolvedSet && resolvedSet !== curSrcset) {
+            origSetAttr.call(el, "srcset", resolvedSet);
+          }
+        }
+      }
+      if ((checkAll || attrName === "poster") && tag === "VIDEO") {
+        var curPoster = el.getAttribute("poster");
+        if (curPoster) {
+          var resolvedPoster = resolveUrl(curPoster);
+          if (resolvedPoster && curPoster !== resolvedPoster) {
+            origSetAttr.call(el, "poster", resolvedPoster);
+          }
+        }
+      }
+      if (checkAll || attrName === "style") {
+        var st = el.getAttribute("style");
+        if (st && st.indexOf("url(") !== -1) {
+          var nextSt = st.replace(/url\\(\\s*(?:["']([^"']+)["']|([^)"'\\s]+))\\s*\\)/gi, function (fm, qUrl, bUrl) {
+            var r = resolveUrl(qUrl || bUrl || "");
+            return r ? 'url("' + r + '")' : fm;
+          });
+          if (nextSt !== st) origSetAttr.call(el, "style", nextSt);
         }
       }
     }
-    if (tag === "IMG" || tag === "SOURCE") {
-      var curSrcset = el.getAttribute("srcset");
-      if (curSrcset) {
-        var resolvedSet = resolveSrcset(curSrcset);
-        if (resolvedSet && resolvedSet !== curSrcset) {
-          origSetAttr.call(el, "srcset", resolvedSet);
-        }
+
+    function scanSubtree(root) {
+      if (!root || root.nodeType !== 1) return;
+      patchElementMedia(root, null);
+      if (root.firstElementChild && typeof root.querySelectorAll === "function") {
+        var nodes = root.querySelectorAll("img[src],source[src],video[src],audio[src],input[type='image'][src],img[srcset],source[srcset],video[poster],[style*='url(']");
+        for (var i = 0; i < nodes.length; i++) patchElementMedia(nodes[i], null);
       }
     }
-    if (tag === "VIDEO") {
-      var curPoster = el.getAttribute("poster");
-      if (curPoster) {
-        var resolvedPoster = resolveUrl(curPoster);
-        if (resolvedPoster && curPoster !== resolvedPoster) {
-          origSetAttr.call(el, "poster", resolvedPoster);
-        }
+
+    Element.prototype.setAttribute = function (name, value) {
+      var lowerName = String(name || "").toLowerCase();
+      if (lowerName === "src" && (this.tagName === "IMG" || this.tagName === "SOURCE" || this.tagName === "VIDEO" || this.tagName === "AUDIO" || this.tagName === "INPUT")) {
+        var r = resolveUrl(String(value));
+        if (r) value = r;
+      } else if (lowerName === "srcset" && (this.tagName === "IMG" || this.tagName === "SOURCE")) {
+        value = resolveSrcset(String(value));
+      } else if (lowerName === "poster" && this.tagName === "VIDEO") {
+        var rp = resolveUrl(String(value));
+        if (rp) value = rp;
       }
-    }
-    var st = el.getAttribute("style");
-    if (st && st.indexOf("url(") !== -1) {
-      var nextSt = st.replace(/url\\(\\s*(?:["']([^"']+)["']|([^)"'\\s]+))\\s*\\)/gi, function (fm, qUrl, bUrl) {
-        var r = resolveUrl(qUrl || bUrl || "");
-        return r ? 'url("' + r + '")' : fm;
-      });
-      if (nextSt !== st) origSetAttr.call(el, "style", nextSt);
-    }
-  }
+      return origSetAttr.call(this, name, value);
+    };
 
-  function scanSubtree(root) {
-    if (!root || root.nodeType !== 1) return;
-    patchElementMedia(root);
-    if (typeof root.querySelectorAll === "function") {
-      var nodes = root.querySelectorAll("img[src],source[src],video[src],audio[src],input[type='image'][src],img[srcset],source[srcset],video[poster],[style*='url(']");
-      for (var i = 0; i < nodes.length; i++) patchElementMedia(nodes[i]);
+    function wrapUrlProp(proto, prop, resolverFn) {
+      try {
+        var desc = Object.getOwnPropertyDescriptor(proto, prop);
+        if (desc && desc.configurable && typeof desc.set === "function") {
+          Object.defineProperty(proto, prop, {
+            configurable: true,
+            enumerable: desc.enumerable,
+            get: desc.get,
+            set: function (val) {
+              var r = resolverFn(String(val == null ? "" : val));
+              return desc.set.call(this, r || val);
+            }
+          });
+        }
+      } catch (_) {}
     }
-  }
-
-  var origSetAttr = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function (name, value) {
-    var lowerName = String(name || "").toLowerCase();
-    if (lowerName === "src" && (this.tagName === "IMG" || this.tagName === "SOURCE" || this.tagName === "VIDEO" || this.tagName === "AUDIO" || this.tagName === "INPUT")) {
-      var r = resolveUrl(String(value));
-      if (r) value = r;
-    } else if (lowerName === "srcset" && (this.tagName === "IMG" || this.tagName === "SOURCE")) {
-      value = resolveSrcset(String(value));
-    } else if (lowerName === "poster" && this.tagName === "VIDEO") {
-      var rp = resolveUrl(String(value));
-      if (rp) value = rp;
+    if (typeof HTMLImageElement !== "undefined") {
+      wrapUrlProp(HTMLImageElement.prototype, "src", resolveUrl);
+      wrapUrlProp(HTMLImageElement.prototype, "srcset", resolveSrcset);
     }
-    return origSetAttr.call(this, name, value);
-  };
+    if (typeof HTMLSourceElement !== "undefined") {
+      wrapUrlProp(HTMLSourceElement.prototype, "src", resolveUrl);
+      wrapUrlProp(HTMLSourceElement.prototype, "srcset", resolveSrcset);
+    }
+    if (typeof HTMLMediaElement !== "undefined") {
+      wrapUrlProp(HTMLMediaElement.prototype, "src", resolveUrl);
+    }
+    if (typeof HTMLVideoElement !== "undefined") {
+      wrapUrlProp(HTMLVideoElement.prototype, "poster", resolveUrl);
+    }
 
-  function wrapUrlProp(proto, prop) {
     try {
-      var desc = Object.getOwnPropertyDescriptor(proto, prop);
-      if (desc && desc.configurable && typeof desc.set === "function") {
-        Object.defineProperty(proto, prop, {
+      var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
+      if (innerDesc && innerDesc.configurable && typeof innerDesc.set === "function") {
+        Object.defineProperty(Element.prototype, "innerHTML", {
           configurable: true,
-          enumerable: desc.enumerable,
-          get: desc.get,
-          set: function (val) {
-            var r = resolveUrl(String(val == null ? "" : val));
-            return desc.set.call(this, r || val);
+          enumerable: innerDesc.enumerable,
+          get: innerDesc.get,
+          set: function (htmlStr) {
+            innerDesc.set.call(this, htmlStr);
+            scanSubtree(this);
           }
         });
       }
     } catch (_) {}
-  }
-  if (typeof HTMLImageElement !== "undefined") wrapUrlProp(HTMLImageElement.prototype, "src");
-  if (typeof HTMLSourceElement !== "undefined") wrapUrlProp(HTMLSourceElement.prototype, "src");
-  if (typeof HTMLVideoElement !== "undefined") wrapUrlProp(HTMLVideoElement.prototype, "poster");
 
-  try {
-    var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, "innerHTML");
-    if (innerDesc && innerDesc.configurable && typeof innerDesc.set === "function") {
-      Object.defineProperty(Element.prototype, "innerHTML", {
-        configurable: true,
-        enumerable: innerDesc.enumerable,
-        get: innerDesc.get,
-        set: function (htmlStr) {
-          innerDesc.set.call(this, htmlStr);
-          scanSubtree(this);
-        }
-      });
-    }
-  } catch (_) {}
-
-  if (typeof MutationObserver === "function") {
-    try {
-      var obs = new MutationObserver(function (mutations) {
-        for (var i = 0; i < mutations.length; i++) {
-          var m = mutations[i];
-          if (m.type === "attributes") {
-            patchElementMedia(m.target);
-          } else if (m.addedNodes) {
-            for (var j = 0; j < m.addedNodes.length; j++) {
-              scanSubtree(m.addedNodes[j]);
+    if (typeof MutationObserver === "function") {
+      try {
+        var obsOpts = {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["src", "srcset", "poster", "style"]
+        };
+        var obsDisposed = false;
+        var obs = new MutationObserver(function (mutations) {
+          for (var i = 0; i < mutations.length; i++) {
+            var m = mutations[i];
+            if (m.type === "attributes") {
+              patchElementMedia(m.target, m.attributeName || null);
+            } else if (m.addedNodes) {
+              for (var j = 0; j < m.addedNodes.length; j++) {
+                scanSubtree(m.addedNodes[j]);
+              }
             }
           }
+        });
+        var startObs = function () {
+          if (obsDisposed || !document.documentElement) return;
+          try { obs.observe(document.documentElement, obsOpts); } catch (_) {}
+        };
+        var stopObs = function () {
+          try { obs.disconnect(); } catch (_) {}
+        };
+        if (!document.hidden) {
+          startObs();
         }
-      });
-      obs.observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ["src", "srcset", "poster", "style"]
-      });
-    } catch (_) {}
+        if (typeof document.addEventListener === "function") {
+          document.addEventListener("visibilitychange", function () {
+            if (obsDisposed) return;
+            if (document.hidden) {
+              stopObs();
+            } else {
+              startObs();
+              if (document.body) scanSubtree(document.body);
+            }
+          });
+        }
+        var disposeObs = function () {
+          obsDisposed = true;
+          stopObs();
+        };
+        window.addEventListener("pagehide", disposeObs);
+        window.addEventListener("unload", disposeObs);
+      } catch (_) {}
+    }
   }
 
   if (typeof window.fetch === "function") {

@@ -19,6 +19,7 @@ async function loadClangToolchain() {
 }
 
 const FORBIDDEN_VIRTUAL_SEGMENTS = new Set([".", "..", "__proto__", "constructor", "prototype"]);
+const MAX_COMPILER_LOG_CHARS = 512 * 1024;
 
 /**
  * Normaliza un nombre de archivo para el sistema de archivos virtual de Clang WASI.
@@ -28,21 +29,47 @@ const FORBIDDEN_VIRTUAL_SEGMENTS = new Set([".", "..", "__proto__", "constructor
  */
 export function sanitizeVirtualSourcePath(rawPath, fallback = "main.c") {
   let clean = String(rawPath || "")
-    .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+    .replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "")
     .replace(/\\/g, "/")
     .replace(/^\/+/, "")
     .trim();
-  const segments = clean ? clean.split("/") : [];
+  const segments = clean ? clean.split("/").map((seg) => seg.trim()) : [];
   if (
     !clean ||
-    segments.some((seg) => !seg || FORBIDDEN_VIRTUAL_SEGMENTS.has(seg))
+    segments.some((seg) => !seg || seg.includes(":") || FORBIDDEN_VIRTUAL_SEGMENTS.has(seg)) ||
+    segments.join("/").toLowerCase() === "program.wasm"
   ) {
     clean = fallback;
+  } else {
+    clean = segments.join("/");
   }
-  if (clean.startsWith("-") || clean.startsWith("@")) {
+  if (clean && (clean.startsWith("-") || clean.startsWith("@"))) {
     clean = `./${clean}`;
   }
   return clean;
+}
+
+/**
+ * Inserta una entrada en el árbol virtual jerárquico esperado por `@yowasp/clang`,
+ * creando subdirectorios anidados (sin prototipo y sin prefijo literal "./").
+ */
+function insertVirtualTreeEntry(rootTree, safePath, value) {
+  const normalized = String(safePath || "").replace(/^\.\//, "");
+  if (!normalized) return;
+  const parts = normalized.split("/").filter(Boolean);
+  if (parts.length === 0) return;
+  let dir = rootTree;
+  for (let i = 0; i < parts.length - 1; i += 1) {
+    const seg = parts[i];
+    if (FORBIDDEN_VIRTUAL_SEGMENTS.has(seg)) return;
+    if (!dir[seg] || typeof dir[seg] !== "object" || dir[seg] instanceof Uint8Array) {
+      dir[seg] = Object.create(null);
+    }
+    dir = dir[seg];
+  }
+  const leaf = parts[parts.length - 1];
+  if (FORBIDDEN_VIRTUAL_SEGMENTS.has(leaf) || leaf.toLowerCase() === "program.wasm") return;
+  dir[leaf] = value;
 }
 
 /**
@@ -79,22 +106,34 @@ export async function compileAndRunWithClang({
   onPhase("compiling");
   const safeMain = sanitizeVirtualSourcePath(mainFileName, isC ? "main.c" : "main.cpp");
   const safeExtras = Array.isArray(extraSources)
-    ? extraSources.map((s) => sanitizeVirtualSourcePath(s, "helper.c"))
+    ? extraSources.map((s) => sanitizeVirtualSourcePath(s, "")).filter(Boolean)
     : [];
 
-  const virtualFs = Object.create(null);
+  let virtualFs = Object.create(null);
   for (const [k, v] of Object.entries(files || {})) {
     const safeKey = sanitizeVirtualSourcePath(k, "");
     if (!safeKey) continue;
-    virtualFs[safeKey] = v instanceof Uint8Array ? v : String(v ?? "");
+    insertVirtualTreeEntry(virtualFs, safeKey, v instanceof Uint8Array ? v : String(v ?? ""));
   }
 
   const decoderOut = new TextDecoder("utf-8", { fatal: false });
   const decoderErr = new TextDecoder("utf-8", { fatal: false });
   let compilerOut = "";
   let compilerErr = "";
+  let compilerOutTruncated = false;
+  let compilerErrTruncated = false;
   let exitStatus = 0;
   let outFiles = null;
+
+  const appendBounded = (current, text, wasTruncated) => {
+    if (wasTruncated || !text) return { text: current, truncated: wasTruncated };
+    const remaining = MAX_COMPILER_LOG_CHARS - current.length;
+    if (remaining <= 0) return { text: current, truncated: true };
+    if (text.length > remaining) {
+      return { text: `${current}${text.slice(0, remaining)}\n...[log del compilador truncado a 512 KB]`, truncated: true };
+    }
+    return { text: current + text, truncated: false };
+  };
 
   const compilerCmd = isC ? "clang" : "clang++";
   const args = [
@@ -110,18 +149,16 @@ export async function compileAndRunWithClang({
   try {
     outFiles = await runClang(args, virtualFs, {
       stdout: (chunk) => {
-        if (chunk instanceof Uint8Array) {
-          compilerOut += decoderOut.decode(chunk, { stream: true });
-        } else if (chunk != null) {
-          compilerOut += String(chunk);
-        }
+        const piece = chunk instanceof Uint8Array ? decoderOut.decode(chunk, { stream: true }) : (chunk != null ? String(chunk) : "");
+        const next = appendBounded(compilerOut, piece, compilerOutTruncated);
+        compilerOut = next.text;
+        compilerOutTruncated = next.truncated;
       },
       stderr: (chunk) => {
-        if (chunk instanceof Uint8Array) {
-          compilerErr += decoderErr.decode(chunk, { stream: true });
-        } else if (chunk != null) {
-          compilerErr += String(chunk);
-        }
+        const piece = chunk instanceof Uint8Array ? decoderErr.decode(chunk, { stream: true }) : (chunk != null ? String(chunk) : "");
+        const next = appendBounded(compilerErr, piece, compilerErrTruncated);
+        compilerErr = next.text;
+        compilerErrTruncated = next.truncated;
       }
     });
   } catch (err) {
@@ -133,12 +170,17 @@ export async function compileAndRunWithClang({
       throw err;
     }
   } finally {
-    compilerOut += decoderOut.decode();
-    compilerErr += decoderErr.decode();
+    const tailOut = appendBounded(compilerOut, decoderOut.decode(), compilerOutTruncated);
+    compilerOut = tailOut.text;
+    const tailErr = appendBounded(compilerErr, decoderErr.decode(), compilerErrTruncated);
+    compilerErr = tailErr.text;
+    virtualFs = null;
   }
 
-  const wasmBinary = outFiles?.["program.wasm"];
+  let wasmBinary = outFiles?.["program.wasm"] || null;
+  outFiles = null;
   if (!(wasmBinary instanceof Uint8Array) || wasmBinary.byteLength === 0 || exitStatus !== 0) {
+    wasmBinary = null;
     return {
       status: exitStatus || 1,
       success: false,
@@ -151,10 +193,15 @@ export async function compileAndRunWithClang({
   }
 
   onPhase("running");
-  const runResult = await runWasiModule(wasmBinary, {
-    stdin: String(stdin || ""),
-    args: ["program.wasm"]
-  });
+  let runResult;
+  try {
+    runResult = await runWasiModule(wasmBinary, {
+      stdin: String(stdin || ""),
+      args: ["program.wasm"]
+    });
+  } finally {
+    wasmBinary = null;
+  }
 
   return {
     status: runResult.exitCode,
@@ -175,8 +222,13 @@ if (typeof window === "undefined" && typeof self !== "undefined" && typeof self.
 
     if (msg.action === "compileAndRun") {
       try {
+        const rawPayload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
         const result = await compileAndRunWithClang({
-          ...(msg.payload || {}),
+          isC: Boolean(rawPayload.isC),
+          mainFileName: typeof rawPayload.mainFileName === "string" ? rawPayload.mainFileName : undefined,
+          files: rawPayload.files && typeof rawPayload.files === "object" ? rawPayload.files : {},
+          extraSources: Array.isArray(rawPayload.extraSources) ? rawPayload.extraSources : [],
+          stdin: typeof rawPayload.stdin === "string" ? rawPayload.stdin : "",
           onPhase: (phase) => {
             self.postMessage({ id: msg.id, type: "phase", phase });
           }

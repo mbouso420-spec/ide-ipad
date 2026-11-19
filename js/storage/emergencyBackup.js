@@ -119,6 +119,13 @@ function parseBackupItems(raw) {
 
 const MAX_EMERGENCY_BACKUP_CHARS = 2 * 1024 * 1024;
 
+function isQuotaExceededError(err) {
+  if (!err) return false;
+  if (err.name === "QuotaExceededError" || err.name === "NS_ERROR_DOM_QUOTA_REACHED") return true;
+  if (err.code === 22 || err.code === 1014) return true;
+  return /quota|storage\s*full|insufficient\s*space/i.test(String(err.message || ""));
+}
+
 /**
  * @param {Array<{ projectId: string, filePath: string, content: string }>} items
  * @param {Storage} [storage]
@@ -162,19 +169,51 @@ export function writeEmergencyBackup(items, storage = getDefaultStorage(), proje
     try {
       storage.setItem(targetKey, payloadStr);
       return true;
-    } catch {
-      const staleCandidates = getAllStorageKeys(storage)
-        .filter((k) => k && k.startsWith(EMERGENCY_BACKUP_PREFIX) && k !== targetKey)
-        .map((k) => ({ key: k, savedAt: parseBackupPayload(storage.getItem(k)).savedAt }))
+    } catch (writeErr) {
+      if (!isQuotaExceededError(writeErr)) {
+        return false;
+      }
+
+      const candidateKeys = getAllStorageKeys(storage).filter(
+        (k) => k && k !== targetKey && (k.startsWith(EMERGENCY_BACKUP_PREFIX) || k === EMERGENCY_BACKUP_KEY)
+      );
+      if (
+        EMERGENCY_BACKUP_KEY !== targetKey &&
+        !candidateKeys.includes(EMERGENCY_BACKUP_KEY) &&
+        storage.getItem(EMERGENCY_BACKUP_KEY) !== null
+      ) {
+        candidateKeys.push(EMERGENCY_BACKUP_KEY);
+      }
+
+      const staleCandidates = candidateKeys
+        .map((k) => {
+          const raw = storage.getItem(k);
+          return { key: k, raw, savedAt: parseBackupPayload(raw).savedAt };
+        })
+        .filter((entry) => entry.raw !== null)
         .sort((a, b) => a.savedAt - b.savedAt);
 
+      const evicted = [];
       for (const stale of staleCandidates) {
         try {
           storage.removeItem(stale.key);
+          evicted.push(stale);
           storage.setItem(targetKey, payloadStr);
           return true;
-        } catch (_) {
+        } catch (retryErr) {
+          if (!isQuotaExceededError(retryErr)) {
+            break;
+          }
           // Seguir liberando particiones antiguas hasta recuperar espacio
+        }
+      }
+
+      // Rollback: si pese a liberar particiones antiguas el payload aún no entra, restaurar lo evictado
+      for (let i = evicted.length - 1; i >= 0; i -= 1) {
+        try {
+          storage.setItem(evicted[i].key, evicted[i].raw);
+        } catch (_) {
+          // Mejor esfuerzo al revertir
         }
       }
       return false;
@@ -332,52 +371,7 @@ function hasRecordReader(db) {
   );
 }
 
-async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache, filterProjectId = null) {
-  let restored = 0;
-  const canReadRecord = hasRecordReader(db);
-  if (!db || typeof db.updateFileContent !== "function" || (!canReadRecord && typeof db.entryExists !== "function")) {
-    return 0;
-  }
-  const itemsToApply = filterProjectId
-    ? snap.items.filter((it) => it.projectId === filterProjectId)
-    : snap.items;
-
-  if (itemsToApply.length > 0) {
-    for (const item of itemsToApply) {
-      if (canReadRecord) {
-        // Una única lectura por snapshot/archivo: evita duplicar viajes a IndexedDB (entryExists + getEntryRecord).
-        const record = await readInitialDbRecord(
-          db,
-          item.projectId,
-          item.filePath,
-          recordCache,
-          projectEntriesCache
-        );
-        if (!record || record.deleted || record.isFolder || record.isBinary || record.encoding === "base64") {
-          continue;
-        }
-        if (
-          snap.savedAt > 0 &&
-          typeof record.updatedAt === "number" &&
-          Number.isFinite(record.updatedAt) &&
-          snap.savedAt < record.updatedAt
-        ) {
-          continue;
-        }
-      } else {
-        if (!(await db.entryExists(item.projectId, item.filePath))) {
-          continue;
-        }
-      }
-
-      const updated = await db.updateFileContent(item.projectId, item.filePath, item.content);
-      if (updated === null || (updated && (updated.deleted || updated.isFolder || updated.isBinary || updated.encoding === "base64"))) {
-        continue;
-      }
-      restored += 1;
-    }
-  }
-
+function cleanupSnapshotKey(storage, snap, filterProjectId = null) {
   // Solo eliminar o actualizar la clave si no fue modificada concurrentemente mientras corrían los await.
   try {
     if (storage.getItem(snap.key) === snap.raw) {
@@ -401,7 +395,59 @@ async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEn
   } catch (_) {
     /* entorno restringido sin escritura */
   }
+}
 
+async function applyBackupItemToDb(db, item, savedAt, canReadRecord, recordCache, projectEntriesCache) {
+  if (canReadRecord) {
+    // Una única lectura por archivo: evita duplicar viajes a IndexedDB (entryExists + getEntryRecord).
+    const record = await readInitialDbRecord(
+      db,
+      item.projectId,
+      item.filePath,
+      recordCache,
+      projectEntriesCache
+    );
+    if (!record || record.deleted || record.isFolder || record.isBinary || record.encoding === "base64") {
+      return false;
+    }
+    if (
+      savedAt > 0 &&
+      typeof record.updatedAt === "number" &&
+      Number.isFinite(record.updatedAt) &&
+      savedAt < record.updatedAt
+    ) {
+      return false;
+    }
+  } else {
+    if (!(await db.entryExists(item.projectId, item.filePath))) {
+      return false;
+    }
+  }
+
+  const updated = await db.updateFileContent(item.projectId, item.filePath, item.content);
+  if (updated === null || (updated && (updated.deleted || updated.isFolder || updated.isBinary || updated.encoding === "base64"))) {
+    return false;
+  }
+  return true;
+}
+
+async function applySnapshotAndCleanup(db, storage, snap, recordCache, projectEntriesCache, filterProjectId = null) {
+  let restored = 0;
+  const canReadRecord = hasRecordReader(db);
+  if (!db || typeof db.updateFileContent !== "function" || (!canReadRecord && typeof db.entryExists !== "function")) {
+    return 0;
+  }
+  const itemsToApply = filterProjectId
+    ? snap.items.filter((it) => it.projectId === filterProjectId)
+    : snap.items;
+
+  for (const item of itemsToApply) {
+    if (await applyBackupItemToDb(db, item, snap.savedAt, canReadRecord, recordCache, projectEntriesCache)) {
+      restored += 1;
+    }
+  }
+
+  cleanupSnapshotKey(storage, snap, filterProjectId);
   return restored;
 }
 

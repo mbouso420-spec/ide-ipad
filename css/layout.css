@@ -7,6 +7,9 @@
   background: var(--color-paper);
   color: var(--color-ink);
   overflow: hidden;
+}
+
+body[data-vv-offset="true"] .ide-shell {
   transform: translateY(var(--vv-offset-top));
 }
 
@@ -124,13 +127,18 @@ body[data-keyboard-open="true"] .ide-workspace {
     background: var(--color-backdrop);
     z-index: var(--z-sticky);
     opacity: 0;
+    visibility: hidden;
     pointer-events: none;
-    transition: opacity var(--dur-short) var(--ease-out);
+    transition:
+      opacity var(--dur-short) var(--ease-out),
+      visibility 0s linear var(--dur-short);
   }
 
   body[data-drawer-backdrop="true"] .ide-drawer-backdrop {
     opacity: 1;
+    visibility: visible;
     pointer-events: auto;
+    transition: opacity var(--dur-short) var(--ease-out);
   }
 
   .ide-panel-left,
@@ -144,7 +152,8 @@ body[data-keyboard-open="true"] .ide-workspace {
     box-shadow: var(--shadow-drawer);
     transition:
       transform var(--dur-short) var(--ease-out),
-      opacity var(--dur-short) var(--ease-out);
+      opacity var(--dur-short) var(--ease-out),
+      visibility 0s linear var(--dur-short);
   }
 
   .ide-panel-left {
@@ -155,13 +164,21 @@ body[data-keyboard-open="true"] .ide-workspace {
   body[data-left-open="false"] .ide-panel-left {
     transform: translateX(calc(-100% - var(--space-md)));
     opacity: 0;
+    visibility: hidden;
     pointer-events: none;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
 
   body[data-left-open="true"] .ide-panel-left {
     transform: translateX(0);
     opacity: 1;
+    visibility: visible;
     pointer-events: auto;
+    transition:
+      transform var(--dur-short) var(--ease-out),
+      opacity var(--dur-short) var(--ease-out);
   }
 
   .ide-panel-right {
@@ -172,13 +189,21 @@ body[data-keyboard-open="true"] .ide-workspace {
   body[data-right-open="false"] .ide-panel-right {
     transform: translateX(calc(100% + var(--space-md)));
     opacity: 0;
+    visibility: hidden;
     pointer-events: none;
+    box-shadow: none;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
   }
 
   body[data-right-open="true"] .ide-panel-right {
     transform: translateX(0);
     opacity: 1;
+    visibility: visible;
     pointer-events: auto;
+    transition:
+      transform var(--dur-short) var(--ease-out),
+      opacity var(--dur-short) var(--ease-out);
   }
 
   body[data-keyboard-open="true"] .ide-panel-left,

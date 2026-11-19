@@ -3,8 +3,10 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://gist.githubusercontent.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org; img-src 'self' data: https: blob:; media-src 'self' data: https: blob:; frame-src 'self' blob: data:; worker-src 'self' blob:; form-action 'self'; object-src 'none'; base-uri 'self';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline' https://esm.sh https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; connect-src 'self' https://api.github.com https://gist.githubusercontent.com https://generativelanguage.googleapis.com https://api.groq.com https://openrouter.ai https://api.mistral.ai https://cdn.jsdelivr.net https://esm.sh https://wandbox.org; img-src 'self' data: https: blob:; media-src 'self' data: https: blob:; frame-src 'self' blob:; worker-src 'self' blob:; form-action 'self'; object-src 'none'; base-uri 'self';">
+  <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#10131a">
+  <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="apple-mobile-web-app-title" content="Studio IDE">
@@ -913,6 +915,8 @@
             id="preview-iframe"
             class="preview-iframe device-desktop"
             sandbox="allow-scripts allow-modals allow-downloads allow-popups"
+            referrerpolicy="no-referrer"
+            allow="camera 'none'; microphone 'none'; geolocation 'none'; payment 'none'; usb 'none'; display-capture 'none'"
             title="Vista previa web en vivo"
           ></iframe>
         </div>
@@ -1123,8 +1127,11 @@
                 class="field-control"
                 aria-label="Contraseña maestra de la bóveda cifrada"
                 placeholder="Contraseña maestra (mínimo 6 caracteres)…"
-                autocomplete="new-password"
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
                 spellcheck="false"
+                writingsuggestions="false"
               />
               <div class="field-row">
                 <button type="button" id="btn-export-keys-encrypted" class="btn btn-primary btn-sm">

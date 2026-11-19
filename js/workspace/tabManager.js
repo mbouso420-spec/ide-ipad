@@ -21,7 +21,47 @@ export function createTabManager({
 }) {
   /** @type {Map<string, { wrapper: HTMLElement, selectBtn: HTMLButtonElement }>} */
   const tabElementsById = new Map();
+  const listenerController = typeof AbortController === "function" ? new AbortController() : null;
+  const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
   let persistChain = Promise.resolve();
+
+  tabStripEl?.addEventListener?.("click", (event) => {
+    const closeBtn = event.target?.closest?.(".editor-tab-close");
+    if (closeBtn) {
+      const tabId = closeBtn.dataset?.tabId || closeBtn.closest?.(".editor-tab-item")?.dataset?.tabId;
+      if (tabId) {
+        event.stopPropagation();
+        onRequestCloseTab?.(tabId);
+      }
+      return;
+    }
+    const triggerBtn = event.target?.closest?.(".editor-tab-trigger");
+    if (triggerBtn) {
+      const tabId = triggerBtn.dataset?.tabId || triggerBtn.closest?.(".editor-tab-item")?.dataset?.tabId;
+      if (tabId) {
+        onOpenFile?.(tabId);
+      }
+    }
+  }, listenOpts);
+
+  tabStripEl?.addEventListener?.("auxclick", (event) => {
+    if (event.button !== 1) return;
+    const item = event.target?.closest?.(".editor-tab-item");
+    const tabId = item?.dataset?.tabId;
+    if (tabId) {
+      event.preventDefault();
+      event.stopPropagation();
+      onRequestCloseTab?.(tabId);
+    }
+  }, listenOpts);
+
+  emptyQuickListEl?.addEventListener?.("click", (event) => {
+    const btn = event.target?.closest?.("button[data-file-id]");
+    const fileId = btn?.dataset?.fileId;
+    if (fileId) {
+      onOpenFile?.(fileId);
+    }
+  }, listenOpts);
 
   function persistTabsState() {
     const activeProject = getActiveProject?.();
@@ -98,11 +138,13 @@ export function createTabManager({
 
       const wrapper = document.createElement("div");
       wrapper.className = isActive ? "editor-tab-item is-active" : "editor-tab-item";
+      wrapper.dataset.tabId = file.id;
 
       const selectBtn = document.createElement("button");
       selectBtn.type = "button";
       selectBtn.role = "tab";
       selectBtn.className = "editor-tab-trigger";
+      selectBtn.dataset.tabId = file.id;
       selectBtn.title = file.path;
       selectBtn.setAttribute("aria-selected", String(isActive));
       selectBtn.innerHTML = `
@@ -110,25 +152,13 @@ export function createTabManager({
         <span>${escapeHtml(file.shortName)}</span>
         ${dirty ? '<span class="editor-tab-dirty" title="Modificado frente al repositorio" aria-label="Modificado"></span>' : ""}
       `;
-      selectBtn.addEventListener("click", () => onOpenFile?.(file.id));
 
       const closeBtn = document.createElement("button");
       closeBtn.type = "button";
       closeBtn.className = "editor-tab-close";
+      closeBtn.dataset.tabId = file.id;
       closeBtn.setAttribute("aria-label", `Cerrar pestaña ${file.shortName}`);
       closeBtn.innerHTML = icon("x");
-      closeBtn.addEventListener("click", (event) => {
-        event.stopPropagation();
-        onRequestCloseTab?.(file.id);
-      });
-
-      wrapper.addEventListener("auxclick", (event) => {
-        if (event.button === 1) {
-          event.preventDefault();
-          event.stopPropagation();
-          onRequestCloseTab?.(file.id);
-        }
-      });
 
       wrapper.append(selectBtn, closeBtn);
       tabElementsById.set(file.id, { wrapper, selectBtn });
@@ -149,8 +179,8 @@ export function createTabManager({
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "btn";
+      btn.dataset.fileId = file.id;
       btn.innerHTML = `${icon(file.icon)}<span>${escapeHtml(file.shortName)}</span>`;
-      btn.addEventListener("click", () => onOpenFile?.(file.id));
       fragment.appendChild(btn);
     }
     emptyQuickListEl.appendChild(fragment);
@@ -160,6 +190,10 @@ export function createTabManager({
     persistTabsState,
     renderTabs,
     updateTabDirtyBadge,
-    renderEmptyQuickList
+    renderEmptyQuickList,
+    destroy() {
+      listenerController?.abort();
+      tabElementsById.clear();
+    }
   };
 }

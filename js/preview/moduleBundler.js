@@ -23,7 +23,6 @@ export {
 } from "./bundler/liveBindingsRewriter.js";
 
 export {
-  buildVirtualModuleRuntimeScript,
   buildVirtualModuleBundle,
   formatVirtualModuleExecution
 } from "./bundler/virtualRuntime.js";

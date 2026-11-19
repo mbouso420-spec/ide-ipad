@@ -24,6 +24,7 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
   let isMatchWholeWord = false;
   let isRegex = false;
   let debounceTimer = null;
+  let focusRaf = 0;
   let currentResults = [];
   let flatMatchItems = [];
   let renderedRows = [];
@@ -49,14 +50,33 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
       blockGlobalShortcuts: true,
       onEscape: () => close()
     });
-    window.requestAnimationFrame(() => {
+    if (focusRaf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(focusRaf);
+    }
+    focusRaf = window.requestAnimationFrame(() => {
+      focusRaf = 0;
       input?.focus();
     });
+  }
+
+  function clearSearchCache() {
+    currentResults = [];
+    flatMatchItems = [];
+    renderedRows = [];
+    selectedIndex = 0;
+    if (resultsEl) {
+      resultsEl.innerHTML = "";
+    }
   }
 
   function close() {
     clearTimeout(debounceTimer);
     debounceTimer = null;
+    if (focusRaf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(focusRaf);
+      focusRaf = 0;
+    }
+    clearSearchCache();
     keyboardRouter.popModal("global-search-dialog");
     if (dialog?.open) {
       dialog.close();
@@ -296,11 +316,14 @@ export function initGlobalSearchModal({ getFiles, onSelectMatch }) {
 
   return {
     open,
-    close,
-    search: performSearch,
     destroy() {
       clearTimeout(debounceTimer);
       debounceTimer = null;
+      if (focusRaf && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(focusRaf);
+        focusRaf = 0;
+      }
+      clearSearchCache();
       controller?.abort();
     }
   };

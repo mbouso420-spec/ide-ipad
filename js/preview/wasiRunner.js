@@ -52,14 +52,15 @@ export async function runWasiModule(wasmInput, {
   let stdinOffset = 0;
 
   const argBytesList = (Array.isArray(args) && args.length > 0 ? args : ["program.wasm"])
-    .map((a) => encoder.encode(`${String(a)}\0`));
+    .map((a) => encoder.encode(`${String(a).replace(/\0/g, "")}\0`));
   const envBytesList = Object.entries(env || {})
-    .map(([k, v]) => encoder.encode(`${String(k)}=${String(v ?? "")}\0`));
+    .map(([k, v]) => encoder.encode(`${String(k).replace(/[\0=]/g, "")}=${String(v ?? "").replace(/\0/g, "")}\0`));
 
   const stdoutChunks = [];
   const stderrChunks = [];
   let totalOutputBytes = 0;
   let truncated = false;
+  let truncatedChannel = null;
   let memory = null;
   let cachedBuffer = null;
   let cachedBytes = null;
@@ -86,7 +87,7 @@ export async function runWasiModule(wasmInput, {
     return ptr <= byteLen && len <= byteLen - ptr;
   };
 
-  const pushOutput = (targetChunks, chunkCopy) => {
+  const pushOutput = (targetChunks, chunkCopy, channel) => {
     if (truncated) return;
     if (totalOutputBytes + chunkCopy.byteLength > maxOutputBytes) {
       const remaining = Math.max(0, maxOutputBytes - totalOutputBytes);
@@ -95,6 +96,7 @@ export async function runWasiModule(wasmInput, {
         totalOutputBytes += remaining;
       }
       truncated = true;
+      truncatedChannel = channel;
       return;
     }
     targetChunks.push(chunkCopy);
@@ -170,11 +172,16 @@ export async function runWasiModule(wasmInput, {
     },
 
     clock_time_get(id, _precision, timePtr) {
+      const clockId = id >>> 0;
+      if (clockId !== 0 && clockId !== 1) return ERRNO_INVAL;
       const { view, bytes } = getMemoryView();
       if (!inBounds(bytes.byteLength, timePtr, 8)) return ERRNO_FAULT;
       let ns = BigInt(Date.now()) * 1_000_000n;
-      if (id === 1 && typeof performance !== "undefined" && typeof performance.now === "function") {
-        ns = BigInt(Math.round(performance.now() * 1_000_000));
+      if (clockId === 1 && typeof performance !== "undefined" && typeof performance.now === "function") {
+        const ms = performance.now();
+        const wholeMs = Math.floor(ms);
+        const fracNs = Math.round((ms - wholeMs) * 1_000_000);
+        ns = BigInt(wholeMs) * 1_000_000n + BigInt(fracNs);
       }
       view.setBigUint64(timePtr >>> 0, ns, true);
       return ERRNO_SUCCESS;
@@ -222,11 +229,16 @@ export async function runWasiModule(wasmInput, {
       if (!inBounds(bytes.byteLength, iovsPtr, iovsLen * 8) || !inBounds(bytes.byteLength, nreadPtr, 4)) {
         return ERRNO_FAULT;
       }
-      let totalRead = 0;
+      // Pre-validar todos los iovecs atómicamente antes de mutar memoria o stdinOffset
       for (let i = 0; i < iovsLen; i += 1) {
         const ptr = view.getUint32(iovsPtr + i * 8, true);
         const len = view.getUint32(iovsPtr + i * 8 + 4, true);
         if (!inBounds(bytes.byteLength, ptr, len)) return ERRNO_FAULT;
+      }
+      let totalRead = 0;
+      for (let i = 0; i < iovsLen; i += 1) {
+        const ptr = view.getUint32(iovsPtr + i * 8, true);
+        const len = view.getUint32(iovsPtr + i * 8 + 4, true);
         if (len === 0) continue;
         const available = stdinBytes.byteLength - stdinOffset;
         if (available <= 0) break;
@@ -251,12 +263,14 @@ export async function runWasiModule(wasmInput, {
       return fd >= 0 && fd <= 2 ? ERRNO_SPIPE : ERRNO_BADF;
     },
 
-    fd_sync() {
-      return ERRNO_SUCCESS;
+    fd_sync(rawFd) {
+      const fd = rawFd | 0;
+      return fd >= 0 && fd <= 2 ? ERRNO_SUCCESS : ERRNO_BADF;
     },
 
-    fd_datasync() {
-      return ERRNO_SUCCESS;
+    fd_datasync(rawFd) {
+      const fd = rawFd | 0;
+      return fd >= 0 && fd <= 2 ? ERRNO_SUCCESS : ERRNO_BADF;
     },
 
     fd_write(rawFd, rawIovsPtr, rawIovsLen, rawNwrittenPtr) {
@@ -270,17 +284,23 @@ export async function runWasiModule(wasmInput, {
       if (!inBounds(bytes.byteLength, iovsPtr, iovsLen * 8) || !inBounds(bytes.byteLength, nwrittenPtr, 4)) {
         return ERRNO_FAULT;
       }
-      let written = 0;
-      const target = fd === 1 ? stdoutChunks : stderrChunks;
+      // Pre-validar todos los iovecs atómicamente antes de escribir chunks
       for (let i = 0; i < iovsLen; i += 1) {
         const ptr = view.getUint32(iovsPtr + i * 8, true);
         const len = view.getUint32(iovsPtr + i * 8 + 4, true);
         if (!inBounds(bytes.byteLength, ptr, len)) return ERRNO_FAULT;
+      }
+      let written = 0;
+      const channel = fd === 1 ? "stdout" : "stderr";
+      const target = fd === 1 ? stdoutChunks : stderrChunks;
+      for (let i = 0; i < iovsLen; i += 1) {
+        const ptr = view.getUint32(iovsPtr + i * 8, true);
+        const len = view.getUint32(iovsPtr + i * 8 + 4, true);
         if (len > 0) {
           if (!truncated) {
             const remaining = Math.max(0, maxOutputBytes - totalOutputBytes);
             const sliceLen = Math.min(len, remaining + 1);
-            pushOutput(target, bytes.slice(ptr, ptr + sliceLen));
+            pushOutput(target, bytes.slice(ptr, ptr + sliceLen), channel);
           }
           written += len;
         }
@@ -289,7 +309,10 @@ export async function runWasiModule(wasmInput, {
       return ERRNO_SUCCESS;
     },
 
-    fd_advise: () => ERRNO_SUCCESS,
+    fd_advise(rawFd) {
+      const fd = rawFd | 0;
+      return fd >= 0 && fd <= 2 ? ERRNO_SUCCESS : ERRNO_BADF;
+    },
     fd_allocate: () => ERRNO_NOSYS,
     fd_filestat_get: () => ERRNO_BADF,
     fd_filestat_set_size: () => ERRNO_BADF,
@@ -309,11 +332,24 @@ export async function runWasiModule(wasmInput, {
     path_symlink: () => ERRNO_NOSYS,
     path_unlink_file: () => ERRNO_NOSYS,
 
-    poll_oneoff(_inPtr, _outPtr, rawNsubs, neventsPtr) {
+    poll_oneoff(rawInPtr, rawOutPtr, rawNsubs, neventsPtr) {
       const nsubscriptions = rawNsubs | 0;
-      if (nsubscriptions < 0) return ERRNO_INVAL;
+      if (nsubscriptions < 0 || nsubscriptions > MAX_IOVS) return ERRNO_INVAL;
       const { view, bytes } = getMemoryView();
-      if (!inBounds(bytes.byteLength, neventsPtr, 4)) return ERRNO_FAULT;
+      const inPtr = rawInPtr >>> 0;
+      const outPtr = rawOutPtr >>> 0;
+      if (
+        !inBounds(bytes.byteLength, neventsPtr, 4) ||
+        (nsubscriptions > 0 && (
+          !inBounds(bytes.byteLength, inPtr, nsubscriptions * 48) ||
+          !inBounds(bytes.byteLength, outPtr, nsubscriptions * 32)
+        ))
+      ) {
+        return ERRNO_FAULT;
+      }
+      if (nsubscriptions > 0) {
+        bytes.fill(0, outPtr, outPtr + 32);
+      }
       view.setUint32(neventsPtr >>> 0, nsubscriptions > 0 ? 1 : 0, true);
       return ERRNO_SUCCESS;
     },
@@ -327,17 +363,14 @@ export async function runWasiModule(wasmInput, {
       const bufPtr = rawBufPtr >>> 0;
       const bufLen = rawBufLen >>> 0;
       if (!inBounds(bytes.byteLength, bufPtr, bufLen)) return ERRNO_FAULT;
-      const slice = bytes.subarray(bufPtr, bufPtr + bufLen);
       const webCrypto = globalThis.crypto;
-      if (webCrypto && typeof webCrypto.getRandomValues === "function") {
-        // getRandomValues tiene límite de 65536 bytes por llamada en la spec WebCrypto
-        for (let offset = 0; offset < slice.length; offset += 65536) {
-          webCrypto.getRandomValues(slice.subarray(offset, Math.min(slice.length, offset + 65536)));
-        }
-      } else {
-        for (let i = 0; i < slice.length; i += 1) {
-          slice[i] = Math.floor(Math.random() * 256);
-        }
+      if (!webCrypto || typeof webCrypto.getRandomValues !== "function") {
+        return ERRNO_NOSYS;
+      }
+      const slice = bytes.subarray(bufPtr, bufPtr + bufLen);
+      // getRandomValues tiene límite de 65536 bytes por llamada en la spec WebCrypto
+      for (let offset = 0; offset < slice.length; offset += 65536) {
+        webCrypto.getRandomValues(slice.subarray(offset, Math.min(slice.length, offset + 65536)));
       }
       return ERRNO_SUCCESS;
     },
@@ -355,45 +388,64 @@ export async function runWasiModule(wasmInput, {
     wasi_snapshot_preview1: wasiSnapshotPreview1
   });
 
-  memory = instance.exports.memory || null;
+  if (!(instance.exports.memory instanceof WebAssembly.Memory)) {
+    throw new Error("El módulo WASM no exportó una instancia válida de WebAssembly.Memory.");
+  }
+  memory = instance.exports.memory;
 
   let exitCode = 0;
   try {
-    if (typeof instance.exports._start === "function") {
-      instance.exports._start();
-    } else if (typeof instance.exports.main === "function") {
-      exitCode = Number(instance.exports.main(0, 0) || 0);
-    } else {
-      throw new Error("El binario WASI no expone función '_start' ni 'main'.");
+    try {
+      if (typeof instance.exports._start === "function") {
+        instance.exports._start();
+      } else if (typeof instance.exports.main === "function") {
+        exitCode = Number(instance.exports.main(0, 0) || 0);
+      } else {
+        throw new Error("El binario WASI no expone función '_start' ni 'main'.");
+      }
+    } catch (err) {
+      if (err instanceof WasiExitError) {
+        exitCode = err.code;
+      } else {
+        throw err;
+      }
     }
-  } catch (err) {
-    if (err instanceof WasiExitError) {
-      exitCode = err.code;
-    } else {
-      throw err;
+
+    const concatChunks = (chunks) => {
+      const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+      const out = new Uint8Array(total);
+      let pos = 0;
+      for (const c of chunks) {
+        out.set(c, pos);
+        pos += c.byteLength;
+      }
+      return decoder.decode(out);
+    };
+
+    let stdoutText = concatChunks(stdoutChunks);
+    let stderrText = concatChunks(stderrChunks);
+    if (truncated) {
+      const limitKb = Math.max(1, Math.round(maxOutputBytes / 1024));
+      const truncMsg = `\n...[salida truncada a ${limitKb} KB]`;
+      if (truncatedChannel === "stderr") {
+        stderrText += truncMsg;
+      } else {
+        stdoutText += truncMsg;
+      }
     }
+
+    return {
+      exitCode,
+      stdout: stdoutText,
+      stderr: stderrText,
+      truncated
+    };
+  } finally {
+    memory = null;
+    cachedBuffer = null;
+    cachedBytes = null;
+    cachedView = null;
+    stdoutChunks.length = 0;
+    stderrChunks.length = 0;
   }
-
-  const concatChunks = (chunks) => {
-    const total = chunks.reduce((acc, c) => acc + c.byteLength, 0);
-    const out = new Uint8Array(total);
-    let pos = 0;
-    for (const c of chunks) {
-      out.set(c, pos);
-      pos += c.byteLength;
-    }
-    return decoder.decode(out);
-  };
-
-  let stdoutText = concatChunks(stdoutChunks);
-  if (truncated) {
-    stdoutText += "\n...[salida truncada a 512 KB]";
-  }
-
-  return {
-    exitCode,
-    stdout: stdoutText,
-    stderr: concatChunks(stderrChunks),
-    truncated
-  };
 }

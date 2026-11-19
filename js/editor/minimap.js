@@ -46,20 +46,58 @@ export function createMinimapController({
   let containerEl = null;
   let isDragging = false;
   let activePointerId = null;
+  let dragRect = null;
+  let pendingDragClientY = null;
+  let dragRaf = null;
   let animFrameId = null;
   let sliderRaf = null;
   let resizeObserver = null;
+  let pendingRenderWhileHidden = false;
+  let pendingSliderWhileHidden = false;
+  let lastSliderTop = null;
+  let lastSliderHeight = null;
+
+  const isDocumentHidden = () => typeof document !== "undefined" && Boolean(document.hidden);
+
+  const measureLineSpan = (line) => {
+    const len = line.length;
+    let start = 0;
+    while (start < len && line.charCodeAt(start) <= 32) start += 1;
+    if (start >= len) return null;
+    let end = len - 1;
+    while (end > start && line.charCodeAt(end) <= 32) end -= 1;
+    return { indent: start, trimmedLen: end - start + 1 };
+  };
+
+  const applyDragScroll = (clientY) => {
+    const rect = dragRect || containerEl?.getBoundingClientRect?.();
+    if (!rect || rect.height <= 0) return;
+    const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    onScrollToRatio?.(ratio);
+  };
 
   const handlePointerMove = (e) => {
     if (!isDragging) return;
     if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
     e.preventDefault();
-    updateScrollFromPointer(e);
+    pendingDragClientY = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
+    if (dragRaf) return;
+    dragRaf = safeRequestAnim(() => {
+      dragRaf = null;
+      if (!isDragging || pendingDragClientY === null) return;
+      applyDragScroll(pendingDragClientY);
+    });
   };
 
   const handlePointerUp = (e) => {
     if (e && activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
     isDragging = false;
+    dragRect = null;
+    pendingDragClientY = null;
+    if (dragRaf) {
+      safeCancelAnim(dragRaf);
+      dragRaf = null;
+    }
     if (activePointerId !== null) {
       try {
         containerEl?.releasePointerCapture?.(activePointerId);
@@ -77,6 +115,7 @@ export function createMinimapController({
     e.preventDefault();
     isDragging = true;
     activePointerId = e.pointerId ?? null;
+    dragRect = containerEl?.getBoundingClientRect?.() || null;
     if (activePointerId !== null) {
       try {
         containerEl?.setPointerCapture?.(activePointerId);
@@ -89,6 +128,26 @@ export function createMinimapController({
     window.addEventListener("pointerup", handlePointerUp);
     window.addEventListener("pointercancel", handlePointerUp);
   };
+
+  const handleVisibilityChange = () => {
+    if (isDocumentHidden() || !isVisible) return;
+    if (pendingRenderWhileHidden) {
+      pendingRenderWhileHidden = false;
+      pendingSliderWhileHidden = false;
+      requestRender();
+    } else if (pendingSliderWhileHidden) {
+      pendingSliderWhileHidden = false;
+      updateSlider();
+    }
+  };
+
+  function observeResizeTargets() {
+    if (!resizeObserver || !containerEl) return;
+    resizeObserver.observe(containerEl);
+    if (mountEl && mountEl !== containerEl) {
+      resizeObserver.observe(mountEl);
+    }
+  }
 
   function initDOM() {
     if (!mountEl) return;
@@ -111,14 +170,17 @@ export function createMinimapController({
 
     if (typeof ResizeObserver === "function") {
       resizeObserver = new ResizeObserver(() => {
-        if (isVisible) {
+        if (isVisible && !isDocumentHidden()) {
           requestRender();
         }
       });
-      resizeObserver.observe(containerEl);
-      if (mountEl && mountEl !== containerEl) {
-        resizeObserver.observe(mountEl);
+      if (isVisible) {
+        observeResizeTargets();
       }
+    }
+
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", handleVisibilityChange);
     }
 
     setupEvents();
@@ -148,8 +210,8 @@ export function createMinimapController({
     if (!isVisible || !canvas || !ctx || !containerEl) return null;
     if (!skipStyleCheck) {
       cachedCssHidden = isElementHidden(containerEl) || isElementHidden(mountEl);
-    }
-    if (isElementHidden(containerEl, { skipStyleCheck }) || isElementHidden(mountEl, { skipStyleCheck })) {
+      if (cachedCssHidden) return null;
+    } else if (isElementHidden(containerEl, { skipStyleCheck: true }) || isElementHidden(mountEl, { skipStyleCheck: true })) {
       return null;
     }
     if (!skipStyleCheck && typeof window !== "undefined" && typeof window.matchMedia === "function") {
@@ -176,14 +238,45 @@ export function createMinimapController({
 
   function updateScrollFromPointer(e) {
     if (!containerEl) return;
-    const rect = containerEl.getBoundingClientRect();
-    if (rect.height <= 0) return;
     const clientY = e.clientY ?? e.touches?.[0]?.clientY ?? 0;
-    const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
-    onScrollToRatio?.(ratio);
+    applyDragScroll(clientY);
+  }
+
+  function applySliderPosition(containerH) {
+    if (!sliderEl || containerH <= 1) return;
+    const viewport = typeof getViewport === "function" ? getViewport() : { top: 0, height: 100, totalHeight: 100 };
+    const totalH = Math.max(1, viewport.totalHeight);
+    const topRatio = Math.max(0, Math.min(1, viewport.top / totalH));
+    const heightRatio = Math.max(0.05, Math.min(1, viewport.height / totalH));
+
+    const sliderHeight = Math.round(
+      Math.min(
+        containerH,
+        Math.max(Math.min(20, containerH), heightRatio * containerH)
+      ) * 2
+    ) / 2;
+    const sliderTop = Math.round(
+      Math.min(
+        Math.max(0, topRatio * containerH),
+        Math.max(0, containerH - sliderHeight)
+      ) * 2
+    ) / 2;
+
+    if (sliderTop !== lastSliderTop) {
+      lastSliderTop = sliderTop;
+      sliderEl.style.transform = `translateY(${sliderTop}px)`;
+    }
+    if (sliderHeight !== lastSliderHeight) {
+      lastSliderHeight = sliderHeight;
+      sliderEl.style.height = `${sliderHeight}px`;
+    }
   }
 
   function render() {
+    if (isDocumentHidden()) {
+      pendingRenderWhileHidden = true;
+      return;
+    }
     const dims = getRenderDimensions();
     if (!dims) return;
 
@@ -211,19 +304,24 @@ export function createMinimapController({
       const lineHeight = Math.min(3, Math.max(1, height / totalLines));
       const effectiveHeight = Math.min(height, totalLines * (lineHeight + 3));
       const maxChars = 80;
+      const barHeight = Math.max(0.8, lineHeight - 0.5);
       ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
 
       for (const sample of sampled?.samples || []) {
         const line = sample?.text || "";
-        if (!line.trim()) continue;
+        const span = measureLineSpan(line);
+        if (!span) continue;
         const y = (sample.index / totalLines) * effectiveHeight;
-        const indent = line.search(/\S|$/);
-        const startX = Math.min(width - 6, indent * 1.5);
-        const textLen = Math.min(maxChars, line.trim().length);
+        const startX = Math.min(width - 6, span.indent * 1.5);
+        const textLen = Math.min(maxChars, span.trimmedLen);
         const lineWidth = Math.max(2, Math.min(width - startX - 2, textLen * 0.8));
-        ctx.fillRect(startX, y, lineWidth, Math.max(0.8, lineHeight - 0.5));
+        ctx.fillRect(startX, y, lineWidth, barHeight);
       }
-      updateSlider();
+      if (sliderRaf) {
+        safeCancelAnim(sliderRaf);
+        sliderRaf = null;
+      }
+      applySliderPosition(height);
       return;
     }
 
@@ -239,6 +337,7 @@ export function createMinimapController({
     const lineHeight = Math.min(3, Math.max(1, height / totalLines));
     const effectiveHeight = Math.min(height, totalLines * (lineHeight + 3));
     const maxChars = 80;
+    const barHeight = Math.max(0.8, lineHeight - 0.5);
 
     ctx.fillStyle = "rgba(180, 190, 210, 0.4)";
 
@@ -246,49 +345,45 @@ export function createMinimapController({
 
     for (let i = 0; i < totalLines; i += step) {
       const line = (useIndexed ? getLine(i) : lines[i]) || "";
-      if (!line.trim()) continue;
+      const span = measureLineSpan(line);
+      if (!span) continue;
 
       const y = (i / totalLines) * effectiveHeight;
-      const indent = line.search(/\S|$/);
-      const startX = Math.min(width - 6, indent * 1.5);
-      const textLen = Math.min(maxChars, line.trim().length);
+      const startX = Math.min(width - 6, span.indent * 1.5);
+      const textLen = Math.min(maxChars, span.trimmedLen);
       const lineWidth = Math.max(2, Math.min(width - startX - 2, textLen * 0.8));
 
-      ctx.fillRect(startX, y, lineWidth, Math.max(0.8, lineHeight - 0.5));
+      ctx.fillRect(startX, y, lineWidth, barHeight);
     }
 
-    updateSlider();
+    if (sliderRaf) {
+      safeCancelAnim(sliderRaf);
+      sliderRaf = null;
+    }
+    applySliderPosition(height);
   }
 
   function updateSlider() {
     if (!sliderEl || !containerEl || !isVisible) return;
+    if (isDocumentHidden()) {
+      pendingSliderWhileHidden = true;
+      return;
+    }
     if (sliderRaf) return;
     sliderRaf = safeRequestAnim(() => {
       sliderRaf = null;
-      if (!sliderEl || !getRenderDimensions({ skipStyleCheck: true })) return;
-      const viewport = typeof getViewport === "function" ? getViewport() : { top: 0, height: 100, totalHeight: 100 };
+      if (!sliderEl || isDocumentHidden() || !getRenderDimensions({ skipStyleCheck: true })) return;
       const containerH = containerEl.clientHeight || 0;
-      if (containerH <= 1) return;
-
-      const totalH = Math.max(1, viewport.totalHeight);
-      const topRatio = Math.max(0, Math.min(1, viewport.top / totalH));
-      const heightRatio = Math.max(0.05, Math.min(1, viewport.height / totalH));
-
-      const sliderHeight = Math.min(
-        containerH,
-        Math.max(Math.min(20, containerH), heightRatio * containerH)
-      );
-      const sliderTop = Math.min(
-        Math.max(0, topRatio * containerH),
-        Math.max(0, containerH - sliderHeight)
-      );
-
-      sliderEl.style.transform = `translateY(${sliderTop}px)`;
-      sliderEl.style.height = `${sliderHeight}px`;
+      applySliderPosition(containerH);
     });
   }
 
   function requestRender() {
+    if (!isVisible) return;
+    if (isDocumentHidden()) {
+      pendingRenderWhileHidden = true;
+      return;
+    }
     if (animFrameId) return;
     animFrameId = safeRequestAnim(() => {
       animFrameId = null;
@@ -303,7 +398,24 @@ export function createMinimapController({
     if (containerEl) {
       containerEl.hidden = !isVisible;
     }
-    if (isVisible) {
+    if (!isVisible) {
+      pendingRenderWhileHidden = false;
+      pendingSliderWhileHidden = false;
+      if (animFrameId) {
+        safeCancelAnim(animFrameId);
+        animFrameId = null;
+      }
+      if (sliderRaf) {
+        safeCancelAnim(sliderRaf);
+        sliderRaf = null;
+      }
+      if (dragRaf) {
+        safeCancelAnim(dragRaf);
+        dragRaf = null;
+      }
+      resizeObserver?.disconnect();
+    } else {
+      observeResizeTargets();
       requestRender();
     }
     return isVisible;
@@ -318,9 +430,16 @@ export function createMinimapController({
       safeCancelAnim(sliderRaf);
       sliderRaf = null;
     }
+    if (dragRaf) {
+      safeCancelAnim(dragRaf);
+      dragRaf = null;
+    }
     if (resizeObserver) {
       resizeObserver.disconnect();
       resizeObserver = null;
+    }
+    if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     }
     containerEl?.removeEventListener("pointerdown", handlePointerDown);
     containerEl?.removeEventListener("lostpointercapture", handlePointerUp);

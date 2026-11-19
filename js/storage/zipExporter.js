@@ -95,10 +95,17 @@ function buildZipParts(files, options = {}) {
       throw new Error(`Ruta ZIP demasiado larga (> 65535 bytes): ${cleanPath}`);
     }
 
+    const prevEntry = entriesByPath.get(cleanPath);
+    const prevEntryTotal = prevEntry ? prevEntry.localSize + prevEntry.centralSize : 0;
+
     let dataBytes;
     if (file.content instanceof Uint8Array) {
       dataBytes = file.content;
     } else if (typeof file.content === "string") {
+      // Cota inferior antes de codificar UTF-8 (evita duplicar en RAM una cadena que ya supera 250 MB)
+      if (runningTotalBytes - prevEntryTotal + 76 + nameBytes.length * 2 + file.content.length > MAX_SAFE_ZIP_BYTES) {
+        throw new Error("El archivo ZIP supera el límite seguro de 250 MB en memoria.");
+      }
       dataBytes = encoder.encode(file.content);
     } else {
       dataBytes = new Uint8Array(0);
@@ -109,9 +116,7 @@ function buildZipParts(files, options = {}) {
 
     const localSize = 30 + nameBytes.length + dataBytes.length;
     const centralSize = 46 + nameBytes.length;
-    const prevEntry = entriesByPath.get(cleanPath);
-    const nextTotalBytes =
-      runningTotalBytes - (prevEntry ? prevEntry.localSize + prevEntry.centralSize : 0) + localSize + centralSize;
+    const nextTotalBytes = runningTotalBytes - prevEntryTotal + localSize + centralSize;
 
     if (nextTotalBytes > MAX_SAFE_ZIP_BYTES) {
       throw new Error("El archivo ZIP supera el límite seguro de 250 MB en memoria.");
@@ -154,25 +159,27 @@ function buildZipParts(files, options = {}) {
   let currentLocalOffset = 0;
   const localHeaderOffsets = [];
 
-  // 1. Emitir Local File Headers + File Data como fragmentos independientes (evita doble copia contigua al generar Blob).
-  for (const entry of entries) {
+  // 1. Empaquetar todos los Local File Headers en un único buffer contiguo (evita N ArrayBuffers/DataViews).
+  const localHeadersBuf = new Uint8Array(entries.length * 30);
+  const localHeadersView = new DataView(localHeadersBuf.buffer);
+  for (let i = 0; i < entries.length; i += 1) {
+    const entry = entries[i];
     localHeaderOffsets.push(currentLocalOffset);
-    const localHeader = new Uint8Array(30);
-    const view = new DataView(localHeader.buffer);
+    const hdrOffset = i * 30;
 
-    view.setUint32(0, 0x04034b50, true);
-    view.setUint16(4, 20, true);
-    view.setUint16(6, 0x0800, true);
-    view.setUint16(8, 0, true);
-    view.setUint16(10, dosTime, true);
-    view.setUint16(12, dosDate, true);
-    view.setUint32(14, entry.crc, true);
-    view.setUint32(18, entry.dataBytes.length, true);
-    view.setUint32(22, entry.dataBytes.length, true);
-    view.setUint16(26, entry.nameBytes.length, true);
-    view.setUint16(28, 0, true);
+    localHeadersView.setUint32(hdrOffset + 0, 0x04034b50, true);
+    localHeadersView.setUint16(hdrOffset + 4, 20, true);
+    localHeadersView.setUint16(hdrOffset + 6, 0x0800, true);
+    localHeadersView.setUint16(hdrOffset + 8, 0, true);
+    localHeadersView.setUint16(hdrOffset + 10, dosTime, true);
+    localHeadersView.setUint16(hdrOffset + 12, dosDate, true);
+    localHeadersView.setUint32(hdrOffset + 14, entry.crc, true);
+    localHeadersView.setUint32(hdrOffset + 18, entry.dataBytes.length, true);
+    localHeadersView.setUint32(hdrOffset + 22, entry.dataBytes.length, true);
+    localHeadersView.setUint16(hdrOffset + 26, entry.nameBytes.length, true);
+    localHeadersView.setUint16(hdrOffset + 28, 0, true);
 
-    parts.push(localHeader, entry.nameBytes);
+    parts.push(localHeadersBuf.subarray(hdrOffset, hdrOffset + 30), entry.nameBytes);
     if (entry.dataBytes.length > 0) {
       parts.push(entry.dataBytes);
     }
@@ -265,5 +272,5 @@ export function downloadZip(zipBytesOrBlob, filename = "proyecto.zip") {
     typeof Blob !== "undefined" && zipBytesOrBlob instanceof Blob
       ? zipBytesOrBlob
       : new Blob([zipBytesOrBlob], { type: "application/zip" });
-  return downloadBlob(blob, sanitizeZipDownloadFilename(filename), { revokeDelayMs: 1500 });
+  return downloadBlob(blob, sanitizeZipDownloadFilename(filename), { revokeDelayMs: 30_000 });
 }

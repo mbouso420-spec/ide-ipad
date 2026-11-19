@@ -4,7 +4,7 @@
  */
 
 import { normalizePath } from "../storage/workspaceDb.js";
-import { getFileExtension, escapeHtmlText, PYTHON_EXTENSIONS } from "./previewUtils.js";
+import { getFileExtension, escapeHtmlText, escapeJsonForInlineScript, PYTHON_EXTENSIONS } from "./previewUtils.js";
 
 export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseFolder = "") {
   const pyPath = String(pyFile?.path || "main.py");
@@ -37,7 +37,7 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
   }
 
   const pythonBootstrap = [
-    "import builtins, json, random, sys, time, traceback",
+    "import builtins, gc, json, random, sys, time, traceback",
     "if '.' not in sys.path:",
     "    sys.path.insert(0, '.')",
     "class _StudioPauseForInput(BaseException):",
@@ -68,6 +68,9 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "builtins.input = __studio_input",
     "_result = {'status': 'ok'}",
     "global _studio_repl_ns",
+    "if '_studio_repl_ns' in globals() and isinstance(globals().get('_studio_repl_ns'), dict):",
+    "    globals()['_studio_repl_ns'].clear()",
+    "    gc.collect()",
     "_studio_repl_ns = {'__name__': '__main__', '__file__': __studio_entry_name}",
     "_studio_limit_sec = float(globals().get('__studio_exec_limit_sec', 0) or 0)",
     "_studio_trace_n = 0",
@@ -109,14 +112,14 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     "json.dumps(_result)"
   ].join("\n");
 
-  const payloadJson = JSON.stringify({
+  const payloadJson = escapeJsonForInlineScript({
     entryName: pyShortName,
     entryPath: pyPath,
     code: pyCode,
     modules,
     modPrefixes: [...modPrefixes],
     bootstrap: pythonBootstrap
-  }).replace(/</g, "\\u003c");
+  });
 
   const safePathLabel = escapeHtmlText(pyPath);
 
@@ -333,9 +336,21 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
     self.onmessage = async function (event) {
       var job = event.data;
       if (!job) return;
+      if (job.type === "dispose") {
+        if (pyodide) {
+          try {
+            pyodide.runPython("import gc\\nif '_studio_repl_ns' in globals() and isinstance(_studio_repl_ns, dict): _studio_repl_ns.clear()\\ngc.collect()");
+          } catch (_) {}
+        }
+        pyodide = null;
+        loading = null;
+        filesWritten = false;
+        return;
+      }
       if (job.type === "eval") {
         try {
           var pyEval = await ensurePyodide();
+          send({ type: "status", text: "running" });
           if (!filesWritten && Array.isArray(job.modules)) writeFiles(pyEval, job);
           if (job.entryName) pyEval.globals.set("__studio_entry_name", String(job.entryName));
           pyEval.globals.set("__studio_exec_limit_sec", isMainThread ? MAIN_THREAD_LIMIT_SEC : 0);
@@ -488,29 +503,48 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         statusEl.style.color = colorVar;
       }
 
+      var tickerActive = false;
+
+      function stopTicker() {
+        if (ticker) {
+          window.clearInterval(ticker);
+          ticker = 0;
+        }
+      }
+
+      function startTicker() {
+        stopTicker();
+        if (!running || !tickerActive) return;
+        if (typeof document !== "undefined" && document.hidden) return;
+        ticker = window.setInterval(function () {
+          if (typeof document !== "undefined" && document.hidden) {
+            stopTicker();
+            return;
+          }
+          var secs = Math.floor((Date.now() - runStartedAt) / 1000);
+          if (secs >= 1) {
+            var canStopNow = Boolean(runner && runner.canStop);
+            if (!canStopNow) {
+              setStatus("Ejecutando en hilo principal… " + secs + " s (límite de seguridad 5 s)", "var(--warn)");
+            } else {
+              setStatus(
+                secs >= 5
+                  ? "Ejecutando… " + secs + " s (¿bucle infinito? Tocá Detener)"
+                  : "Ejecutando… " + secs + " s",
+                secs >= 5 ? "var(--warn)" : "var(--accent)"
+              );
+            }
+          }
+        }, 1000);
+      }
+
       function setRunning(next) {
         running = next;
-        window.clearInterval(ticker);
-        if (stopBtn) stopBtn.hidden = !(next && runner && runner.canStop);
-        if (next) {
-          runStartedAt = Date.now();
-          ticker = window.setInterval(function () {
-            var secs = Math.floor((Date.now() - runStartedAt) / 1000);
-            if (secs >= 1) {
-              var canStopNow = Boolean(runner && runner.canStop);
-              if (!canStopNow) {
-                setStatus("Ejecutando en hilo principal… " + secs + " s (límite de seguridad 5 s)", "var(--warn)");
-              } else {
-                setStatus(
-                  secs >= 5
-                    ? "Ejecutando… " + secs + " s (¿bucle infinito? Tocá Detener)"
-                    : "Ejecutando… " + secs + " s",
-                  secs >= 5 ? "var(--warn)" : "var(--accent)"
-                );
-              }
-            }
-          }, 1000);
+        if (!next) {
+          tickerActive = false;
+          stopTicker();
         }
+        if (stopBtn) stopBtn.hidden = !(next && runner && runner.canStop);
       }
 
       function loadScriptTag(url) {
@@ -535,9 +569,13 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
       }
 
       function createMainThreadRunner() {
+        var disposed = false;
         var fakeSelf = {
           __studioMainThread: true,
-          postMessage: function (msg) { window.setTimeout(function () { handle(msg); }, 0); },
+          postMessage: function (msg) {
+            if (disposed) return;
+            window.setTimeout(function () { if (!disposed) handle(msg); }, 0);
+          },
           onmessage: null
         };
         new Function("self", "__loadScript", runnerSrc)(fakeSelf, loadScriptTag);
@@ -547,8 +585,21 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         }
         return {
           canStop: false,
-          post: function (msg) { fakeSelf.onmessage({ data: msg }); },
-          stop: function () {}
+          post: function (msg) {
+            if (!disposed && typeof fakeSelf.onmessage === "function") {
+              fakeSelf.onmessage({ data: msg });
+            }
+          },
+          stop: function () {
+            if (disposed) return;
+            disposed = true;
+            try {
+              if (typeof fakeSelf.onmessage === "function") {
+                fakeSelf.onmessage({ data: { type: "dispose" } });
+              }
+            } catch (_) {}
+            fakeSelf.onmessage = null;
+          }
         };
       }
 
@@ -590,14 +641,12 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             canStop: true,
             post: function (msg) { worker.postMessage(msg); },
             stop: function () {
-              window.removeEventListener("pagehide", onPageHide);
+              worker.onmessage = null;
+              worker.onerror = null;
               revokeBlobUrl();
-              worker.terminate();
+              try { worker.terminate(); } catch (_) {}
             }
           };
-          function onPageHide() {
-            r.stop();
-          }
           worker.onmessage = function (event) {
             sawWorkerMessage = true;
             revokeBlobUrl();
@@ -621,7 +670,6 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
             }
             handle({ type: "fatal", message: event && event.message ? event.message : "Error en el motor Python." });
           };
-          window.addEventListener("pagehide", onPageHide, { once: true });
           return r;
         } catch (_) {
           revokeBlobUrl();
@@ -636,8 +684,17 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
           return;
         }
         if (msg.type === "status") {
-          if (msg.text === "loading") setStatus("Iniciando motor Python 3 (WebAssembly)…", "var(--warn)");
-          if (msg.text === "running") setStatus("Ejecutando script…", "var(--accent)");
+          if (msg.text === "loading") {
+            tickerActive = false;
+            stopTicker();
+            setStatus("Iniciando motor Python 3 (WebAssembly)…", "var(--warn)");
+          }
+          if (msg.text === "running") {
+            setStatus("Ejecutando script…", "var(--accent)");
+            runStartedAt = Date.now();
+            tickerActive = true;
+            startTicker();
+          }
           return;
         }
         if (msg.type === "fatal") {
@@ -774,6 +831,27 @@ export function buildStandalonePythonPreview(pyFile, sameFolderFiles = [], baseF
         }
         postEvalJob(code);
       });
+
+      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        document.addEventListener("visibilitychange", function () {
+          if (document.hidden) {
+            stopTicker();
+          } else if (running && tickerActive) {
+            startTicker();
+          }
+        });
+      }
+
+      function disposePythonRunner() {
+        tickerActive = false;
+        stopTicker();
+        if (runner) {
+          try { runner.stop(); } catch (_) {}
+          runner = null;
+        }
+      }
+      window.addEventListener("pagehide", disposePythonRunner);
+      window.addEventListener("unload", disposePythonRunner);
 
       executePass();
     })();

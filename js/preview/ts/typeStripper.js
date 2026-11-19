@@ -51,7 +51,7 @@ const TYPE_CONT_PREV_KEYWORDS = new Set([
   "new"
 ]);
 
-export function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
+function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
   let k = startIdx;
   let angle = 0;
   let paren = 0;
@@ -60,6 +60,15 @@ export function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
 
   while (k < tokens.length) {
     const t = tokens[k];
+    if (
+      (t.type === "template_tail" || t.type === "template_mid") &&
+      angle === 0 &&
+      paren === 0 &&
+      brace === 0 &&
+      bracket === 0
+    ) {
+      return k;
+    }
     if (t.type === "ws" || t.type === "comment") {
       if (
         angle === 0 &&
@@ -110,6 +119,14 @@ export function skipTypeAnnotation(tokens, startIdx, stopPuncts) {
           k = skipBalancedPair(tokens, k, "{", "}");
           continue;
         }
+      }
+      if (v === "<" && angle === 0 && paren === 0 && brace === 0 && bracket === 0 && stopPuncts.has("<")) {
+        if (scanBalancedGenericCloseIndex(tokens, k) === -1) {
+          return k;
+        }
+        angle += 1;
+        k += 1;
+        continue;
       }
       if (angle === 0 && paren === 0 && brace === 0 && bracket === 0 && stopPuncts.has(v)) {
         return k;
@@ -268,7 +285,7 @@ export function isArrowGenericAhead(tokens, ltIdx) {
   return false;
 }
 
-export function skipStatement(tokens, startIdx) {
+function skipStatement(tokens, startIdx) {
   let k = startIdx;
   let brace = 0;
   let paren = 0;
@@ -329,7 +346,7 @@ export function skipStatement(tokens, startIdx) {
   return k;
 }
 
-export function compileEnumDeclaration(tokens, enumKwIdx) {
+function compileEnumDeclaration(tokens, enumKwIdx) {
   const nameIdx = nextSigIndex(tokens, enumKwIdx + 1);
   if (nameIdx >= tokens.length || tokens[nameIdx].type !== "ident") return null;
   const enumName = tokens[nameIdx].value;
@@ -917,12 +934,103 @@ export function stripTypeScriptFromTokens(tokens) {
       continue;
     }
 
+    // Omitir sobrecargas de función sin cuerpo: `[export] [async] function foo<T>(a: number): void;`
+    const isFunctionOverloadStart = (startIdx) => {
+      let cur = startIdx;
+      if (tokens[cur]?.value === "export") cur = nextSigIndex(tokens, cur + 1);
+      if (tokens[cur]?.value === "default") cur = nextSigIndex(tokens, cur + 1);
+      if (tokens[cur]?.value === "async") cur = nextSigIndex(tokens, cur + 1);
+      if (tokens[cur]?.type !== "ident" || tokens[cur]?.value !== "function") return -1;
+      cur = nextSigIndex(tokens, cur + 1);
+      if (tokens[cur]?.value === "*") cur = nextSigIndex(tokens, cur + 1);
+      if (cur >= tokens.length || tokens[cur]?.type !== "ident") return -1;
+      cur = nextSigIndex(tokens, cur + 1);
+      if (tokens[cur]?.value === "<") {
+        const gClose = scanBalancedGenericCloseIndex(tokens, cur);
+        if (gClose === -1) return -1;
+        cur = nextSigIndex(tokens, gClose + 1);
+      }
+      if (tokens[cur]?.value !== "(") return -1;
+      cur = skipBalancedPair(tokens, cur, "(", ")");
+      const afterParams = nextSigIndex(tokens, cur);
+      if (afterParams >= tokens.length) return -1;
+      let tailIdx = afterParams;
+      if (tokens[tailIdx]?.value === ":") {
+        tailIdx = skipTypeAnnotation(tokens, tailIdx + 1, new Set(["{", ";"]));
+      }
+      if (tailIdx >= tokens.length) return tokens.length;
+      if (tokens[tailIdx]?.value === ";") return tailIdx + 1;
+      if (tokens[tailIdx]?.value === "{") return -1;
+      if (hasNewlineBeforeToken(tokens, tailIdx)) return tailIdx;
+      return -1;
+    };
+
+    if (
+      tok.type === "ident" &&
+      startsTsStmt &&
+      (tok.value === "function" || tok.value === "async" || tok.value === "export")
+    ) {
+      const overloadEnd = isFunctionOverloadStart(i);
+      if (overloadEnd !== -1) {
+        i = overloadEnd;
+        continue;
+      }
+    }
+
     if (tok.type === "ident" && MODIFIER_KEYWORDS.has(tok.value)) {
       const brace = currentBrace();
       const paren = currentParen();
       const inClassScope = Boolean(brace?.inClass) || (paren?.isParams && pendingConstructorParams !== null);
       const nextTokIdx = nextSigIndex(tokens, i + 1);
       const nextTok = nextTokIdx < tokens.length ? tokens[nextTokIdx] : null;
+      // Método o propiedad `abstract` sin cuerpo dentro de una clase: omitir declaración completa
+      if (
+        tok.value === "abstract" &&
+        brace?.inClass &&
+        !paren &&
+        nextTok &&
+        nextTok.value !== "class" &&
+        (nextTok.type === "ident" || nextTok.value === "[" || nextTok.value === "#" || nextTok.value === "*")
+      ) {
+        let scan = nextTokIdx;
+        let hasBodyBrace = false;
+        while (scan < tokens.length) {
+          const st = tokens[scan];
+          if (st.type === "punct") {
+            if (st.value === "(") {
+              scan = skipBalancedPair(tokens, scan, "(", ")");
+              continue;
+            }
+            if (st.value === "[") {
+              scan = skipBalancedPair(tokens, scan, "[", "]");
+              continue;
+            }
+            if (st.value === "<") {
+              const gc = scanBalancedGenericCloseIndex(tokens, scan);
+              if (gc !== -1) {
+                scan = gc + 1;
+                continue;
+              }
+            }
+            if (st.value === ":") {
+              scan = skipTypeAnnotation(tokens, scan + 1, new Set(["{", ";", "}", "="]));
+              continue;
+            }
+            if (st.value === "{") {
+              hasBodyBrace = true;
+              break;
+            }
+            if (st.value === ";" || st.value === "}") break;
+          } else if (st.type === "ws" && st.value.includes("\n")) {
+            break;
+          }
+          scan += 1;
+        }
+        if (!hasBodyBrace) {
+          i = tokens[scan]?.value === ";" ? scan + 1 : scan;
+          continue;
+        }
+      }
       if (
         (tok.value === "abstract" && nextTok?.value === "class") ||
         (inClassScope &&
@@ -958,7 +1066,8 @@ export function stripTypeScriptFromTokens(tokens) {
         prev.type === "template_full" ||
         prev.type === "template_tail" ||
         prev.value === ")" ||
-        prev.value === "]");
+        prev.value === "]" ||
+        (prev.value === "}" && !hasNewlineBeforeToken(tokens, i)));
     if (
       tok.type === "ident" &&
       (tok.value === "as" || tok.value === "satisfies") &&
@@ -984,7 +1093,7 @@ export function stripTypeScriptFromTokens(tokens) {
           new Set([
             ";", ",", ")", "]", "}", ":", "?",
             "&&", "||", "??",
-            "=", "==", "===", "!=", "!==", "<=", ">=",
+            "=", "==", "===", "!=", "!==", "<", ">", "<=", ">=",
             "+", "-", "*", "/", "%", "**",
             "instanceof", "in"
           ])
@@ -1064,6 +1173,16 @@ export function stripTypeScriptFromTokens(tokens) {
       }
 
       if (prev && (prev.value === ")" || prev.value === "]")) {
+        // Destructuring tipado `const [a, b]: [number, string] = ...`
+        if (prev.value === "]" && inVarDecl && !inVarInit && (!brace || (!brace.isObject && !brace.isPattern))) {
+          const stopIdx = skipTypeAnnotation(tokens, i + 1, TOP_TYPE_STOP);
+          const stopTok = tokens[stopIdx];
+          if (stopTok && (stopTok.value === "=" || stopTok.value === "in" || stopTok.value === "of") && out.length > 0 && !/\s$/.test(out)) {
+            out += " ";
+          }
+          i = stopIdx;
+          continue;
+        }
         const useMethodStop =
           prev.value === ")" &&
           lastClosedParen?.token === prev &&
@@ -1142,6 +1261,24 @@ export function stripTypeScriptFromTokens(tokens) {
       const parenMeta = classifyParamParen(tokens, i, stack);
       stack.push({ kind: "paren", isParams: parenMeta.isParams, isMethodOrFunc: parenMeta.isMethodOrFunc });
       out += tok.value;
+      if (parenMeta.isParams) {
+        // Parámetro explícito `this: Type` de TypeScript (debe eliminarse completo en JS)
+        const firstParam = nextSigIndex(tokens, i + 1);
+        if (firstParam < tokens.length && tokens[firstParam].type === "ident" && tokens[firstParam].value === "this") {
+          const afterThis = nextSigIndex(tokens, firstParam + 1);
+          if (afterThis < tokens.length && tokens[afterThis].type === "punct" && tokens[afterThis].value === ":") {
+            let afterThisType = skipTypeAnnotation(tokens, afterThis + 1, new Set([",", ")"]));
+            if (afterThisType < tokens.length && tokens[afterThisType].type === "punct" && tokens[afterThisType].value === ",") {
+              afterThisType += 1;
+              while (afterThisType < tokens.length && tokens[afterThisType].type === "ws") {
+                afterThisType += 1;
+              }
+            }
+            i = afterThisType;
+            continue;
+          }
+        }
+      }
       i += 1;
       continue;
     }

@@ -23,7 +23,7 @@ import { rewriteEsModuleToRegistry } from "./liveBindingsRewriter.js";
  * Runtime compartida idempotente para ejecutar módulos CommonJS/ESM locales dentro de `<iframe srcdoc>`.
  * @returns {string}
  */
-export function buildVirtualModuleRuntimeScript() {
+function buildVirtualModuleRuntimeScript() {
   return `(function () {
   if (window.__studioRuntimeInit) return;
   window.__studioRuntimeInit = true;
@@ -32,12 +32,19 @@ export function buildVirtualModuleRuntimeScript() {
   window.__studioPending = window.__studioPending || Object.create(null);
   window.__studioExt = window.__studioExt || Object.create(null);
   var liveWatchers = typeof WeakMap === "function" ? new WeakMap() : null;
+  var activeNotifying = typeof WeakSet === "function" ? new WeakSet() : null;
   function notifyModule(exports) {
     if (!exports || !liveWatchers) return;
+    if (activeNotifying && activeNotifying.has(exports)) return;
     var list = liveWatchers.get(exports);
     if (!list) return;
-    for (var i = 0; i < list.length; i += 1) {
-      try { list[i](); } catch (_) {}
+    if (activeNotifying) activeNotifying.add(exports);
+    try {
+      for (var i = 0; i < list.length; i += 1) {
+        try { list[i](); } catch (_) {}
+      }
+    } finally {
+      if (activeNotifying) activeNotifying.delete(exports);
     }
   }
   function subscribeModule(mod, fn) {
@@ -145,19 +152,24 @@ export function buildVirtualModuleRuntimeScript() {
     var scopedRequire = function (depId) {
       return window.__studioRequireAsync(depId, nextChain);
     };
-    var initPromise = (async function () {
+    var resolvePending, rejectPending;
+    var initPromise = new Promise(function (res, rej) {
+      resolvePending = res;
+      rejectPending = rej;
+    });
+    window.__studioPending[id] = initPromise;
+    (async function () {
       try {
         await factory(scopedRequire, module, module.exports, scopedRequire);
         notifyModule(module.exports);
-        return module.exports;
+        resolvePending(module.exports);
       } catch (err) {
         delete window.__studioCache[id];
-        throw err;
+        rejectPending(err);
       } finally {
         delete window.__studioPending[id];
       }
     })();
-    window.__studioPending[id] = initPromise;
     return await initPromise;
   };
 })();`;

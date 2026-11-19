@@ -13,10 +13,12 @@ import { initGithubController } from "../js/github/githubController.js";
 import { initGithubLocalBackupPanel } from "../js/github/githubLocalBackupPanel.js";
 import {
   applyRemotePullPlan,
+  cacheSingleGithubFileContent,
   convertLocalProjectToGithub,
   createLocalProject,
   deleteProject,
   deleteProjectEntry,
+  discardEntryChange,
   getAllRawProjectEntries,
   getEntryRecord,
   getPendingGithubChanges,
@@ -24,9 +26,12 @@ import {
   getProjectEntries,
   hydrateGithubProject,
   hydrateLazyGithubProject,
+  markProjectOfflineCached,
+  renameProjectEntry,
   updateFileContent,
   upsertEntry
 } from "../js/storage/workspaceDb.js";
+import { evictCleanGithubCache } from "../js/storage/storageQuota.js";
 import { restoreEmergencyBackup, writeEmergencyBackup, getEmergencyBackupKey } from "../js/storage/emergencyBackup.js";
 import {
   SUPPORTED_BINARY_ASSET_EXTENSIONS,
@@ -56,6 +61,11 @@ import {
   resolveLocalModuleEntry
 } from "../js/preview/moduleBundler.js";
 import { buildWorkspaceAssetMap, bundleHtmlWithFolderAssets } from "../js/preview/htmlBundler.js";
+import {
+  buildSafeImageDataUrl,
+  safeEncodeURIComponent,
+  sanitizeSvgMarkup
+} from "../js/preview/previewUtils.js";
 import { buildLoopGuardRuntime, instrumentLoops } from "../js/preview/loopGuard.js";
 import { buildStandalonePythonPreview } from "../js/preview/pythonRunner.js";
 import { buildSqlRunnerPreview, convertResultsToCsv, hasLimitClause } from "../js/preview/sqlRunner.js";
@@ -1442,11 +1452,248 @@ describe("Ronda 2 — Parte 3: Editor, UI, CSS, A11y y PWA", () => {
     assert.ok(/role="tabpanel"[^>]*aria-labelledby="settings-tab-appearance"/i.test(html));
 
     const sw = fs.readFileSync(path.join(ROOT_DIR, "sw.js"), "utf8");
-    assert.ok(sw.includes('SHELL_CACHE = "studio-ide-shell-v32"'));
+    assert.ok(sw.includes('SHELL_CACHE = "studio-ide-shell-v33"'));
     assert.ok(sw.includes('RUNTIME_CACHE = "studio-ide-runtime-v2"'));
     assert.ok(sw.includes('response.type !== "opaque"'));
     assert.ok(sw.includes("ignoreSearch: true"));
     assert.ok(sw.includes("fetchWithTimeout"));
     assert.ok(sw.includes("event.waitUntil("));
+  });
+
+  test("Comité 9 Agentes (B1): TS transpila as/satisfies con genéricos, import type, this: Type y abstract con tipos objeto", () => {
+    const src = `
+import type Foo from "./foo"
+export type * from "./bar"
+declare var externalThing
+const a = obj as Record<string, number>;
+const b = items as Array<Map<string, number>>;
+const c = { x: 1 } satisfies Record<string, number>;
+const cmp = (val as number) < 10 && val as number < 20;
+function onClick(this: HTMLElement, ev: number): void { return this && ev; }
+function onlyThis(this: { id: string }): string { return this.id; }
+abstract class Base {
+  abstract getConfig(): { a: number; b: string };
+  abstract data: { k: string } | null;
+  run() { return 7; }
+}
+abstract class OneLine { abstract x: number }
+class ConcreteAbstractField { abstract = 42; }
+`;
+    const out = transpileTypeScriptAndJsx(src, { fileName: "test.ts" }).code;
+    assert.doesNotThrow(() => acorn.parse(out, { ecmaVersion: "latest", sourceType: "module" }), out);
+    assert.ok(!out.includes("<string, number>"), out);
+    assert.ok(!out.includes("getConfig"), out);
+    assert.ok(!out.includes("import type"), out);
+    assert.ok(out.includes("function onClick(ev)"), out);
+    assert.ok(out.includes("function onlyThis()"), out);
+    assert.ok(out.includes("abstract = 42"), out);
+  });
+
+  test("Comité 9 Agentes (B2): livePreviewModal redacta PAT clásico 40-hex en ide.github.pat y refresca caché en saveGithubToken", async () => {
+    const classicPat = "a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0";
+    const rotatedPat = "f0e1d2c3b4a5968778695a4b3c2d1e0f12345678";
+    const winListeners = new Map();
+    const origAdd = window.addEventListener;
+    const origDispatch = window.dispatchEvent;
+    window.addEventListener = (type, fn, opts) => {
+      if (!winListeners.has(type)) winListeners.set(type, new Set());
+      const bucket = winListeners.get(type);
+      bucket.add(fn);
+      opts?.signal?.addEventListener?.("abort", () => bucket.delete(fn), { once: true });
+    };
+    window.dispatchEvent = (evt) => {
+      for (const fn of winListeners.get(evt?.type) || []) fn(evt);
+      return true;
+    };
+
+    gh.saveGithubToken(classicPat);
+
+    makeDomEl("dialog", "preview-dialog");
+    const iframe = makeDomEl("iframe", "preview-iframe");
+    iframe.contentWindow = { postMessage() {} };
+    const consoleList = makeDomEl("div", "preview-console-list");
+    makeDomEl("div", "preview-iframe-wrapper");
+    makeDomEl("div", "preview-console-panel");
+    makeDomEl("div", "preview-unavailable-state");
+    makeDomEl("div", "preview-c-runner");
+
+    const modal = initLivePreviewModal({
+      bindOpenButton: false,
+      getWorkspaceSnapshot: () => ({
+        projectId: "p-b2",
+        activeFileId: "index.html",
+        files: [{ id: "index.html", path: "index.html", shortName: "index.html", content: "<h1>Hi</h1>" }]
+      })
+    });
+
+    try {
+      await modal.openPreview();
+      window.dispatchEvent({
+        type: "message",
+        origin: "null",
+        source: iframe.contentWindow,
+        data: { source: "studio-ide-preview", level: "log", text: `Leaked: ${classicPat}` }
+      });
+      assert.equal(consoleList.children.length, 1);
+      assert.ok(!consoleList.children[0].textContent.includes(classicPat), consoleList.children[0].textContent);
+      assert.ok(consoleList.children[0].textContent.includes("[REDACTED_SECRET]"));
+
+      // Al actualizar el PAT mientras el modal está abierto, la caché se refresca automáticamente
+      gh.saveGithubToken(rotatedPat);
+      window.dispatchEvent({
+        type: "message",
+        origin: "null",
+        source: iframe.contentWindow,
+        data: { source: "studio-ide-preview", level: "log", text: `Rotated: ${rotatedPat}` }
+      });
+      assert.equal(consoleList.children.length, 2);
+      assert.ok(!consoleList.children[1].textContent.includes(rotatedPat), consoleList.children[1].textContent);
+      assert.ok(consoleList.children[1].textContent.includes("[REDACTED_SECRET]"));
+    } finally {
+      modal.destroy();
+      gh.clearGithubToken();
+      window.addEventListener = origAdd;
+      window.dispatchEvent = origDispatch;
+    }
+  });
+
+  test("Comité 9 Agentes (B3): sanitizeSvgMarkup neutraliza continuaciones CSS (\\\\\\n), entidades XML y comillas en nombres de atributo", () => {
+    const svgLineCont1 = sanitizeSvgMarkup(
+      '<svg xmlns="http://www.w3.org/2000/svg"><style>a{background:url("java\\\nscript:alert(1)")}</style></svg>'
+    );
+    assert.ok(svgLineCont1 && !/javascript/i.test(svgLineCont1) && !/alert\(/i.test(svgLineCont1), svgLineCont1);
+
+    const svgLineCont2 = buildSafeImageDataUrl({
+      path: "evil.svg",
+      content: '<svg xmlns="http://www.w3.org/2000/svg"><style>a{background:url("da\\\nta:image/svg+xml,<svg onload=alert(1)>")}</style></svg>'
+    });
+    assert.ok(svgLineCont2 && typeof svgLineCont2.src === "string" && svgLineCont2.src.startsWith("data:image/svg+xml"));
+    const decoded2 = decodeURIComponent(svgLineCont2.src.split(",")[1] || "");
+    assert.ok(decoded2.includes("url(#)") && !/image\/svg\+xml/i.test(decoded2) && !/onload/i.test(decoded2), decoded2);
+
+    const svgEntities = sanitizeSvgMarkup(
+      '<svg xmlns="http://www.w3.org/2000/svg"><rect style="background:&#x75;rl(&#x6a;avascript:alert(1))" fill="&#x75;rl(data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;)" /></svg>'
+    );
+    assert.ok(svgEntities && !/javascript/i.test(svgEntities) && !/text\/html/i.test(svgEntities), svgEntities);
+
+    const svgQuoteAttr = sanitizeSvgMarkup('<svg><rect a="1""onload="alert(1)"/></svg>');
+    assert.ok(svgQuoteAttr && !/onload/i.test(svgQuoteAttr) && !/alert\(/i.test(svgQuoteAttr), svgQuoteAttr);
+
+    assert.equal(
+      safeEncodeURIComponent("a\uD800b\uDC00c\uD83D\uDE00"),
+      encodeURIComponent("a\uFFFDb\uFFFDc\uD83D\uDE00")
+    );
+  });
+
+  test("Comité 9 Agentes (B4): chatController difiere validación por red cuando #panel-assistant inicia colapsado", async () => {
+    saveProviderId("groq");
+    saveApiKey("groq", "gsk_1234567890abcdefghijklmnop");
+
+    makeDomEl("aside", "panel-assistant");
+    document.body.dataset.rightOpen = "false";
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    };
+
+    const chat = initChatController({
+      getContextSnapshot: () => ({ activeFile: null, openFiles: [], otherOpenFiles: [], projectFiles: [], selection: null })
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 25));
+      assert.equal(fetchCalls, 0, "Con rightOpen=false no debe validar clave por red en arranque frío");
+
+      chat.setPanelVisible(true);
+      await new Promise((r) => setTimeout(r, 25));
+      assert.ok(fetchCalls >= 1, "Al abrir #panel-assistant debe ejecutarse la validación diferida");
+    } finally {
+      chat.destroy();
+      delete document.body.dataset.rightOpen;
+    }
+  });
+
+  test("Comité 9 Agentes (IndexedDB): evictCleanGithubCache invalida offlineCached y reemplazo binario<->texto preserva discardEntryChange", async () => {
+    const ghProj = await hydrateLazyGithubProject({
+      owner: "qa",
+      repo: "integrity-repo",
+      branch: "main",
+      commitSha: "c1",
+      entries: [
+        { path: "clean.txt", blobSha: "sha-clean", mode: "100644" },
+        { path: "img.png", blobSha: "sha-img", mode: "100644", isBinary: true },
+        { path: "lazy.txt", blobSha: "sha-lazy", mode: "100644" }
+      ]
+    });
+    try {
+      await cacheSingleGithubFileContent(ghProj.id, "clean.txt", "contenido-limpio", "sha-clean");
+      await cacheSingleGithubFileContent(ghProj.id, "img.png", { isBinary: true, base64: "AQID" }, "sha-img");
+      await markProjectOfflineCached(ghProj.id, true);
+
+      const ev = await evictCleanGithubCache({ excludeProjectId: "otro", targetBytes: 1 });
+      assert.ok(ev.evictedCount >= 1);
+      assert.equal((await getProject(ghProj.id)).offlineCached, false);
+
+      // Reemplazar binario trackeado por texto -> discardEntryChange debe revertir a contentLoaded:false
+      await cacheSingleGithubFileContent(ghProj.id, "img.png", { isBinary: true, base64: "AQID" }, "sha-img");
+      await upsertEntry(ghProj.id, "img.png", { isFolder: false, isBinary: false, content: "texto-sobre-binario" });
+      await discardEntryChange(ghProj.id, "img.png");
+      const imgRec = await getEntryRecord(ghProj.id, "img.png");
+      assert.equal(imgRec.contentLoaded, false);
+
+      // Borrar archivo lazy no descargado -> renombrar archivo local encima -> discardEntryChange revierte a contentLoaded:false
+      await deleteProjectEntry(ghProj.id, "lazy.txt", false);
+      await upsertEntry(ghProj.id, "local.txt", { isFolder: false, content: "tmp" });
+      await renameProjectEntry(ghProj.id, "local.txt", "lazy.txt");
+      await discardEntryChange(ghProj.id, "lazy.txt");
+      const lazyRec = await getEntryRecord(ghProj.id, "lazy.txt");
+      assert.equal(lazyRec.contentLoaded, false);
+      assert.equal(lazyRec.deleted, false);
+    } finally {
+      await deleteProject(ghProj.id).catch(() => {});
+    }
+  });
+
+  test("Comité 9 Agentes (Bundler): live bindings en destructuring, for..of y exclusión en métodos computados/clave string", () => {
+    const files = [
+      {
+        path: "counter.js",
+        content: `
+export let count = 0;
+export function setObj() { ({ count } = { count: 10 }); }
+export function setArr() { [count] = [20]; }
+export function loopSet() { for (count of [1, 2, 30]) { /* sync */ } }
+export class C {
+  [Symbol.toStringTag](x, [count] = [99]) { count = 123; return count; }
+}
+export const o = { "m"(x, [count] = [77]) { return count; } };
+`
+      },
+      {
+        path: "main.js",
+        content: `
+import { count, setObj, setArr, loopSet, C, o } from "./counter.js";
+const out = [count];
+setObj(); out.push(count);
+setArr(); out.push(count);
+loopSet(); out.push(count);
+out.push(new C()[Symbol.toStringTag](0));
+out.push(o.m(0));
+globalThis.__liveOut = out;
+`
+      }
+    ];
+    const bundle = buildVirtualModuleBundle({
+      entryPath: "main.js",
+      entryCode: files[1].content,
+      exactMap: buildExactModuleMap(files)
+    });
+    const { scriptCode } = formatVirtualModuleExecution(bundle);
+    const ctx = { console, Symbol };
+    ctx.window = ctx;
+    ctx.globalThis = ctx;
+    ctx.self = ctx;
+    vm.runInNewContext(scriptCode, ctx);
+    assert.deepEqual([...ctx.__liveOut], [0, 10, 20, 30, 123, 77]);
   });
 });

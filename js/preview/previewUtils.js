@@ -123,8 +123,8 @@ export function isBlockedPreviewUrlScheme(ref) {
  */
 export function safeEncodeURIComponent(value) {
   const safe = String(value ?? "").replace(
-    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
-    "\uFFFD"
+    /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g,
+    (match) => (match.length === 2 ? match : "\uFFFD")
   );
   return encodeURIComponent(safe);
 }
@@ -140,13 +140,27 @@ const SVG_DANGEROUS_TAG_NAMES = new Set([
   "base",
   "set",
   "animate",
+  "animatecolor",
   "animatetransform",
   "animatemotion",
+  "discard",
+  "link",
   "handler",
   "listener"
 ]);
 
 const SVG_URI_ATTR_NAMES = new Set(["href", "xlink:href", "src", "action", "formaction"]);
+const SVG_URL_REF_ATTR_NAMES = new Set([
+  "fill",
+  "stroke",
+  "filter",
+  "clip-path",
+  "mask",
+  "cursor",
+  "marker-start",
+  "marker-mid",
+  "marker-end"
+]);
 
 function getSvgLocalName(rawName) {
   const lower = String(rawName || "").toLowerCase();
@@ -154,10 +168,10 @@ function getSvgLocalName(rawName) {
   return colonIdx !== -1 ? lower.slice(colonIdx + 1) : lower;
 }
 
-function decodeSvgAttrValue(val) {
+function decodeSvgEntitiesPreserveWs(val) {
   let out = String(val || "");
-  for (let pass = 0; pass < 2; pass += 1) {
-    out = out
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = out
       .replace(/&#x([0-9a-f]+);?/gi, (_, hex) => {
         const cp = Number.parseInt(hex, 16);
         return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
@@ -171,15 +185,32 @@ function decodeSvgAttrValue(val) {
       .replace(/&newline;/gi, "\n")
       .replace(/&quot;/gi, '"')
       .replace(/&apos;/gi, "'")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
       .replace(/&amp;/gi, "&");
+    if (next === out) break;
+    out = next;
   }
-  return out.replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
+  return out;
+}
+
+function escapeSvgAttrValue(val) {
+  return String(val || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function decodeSvgAttrValue(val) {
+  return decodeSvgEntitiesPreserveWs(val).replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
 }
 
 function isDangerousSvgUri(rawVal) {
   const normVal = decodeSvgAttrValue(rawVal);
   if (!normVal) return false;
-  if (/^(?:javascript|vbscript|file|filesystem):/i.test(normVal)) return true;
+  if (/^(?:javascript|vbscript|blob|file|filesystem):/i.test(normVal)) return true;
   if (normVal.startsWith("data:")) {
     return !/^data:image\/(?:png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,]/i.test(normVal);
   }
@@ -187,38 +218,66 @@ function isDangerousSvgUri(rawVal) {
 }
 
 function unescapeCssText(css) {
-  return decodeSvgAttrValue(css).replace(/\\([0-9a-f]{1,6})\s?|\\([^\n\r])/gi, (_, hex, ch) => {
+  const entitiesDecoded = decodeSvgEntitiesPreserveWs(css)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\\(?:\r\n|[\n\r\f])/g, "");
+  const cssDecoded = entitiesDecoded.replace(/\\([0-9a-f]{1,6})[\t\n\f\r ]?|\\([^\n\r\f])/gi, (_, hex, ch) => {
     if (ch) return ch;
     const cp = Number.parseInt(hex, 16);
     return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : "";
   });
+  return cssDecoded.replace(/[\u0000-\u0020\u007f]+/g, "").toLowerCase();
 }
 
-function sanitizeSvgStyleBlock(css) {
-  let safe = String(css || "")
+const DANGEROUS_CSS_RESIDUAL_RE =
+  /(?:javascript|vbscript|blob|file|filesystem):|data:(?!image\/(?:png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,])|expression\(|-moz-binding|behavior:|@import/i;
+
+function sanitizeSvgStyleBlock(css, { forStyleTag = false } = {}) {
+  let safe = decodeSvgEntitiesPreserveWs(css)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\\(?:\r\n|[\n\r\f])/g, "")
     .replace(/@import\b[^;]*(?:;|$)/gi, "")
     .replace(/expression\s*\([^)]*\)/gi, "")
     .replace(/(?:-moz-binding|behavior)\s*:[^;}]*/gi, "");
 
-  safe = safe.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi, (full, q1, q2, bare) => {
+  safe = safe.replace(/url\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi, (full, q1, q2, bare) => {
     const raw = q1 ?? q2 ?? bare ?? "";
     const decodedCss = unescapeCssText(raw);
-    if (isDangerousSvgUri(decodedCss) || /^(?:javascript|vbscript|file|filesystem|data\s*:(?!image\/(?:png|jpeg|jpg|gif|webp|avif|bmp)\b))/i.test(decodedCss)) {
+    if (
+      isDangerousSvgUri(decodedCss) ||
+      /^(?:javascript|vbscript|blob|file|filesystem):|^data:(?!image\/(?:png|jpeg|jpg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)[;,])/i.test(
+        decodedCss
+      )
+    ) {
       return "url(#)";
     }
     return full;
   });
 
-  if (/(?:javascript|vbscript)\s*:|expression\s*\(|-moz-binding|@import/i.test(unescapeCssText(safe))) {
-    safe = safe.replace(/\\([0-9a-f]{1,6}\s?|.)/gi, "");
+  if (DANGEROUS_CSS_RESIDUAL_RE.test(unescapeCssText(safe))) {
+    safe = safe.replace(/\\(?:\r\n|[\n\r\f])|\\([0-9a-f]{1,6}[\t\n\f\r ]?|.)/gi, "");
     safe = safe
       .replace(/@import\b[^;]*(?:;|$)/gi, "")
       .replace(/expression\s*\([^)]*\)/gi, "")
       .replace(/(?:-moz-binding|behavior)\s*:[^;}]*/gi, "")
-      .replace(/(?:javascript|vbscript)\s*:/gi, "");
+      .replace(/url\s*\(\s*(?:"([^"]*)"|'([^']*)'|([^)]*))\s*\)/gi, (full, q1, q2, bare) => {
+        const raw = q1 ?? q2 ?? bare ?? "";
+        const decodedCss = unescapeCssText(raw);
+        if (isDangerousSvgUri(decodedCss)) return "url(#)";
+        return full;
+      })
+      .replace(/(?:javascript|vbscript|blob|file|filesystem)\s*:/gi, "");
+    if (DANGEROUS_CSS_RESIDUAL_RE.test(unescapeCssText(safe))) {
+      return "";
+    }
+  }
+  if (forStyleTag) {
+    safe = safe.replace(/&/g, "&amp;").replace(/</g, "");
   }
   return safe;
 }
+
+const VALID_SVG_ATTR_NAME_RE = /^[a-zA-Z_:][a-zA-Z0-9._:-]*$/;
 
 function sanitizeSvgOpeningTag(tagSource) {
   // Parse tag name and attributes sequentially (handling quotes and slash separators)
@@ -256,7 +315,7 @@ function sanitizeSvgOpeningTag(tagSource) {
       break;
     }
     const attrStart = i;
-    while (i < len && !/[\s=/>]/.test(tagSource[i])) i += 1;
+    while (i < len && !/[\s=/>"']/.test(tagSource[i])) i += 1;
     const attrName = tagSource.slice(attrStart, i);
     if (!attrName) {
       i += 1;
@@ -285,6 +344,9 @@ function sanitizeSvgOpeningTag(tagSource) {
       }
     }
 
+    if (!VALID_SVG_ATTR_NAME_RE.test(attrName)) {
+      continue;
+    }
     const attrLower = attrName.toLowerCase();
     const attrLocal = getSvgLocalName(attrLower);
     if (attrLower.startsWith("on") || attrLocal.startsWith("on")) {
@@ -297,6 +359,21 @@ function sanitizeSvgOpeningTag(tagSource) {
     ) {
       keptAttrs.push(`${attrName}="#"`);
       continue;
+    }
+    if (rawAttrVal !== null && (attrLocal === "style" || SVG_URL_REF_ATTR_NAMES.has(attrLocal))) {
+      const needsStyleSanitize =
+        attrLocal === "style" ||
+        /url\s*\(/i.test(decodeSvgEntitiesPreserveWs(rawAttrVal)) ||
+        /url\s*\(/i.test(unescapeCssText(rawAttrVal));
+      if (needsStyleSanitize) {
+        const cleanedAttrVal = escapeSvgAttrValue(sanitizeSvgStyleBlock(rawAttrVal));
+        if (quote) {
+          keptAttrs.push(`${attrName}=${quote}${cleanedAttrVal}${quote}`);
+        } else {
+          keptAttrs.push(`${attrName}="${cleanedAttrVal}"`);
+        }
+        continue;
+      }
     }
     if (rawAttrVal === null) {
       keptAttrs.push(attrName);
@@ -334,6 +411,7 @@ export function sanitizeSvgMarkup(svgMarkup) {
     let i = 0;
     const len = input.length;
     let skipDepthTag = null;
+    let skipDepthCount = 0;
 
     while (i < len) {
       const lt = input.indexOf("<", i);
@@ -349,7 +427,17 @@ export function sanitizeSvgMarkup(svgMarkup) {
         i = endComment === -1 ? len : endComment + 3;
         continue;
       }
-      if (/^<!(?:doctype|entity)/i.test(input.slice(lt, lt + 12))) {
+      if (input.startsWith("<?", lt)) {
+        const endPi = input.indexOf("?>", lt + 2);
+        i = endPi === -1 ? len : endPi + 2;
+        continue;
+      }
+      if (input.startsWith("<![CDATA[", lt)) {
+        const endCdata = input.indexOf("]]>", lt + 9);
+        i = endCdata === -1 ? len : endCdata + 3;
+        continue;
+      }
+      if (/^<!(?:doctype|entity|attlist|element|notation)/i.test(input.slice(lt, lt + 14))) {
         let j = lt + 2;
         let q = "";
         let bracketDepth = 0;
@@ -404,8 +492,17 @@ export function sanitizeSvgMarkup(svgMarkup) {
       const parsed = sanitizeSvgOpeningTag(rawTag);
 
       if (skipDepthTag) {
-        if (parsed.isClose && (parsed.tagLocal === skipDepthTag || parsed.tagLower === skipDepthTag)) {
-          skipDepthTag = null;
+        const sameSkipTag = parsed.tagLocal === skipDepthTag || parsed.tagLower === skipDepthTag;
+        if (sameSkipTag) {
+          if (parsed.isClose) {
+            skipDepthCount -= 1;
+            if (skipDepthCount <= 0) {
+              skipDepthTag = null;
+              skipDepthCount = 0;
+            }
+          } else if (!parsed.isSelfClosing) {
+            skipDepthCount += 1;
+          }
         }
         i = j;
         continue;
@@ -414,6 +511,7 @@ export function sanitizeSvgMarkup(svgMarkup) {
       if (parsed.removed) {
         if (!parsed.isClose && !parsed.isSelfClosing) {
           skipDepthTag = parsed.tagLocal || parsed.tagLower;
+          skipDepthCount = 1;
         }
         i = j;
         continue;
@@ -423,7 +521,7 @@ export function sanitizeSvgMarkup(svgMarkup) {
         const restAfterStyle = input.slice(j);
         const closeStyleMatch = /<\/(?:[a-z0-9_-]+:)?style\s*>/i.exec(restAfterStyle);
         const cssBody = closeStyleMatch ? restAfterStyle.slice(0, closeStyleMatch.index) : restAfterStyle;
-        out.push(parsed.html, sanitizeSvgStyleBlock(cssBody), `</${parsed.tagName}>`);
+        out.push(parsed.html, sanitizeSvgStyleBlock(cssBody, { forStyleTag: true }), `</${parsed.tagName}>`);
         i = closeStyleMatch ? j + closeStyleMatch.index + closeStyleMatch[0].length : len;
         continue;
       }
@@ -483,8 +581,10 @@ export function buildSafeImageDataUrl(
   { mimeResolver = getImageMimeType, budgetCheck = null } = {}
 ) {
   if (!entry) return null;
-  const targetPath = entry.path || refPath || "";
+  const rawTargetPath = entry.path || refPath || "";
+  const targetPath = String(rawTargetPath).split(/[?#]/)[0];
   const ext = getFileExtension(targetPath);
+  const resolvedMime = mimeResolver(targetPath);
   const rawB64 =
     typeof entry.base64 === "string" && entry.base64.length > 0
       ? entry.base64
@@ -494,7 +594,7 @@ export function buildSafeImageDataUrl(
   const compactB64 = typeof rawB64 === "string" ? rawB64.replace(/\s+/g, "") : "";
   const safeB64 = compactB64 && PREVIEW_BASE64_RE.test(compactB64) ? compactB64 : null;
 
-  if (ext === "svg") {
+  if (ext === "svg" || resolvedMime === "image/svg+xml") {
     let svgText = typeof entry.content === "string" && entry.content.trim().length > 0 && !entry.isBinary
       ? entry.content
       : "";

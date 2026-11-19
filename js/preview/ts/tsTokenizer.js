@@ -47,6 +47,8 @@ export const MODIFIER_KEYWORDS = new Set([
   "declare"
 ]);
 
+export const FOUR_CHAR_OPS = new Set([">>>="]);
+
 export const THREE_CHAR_OPS = new Set([
   "===",
   "!==",
@@ -83,9 +85,44 @@ export const TWO_CHAR_OPS = new Set([
   "::"
 ]);
 
-export function canStartRegex(prevToken) {
+const UNICODE_ID_START_RE = /[\p{ID_Start}$_]/u;
+const UNICODE_ID_CONT_RE = /[\p{ID_Continue}$\u200c\u200d]/u;
+
+function isIdentStartChar(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  if (code <= 127) {
+    return (
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      code === 95 ||
+      code === 36
+    );
+  }
+  return UNICODE_ID_START_RE.test(ch);
+}
+
+function isIdentContinueChar(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  if (code <= 127) {
+    return (
+      (code >= 65 && code <= 90) ||
+      (code >= 97 && code <= 122) ||
+      (code >= 48 && code <= 57) ||
+      code === 95 ||
+      code === 36
+    );
+  }
+  return UNICODE_ID_CONT_RE.test(ch);
+}
+
+export function canStartRegex(prevToken, prevWasProp = false) {
   if (!prevToken) return true;
-  if (prevToken.type === "ident") return EXPR_BEFORE_REGEX_KEYWORDS.has(prevToken.value);
+  if (prevToken.type === "template_head" || prevToken.type === "template_mid") return true;
+  if (prevToken.type === "ident") {
+    return !prevWasProp && EXPR_BEFORE_REGEX_KEYWORDS.has(prevToken.value);
+  }
   if (prevToken.type === "punct") {
     return (
       prevToken.value !== ")" &&
@@ -103,7 +140,13 @@ export function tokenize(source) {
   const len = source.length;
   let i = 0;
   let lastSig = null;
+  let lastSigWasProp = false;
   const tmplBraceStack = [];
+
+  const setLastSig = (tok, wasProp = false) => {
+    lastSig = tok;
+    lastSigWasProp = wasProp;
+  };
 
   function scanTemplatePiece(isHead) {
     let val = isHead ? "`" : "}";
@@ -118,23 +161,26 @@ export function tokenize(source) {
       if (ch === "`") {
         val += "`";
         i += 1;
-        tokens.push({ type: isHead ? "template_full" : "template_tail", value: val });
-        lastSig = tokens[tokens.length - 1];
+        const tok = { type: isHead ? "template_full" : "template_tail", value: val };
+        tokens.push(tok);
+        setLastSig(tok, false);
         return;
       }
       if (ch === "$" && source[i + 1] === "{") {
         val += "${";
         i += 2;
-        tokens.push({ type: isHead ? "template_head" : "template_mid", value: val });
-        lastSig = tokens[tokens.length - 1];
+        const tok = { type: isHead ? "template_head" : "template_mid", value: val };
+        tokens.push(tok);
+        setLastSig(tok, false);
         tmplBraceStack.push(0);
         return;
       }
       val += ch;
       i += 1;
     }
-    tokens.push({ type: isHead ? "template_full" : "template_tail", value: val });
-    lastSig = tokens[tokens.length - 1];
+    const tok = { type: isHead ? "template_full" : "template_tail", value: val };
+    tokens.push(tok);
+    setLastSig(tok, false);
   }
 
   while (i < len) {
@@ -181,7 +227,7 @@ export function tokenize(source) {
       }
       const tok = { type: "string", value: source.slice(i, j) };
       tokens.push(tok);
-      lastSig = tok;
+      setLastSig(tok, false);
       i = j;
       continue;
     }
@@ -191,7 +237,7 @@ export function tokenize(source) {
       continue;
     }
 
-    if (ch === "/" && canStartRegex(lastSig)) {
+    if (ch === "/" && canStartRegex(lastSig, lastSigWasProp)) {
       let j = i + 1;
       let inClass = false;
       let closed = false;
@@ -214,7 +260,7 @@ export function tokenize(source) {
       if (closed) {
         const tok = { type: "regex", value: source.slice(i, j) };
         tokens.push(tok);
-        lastSig = tok;
+        setLastSig(tok, false);
         i = j;
         continue;
       }
@@ -250,7 +296,7 @@ export function tokenize(source) {
         let sawExp = false;
         j += 1;
         while (j < len && /[0-9_]/.test(source[j])) j += 1;
-        if (!sawDot && source[j] === "." && !/[A-Za-z_$]/.test(source[j + 1] || "")) {
+        if (!sawDot && source[j] === "." && !isIdentStartChar(source[j + 1] || "")) {
           sawDot = true;
           j += 1;
           while (j < len && /[0-9_]/.test(source[j])) j += 1;
@@ -267,27 +313,35 @@ export function tokenize(source) {
       }
       const tok = { type: "number", value: source.slice(i, j) };
       tokens.push(tok);
-      lastSig = tok;
+      setLastSig(tok, false);
       i = j;
       continue;
     }
 
-    if (/[A-Za-z_$]/.test(ch)) {
+    if (isIdentStartChar(ch)) {
       let j = i + 1;
-      while (j < len && /[A-Za-z0-9_$]/.test(source[j])) j += 1;
+      while (j < len && isIdentContinueChar(source[j])) j += 1;
       const tok = { type: "ident", value: source.slice(i, j) };
+      const wasProp = Boolean(lastSig && lastSig.type === "punct" && (lastSig.value === "." || lastSig.value === "?."));
       tokens.push(tok);
-      lastSig = tok;
+      setLastSig(tok, wasProp);
       i = j;
       continue;
     }
 
+    const quad = source.slice(i, i + 4);
     const tri = source.slice(i, i + 3);
     const duo = source.slice(i, i + 2);
-    const op = THREE_CHAR_OPS.has(tri) ? tri : TWO_CHAR_OPS.has(duo) ? duo : ch;
+    const op = FOUR_CHAR_OPS.has(quad)
+      ? quad
+      : THREE_CHAR_OPS.has(tri)
+        ? tri
+        : TWO_CHAR_OPS.has(duo)
+          ? duo
+          : ch;
     const tok = { type: "punct", value: op };
     tokens.push(tok);
-    lastSig = tok;
+    setLastSig(tok, false);
     i += op.length;
   }
 

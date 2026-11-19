@@ -2,10 +2,8 @@ import { hydrateIcons } from "./ui/icons.js";
 import { initLayoutController } from "./ui/layout.js";
 import { initSymbolBar } from "./ui/symbolBar.js";
 import { generateDuplicatePath, initExplorerController } from "./ui/explorerController.js";
-import { buildZipBlob, downloadZip } from "./storage/zipExporter.js";
 import { initDiffModal } from "./ui/diffModal.js";
 import { initProjectModal } from "./ui/projectModal.js";
-import { initLivePreviewModal } from "./ui/livePreviewModal.js";
 import { initQuickOpenModal } from "./ui/quickOpenModal.js";
 import { initGlobalSearchModal } from "./ui/globalSearchModal.js";
 import { initSettingsModal } from "./ui/settingsModal.js";
@@ -18,7 +16,6 @@ import {
 } from "./editor/editorManager.js";
 import { createSplitEditorController } from "./editor/splitEditorController.js";
 import { createBinaryPreview } from "./ui/binaryPreview.js";
-import { formatCode } from "./editor/codeFormatter.js";
 import { initChatController } from "./ai/chatController.js";
 import { initGithubController } from "./github/githubController.js";
 import {
@@ -115,7 +112,20 @@ async function initApp() {
     // Continuar con el arranque normal si falla la lectura de respaldo
   }
 
-  const layout = initLayoutController();
+  let chat = null;
+  let explorer = null;
+  let lastRightPanelVisible = null;
+  const layout = initLayoutController({
+    onLeftPanelVisibilityChange(visible) {
+      if (visible) {
+        void explorer?.refreshStorageIndicator?.();
+      }
+    },
+    onRightPanelVisibilityChange(visible) {
+      lastRightPanelVisible = Boolean(visible);
+      chat?.setPanelVisible?.(visible);
+    }
+  });
   const diffModal = initDiffModal();
 
   const tabStripEl = document.getElementById("editor-tabs");
@@ -183,8 +193,6 @@ async function initApp() {
 
   /** @type {ReturnType<typeof createSplitEditorController> | null} */
   let splitController = null;
-  let chat = null;
-  let explorer = null;
   let github = null;
   let settingsModal = null;
   let statusBar = null;
@@ -832,6 +840,7 @@ async function initApp() {
       try {
         await autosaveManager.flushPendingSaves();
         if (selectSeq !== pendingProjectSelectSeq || activeProject?.id !== removedId) return;
+        chat?.abortProjectStream?.(removedId);
         await deleteProject(removedId);
         projects = await listProjects();
         if (selectSeq !== pendingProjectSelectSeq) return;
@@ -967,6 +976,8 @@ async function initApp() {
             content: f.content || ""
           };
         });
+        const { buildZipBlob, downloadZip } = await import("./storage/zipExporter.js");
+        if (activeProject?.id !== sourceProjectId) return;
         const zipBlob = buildZipBlob(zipFiles);
         const projectName = (activeProject?.name || "proyecto").replace(/[/\\?%*:|"<>]/g, "-");
         downloadZip(zipBlob, `${projectName}.zip`);
@@ -1078,49 +1089,89 @@ async function initApp() {
     }
   });
 
-  const livePreviewModal = initLivePreviewModal({
-    getWorkspaceSnapshot() {
-      return {
-        files: filesOnly,
-        activeFileId,
-        projectId: activeProject?.id || null
-      };
-    },
-    async ensureFileLoaded(fileOrPath) {
-      const target = typeof fileOrPath === "string"
-        ? filesOnly.find((f) => normalizePath(f.path) === normalizePath(fileOrPath))
-        : fileOrPath;
-      if (target) {
-        await githubLazySync.ensureFileContentLoaded(target);
-      }
-      return target;
-    },
-    async ensureFilesLoaded(fileList) {
-      if (!Array.isArray(fileList) || fileList.length === 0) return;
-      const targets = fileList
-        .map((f) =>
-          typeof f === "string"
-            ? filesOnly.find((item) => normalizePath(item.path) === normalizePath(f))
-            : f
-        )
-        .filter(Boolean);
-      await githubLazySync.ensureFilesLoaded(targets);
-    },
-    onErrorMarker(lineNum, errorMessage) {
-      editor?.addErrorMarker?.(lineNum, errorMessage);
-    },
-    onClearErrorMarkers() {
-      editor?.clearErrorMarkers?.();
-    },
-    onGoToLine(lineNum) {
-      editor?.goToLine?.(lineNum);
-    },
-    async onBeforePreview() {
-      await autosaveManager.flushPendingSaves();
-      const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
-      await githubLazySync.preloadForPreview(activeFile);
+  let livePreviewInstance = null;
+  let livePreviewInitPromise = null;
+  let appDestroyed = false;
+
+  function ensureLivePreviewModal() {
+    if (livePreviewInstance) return Promise.resolve(livePreviewInstance);
+    if (!livePreviewInitPromise) {
+      livePreviewInitPromise = import("./ui/livePreviewModal.js")
+        .then(({ initLivePreviewModal }) => {
+          if (appDestroyed) return null;
+          livePreviewInstance = initLivePreviewModal({
+            bindOpenButton: false,
+            getWorkspaceSnapshot() {
+              return {
+                files: filesOnly,
+                activeFileId,
+                projectId: activeProject?.id || null
+              };
+            },
+            async ensureFileLoaded(fileOrPath) {
+              const target = typeof fileOrPath === "string"
+                ? filesOnly.find((f) => normalizePath(f.path) === normalizePath(fileOrPath))
+                : fileOrPath;
+              if (target) {
+                await githubLazySync.ensureFileContentLoaded(target);
+              }
+              return target;
+            },
+            async ensureFilesLoaded(fileList) {
+              if (!Array.isArray(fileList) || fileList.length === 0) return;
+              const targets = fileList
+                .map((f) =>
+                  typeof f === "string"
+                    ? filesOnly.find((item) => normalizePath(item.path) === normalizePath(f))
+                    : f
+                )
+                .filter(Boolean);
+              await githubLazySync.ensureFilesLoaded(targets);
+            },
+            onErrorMarker(lineNum, errorMessage) {
+              editor?.addErrorMarker?.(lineNum, errorMessage);
+            },
+            onClearErrorMarkers() {
+              editor?.clearErrorMarkers?.();
+            },
+            onGoToLine(lineNum) {
+              editor?.goToLine?.(lineNum);
+            },
+            async onBeforePreview() {
+              await autosaveManager.flushPendingSaves();
+              const activeFile = activeFileId ? filesOnly.find((f) => f.id === activeFileId) : null;
+              await githubLazySync.preloadForPreview(activeFile);
+            },
+            onClosePreview() {
+              githubLazySync.cancelPreviewPreload();
+            }
+          });
+          return livePreviewInstance;
+        })
+        .catch((err) => {
+          livePreviewInitPromise = null;
+          throw err;
+        });
     }
-  });
+    return livePreviewInitPromise;
+  }
+
+  const livePreviewModal = {
+    async openPreview() {
+      const inst = await ensureLivePreviewModal();
+      if (inst && !appDestroyed) {
+        await inst.openPreview();
+      }
+    },
+    destroy() {
+      livePreviewInstance?.destroy?.();
+      livePreviewInstance = null;
+    }
+  };
+
+  document.getElementById("btn-live-preview")?.addEventListener("click", () => {
+    void livePreviewModal.openPreview();
+  }, appListenOpts);
 
   function inferFallbackFilename(rawLang) {
     const clean = String(rawLang || "").trim().toLowerCase();
@@ -1178,6 +1229,7 @@ async function initApp() {
 
   chat = initChatController({
     getContextSnapshot,
+    initialPanelVisible: lastRightPanelVisible ?? undefined,
     async onResolveFileContent(targetPath) {
       const sourceProjectId = activeProject?.id;
       const norm = normalizePath(String(targetPath || "").trim());
@@ -1609,12 +1661,22 @@ async function initApp() {
     onFocusMain: () => editor.focus()
   });
 
-  function formatActiveDocument() {
+  let codeFormatterModPromise = null;
+  async function formatActiveDocument() {
     if (!activeFileId) return;
-    const target = filesOnly.find((f) => f.id === activeFileId);
+    const targetFileId = activeFileId;
+    const target = filesOnly.find((f) => f.id === targetFileId);
     if (!target || target.contentLoaded === false || isBinaryFile(target)) return;
     const current = editor.getValue();
     const lang = target.lang || inferFileMeta(target.path).lang;
+    if (!codeFormatterModPromise) {
+      codeFormatterModPromise = import("./editor/codeFormatter.js").catch((err) => {
+        codeFormatterModPromise = null;
+        throw err;
+      });
+    }
+    const { formatCode } = await codeFormatterModPromise;
+    if (appDestroyed || activeFileId !== targetFileId || editor.getValue() !== current) return;
     const result = formatCode(current, lang);
     if (!result.ok) {
       explorer.setAutosaveStatus(result.error);
@@ -1628,12 +1690,12 @@ async function initApp() {
     explorer.setAutosaveStatus("Documento formateado (Cmd/Ctrl+Z para deshacer)");
   }
 
-  keyboardRouter.registerGlobalShortcut("alt+shift+f", () => formatActiveDocument());
+  keyboardRouter.registerGlobalShortcut("alt+shift+f", () => void formatActiveDocument());
 
   btnUndo?.addEventListener("click", () => editor.triggerUndo(), appListenOpts);
   btnRedo?.addEventListener("click", () => editor.triggerRedo(), appListenOpts);
   btnSearch?.addEventListener("click", () => editor.triggerSearch(), appListenOpts);
-  btnFormat?.addEventListener("click", () => formatActiveDocument(), appListenOpts);
+  btnFormat?.addEventListener("click", () => void formatActiveDocument(), appListenOpts);
   btnWrap?.addEventListener("click", () => {
     statusBar.syncWordWrapPressed(editor.toggleWordWrap());
   }, appListenOpts);
@@ -1651,6 +1713,7 @@ async function initApp() {
 
   async function switchProject(projectId) {
     const seq = ++switchProjectSeq;
+    githubLazySync.cancelPreviewPreload();
     const nextProj = await getProject(projectId);
     if (!nextProj || seq !== switchProjectSeq) return;
 
@@ -1909,10 +1972,13 @@ async function initApp() {
 
   return {
     destroy() {
+      appDestroyed = true;
       appListeners?.abort();
+      keyboardRouter?.unregisterGlobalShortcut?.("alt+shift+f");
       broadcastSync?.destroy?.();
       closeWorkspaceBroadcast();
       autosaveManager?.destroy?.();
+      tabManager?.destroy?.();
       statusBar?.destroy?.();
       splitController?.destroy?.();
       symbolBar?.destroy?.();
@@ -1927,6 +1993,7 @@ async function initApp() {
       globalSearchModal?.destroy?.();
       settingsModal?.destroy?.();
       livePreviewModal?.destroy?.();
+      githubLazySync?.cancelPreviewPreload?.();
       layout?.destroy?.();
       keyboardRouter?.destroy?.();
     }

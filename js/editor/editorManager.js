@@ -21,6 +21,94 @@ export {
 } from "./autocompleteCatalog.js";
 
 const MAX_IDENT_SLICE_CHARS = 120000;
+const MAX_LIVE_LINT_CHARS = 350000;
+
+const CM_LANG_IMPORTERS = {
+  cpp: () => import("@codemirror/lang-cpp").then((m) => m?.cpp ?? null),
+  html: () => import("@codemirror/lang-html").then((m) => m?.html ?? null),
+  css: () => import("@codemirror/lang-css").then((m) => m?.css ?? null),
+  javascript: () => import("@codemirror/lang-javascript").then((m) => m?.javascript ?? null),
+  python: () => import("@codemirror/lang-python").then((m) => m?.python ?? null),
+  markdown: () => import("@codemirror/lang-markdown").then((m) => m?.markdown ?? null),
+  json: () => import("@codemirror/lang-json").then((m) => m?.json ?? null),
+  sql: () => import("@codemirror/lang-sql").then((m) => m?.sql ?? null)
+};
+const loadedLangFactories = new Map();
+const pendingLangFactories = new Map();
+
+function resolveLangKeyForFile(lang) {
+  switch (lang) {
+    case "python":
+      return "python";
+    case "markdown":
+      return "markdown";
+    case "text":
+      return null;
+    case "json":
+      return "json";
+    case "rust":
+    case "go":
+    case "java":
+    case "csharp":
+    case "cpp":
+    case "c":
+      return "cpp";
+    case "html":
+      return "html";
+    case "css":
+      return "css";
+    case "sql":
+      return "sql";
+    case "ts":
+    case "tsx":
+    case "js":
+    default:
+      return "javascript";
+  }
+}
+
+function buildLoadedLangExtension(lang) {
+  const key = resolveLangKeyForFile(lang);
+  if (!key) return [];
+  const factory = loadedLangFactories.get(key);
+  if (typeof factory === "function") {
+    return lang === "ts" || lang === "tsx"
+      ? factory({ typescript: true, jsx: true })
+      : factory();
+  }
+  if (key === "json") {
+    const jsFactory = loadedLangFactories.get("javascript");
+    if (typeof jsFactory === "function") return jsFactory();
+  }
+  return [];
+}
+
+function ensureLangFactoryLoaded(lang) {
+  const key = resolveLangKeyForFile(lang);
+  if (!key || loadedLangFactories.has(key)) {
+    return Promise.resolve(loadedLangFactories.get(key) ?? null);
+  }
+  if (pendingLangFactories.has(key)) {
+    return pendingLangFactories.get(key);
+  }
+  const importer = CM_LANG_IMPORTERS[key];
+  if (!importer) return Promise.resolve(null);
+  const promise = importer()
+    .then((factory) => {
+      pendingLangFactories.delete(key);
+      if (typeof factory === "function") {
+        loadedLangFactories.set(key, factory);
+        return factory;
+      }
+      return null;
+    })
+    .catch(() => {
+      pendingLangFactories.delete(key);
+      return null;
+    });
+  pendingLangFactories.set(key, promise);
+  return promise;
+}
 
 /**
  * Helper compartido para procesar ediciones de documento desde el editor principal y el Split View,
@@ -159,7 +247,7 @@ export async function createEditorManager({
   let activeFileId = null;
 
   applyFontSize(fontSize);
-  applyHardwareKeyboardAttributes(hardwareKeyboard);
+  applyHardwareKeyboardAttributes(hardwareKeyboard, null, !isSplitInstance);
 
   let cm = null;
   try {
@@ -192,6 +280,7 @@ export async function createEditorManager({
   const {
     EditorState,
     Compartment,
+    Transaction,
     EditorView,
     keymap,
     lineNumbers,
@@ -216,12 +305,10 @@ export async function createEditorManager({
     openSearchPanel,
     autocompletion,
     completionKeymap,
-    completeAnyWord,
     acceptCompletion,
     closeBrackets,
     closeBracketsKeymap,
     tags,
-    langs,
     StateEffect,
     StateField,
     Decoration
@@ -229,11 +316,13 @@ export async function createEditorManager({
 
   const wrapCompartment = new Compartment();
   const contentAttrsCompartment = new Compartment();
+  const languageCompartment = new Compartment();
   const statesByFile = new Map();
   const MAX_CACHED_STATES = isSplitInstance ? 4 : 15;
   const stateCompartmentPrefs = new WeakMap();
+  let isDestroyed = false;
 
-  function setCachedState(fileId, state) {
+  function setCachedState(fileId, state, prefs = { wordWrap, hardwareKeyboard }) {
     if (!fileId || !state) return;
     if (statesByFile.has(fileId)) {
       statesByFile.delete(fileId);
@@ -246,7 +335,40 @@ export async function createEditorManager({
       }
     }
     statesByFile.set(fileId, state);
-    stateCompartmentPrefs.set(state, { wordWrap, hardwareKeyboard });
+    if (prefs) {
+      stateCompartmentPrefs.set(state, prefs);
+    }
+  }
+
+  function hydrateLanguageForFile(fileId, lang) {
+    const key = resolveLangKeyForFile(lang);
+    if (!key || loadedLangFactories.has(key)) return;
+    void ensureLangFactoryLoaded(lang).then((factory) => {
+      if (isDestroyed || typeof factory !== "function") return;
+      const ext = buildLoadedLangExtension(lang);
+      if (activeFileId === fileId && view) {
+        const prevPrefs = stateCompartmentPrefs.get(view.state) || { wordWrap, hardwareKeyboard };
+        try {
+          view.dispatch({ effects: languageCompartment.reconfigure(ext) });
+          stateCompartmentPrefs.set(view.state, prevPrefs);
+          if (statesByFile.has(fileId)) {
+            statesByFile.set(fileId, view.state);
+          }
+        } catch (_) {
+          /* vista destruida o estado ya reemplazado */
+        }
+      } else if (statesByFile.has(fileId)) {
+        const cached = statesByFile.get(fileId);
+        const prevPrefs = stateCompartmentPrefs.get(cached) || null;
+        try {
+          const updated = cached.update({ effects: languageCompartment.reconfigure(ext) }).state;
+          statesByFile.set(fileId, updated);
+          if (prevPrefs) stateCompartmentPrefs.set(updated, prevPrefs);
+        } catch (_) {
+          /* estado ya evictado */
+        }
+      }
+    });
   }
 
   function getCachedState(fileId) {
@@ -360,10 +482,13 @@ export async function createEditorManager({
   function scheduleLiveLint(targetFileId = activeFileId, delayMs = LIVE_LINT_DEBOUNCE_MS) {
     cancelLiveLint();
     if (!targetFileId || !isLiveLintablePath(targetFileId)) return;
+    if (typeof document !== "undefined" && document.hidden) return;
     const seq = liveLintSeq;
     liveLintTimer = setTimeout(async () => {
       liveLintTimer = null;
       if (seq !== liveLintSeq || targetFileId !== activeFileId || !view) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      if (view.state.doc.length > MAX_LIVE_LINT_CHARS) return;
       const docText = view.state.doc.toString();
       try {
         const issues = await lintDocument(targetFileId, docText);
@@ -377,15 +502,38 @@ export async function createEditorManager({
 
   function setLiveMarkers(fileId, issues = []) {
     if (!fileId || fileId !== activeFileId) return;
-    errorMarkers.clearFile(fileId);
-    if (view && clearErrorEffect) {
-      view.dispatch({ effects: clearErrorEffect.of(null) });
-    }
+    const normalized = [];
     if (Array.isArray(issues)) {
       for (const issue of issues) {
         if (!issue || !(issue.line > 0)) continue;
-        addErrorMarker(issue.line, issue.message || "Error de sintaxis", { jumpToLine: false });
+        normalized.push({
+          lineNum: Math.max(1, parseInt(issue.line, 10) || 1),
+          errorMessage: String(issue.message || "Error de sintaxis")
+        });
       }
+    }
+
+    const prevMarkers = errorMarkers.getMarkers(fileId);
+    if (
+      prevMarkers.length === normalized.length &&
+      prevMarkers.every((m, idx) => m.lineNum === normalized[idx].lineNum && m.errorMessage === normalized[idx].errorMessage)
+    ) {
+      return;
+    }
+
+    errorMarkers.clearFile(fileId);
+    const effects = [];
+    if (clearErrorEffect) {
+      effects.push(clearErrorEffect.of(null));
+    }
+    for (const item of normalized) {
+      const { marker } = errorMarkers.addMarker(fileId, item.lineNum, item.errorMessage);
+      if (addErrorEffect) {
+        effects.push(addErrorEffect.of({ lineNum: marker.lineNum, errorMessage: marker.errorMessage }));
+      }
+    }
+    if (view && effects.length > 0) {
+      view.dispatch({ effects });
     }
     syncErrorRuler(view?.state?.doc?.lines || 1);
   }
@@ -529,6 +677,7 @@ export async function createEditorManager({
   }
 
   function refreshAutocompleteBar(state) {
+    if (!enableAutocomplete) return;
     if (!state) {
       autocompleteBar.hide();
       return;
@@ -574,41 +723,10 @@ export async function createEditorManager({
     };
   }
 
-  function resolveLanguageExtension(lang) {
-    switch (lang) {
-      case "python":
-        return langs.python ? langs.python() : [];
-      case "markdown":
-        return langs.markdown ? langs.markdown() : [];
-      case "text":
-        return [];
-      case "json":
-        return langs.json ? langs.json() : langs.javascript();
-      case "rust":
-      case "go":
-      case "java":
-      case "csharp":
-      case "cpp":
-      case "c":
-        return langs.cpp ? langs.cpp() : [];
-      case "html":
-        return langs.html ? langs.html() : [];
-      case "css":
-        return langs.css ? langs.css() : [];
-      case "sql":
-        return langs.sql ? langs.sql() : [];
-      case "ts":
-      case "tsx":
-        return langs.javascript ? langs.javascript({ typescript: true, jsx: true }) : [];
-      case "js":
-      default:
-        return langs.javascript ? langs.javascript() : [];
-    }
-  }
-
   function buildEditorState(file) {
     const spaces = getIndentSize(file.lang);
     const indentStr = " ".repeat(spaces);
+    const langExt = buildLoadedLangExtension(file.lang);
 
     return EditorState.create({
       doc: file.content,
@@ -621,46 +739,54 @@ export async function createEditorManager({
         indentOnInput(),
         bracketMatching(),
         closeBrackets(),
-        autocompletion({
-          activateOnTyping: true,
-          icons: false,
-          override: [createCmCompletionSource(file.lang), completeAnyWord].filter(Boolean)
-        }),
+        ...(enableAutocomplete
+          ? [
+              autocompletion({
+                activateOnTyping: true,
+                icons: false,
+                override: [createCmCompletionSource(file.lang)]
+              })
+            ]
+          : []),
         history(),
         search({ top: true }),
         EditorState.tabSize.of(spaces),
         indentUnit.of(indentStr),
         wrapCompartment.of(wordWrap ? EditorView.lineWrapping : []),
         contentAttrsCompartment.of(buildCmContentAttrsExtension(hardwareKeyboard)),
-        resolveLanguageExtension(file.lang),
+        languageCompartment.of(langExt),
         syntaxHighlighting(studioHighlightStyle),
         studioBaseTheme,
         ...(errorMarkerField ? [errorMarkerField] : []),
         keymap.of([
-          {
-            key: "Tab",
-            run(v) {
-              if (typeof acceptCompletion === "function" && acceptCompletion(v)) {
-                autocompleteBar.hide();
-                return true;
-              }
-              if (autocompleteBar.isOpen() && autocompleteBar.acceptCurrent()) {
-                return true;
-              }
-              return false;
-            }
-          },
-          {
-            key: "Escape",
-            run() {
-              if (autocompleteBar.isOpen()) {
-                autocompleteBar.hide();
-                return true;
-              }
-              return false;
-            }
-          },
-          ...completionKeymap,
+          ...(enableAutocomplete
+            ? [
+                {
+                  key: "Tab",
+                  run(v) {
+                    if (typeof acceptCompletion === "function" && acceptCompletion(v)) {
+                      autocompleteBar.hide();
+                      return true;
+                    }
+                    if (autocompleteBar.isOpen() && autocompleteBar.acceptCurrent()) {
+                      return true;
+                    }
+                    return false;
+                  }
+                },
+                {
+                  key: "Escape",
+                  run() {
+                    if (autocompleteBar.isOpen()) {
+                      autocompleteBar.hide();
+                      return true;
+                    }
+                    return false;
+                  }
+                },
+                ...completionKeymap
+              ]
+            : []),
           ...closeBracketsKeymap,
           ...defaultKeymap,
           ...searchKeymap,
@@ -672,15 +798,15 @@ export async function createEditorManager({
           if (update.docChanged && activeFileId && !isSyncingExternal) {
             onDocChange(activeFileId, update.state.doc.toString());
             minimap?.render();
-            refreshAutocompleteBar(update.state);
+            if (enableAutocomplete) refreshAutocompleteBar(update.state);
             if (isLiveLintablePath(activeFileId)) {
               scheduleLiveLint(activeFileId);
             }
           } else if (update.docChanged && isSyncingExternal) {
             minimap?.render();
-            autocompleteBar.hide();
+            if (enableAutocomplete) autocompleteBar.hide();
           } else if (update.selectionSet && !update.docChanged) {
-            autocompleteBar.hide();
+            if (enableAutocomplete) autocompleteBar.hide();
           }
           if (update.selectionSet || update.docChanged) {
             emitSelection(update.state);
@@ -771,6 +897,7 @@ export async function createEditorManager({
     } else {
       cancelLiveLint();
     }
+    hydrateLanguageForFile(file.id, activeLang);
   }
 
   function purgeViewDocument() {
@@ -807,10 +934,19 @@ export async function createEditorManager({
     onSelectionChange({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
   }
 
-  function dropFileState(fileId) {
+  function dropFileState(fileId, isFolder = false) {
     statesByFile.delete(fileId);
-    errorMarkers.dropFile(fileId);
-    if (docVocabFileId === fileId) {
+    errorMarkers.dropFile(fileId, isFolder);
+    const folderPrefix = isFolder && typeof fileId === "string" && fileId ? `${fileId}/` : null;
+    if (folderPrefix) {
+      for (const cachedKey of [...statesByFile.keys()]) {
+        if (cachedKey.startsWith(folderPrefix)) {
+          statesByFile.delete(cachedKey);
+        }
+      }
+    }
+    const affectsVocab = docVocabFileId === fileId || Boolean(folderPrefix && docVocabFileId?.startsWith(folderPrefix));
+    if (affectsVocab) {
       if (docVocabTimer) {
         clearTimeout(docVocabTimer);
         docVocabTimer = null;
@@ -820,7 +956,8 @@ export async function createEditorManager({
       docVocabDocRef = null;
       docVocabHasComputed = false;
     }
-    if (activeFileId === fileId) {
+    const affectsActive = activeFileId === fileId || Boolean(folderPrefix && activeFileId?.startsWith(folderPrefix));
+    if (affectsActive) {
       cancelLiveLint();
       autocompleteBar.hide();
       clearErrorMarkers();
@@ -834,7 +971,8 @@ export async function createEditorManager({
 
   function renameFileStates(oldPath, newPath, isFolder) {
     if (view && activeFileId) {
-      setCachedState(activeFileId, view.state);
+      const activePrefs = stateCompartmentPrefs.get(view.state) || { wordWrap, hardwareKeyboard };
+      setCachedState(activeFileId, view.state, activePrefs);
     }
 
     errorMarkers.renamePaths(oldPath, newPath, isFolder);
@@ -842,18 +980,18 @@ export async function createEditorManager({
     const updates = [];
     for (const [key, stateVal] of statesByFile.entries()) {
       if (key === oldPath) {
-        updates.push([key, newPath, stateVal]);
+        updates.push([key, newPath, stateVal, stateCompartmentPrefs.get(stateVal) || null]);
       } else if (isFolder && key.startsWith(`${oldPath}/`)) {
-        updates.push([key, `${newPath}${key.slice(oldPath.length)}`, stateVal]);
+        updates.push([key, `${newPath}${key.slice(oldPath.length)}`, stateVal, stateCompartmentPrefs.get(stateVal) || null]);
       }
     }
 
-    for (const [fromKey, toKey, stateVal] of updates) {
+    for (const [fromKey, toKey, stateVal, prevPrefs] of updates) {
       statesByFile.delete(fromKey);
       const oldLang = inferFileMeta(fromKey).lang;
       const newLang = inferFileMeta(toKey).lang;
       if (oldLang === newLang) {
-        setCachedState(toKey, stateVal);
+        setCachedState(toKey, stateVal, prevPrefs);
         continue;
       }
       // Cambió la extensión: reconstruir con el nuevo lenguaje e indentación conservando texto y cursor
@@ -865,14 +1003,18 @@ export async function createEditorManager({
       const head = Math.min(stateVal.selection.main.head, rebuilt.doc.length);
       const anchor = Math.min(stateVal.selection.main.anchor, rebuilt.doc.length);
       setCachedState(toKey, rebuilt.update({ selection: { anchor, head } }).state);
+      hydrateLanguageForFile(toKey, newLang);
     }
 
+    let activeRenamed = false;
     if (activeFileId === oldPath) {
       activeFileId = newPath;
       activeLang = inferFileMeta(newPath).lang;
+      activeRenamed = true;
     } else if (isFolder && activeFileId && activeFileId.startsWith(`${oldPath}/`)) {
       activeFileId = `${newPath}${activeFileId.slice(oldPath.length)}`;
       activeLang = inferFileMeta(activeFileId).lang;
+      activeRenamed = true;
     }
 
     if (view && activeFileId && statesByFile.get(activeFileId) !== view.state) {
@@ -881,6 +1023,15 @@ export async function createEditorManager({
         view.setState(refreshed);
         emitSelection(view.state);
       }
+    }
+
+    if (activeRenamed && activeFileId) {
+      if (isLiveLintablePath(activeFileId)) {
+        scheduleLiveLint(activeFileId, 180);
+      } else {
+        cancelLiveLint();
+      }
+      syncErrorRuler(view?.state?.doc?.lines || 1);
     }
   }
 
@@ -961,34 +1112,30 @@ export async function createEditorManager({
     if (!view) {
       return;
     }
-    const prevLine = preserveCursorLine
-      ? view.state.doc.lineAt(view.state.selection.main.head).number
-      : 1;
-    // Reemplaza todo el rango del documento (from: 0, to: length) en lugar de insertar en el cursor
+    const nextText = String(text ?? "");
+    let targetOffset = 0;
+    if (preserveCursorLine) {
+      const prevLine = view.state.doc.lineAt(view.state.selection.main.head).number;
+      if (prevLine > 1) {
+        let lineNo = 1;
+        let idx = 0;
+        while (lineNo < prevLine) {
+          const nl = nextText.indexOf("\n", idx);
+          if (nl === -1) break;
+          idx = nl + 1;
+          lineNo += 1;
+        }
+        targetOffset = idx;
+      }
+    }
+    // Reemplaza el documento y sitúa el cursor en una única transacción atómica (1 paso de Undo)
     view.dispatch({
-      changes: { from: 0, to: view.state.doc.length, insert: text },
-      selection: { anchor: 0, head: 0 },
+      changes: { from: 0, to: view.state.doc.length, insert: nextText },
+      selection: { anchor: targetOffset, head: targetOffset },
       scrollIntoView: true
     });
-    if (preserveCursorLine && prevLine > 1 && view.state?.doc?.lines) {
-      const clampedLine = Math.max(1, Math.min(prevLine, view.state.doc.lines));
-      const targetLine = view.state.doc.line(clampedLine);
-      view.dispatch({
-        selection: { anchor: targetLine.from, head: targetLine.from },
-        scrollIntoView: true
-      });
-    }
     view.focus();
     emitSelection(view.state);
-  }
-
-  function replaceCode(text, forceWholeDoc = false, contextHint = null) {
-    if (!view) return;
-    if (forceWholeDoc) {
-      replaceEntireDocument(text);
-      return;
-    }
-    replaceSelection(text, contextHint);
   }
 
   function addErrorMarker(lineNum, errorMessage, { jumpToLine = true } = {}) {
@@ -1087,17 +1234,43 @@ export async function createEditorManager({
     if (activeFileId === fileId && view) {
       const cur = view.state.doc.toString();
       if (cur !== newContent) {
+        // Calcular diferencia mínima por prefijo/sufijo para evitar re-parsear todo el AST en Lezer
+        let prefix = 0;
+        const minLen = Math.min(cur.length, newContent.length);
+        while (prefix < minLen && cur.charCodeAt(prefix) === newContent.charCodeAt(prefix)) {
+          prefix += 1;
+        }
+        let curEnd = cur.length;
+        let nextEnd = newContent.length;
+        while (curEnd > prefix && nextEnd > prefix && cur.charCodeAt(curEnd - 1) === newContent.charCodeAt(nextEnd - 1)) {
+          curEnd -= 1;
+          nextEnd -= 1;
+        }
+        const insertedSlice = newContent.slice(prefix, nextEnd);
+        const delta = insertedSlice.length - (curEnd - prefix);
+        const mapPos = (pos) => {
+          if (pos <= prefix) return pos;
+          if (pos >= curEnd) return Math.max(0, Math.min(newContent.length, pos + delta));
+          return Math.min(newContent.length, prefix + insertedSlice.length);
+        };
         const prevMain = view.state.selection.main;
-        const nextAnchor = Math.min(prevMain.anchor, newContent.length);
-        const nextHead = Math.min(prevMain.head, newContent.length);
+        const nextAnchor = mapPos(prevMain.anchor);
+        const nextHead = mapPos(prevMain.head);
+        const spec = {
+          changes: { from: prefix, to: curEnd, insert: insertedSlice },
+          selection: { anchor: nextAnchor, head: nextHead }
+        };
+        if (Transaction?.addToHistory?.of) {
+          spec.annotations = Transaction.addToHistory.of(false);
+        }
         isSyncingExternal = true;
         try {
-          view.dispatch({
-            changes: { from: 0, to: view.state.doc.length, insert: newContent },
-            selection: { anchor: nextAnchor, head: nextHead }
-          });
+          view.dispatch(spec);
         } finally {
           isSyncingExternal = false;
+        }
+        if (isLiveLintablePath(fileId)) {
+          scheduleLiveLint(fileId);
         }
       }
     } else {
@@ -1117,7 +1290,6 @@ export async function createEditorManager({
     insertAtCursor,
     replaceSelection,
     replaceEntireDocument,
-    replaceCode,
     addErrorMarker,
     clearErrorMarkers,
     getErrorMarkers,
@@ -1145,9 +1317,9 @@ export async function createEditorManager({
     },
     acceptTopCompletion: () => autocompleteBar.acceptCurrent(),
     syncDoc,
-    setLiveMarkers,
     focus: () => view?.focus(),
     destroy() {
+      isDestroyed = true;
       cancelLiveLint();
       if (docVocabTimer) {
         clearTimeout(docVocabTimer);
@@ -1194,20 +1366,13 @@ async function loadCodeMirrorModules() {
     import("@codemirror/commands"),
     import("@codemirror/search"),
     import("@codemirror/autocomplete"),
-    import("@lezer/highlight"),
-    import("@codemirror/lang-cpp"),
-    import("@codemirror/lang-html"),
-    import("@codemirror/lang-css"),
-    import("@codemirror/lang-javascript"),
-    import("@codemirror/lang-python").catch(() => null),
-    import("@codemirror/lang-markdown").catch(() => null),
-    import("@codemirror/lang-json").catch(() => null),
-    import("@codemirror/lang-sql")
+    import("@lezer/highlight")
   ]);
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
       reject(new Error("Tiempo de espera agotado al cargar módulos CodeMirror 6."));
     }, 8000);
+    if (typeof timeoutId?.unref === "function") timeoutId.unref();
   });
 
   const [
@@ -1217,15 +1382,7 @@ async function loadCodeMirrorModules() {
     cmdMod,
     searchMod,
     autoMod,
-    hiMod,
-    cppMod,
-    htmlMod,
-    cssMod,
-    jsMod,
-    pyMod,
-    mdMod,
-    jsonMod,
-    sqlMod
+    hiMod
   ] = await Promise.race([loadPromise, timeoutPromise]).finally(() => {
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -1236,6 +1393,7 @@ async function loadCodeMirrorModules() {
   return {
     EditorState: stateMod.EditorState,
     Compartment: stateMod.Compartment,
+    Transaction: stateMod.Transaction ?? null,
     StateEffect: stateMod.StateEffect,
     StateField: stateMod.StateField,
     EditorView: viewMod.EditorView,
@@ -1263,21 +1421,10 @@ async function loadCodeMirrorModules() {
     openSearchPanel: searchMod.openSearchPanel,
     autocompletion: autoMod.autocompletion,
     completionKeymap: autoMod.completionKeymap,
-    completeAnyWord: autoMod.completeAnyWord,
     acceptCompletion: autoMod.acceptCompletion,
     closeBrackets: autoMod.closeBrackets,
     closeBracketsKeymap: autoMod.closeBracketsKeymap,
-    tags: hiMod.tags,
-    langs: {
-      cpp: cppMod.cpp,
-      html: htmlMod.html,
-      css: cssMod.css,
-      javascript: jsMod.javascript,
-      python: pyMod?.python ?? null,
-      markdown: mdMod?.markdown ?? null,
-      json: jsonMod?.json ?? null,
-      sql: sqlMod.sql
-    }
+    tags: hiMod.tags
   };
 }
 

@@ -3,8 +3,10 @@
  * Centraliza codecs y validaciones para evitar duplicación entre almacenamiento, criptografía y GitHub.
  */
 
-const BASE64_CHUNK_SIZE = 8192;
-const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const BASE64_FROM_CHAR_CHUNK = 8192;
+const BASE64_ENCODE_BLOCK_BYTES = 24576; // 3 * 8192: múltiplo exacto de 3 bytes (cero padding intermedio)
+const BASE64_DECODE_BLOCK_CHARS = 32768; // 4 * 8192: múltiplo exacto de 4 chars Base64
+const FLAT_BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 function getBtoa() {
   if (typeof btoa === "function") return btoa;
@@ -21,7 +23,8 @@ function getAtob() {
 }
 
 /**
- * Codifica un buffer binario (Uint8Array) a Base64 estándar por bloques para evitar stack overflow.
+ * Codifica un buffer binario (Uint8Array) a Base64 estándar por bloques para evitar
+ * picos de memoria en cadenas intermedias y stack overflow en Safari/WebKit.
  * @param {Uint8Array | ArrayLike<number>} bytes
  * @returns {string}
  */
@@ -44,16 +47,28 @@ export function bytesToBase64(bytes) {
     throw new Error("Codificador Base64 no disponible en este entorno.");
   }
 
-  let binary = "";
-  for (let i = 0; i < view.length; i += BASE64_CHUNK_SIZE) {
-    const slice = view.subarray(i, i + BASE64_CHUNK_SIZE);
-    binary += String.fromCharCode.apply(null, slice);
+  const encodeSlice = (slice) => {
+    let binary = "";
+    for (let j = 0; j < slice.length; j += BASE64_FROM_CHAR_CHUNK) {
+      const sub = slice.subarray(j, j + BASE64_FROM_CHAR_CHUNK);
+      binary += String.fromCharCode.apply(null, sub);
+    }
+    return btoaFn(binary);
+  };
+
+  if (view.length <= BASE64_ENCODE_BLOCK_BYTES) {
+    return encodeSlice(view);
   }
-  return btoaFn(binary);
+
+  const chunks = [];
+  for (let i = 0; i < view.length; i += BASE64_ENCODE_BLOCK_BYTES) {
+    chunks.push(encodeSlice(view.subarray(i, i + BASE64_ENCODE_BLOCK_BYTES)));
+  }
+  return chunks.join("");
 }
 
 /**
- * Decodifica una cadena Base64 estándar a Uint8Array.
+ * Decodifica una cadena Base64 estándar a Uint8Array por bloques.
  * En modo estricto (`strict = true`, por defecto) lanza Error ante cadenas Base64 corruptas o mal formadas.
  * @param {string} base64
  * @param {{ strict?: boolean }} [options]
@@ -72,7 +87,7 @@ export function base64ToBytes(base64, { strict = true } = {}) {
     return new Uint8Array(0);
   }
 
-  if (!STRICT_BASE64_RE.test(clean)) {
+  if (clean.length % 4 !== 0 || !FLAT_BASE64_RE.test(clean)) {
     if (strict) {
       throw new Error("La cadena Base64 está corrupta o tiene un formato inválido.");
     }
@@ -97,11 +112,15 @@ export function base64ToBytes(base64, { strict = true } = {}) {
   }
 
   try {
-    const binary = atobFn(clean);
-    const len = binary.length;
-    const out = new Uint8Array(len);
-    for (let i = 0; i < len; i += 1) {
-      out[i] = binary.charCodeAt(i);
+    const padding = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
+    const totalLen = (clean.length / 4) * 3 - padding;
+    const out = new Uint8Array(totalLen);
+    let writeOffset = 0;
+    for (let i = 0; i < clean.length; i += BASE64_DECODE_BLOCK_CHARS) {
+      const binary = atobFn(clean.slice(i, i + BASE64_DECODE_BLOCK_CHARS));
+      for (let j = 0; j < binary.length; j += 1) {
+        out[writeOffset++] = binary.charCodeAt(j);
+      }
     }
     return out;
   } catch (err) {

@@ -277,6 +277,9 @@ function findAssignRhsEndOffset(tokens, startIdx, sourceLen) {
     const t = tokens[k];
     if (t.type === "ws" || t.type === "comment") continue;
     if (b === 0 && p === 0 && br === 0) {
+      if (t.type === "template_tail" || t.type === "template_mid") {
+        break;
+      }
       if (t.type === "punct") {
         if (t.value === "?") {
           ternary += 1;
@@ -383,6 +386,27 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
     return scopes[0];
   };
 
+  const tryWrapDestructuringAssignment = (patStart, assignEndIdx, wrapStartOffset) => {
+    const targetNames = [];
+    const targetTokenIdxs = new Set();
+    traverseBindingPattern(tokens, patStart, targetNames, targetTokenIdxs);
+    if (targetTokenIdxs.size === 0) return false;
+    // Descartar declaraciones (const/let/var), parámetros y defaults internos de otro destructuring ya procesado
+    for (const idx of targetTokenIdxs) {
+      if (nonRefTokens.has(idx)) return false;
+    }
+    if (!targetNames.some((name) => liveExportNames.has(name) && !isShadowed(name))) {
+      return false;
+    }
+    const rhsEnd = findAssignRhsEndOffset(tokens, assignEndIdx + 1, code.length);
+    splices.push({ pos: wrapStartOffset, text: "__studioSync(", isStart: true });
+    splices.push({ pos: rhsEnd, text: ")", isStart: false });
+    for (const idx of targetTokenIdxs) {
+      nonRefTokens.add(idx);
+    }
+    return true;
+  };
+
   const popConciseArrowsIfNeeded = (tok, nextBrace, nextParen, nextBracket) => {
     while (scopes.length > 1) {
       const top = scopes[scopes.length - 1];
@@ -471,6 +495,45 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
           } else {
             attachConciseArrowAt.set(afterP, new Set(pNames));
           }
+        } else if (!nonRefTokens.has(i)) {
+          // Métodos computados/privados/clave string/generadores en clases u objetos: `[k](x, [a] = [1]) { ... }`
+          const afterPIsBlock = afterP < tokens.length && tokens[afterP].type === "punct" && tokens[afterP].value === "{";
+          const allowedBeforeBlock =
+            prev &&
+            prev.type === "ident" &&
+            (prev.value === "if" ||
+              prev.value === "while" ||
+              prev.value === "with" ||
+              prev.value === "for" ||
+              prev.value === "switch");
+          const isMethodHeader =
+            afterPIsBlock && !allowedBeforeBlock && (curFrame.kind === "class" || curFrame.kind === "obj");
+          if (isMethodHeader) {
+            const pNames = collectParamNamesAndNonRefs(tokens, i, closeP, nonRefTokens);
+            scopes.push({ kind: "paren", parenDepth: paren, shadows: new Set(pNames) });
+            const closeB = findMatchingBrace(tokens, afterP);
+            const hoists = collectFunctionHoists(tokens, afterP, closeB);
+            attachScopeAtBrace.set(afterP, { kind: "fn", shadows: new Set([...pNames, ...hoists]) });
+          } else {
+            // Destructuring de asignación entre paréntesis: `({ count } = obj)` o `([count] = arr)`
+            const innerStart = skipTrivia(tokens, i + 1);
+            if (
+              innerStart < closeP &&
+              tokens[innerStart].type === "punct" &&
+              (tokens[innerStart].value === "{" || tokens[innerStart].value === "[")
+            ) {
+              const closePat = findMatchingBrace(
+                tokens,
+                innerStart,
+                tokens[innerStart].value,
+                tokens[innerStart].value === "{" ? "}" : "]"
+              );
+              const eqIdx = skipTrivia(tokens, closePat + 1);
+              if (eqIdx < closeP && tokens[eqIdx].type === "punct" && tokens[eqIdx].value === "=") {
+                tryWrapDestructuringAssignment(innerStart, eqIdx, tokens[innerStart].start);
+              }
+            }
+          }
         }
         prevSig = i;
         continue;
@@ -490,6 +553,22 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
       if (t.value === "[") {
         if (curFrame.kind === "obj" && curFrame.braceDepth === brace) {
           curFrame.objKeyExpected = false;
+        }
+        // Destructuring de asignación por arreglo: `[count, b] = [1, 2]`
+        if (
+          !nonRefTokens.has(i) &&
+          (!prev ||
+            prev.type !== "ident" ||
+            LIVE_NON_DECL_PREV.has(prev.value) ||
+            prev.value === "else" ||
+            prev.value === "do") &&
+          (!prev || (prev.value !== "." && prev.value !== "?." && prev.value !== ")" && prev.value !== "]"))
+        ) {
+          const closeBracket = findMatchingBrace(tokens, i, "[", "]");
+          const eqIdx = skipTrivia(tokens, closeBracket + 1);
+          if (eqIdx < tokens.length && tokens[eqIdx].type === "punct" && tokens[eqIdx].value === "=") {
+            tryWrapDestructuringAssignment(i, eqIdx, t.start);
+          }
         }
         bracket += 1;
         prevSig = i;
@@ -789,6 +868,25 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
             if (afterP < tokens.length && tokens[afterP].value === "{") {
               attachScopeAtBrace.set(afterP, { kind: "block", shadows: new Set(fNames) });
             }
+          } else if (
+            scan < closeP &&
+            !(tokens[scan].type === "ident" && tokens[scan].value === "var")
+          ) {
+            // Bucle `for (exportedLet of iterable) { ... }` o `for (exportedLet in obj) { ... }`
+            const lhsNames = [];
+            const lhsEnd = traverseBindingPattern(tokens, scan, lhsNames, null);
+            const opIdx = skipTrivia(tokens, lhsEnd);
+            if (
+              opIdx < closeP &&
+              tokens[opIdx].type === "ident" &&
+              (tokens[opIdx].value === "of" || tokens[opIdx].value === "in") &&
+              lhsNames.some((name) => liveExportNames.has(name) && !isShadowed(name))
+            ) {
+              const afterP = skipTrivia(tokens, closeP + 1);
+              if (afterP < tokens.length && tokens[afterP].type === "punct" && tokens[afterP].value === "{") {
+                splices.push({ pos: tokens[afterP].end, text: " __studioNotify(exports);", isStart: false });
+              }
+            }
           }
         }
         prevSig = i;
@@ -843,15 +941,15 @@ function rewriteLiveExportWritesInCode(code, liveExportNames) {
 
       if (!prevIsBreakCont && !isLabel) {
         if (prev && (prev.value === "++" || prev.value === "--") && !isAsiBoundary(tokens, prevSig, i)) {
-          splices.push({ pos: prev.start, text: "(__studioSync(", isStart: true });
-          splices.push({ pos: t.end, text: "))", isStart: false });
+          splices.push({ pos: prev.start, text: "__studioSync(", isStart: true });
+          splices.push({ pos: t.end, text: ")", isStart: false });
         } else if (nextTok && (nextTok.value === "++" || nextTok.value === "--") && !isAsiBoundary(tokens, i, n1Idx)) {
-          splices.push({ pos: t.start, text: "(__studioSync(", isStart: true });
-          splices.push({ pos: nextTok.end, text: "))", isStart: false });
+          splices.push({ pos: t.start, text: "__studioSync(", isStart: true });
+          splices.push({ pos: nextTok.end, text: ")", isStart: false });
         } else if (nextTok && LIVE_ASSIGN_OPS.has(nextTok.value)) {
           const rhsEnd = findAssignRhsEndOffset(tokens, n1Idx + 1, code.length);
-          splices.push({ pos: t.start, text: "(__studioSync(", isStart: true });
-          splices.push({ pos: rhsEnd, text: "))", isStart: false });
+          splices.push({ pos: t.start, text: "__studioSync(", isStart: true });
+          splices.push({ pos: rhsEnd, text: ")", isStart: false });
         }
       }
     }
@@ -906,6 +1004,24 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
   let prevSig = -1;
   let hasTopLevelAwait = false;
   const fnBraceDepthStack = [];
+  const conciseArrowStack = [];
+  const STMT_POP_KEYWORDS = new Set([
+    "const",
+    "let",
+    "var",
+    "function",
+    "class",
+    "if",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "try",
+    "export",
+    "import",
+    "return",
+    "throw"
+  ]);
 
   const depExpr = (spec) => {
     const dep = resolveDep(spec);
@@ -919,7 +1035,31 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
     const t = tokens[i];
     if (t.type === "ws" || t.type === "comment") continue;
 
+    while (conciseArrowStack.length > 0) {
+      const top = conciseArrowStack[conciseArrowStack.length - 1];
+      const sameDepth = brace === top.brace && paren === top.paren && bracket === top.bracket;
+      if (
+        brace < top.brace ||
+        paren < top.paren ||
+        bracket < top.bracket ||
+        (sameDepth && t.type === "punct" && (t.value === "," || t.value === ";")) ||
+        (sameDepth && t.type === "ident" && STMT_POP_KEYWORDS.has(t.value))
+      ) {
+        conciseArrowStack.pop();
+      } else {
+        break;
+      }
+    }
+
     if (t.type === "punct") {
+      if (t.value === "=>") {
+        const afterArrow = skipTrivia(tokens, i + 1);
+        if (afterArrow >= tokens.length || tokens[afterArrow].value !== "{") {
+          conciseArrowStack.push({ brace, paren, bracket });
+        }
+        prevSig = i;
+        continue;
+      }
       if (t.value === "{") {
         brace += 1;
         if (prevSig >= 0) {
@@ -942,7 +1082,8 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
               beforeOpen >= 0 &&
               (tokens[beforeOpen].value === "function" ||
                 tokens[beforeOpen].type === "ident" ||
-                tokens[beforeOpen].value === "*")
+                tokens[beforeOpen].value === "*" ||
+                tokens[beforeOpen].value === "]")
             ) {
               const bTok = tokens[beforeOpen].value;
               if (bTok !== "if" && bTok !== "while" && bTok !== "for" && bTok !== "switch" && bTok !== "catch" && bTok !== "with") {
@@ -968,6 +1109,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
       t.type === "ident" &&
       t.value === "await" &&
       fnBraceDepthStack.length === 0 &&
+      conciseArrowStack.length === 0 &&
       (prevSig < 0 || tokens[prevSig].value !== ".")
     ) {
       const n1 = skipTrivia(tokens, i + 1);
@@ -976,7 +1118,7 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
       }
     }
 
-    // Dynamic `import("./local")` y `import.meta` a cualquier profundidad
+    // Dynamic `import("./local" [, { with: ... }])` y `import.meta` a cualquier profundidad
     if (t.type === "ident" && t.value === "import" && (prevSig < 0 || tokens[prevSig].value !== ".")) {
       const n1 = skipTrivia(tokens, i + 1);
       if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === ".") {
@@ -992,10 +1134,14 @@ export function rewriteEsModuleToRegistry(jsCode, resolveDep, options = {}) {
       }
       if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === "(") {
         const argIdx = skipTrivia(tokens, n1 + 1);
-        const closeP = skipTrivia(tokens, argIdx + 1);
+        const afterArg = skipTrivia(tokens, argIdx + 1);
+        const closeP = findMatchingBrace(tokens, n1, "(", ")");
         if (
           argIdx < tokens.length &&
           tokens[argIdx].type === "string" &&
+          afterArg < tokens.length &&
+          tokens[afterArg].type === "punct" &&
+          (tokens[afterArg].value === ")" || tokens[afterArg].value === ",") &&
           closeP < tokens.length &&
           tokens[closeP].type === "punct" &&
           tokens[closeP].value === ")"

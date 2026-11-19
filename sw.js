@@ -1,4 +1,4 @@
-const SHELL_CACHE = "studio-ide-shell-v32";
+const SHELL_CACHE = "studio-ide-shell-v33";
 const RUNTIME_CACHE = "studio-ide-runtime-v2";
 const CORE_SHELL_URLS = new Set(["./", "./index.html", "./manifest.json", "./js/app.js"]);
 const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";

@@ -44,14 +44,14 @@ export function createFallbackEditor({
   textarea.autocapitalize = "off";
   textarea.autocomplete = "off";
   textarea.setAttribute("aria-label", "Editor de código");
-  applyHardwareKeyboardAttributes(hardwareKeyboard, textarea);
+  applyHardwareKeyboardAttributes(hardwareKeyboard, textarea, !isSplitInstance);
   textarea.wrap = wordWrap ? "soft" : "off";
   if (mountEl) {
     mountEl.innerHTML = "";
     mountEl.appendChild(textarea);
   }
 
-  // Caché ligero de líneas para el minimapa del fallback, invalidado al mutar `textarea.value`
+  // Caché ligero de líneas para navegación/errores y muestreo directo sin split masivo para el minimapa
   let cachedLineText = null;
   let cachedLines = [];
   function getFallbackLines() {
@@ -63,11 +63,37 @@ export function createFallbackEditor({
     return cachedLines;
   }
 
+  function sampleFallbackDocLines(maxSamples) {
+    const val = textarea ? textarea.value : "";
+    const len = val.length;
+    if (!len) return { totalLines: 1, samples: [] };
+    let totalLines = 1;
+    for (let pos = val.indexOf("\n"); pos !== -1; pos = val.indexOf("\n", pos + 1)) {
+      totalLines += 1;
+    }
+    const targetSamples = Math.max(1, Math.min(totalLines, Number(maxSamples) || 200));
+    const step = totalLines > targetSamples * 2 ? Math.max(1, Math.floor(totalLines / targetSamples)) : 1;
+    const samples = [];
+    let lineIdx = 0;
+    let lineStart = 0;
+    while (lineStart <= len) {
+      const nlIdx = val.indexOf("\n", lineStart);
+      const lineEnd = nlIdx === -1 ? len : nlIdx;
+      if (lineIdx % step === 0) {
+        const textEnd = lineEnd > lineStart && val.charCodeAt(lineEnd - 1) === 13 ? lineEnd - 1 : lineEnd;
+        samples.push({ index: lineIdx, text: val.slice(lineStart, textEnd) });
+      }
+      if (nlIdx === -1) break;
+      lineStart = nlIdx + 1;
+      lineIdx += 1;
+    }
+    return { totalLines, samples };
+  }
+
   const fallbackMinimap = enableMinimap
     ? createMinimapController({
         mountEl: minimapParent || mountEl,
-        getLineCount: () => getFallbackLines().length,
-        getLine: (index) => getFallbackLines()[index] || "",
+        sampleDocLines: sampleFallbackDocLines,
         getViewport: () => {
           if (textarea) {
             return {
@@ -109,6 +135,7 @@ export function createFallbackEditor({
   });
 
   function refreshFallbackAutocomplete() {
+    if (!enableAutocomplete) return;
     const start = textarea.selectionStart ?? 0;
     const end = textarea.selectionEnd ?? 0;
     if (start !== end) {
@@ -204,6 +231,7 @@ export function createFallbackEditor({
     if (activeFileId) {
       onDocChange(activeFileId, textarea.value);
     }
+    fallbackMinimap?.render();
     refreshFallbackAutocomplete();
     emitSel();
   }
@@ -335,9 +363,12 @@ export function createFallbackEditor({
       fallbackMinimap?.updateSlider();
       onSelectionChange?.({ text: "", lineCount: 0, cursorLine: 1, cursorCol: 1 });
     },
-    dropFileState(fileId) {
-      errorMarkers.dropFile(fileId);
-      if (activeFileId === fileId) {
+    dropFileState(fileId, isFolder = false) {
+      errorMarkers.dropFile(fileId, isFolder);
+      const affectsActive =
+        activeFileId === fileId ||
+        Boolean(isFolder && typeof fileId === "string" && fileId && activeFileId?.startsWith(`${fileId}/`));
+      if (affectsActive) {
         activeFileId = null;
         textarea.value = "";
         fallbackAutocompleteBar.hide();
@@ -370,13 +401,6 @@ export function createFallbackEditor({
     insertAtCursor: insertInTextarea,
     replaceSelection,
     replaceEntireDocument,
-    replaceCode(text, forceWholeDoc = false, contextHint = null) {
-      if (forceWholeDoc) {
-        replaceEntireDocument(text);
-      } else {
-        replaceSelection(text, contextHint);
-      }
-    },
     addErrorMarker(lineNum, errorMessage) {
       const { marker } = errorMarkers.addMarker(activeFileId, lineNum, errorMessage);
       const lines = getFallbackLines();
@@ -442,7 +466,17 @@ export function createFallbackEditor({
     syncDoc: (fileId, newContent) => {
       if (activeFileId === fileId && textarea) {
         if (textarea.value !== newContent) {
+          const prevStart = Math.min(textarea.selectionStart ?? 0, newContent.length);
+          const prevEnd = Math.min(textarea.selectionEnd ?? prevStart, newContent.length);
+          const prevScrollTop = textarea.scrollTop;
           textarea.value = newContent;
+          try {
+            textarea.setSelectionRange(prevStart, prevEnd);
+          } catch (_) {
+            /* entorno sin soporte */
+          }
+          textarea.scrollTop = prevScrollTop;
+          fallbackMinimap?.render();
         }
       }
     },

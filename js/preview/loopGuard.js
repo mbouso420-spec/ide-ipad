@@ -78,9 +78,9 @@ export function instrumentLoops(code, acorn, { module = false } = {}) {
     return { code: source, loops: 0, instrumented: false };
   }
 
-  const guardCallee = hasGlobalThisShadow
-    ? (module ? "self.__studioLoopGuard" : "__studioLoopGuard")
-    : (hasShadowRisk ? "globalThis.__studioLoopGuard" : "__studioLoopGuard");
+  const guardCallee = hasShadowRisk
+    ? (hasGlobalThisShadow ? (module ? "self.__studioLoopGuard" : "window.__studioLoopGuard") : "globalThis.__studioLoopGuard")
+    : "__studioLoopGuard";
   /** @type {Array<{ pos: number, text: string }>} */
   const edits = [];
   for (const item of loopsList) {
@@ -129,10 +129,49 @@ export function buildLoopGuardRuntime(limitMs = LOOP_GUARD_LIMIT_MS) {
   var limit = ${numericLimit};
   var lastFree = _now();
   var tripped = false;
-  var guardTimerId = _setInterval ? _setInterval(function () {
+  var ticks = 0;
+  var guardTimerId = null;
+  var startGuardTimer = function () {
+    if (!_setInterval || guardTimerId !== null) return;
     lastFree = _now();
     tripped = false;
-  }, 100) : null;
+    ticks = 0;
+    guardTimerId = _setInterval(function () {
+      lastFree = _now();
+      tripped = false;
+      ticks = 0;
+    }, 100);
+  };
+  var stopGuardTimer = function () {
+    if (guardTimerId !== null && _clearInterval) {
+      try { _clearInterval(guardTimerId); } catch (_) {}
+      guardTimerId = null;
+    }
+  };
+  if (typeof document === "undefined" || !document.hidden) {
+    startGuardTimer();
+  }
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) {
+        stopGuardTimer();
+      } else {
+        startGuardTimer();
+      }
+    });
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("pageshow", function () {
+      lastFree = _now();
+      tripped = false;
+      ticks = 0;
+      if (typeof document === "undefined" || !document.hidden) {
+        startGuardTimer();
+      }
+    });
+    window.addEventListener("pagehide", stopGuardTimer);
+    window.addEventListener("unload", stopGuardTimer);
+  }
   var isGuardTimerId = function (id) {
     if (guardTimerId === null || guardTimerId === undefined) return false;
     if (id === guardTimerId) return true;
@@ -163,10 +202,11 @@ export function buildLoopGuardRuntime(limitMs = LOOP_GUARD_LIMIT_MS) {
     var original = window[name];
     if (typeof original !== "function") return;
     window[name] = function () {
-      try { return original.apply(window, arguments); } finally { lastFree = _now(); tripped = false; }
+      try { return original.apply(window, arguments); } finally { lastFree = _now(); tripped = false; ticks = 0; }
     };
   });
   var __guardFn = function (line) {
+    if (!tripped && (ticks++ & 31) !== 0) return;
     if (tripped || _now() - lastFree > limit) {
       var msg = "Bucle detenido en la línea " + line + ": la página quedó bloqueada más de ${formattedSeconds} s (posible bucle infinito). Se cortó para que el iPad no se congele.";
       if (!tripped) {

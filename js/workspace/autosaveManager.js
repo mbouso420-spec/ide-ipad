@@ -3,9 +3,21 @@ import {
   writeEmergencyBackup,
   getTabInstanceId
 } from "../storage/emergencyBackup.js";
+import { evictCleanGithubCache } from "../storage/storageQuota.js";
 import { readStoredValue } from "../utils/storage.js";
 
 const AUTOSAVE_STORAGE_KEY = "studio_autosave_delay";
+
+function isQuotaError(err) {
+  if (!err) return false;
+  return (
+    err.name === "QuotaExceededError" ||
+    err.name === "NS_ERROR_DOM_QUOTA_REACHED" ||
+    err.code === 22 ||
+    err.code === 1014 ||
+    /quota/i.test(String(err.message || ""))
+  );
+}
 
 /**
  * Administra temporizadores de autoguardado por archivo, volcado síncrono de emergencia
@@ -86,7 +98,30 @@ export function createAutosaveManager({
           // Continuar intentando persistir la versión más reciente
         }
       }
-      await updateFileContent(item.projectId, item.filePath, item.content);
+      try {
+        await updateFileContent(item.projectId, item.filePath, item.content);
+      } catch (saveErr) {
+        if (isQuotaError(saveErr)) {
+          let freed = 0;
+          try {
+            const targetBytes = Math.max(512 * 1024, String(item.content || "").length * 4);
+            const evictResult = await evictCleanGithubCache({
+              excludeProjectId: item.projectId,
+              targetBytes
+            });
+            freed = evictResult?.evictedCount || 0;
+          } catch {
+            freed = 0;
+          }
+          if (freed > 0) {
+            await updateFileContent(item.projectId, item.filePath, item.content);
+          } else {
+            throw saveErr;
+          }
+        } else {
+          throw saveErr;
+        }
+      }
       if (saveTimers.get(key) === item) {
         saveTimers.delete(key);
       }
@@ -134,7 +169,7 @@ export function createAutosaveManager({
         await refreshTopbarBadge?.();
       } catch (err) {
         if (destroyed) return;
-        const isQuota = err && err.name === "QuotaExceededError";
+        const isQuota = isQuotaError(err);
         setAutosaveStatus?.(
           isQuota ? "Error: Almacenamiento local lleno" : "Error al guardar en IndexedDB"
         );
@@ -170,7 +205,7 @@ export function createAutosaveManager({
       await refreshTopbarBadge?.();
       return true;
     } catch (err) {
-      const isQuota = err && err.name === "QuotaExceededError";
+      const isQuota = isQuotaError(err);
       setAutosaveStatus?.(
         isQuota
           ? "Almacenamiento lleno (QuotaExceededError). Exportá tu proyecto o liberá espacio."
@@ -180,7 +215,7 @@ export function createAutosaveManager({
     }
   }
 
-  async function flushPendingSaves() {
+  async function flushPendingSaves({ skipUiRefresh = false } = {}) {
     if (saveTimers.size === 0 && inFlightByKey.size === 0) return true;
     const entries = [...saveTimers.entries()];
     const flushedProjectIds = new Set();
@@ -199,7 +234,7 @@ export function createAutosaveManager({
           flushedProjectIds.add(item.projectId);
         } catch (err) {
           hadError = true;
-          if (err && err.name === "QuotaExceededError") {
+          if (isQuotaError(err)) {
             hadQuotaError = true;
           }
           failedProjectIds.add(item.projectId);
@@ -231,8 +266,10 @@ export function createAutosaveManager({
     }
     if (saveTimers.size === 0 && !destroyed) {
       setAutosaveStatus?.("Autoguardado en IndexedDB");
-      refreshStorageIndicator?.();
-      await refreshTopbarBadge?.();
+      if (!skipUiRefresh) {
+        refreshStorageIndicator?.();
+        await refreshTopbarBadge?.();
+      }
     }
     return true;
   }
@@ -260,7 +297,7 @@ export function createAutosaveManager({
     if (isFlushingBackup) return;
     isFlushingBackup = true;
     const currentPid = getActiveProjectId?.() || null;
-    void flushPendingSaves()
+    void flushPendingSaves({ skipUiRefresh: true })
       .then((ok) => {
         if (ok && saveTimers.size === 0 && storage) {
           if (currentPid) {

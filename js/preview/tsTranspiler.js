@@ -17,7 +17,10 @@ function transpileCore(source, jsx, fileName) {
     const jsxRes = expandJsxInSource(working, fileName, (expr, fn) => transpileCore(expr, false, fn));
     working = jsxRes.code;
     usedJsx = jsxRes.usedJsx;
-  } else if (SIMPLE_JS_EXPR_RE.test(working) && !/\b(?:as|satisfies)\b/.test(working)) {
+  } else if (
+    SIMPLE_JS_EXPR_RE.test(working) &&
+    !/\b(?:as|satisfies|import|export|declare|interface|type|enum|abstract|namespace|module)\b/.test(working)
+  ) {
     return { code: working, usedJsx: false };
   }
   const tokens = tokenize(working);

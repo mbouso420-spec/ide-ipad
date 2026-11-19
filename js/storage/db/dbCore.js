@@ -15,6 +15,8 @@ export const MAX_STORED_CHAT_TURNS = 40;
 export const MAX_GIST_RESTORE_ENTRY_BYTES = 5 * 1024 * 1024;
 
 const INVALID_PATH_CHARS = /[:*?"<>|\u0000-\u001f\u007f]/;
+const INVALID_REMOTE_CONTROL_CHARS = /[\u0080-\u009f\u2028\u2029]/;
+const FLAT_BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 /**
  * Solicita almacenamiento persistente al navegador (evita el borrado automático tras 7 días en Safari iPadOS).
@@ -174,9 +176,17 @@ const FORBIDDEN_REMOTE_SEGMENTS = new Set(["..", ".", "__proto__", "constructor"
 export function sanitizeRemoteRepoPath(rawPath) {
   if (typeof rawPath !== "string") return "";
   const raw = rawPath.replace(/\\/g, "/").trim().replace(/^\/+/, "");
-  if (!raw || /^[A-Za-z]:\//.test(raw) || INVALID_PATH_CHARS.test(raw)) return "";
+  if (
+    !raw ||
+    raw.includes("::") ||
+    /^[A-Za-z]:\//.test(raw) ||
+    INVALID_PATH_CHARS.test(raw) ||
+    INVALID_REMOTE_CONTROL_CHARS.test(raw)
+  ) {
+    return "";
+  }
   const segs = raw.split("/");
-  if (segs.some((s) => !s || FORBIDDEN_REMOTE_SEGMENTS.has(s) || s.length > 255)) {
+  if (segs.some((s) => !s || s.trim() !== s || FORBIDDEN_REMOTE_SEGMENTS.has(s) || s.length > 255)) {
     return "";
   }
   return segs.join("/");
@@ -188,7 +198,7 @@ export function makeFileKey(projectId, path) {
 
 let dbPromise = null;
 
-export function openDb() {
+function openDb() {
   if (dbPromise) {
     return dbPromise;
   }
@@ -319,42 +329,76 @@ export function resolveEntryBaselineBase64(entry) {
   return entry.trackedInGithub && entry.isBinary ? (entry.base64 ?? null) : null;
 }
 
+export function resolveTxError(ev, tx, fallbackMsg = "Error en transacción de IndexedDB.") {
+  return tx?.error || ev?.target?.error || new Error(fallbackMsg);
+}
+
+/**
+ * Abre una transacción de IndexedDB y ejecuta `setupFn(tx)` sincrónicamente en el mismo turno
+ * (evitando auto-commit en Safari/WebKit). Si la conexión en caché se cerró (`InvalidStateError`),
+ * reabre la base y reintenta una vez automáticamente.
+ * @template T
+ * @param {string|string[]} stores
+ * @param {"readonly"|"readwrite"} mode
+ * @param {(tx: IDBTransaction) => Promise<T>|T} setupFn
+ * @returns {Promise<T>}
+ */
+export async function openDbTransaction(stores, mode, setupFn) {
+  let db = await openDb();
+  let tx;
+  try {
+    tx = db.transaction(stores, mode);
+  } catch (err) {
+    if (err && (err.name === "InvalidStateError" || /closing|closed/i.test(String(err.message || "")))) {
+      dbPromise = null;
+      db = await openDb();
+      tx = db.transaction(stores, mode);
+    } else {
+      throw err;
+    }
+  }
+  return setupFn(tx);
+}
+
 export function getRecord(storeName, key) {
-  return openDb().then(
-    (db) =>
+  return openDbTransaction(
+    storeName,
+    "readonly",
+    (tx) =>
       new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, "readonly");
         const req = tx.objectStore(storeName).get(key);
         req.onsuccess = () => resolve(req.result || null);
-        req.onerror = () => reject(req.error);
-        tx.onerror = () => reject(tx.error);
-        tx.onabort = () => reject(tx.error || new Error("La transacción getRecord se canceló."));
+        req.onerror = (ev) => reject(resolveTxError(ev, tx, "Error leyendo registro en IndexedDB."));
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción getRecord falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción getRecord se canceló."));
       })
   );
 }
 
 export function putRecord(storeName, value) {
-  return openDb().then(
-    (db) =>
+  return openDbTransaction(
+    storeName,
+    "readwrite",
+    (tx) =>
       new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, "readwrite");
         tx.objectStore(storeName).put(value);
         tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error("La transacción putRecord falló."));
-        tx.onabort = () => reject(tx.error || new Error("La transacción putRecord se canceló."));
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción putRecord falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción putRecord se canceló."));
       })
   );
 }
 
 function deleteRecord(storeName, key) {
-  return openDb().then(
-    (db) =>
+  return openDbTransaction(
+    storeName,
+    "readwrite",
+    (tx) =>
       new Promise((resolve, reject) => {
-        const tx = db.transaction(storeName, "readwrite");
         tx.objectStore(storeName).delete(key);
         tx.oncomplete = () => resolve();
-        tx.onerror = () => reject(tx.error || new Error("La transacción deleteRecord falló."));
-        tx.onabort = () => reject(tx.error || new Error("La transacción deleteRecord se canceló."));
+        tx.onerror = (ev) => reject(resolveTxError(ev, tx, "La transacción deleteRecord falló."));
+        tx.onabort = (ev) => reject(resolveTxError(ev, tx, "La transacción deleteRecord se canceló."));
       })
   );
 }
@@ -362,10 +406,9 @@ function deleteRecord(storeName, key) {
 export function isValidBase64String(raw) {
   if (typeof raw !== "string") return false;
   const compact = raw.replace(/\s+/g, "");
-  return (
-    compact.length % 4 === 0 &&
-    /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(compact)
-  );
+  if (compact.length % 4 !== 0) return false;
+  if (compact.length === 0) return true;
+  return FLAT_BASE64_RE.test(compact);
 }
 
 /**

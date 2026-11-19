@@ -64,11 +64,12 @@ export function classifyRemotePullChanges({
   }
 
   const safeUpdatesMap = new Map();
-  const safeDeletions = [];
-  const conflicts = [];
-  const seenConflictPaths = new Set();
+  const safeDeletionsMap = new Map();
+  const conflictsByPath = new Map();
 
   function recordSafeUpdate(path, status, blobSha = null) {
+    if (conflictsByPath.has(path)) return;
+    safeDeletionsMap.delete(path);
     safeUpdatesMap.set(path, {
       path,
       status,
@@ -76,11 +77,25 @@ export function classifyRemotePullChanges({
     });
   }
 
+  function recordSafeDeletion(path) {
+    if (conflictsByPath.has(path) || safeUpdatesMap.has(path)) return;
+    safeDeletionsMap.set(path, { path, status: "removed" });
+  }
+
   function recordConflict(path, remoteStatus, localStatus, blobSha = null) {
-    if (seenConflictPaths.has(path)) return;
-    seenConflictPaths.add(path);
     safeUpdatesMap.delete(path);
-    conflicts.push({
+    safeDeletionsMap.delete(path);
+    const existing = conflictsByPath.get(path);
+    if (existing) {
+      // Si un rename previo marcó la ruta como "removed" y luego se re-creó/modificó en el mismo compare,
+      // actualizar el estado remoto y el blobSha para reflejar el contenido final en HEAD.
+      if (existing.remoteStatus === "removed" && remoteStatus !== "removed") {
+        existing.remoteStatus = remoteStatus;
+        existing.blobSha = blobSha || existing.blobSha || null;
+      }
+      return;
+    }
+    conflictsByPath.set(path, {
       path,
       remoteStatus,
       localStatus,
@@ -102,12 +117,12 @@ export function classifyRemotePullChanges({
         if (localPrev) {
           if (localPrev.status === "deleted") {
             // El origen fue movido en remoto y ya estaba borrado localmente: limpiar el registro sin conflicto.
-            safeDeletions.push({ path: prevPath, status: "removed" });
+            recordSafeDeletion(prevPath);
           } else {
             recordConflict(prevPath, "removed", localPrev.status, null);
           }
         } else if (localEntryByPath.has(prevPath)) {
-          safeDeletions.push({ path: prevPath, status: "removed" });
+          recordSafeDeletion(prevPath);
         }
       }
 
@@ -125,12 +140,12 @@ export function classifyRemotePullChanges({
       if (localPending) {
         if (localPending.status === "deleted") {
           // Ambos borraron el mismo archivo: limpiar registro sin conflicto
-          safeDeletions.push({ path: cleanPath, status: "removed" });
+          recordSafeDeletion(cleanPath);
         } else {
           recordConflict(cleanPath, "removed", localPending.status, null);
         }
       } else {
-        safeDeletions.push({ path: cleanPath, status: "removed" });
+        recordSafeDeletion(cleanPath);
       }
       continue;
     }
@@ -145,6 +160,8 @@ export function classifyRemotePullChanges({
   }
 
   const safeUpdates = Array.from(safeUpdatesMap.values());
+  const safeDeletions = Array.from(safeDeletionsMap.values());
+  const conflicts = Array.from(conflictsByPath.values());
   safeUpdates.sort((a, b) => a.path.localeCompare(b.path));
   safeDeletions.sort((a, b) => a.path.localeCompare(b.path));
   conflicts.sort((a, b) => a.path.localeCompare(b.path));
@@ -295,12 +312,18 @@ export async function buildRemotePullPlan({
 
   if (blobTasks.length > 0) {
     let nextTaskIdx = 0;
+    let poolFailed = false;
     const workerCount = Math.min(PULL_BLOB_CONCURRENCY, blobTasks.length);
     async function blobWorker() {
-      while (nextTaskIdx < blobTasks.length) {
+      while (nextTaskIdx < blobTasks.length && !poolFailed) {
         const task = blobTasks[nextTaskIdx++];
-        const parsed = normalizeFetchedBlob(await fetchBlob(task.blobSha, task.path));
-        task.apply(parsed);
+        try {
+          const parsed = normalizeFetchedBlob(await fetchBlob(task.blobSha, task.path));
+          task.apply(parsed);
+        } catch (err) {
+          poolFailed = true;
+          throw err;
+        }
       }
     }
     await Promise.all(Array.from({ length: workerCount }, () => blobWorker()));

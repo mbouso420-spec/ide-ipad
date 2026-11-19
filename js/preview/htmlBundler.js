@@ -24,8 +24,7 @@ import {
   getFileExtension,
   getParentFolder,
   resolveRelativePath,
-  escapeAttr,
-  escapeHtmlText
+  escapeAttr
 } from "./previewUtils.js";
 import {
   buildExactModuleMap,
@@ -92,7 +91,6 @@ export {
   getParentFolder,
   resolveRelativePath,
   escapeAttr,
-  escapeHtmlText,
   extractModuleDependencyPaths,
   buildStandalonePythonPreview,
   buildMarkdownPreview,
@@ -439,7 +437,7 @@ export function bundleHtmlWithFolderAssets(
           : cleanBase.startsWith("/")
             ? normalizePath(cleanBase.replace(/^\/+/, ""))
             : resolveRelativePath(scopeDir, cleanBase);
-        if (allowParentTraversal || candDir === scopeDir || (scopeDir && candDir.startsWith(`${scopeDir}/`))) {
+        if (allowParentTraversal || !scopeDir || candDir === scopeDir || candDir.startsWith(`${scopeDir}/`)) {
           assetBaseDir = candDir;
         }
       }
@@ -484,8 +482,9 @@ export function bundleHtmlWithFolderAssets(
   let inlinedActiveCss = false;
   const deferredScripts = [];
 
+  const inlineCssContextPath = dir ? `${dir}/__inline__.css` : entryPath;
   let html = maskedHtml.replace(/<style\b([^>]*)>([\s\S]*?)<\/style>/gi, (_fullTag, attrs, cssBody) => {
-    const safeCss = escapeCloseStyle(inlineCssImports(cssBody, entryPath));
+    const safeCss = escapeCloseStyle(inlineCssImports(cssBody, inlineCssContextPath));
     return `<style${attrs}>${safeCss}</style>`;
   });
 
@@ -508,7 +507,9 @@ export function bundleHtmlWithFolderAssets(
 
     addInlinedCssBytes(asset.content.length);
     const safeCss = escapeCloseStyle(inlineCssImports(asset.content, asset.path));
-    return `<style data-source="${escapeAttr(asset.path)}">\n${safeCss}\n</style>`;
+    const mediaVal = readHtmlAttr(tag, "media");
+    const mediaAttr = mediaVal && mediaVal.trim() ? ` media="${escapeAttr(mediaVal.trim())}"` : "";
+    return `<style${mediaAttr} data-source="${escapeAttr(asset.path)}">\n${safeCss}\n</style>`;
   });
 
   if (ensureCssFile && !inlinedActiveCss) {
@@ -550,7 +551,7 @@ export function bundleHtmlWithFolderAssets(
 
   function inlineSrcsetString(rawSrcset, baseDir = dir) {
     if (!rawSrcset || typeof rawSrcset !== "string") return rawSrcset;
-    return rawSrcset.replace(/([^\s,]+)(\s+[^\s,]+)?/g, (match, url, descriptor) => {
+    return rawSrcset.replace(/(data:[^\s,]+,[^\s,]*|[^\s,]+)(\s+[^\s,]+)?/gi, (match, url, descriptor) => {
       const dataUrl = resolveEntryToDataUrl(url, baseDir);
       if (dataUrl) {
         return descriptor ? `${dataUrl}${descriptor}` : dataUrl;
@@ -559,7 +560,7 @@ export function bundleHtmlWithFolderAssets(
     });
   }
 
-  html = html.replace(/<img\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
+  html = html.replace(/<img\b([^>]*?[^-\w>])src\s*=\s*(?:(["'])([^"']+)\2|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
     const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
     if (dataUrl) {
@@ -574,7 +575,7 @@ export function bundleHtmlWithFolderAssets(
     return `srcset=${quote}${inlined}${quote}`;
   });
 
-  html = html.replace(/<(source|video|audio)\b([^>]*?)(?<![-\w])src\s*=\s*(?:(["'])([^"']+)\3|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, tagName, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
+  html = html.replace(/<(source|video|audio)\b([^>]*?[^-\w>])src\s*=\s*(?:(["'])([^"']+)\3|([^\s"'=<>`]+))([^>]*)>/gi, (fullTag, tagName, beforeSrc, quote, quotedSrc, bareSrc, afterSrc) => {
     const rawSrc = quotedSrc || bareSrc || "";
     const dataUrl = resolveEntryToDataUrl(rawSrc);
     if (dataUrl) {

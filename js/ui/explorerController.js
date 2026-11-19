@@ -75,8 +75,26 @@ export function initExplorerController({
   const autosaveLabel = document.getElementById("explorer-autosave-status");
   const storageLabel = document.getElementById("explorer-storage-status");
 
-  async function refreshStorageIndicator() {
+  const STORAGE_REFRESH_TTL_MS = 15000;
+  let lastStorageRefreshAt = 0;
+  let storageRefreshPending = false;
+
+  async function refreshStorageIndicator({ force = false } = {}) {
     if (!storageLabel) return;
+    const isHidden =
+      (typeof document !== "undefined" && document.hidden) ||
+      document.body?.dataset?.leftOpen === "false" ||
+      document.body?.dataset?.zenMode === "true";
+    if (!force && isHidden) {
+      storageRefreshPending = true;
+      return;
+    }
+    const now = Date.now();
+    if (!force && now - lastStorageRefreshAt < STORAGE_REFRESH_TTL_MS) {
+      return;
+    }
+    lastStorageRefreshAt = now;
+    storageRefreshPending = false;
     const est = await getStorageQuotaEstimate();
     if (est.supported && est.usageBytes > 0) {
       storageLabel.textContent = `${est.usageFormatted} usados`;
@@ -86,12 +104,21 @@ export function initExplorerController({
     }
   }
 
-  void refreshStorageIndicator();
+  void refreshStorageIndicator({ force: true });
 
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = controller ? { signal: controller.signal } : undefined;
   const passiveOpts = controller ? { passive: true, signal: controller.signal } : { passive: true };
-  const captureOpts = controller ? { capture: true, signal: controller.signal } : { capture: true };
+  let contextMenuAbortController = null;
+  let renameFocusRaf = 0;
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && storageRefreshPending) {
+        void refreshStorageIndicator();
+      }
+    }, listenOpts);
+  }
 
   /** @type {Set<string>} */
   const collapsedFolders = new Set();
@@ -138,6 +165,10 @@ export function initExplorerController({
   }, listenOpts);
 
   function closeContextMenu() {
+    if (contextMenuAbortController) {
+      contextMenuAbortController.abort();
+      contextMenuAbortController = null;
+    }
     if (contextMenuEl) {
       contextMenuEl.hidden = true;
     }
@@ -152,12 +183,24 @@ export function initExplorerController({
     contextMenuEl.setAttribute("aria-label", "Acciones de archivo o carpeta");
     contextMenuEl.hidden = true;
     document.body.appendChild(contextMenuEl);
+    return contextMenuEl;
+  }
+
+  function attachContextMenuGlobalListeners() {
+    if (contextMenuAbortController) {
+      contextMenuAbortController.abort();
+    }
+    contextMenuAbortController = typeof AbortController === "function" ? new AbortController() : null;
+    const menuSignal = contextMenuAbortController?.signal;
+    const menuOpts = menuSignal ? { signal: menuSignal } : listenOpts;
+    const menuPassiveOpts = menuSignal ? { passive: true, signal: menuSignal } : passiveOpts;
+    const menuCaptureOpts = menuSignal ? { capture: true, signal: menuSignal } : { capture: true };
 
     document.addEventListener("pointerdown", (event) => {
       if (contextMenuEl && !contextMenuEl.hidden && !contextMenuEl.contains(event.target)) {
         closeContextMenu();
       }
-    }, listenOpts);
+    }, menuOpts);
 
     window.addEventListener(
       "keydown",
@@ -168,17 +211,16 @@ export function initExplorerController({
           closeContextMenu();
         }
       },
-      captureOpts
+      menuCaptureOpts
     );
 
-    window.addEventListener("scroll", handleTreeContainerScroll, passiveOpts);
-    window.addEventListener("blur", closeContextMenu, listenOpts);
-
-    return contextMenuEl;
+    window.addEventListener("scroll", handleTreeContainerScroll, menuPassiveOpts);
+    window.addEventListener("blur", closeContextMenu, menuOpts);
   }
 
   function openContextMenu(node, clientX, clientY) {
     const menu = getOrCreateContextMenu();
+    attachContextMenuGlobalListeners();
     menu.innerHTML = "";
 
     const renameItem = document.createElement("button");
@@ -592,6 +634,7 @@ export function initExplorerController({
 
   let lastRemoteRepos = [];
   let currentRenderedProjectId = "";
+  let lastProjectsSignature = null;
 
   function renderProjects(projects, activeProjectId, remoteGithubRepos = null) {
     closeContextMenu();
@@ -616,6 +659,14 @@ export function initExplorerController({
       syncProjectDeleteButton();
     }
     if (!projectSelect) return;
+    const sig =
+      `${activeProjectId}|` +
+      projects.map((p) => `${p.id}:${p.kind}:${p.name}:${p.offlineCached ? 1 : 0}`).join(",") +
+      `|${lastRemoteRepos.map((r) => `${r?.full_name || ""}:${r?.default_branch || ""}`).join(",")}`;
+    if (sig === lastProjectsSignature && projectSelect.value === activeProjectId) {
+      return;
+    }
+    lastProjectsSignature = sig;
     projectSelect.innerHTML = "";
 
     const localProjects = projects.filter((p) => p.kind !== "github");
@@ -722,7 +773,7 @@ export function initExplorerController({
           clearLongPress();
         }
       }
-    }, listenOpts);
+    }, passiveOpts);
 
     treeContainer.addEventListener("pointerup", (event) => {
       clearLongPress();
@@ -1093,9 +1144,15 @@ export function initExplorerController({
 
     form.append(input, okBtn, cancelBtn);
     wrapper.append(form, errEl);
-    window.requestAnimationFrame(() => {
-      input.focus();
-      input.select();
+    if (renameFocusRaf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(renameFocusRaf);
+    }
+    renameFocusRaf = window.requestAnimationFrame(() => {
+      renameFocusRaf = 0;
+      if (input.isConnected !== false) {
+        input.focus();
+        input.select();
+      }
     });
     return wrapper;
   }
@@ -1128,7 +1185,6 @@ export function initExplorerController({
   return {
     renderProjects,
     renderTree,
-    updateSelection,
     setAutosaveStatus,
     setOfflineRepoState,
     refreshStorageIndicator,
@@ -1136,6 +1192,11 @@ export function initExplorerController({
       clearLongPress();
       clearTimeout(activeLongPressResetTimer);
       clearTimeout(pendingProjectDeleteTimer);
+      if (renameFocusRaf && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(renameFocusRaf);
+        renameFocusRaf = 0;
+      }
+      closeContextMenu();
       controller?.abort();
       if (contextMenuEl) {
         contextMenuEl.remove();
@@ -1143,6 +1204,7 @@ export function initExplorerController({
       }
       rowRefsByPath.clear();
       lastStructureSignature = null;
+      lastProjectsSignature = null;
     }
   };
 }

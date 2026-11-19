@@ -1,20 +1,19 @@
 import { icon } from "./icons.js";
 import {
-  getImageMimeType,
   isImageFile,
   MAX_IMPORT_FILE_BYTES
 } from "../storage/fileImport.js";
 import { formatStorageBytes } from "../storage/storageQuota.js";
-import { sanitizeSvgMarkup, safeEncodeURIComponent } from "../preview/previewUtils.js";
+import { sanitizeSvgMarkup, buildSafeImageDataUrl } from "../preview/previewUtils.js";
 
 export { sanitizeSvgMarkup };
 
-const STRICT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+const FLAT_BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
 
 function sanitizeBase64Payload(raw) {
   if (typeof raw !== "string") return null;
-  const compact = raw.replace(/\s+/g, "");
-  if (!compact || compact.length % 4 !== 0 || !STRICT_BASE64_RE.test(compact)) {
+  const compact = /\s/.test(raw) ? raw.replace(/\s+/g, "") : raw;
+  if (!compact || compact.length % 4 !== 0 || !FLAT_BASE64_RE.test(compact)) {
     return null;
   }
   return compact;
@@ -164,9 +163,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
       sizeFormatted = formatStorageBytes(Math.floor((safeBase64.length * 3) / 4));
     }
 
-    const safeSvg = !safeBase64 && ext === "svg" && typeof file.content === "string" && file.content.trim().length > 0
-      ? sanitizeSvgMarkup(file.content)
-      : null;
+    const builtImg = isImg ? buildSafeImageDataUrl(file, file.path) : null;
 
     // Soporte de Drag & Drop sobre la tarjeta
     card.addEventListener("dragover", (event) => {
@@ -203,11 +200,8 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     });
     card.appendChild(fileInput);
 
-    if (isImg && (safeBase64 || safeSvg)) {
-      const mime = getImageMimeType(file.path);
-      const imgSrc = safeBase64
-        ? `data:${mime};base64,${safeBase64}`
-        : `data:image/svg+xml;utf8,${safeEncodeURIComponent(safeSvg)}`;
+    if (isImg && builtImg) {
+      const imgSrc = builtImg.src;
 
       const imgContainer = document.createElement("div");
       imgContainer.className = "editor-binary-image-container";
@@ -249,7 +243,7 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
 
       info.appendChild(meta);
       card.appendChild(info);
-    } else if (isImg && !safeBase64 && !safeSvg) {
+    } else if (isImg && !builtImg) {
       // Imagen vacía: asistente para cargar o pegar imagen
       const mark = document.createElement("div");
       mark.className = "editor-empty-mark";
@@ -328,8 +322,8 @@ export function createBinaryPreview({ binaryPreviewEl, onDownloadFile, onUpdateF
     if (isImg && typeof onUpdateFileContent === "function") {
       const uploadBtn = document.createElement("button");
       uploadBtn.type = "button";
-      uploadBtn.className = (safeBase64 || safeSvg) ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm";
-      uploadBtn.innerHTML = `${icon("upload")} <span>${(safeBase64 || safeSvg) ? "Reemplazar imagen" : "Cargar imagen"}</span>`;
+      uploadBtn.className = builtImg ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm";
+      uploadBtn.innerHTML = `${icon("upload")} <span>${builtImg ? "Reemplazar imagen" : "Cargar imagen"}</span>`;
       uploadBtn.addEventListener("click", () => {
         fileInput.click();
       });

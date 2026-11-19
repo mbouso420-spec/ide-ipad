@@ -15,7 +15,6 @@ import {
   getProviderModels,
   getSavedModel,
   getSavedProviderId,
-  getSyncCredentialsBackupPayload,
   importKeysBundle,
   isAbortError,
   saveApiKey,
@@ -23,17 +22,21 @@ import {
   saveProviderId,
   setKeyStorageMode,
   streamAiCompletion,
+  syncCredentialsBackup,
   validateApiKey
 } from "./providers.js";
 import {
   AuthLockoutError,
   checkAuthLockout,
+  computeTokenFingerprint,
   formatRemainingCooldown,
+  formatSafeErrorMessage,
   maskCredentialPreview,
   redactSensitiveTokens,
   validateCredentialFormat
 } from "../security/credentialGuard.js";
-import { broadcastWorkspaceChange, saveCredentialsBackup } from "../storage/workspaceDb.js";
+import { broadcastWorkspaceChange } from "../storage/workspaceDb.js";
+import { MAX_STORED_CHAT_TURNS } from "../storage/db/dbCore.js";
 import {
   cleanHistoryForAi,
   truncateCodeContent,
@@ -72,7 +75,8 @@ export function initChatController({
   onApplyToFile,
   onApplyMultiFile,
   onConversationChange,
-  onKeysImported
+  onKeysImported,
+  initialPanelVisible
 }) {
   const settingsBtn = document.getElementById("btn-ai-settings");
   const clearChatBtn = document.getElementById("btn-ai-clear-chat");
@@ -119,9 +123,43 @@ export function initChatController({
   let keyCheckController = null;
   let liveModelsController = null;
   let destroyed = false;
+  const chatPanelEl = document.getElementById("panel-assistant") || null;
+  let panelVisible = (() => {
+    if (typeof initialPanelVisible === "boolean") return initialPanelVisible;
+    if (chatPanelEl && chatPanelEl.hidden) return false;
+    const bodyDataset = document.body?.dataset;
+    if (bodyDataset) {
+      if (bodyDataset.zenMode === "true") return false;
+      if (bodyDataset.rightOpen === "false") return false;
+    }
+    return true;
+  })();
+  let deferredKeyValidation = false;
+  let autoScrollPinned = true;
+  let lastHasSelection = null;
   const listenerAbort = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
+  const passiveListenOpts = listenerAbort ? { signal: listenerAbort.signal, passive: true } : { passive: true };
   const streamDomState = new WeakMap();
+
+  scrollBody?.addEventListener?.(
+    "scroll",
+    () => {
+      if (!scrollBody) return;
+      const gap = (scrollBody.scrollHeight || 0) - (scrollBody.scrollTop || 0) - (scrollBody.clientHeight || 0);
+      autoScrollPinned = gap <= 48;
+    },
+    passiveListenOpts
+  );
+
+  function clearImportKeysSlot() {
+    if (!importKeysSlot) return;
+    importKeysSlot.querySelectorAll?.("input")?.forEach((inp) => {
+      inp.value = "";
+    });
+    importKeysSlot.hidden = true;
+    importKeysSlot.innerHTML = "";
+  }
 
   /** @type {Set<string>} */
   const attachedTabIds = new Set();
@@ -180,7 +218,11 @@ export function initChatController({
   populateProviderOptions();
   syncSettingsForm();
   renderConversation();
-  scheduleKeyValidation(activeProviderId, 0, false);
+  if (panelVisible) {
+    scheduleKeyValidation(activeProviderId, 0, false);
+  } else {
+    deferredKeyValidation = true;
+  }
 
   const mentionPopover = createMentionPopover({
     promptInput,
@@ -214,13 +256,17 @@ export function initChatController({
 
   function scheduleKeyValidation(providerId, delayMs, announce) {
     window.clearTimeout(keyCheckTimer);
+    keyCheckTimer = 0;
     keyCheckController?.abort();
     keyCheckController = null;
+    if (destroyed) return;
 
     const lockState = checkAuthLockout(`ai:${providerId}`);
+    const key = getApiKey(providerId);
+    const keyFp = key ? computeTokenFingerprint(`ai:${providerId}`, key) : "";
     if (lockState.locked) {
       keyChecks.set(providerId, {
-        key: getApiKey(providerId),
+        fingerprint: keyFp,
         status: "locked",
         message: `Bloqueo temporal activo (${formatRemainingCooldown(lockState.remainingMs)}) por intentos fallidos.`
       });
@@ -228,11 +274,10 @@ export function initChatController({
       return;
     }
 
-    const key = getApiKey(providerId);
     if (!key) {
       keyChecks.delete(providerId);
       updateModelStrip();
-      if (providerId === "openrouter") {
+      if (providerId === "openrouter" && panelVisible) {
         void syncLiveModelsSilently(providerId);
       }
       return;
@@ -240,7 +285,7 @@ export function initChatController({
 
     const fmt = validateCredentialFormat(providerId, key);
     if (!fmt.valid) {
-      keyChecks.set(providerId, { key, status: "invalid", message: fmt.reason });
+      keyChecks.set(providerId, { fingerprint: keyFp, status: "invalid", message: fmt.reason });
       updateModelStrip();
       if (providerId === activeProviderId && providerHelpEl && announce) {
         providerHelpEl.textContent = fmt.reason;
@@ -249,15 +294,17 @@ export function initChatController({
     }
 
     const previous = keyChecks.get(providerId);
-    if (!announce && previous && previous.key === key && previous.status !== "checking") {
+    if (!announce && previous && previous.fingerprint === keyFp && previous.status !== "checking") {
       updateModelStrip();
       return;
     }
 
-    keyChecks.set(providerId, { key, status: "checking", message: "" });
+    keyChecks.set(providerId, { fingerprint: keyFp, status: "checking", message: "" });
     updateModelStrip();
 
     keyCheckTimer = window.setTimeout(async () => {
+      keyCheckTimer = 0;
+      if (destroyed) return;
       const controller = new AbortController();
       keyCheckController = controller;
       let result;
@@ -269,10 +316,10 @@ export function initChatController({
       if (keyCheckController === controller) {
         keyCheckController = null;
       }
-      if (getApiKey(providerId) !== key) {
+      if (destroyed || getApiKey(providerId) !== key) {
         return;
       }
-      keyChecks.set(providerId, { key, ...result });
+      keyChecks.set(providerId, { fingerprint: keyFp, ...result });
       updateModelStrip();
       if (result.status === "valid") {
         if (providerId === activeProviderId && document.activeElement !== apiKeyInput) {
@@ -329,6 +376,7 @@ export function initChatController({
     }
     if (!settingsOpen) {
       syncApiKeyMaskPlaceholder(activeProviderId);
+      clearImportKeysSlot();
     }
   }
 
@@ -336,10 +384,12 @@ export function initChatController({
   keyStatusBtn?.addEventListener("click", () => toggleSettings(), listenOpts);
 
   function cancelStreamRaf(stream) {
-    if (stream && stream.rafId && typeof window.cancelAnimationFrame === "function") {
+    if (!stream) return;
+    if (stream.rafId && typeof window.cancelAnimationFrame === "function") {
       window.cancelAnimationFrame(stream.rafId);
-      stream.rafId = 0;
     }
+    stream.rafId = 0;
+    stream.rafPending = false;
   }
 
   clearChatBtn?.addEventListener("click", () => {
@@ -347,6 +397,7 @@ export function initChatController({
     if (running) {
       running.discarded = true;
       cancelStreamRaf(running);
+      activeStreams.delete(conversationKey);
       running.controller.abort();
     }
     currentStreamStatus = "";
@@ -358,6 +409,8 @@ export function initChatController({
   }, listenOpts);
 
   providerSelect?.addEventListener("change", () => {
+    liveModelsController?.abort();
+    liveModelsController = null;
     activeProviderId = providerSelect.value;
     saveProviderId(activeProviderId);
     activeModelId = getSavedModel(activeProviderId);
@@ -393,14 +446,6 @@ export function initChatController({
     }
   }, listenOpts);
 
-  function syncCredentialsBackup() {
-    try {
-      void saveCredentialsBackup(getSyncCredentialsBackupPayload());
-    } catch {
-      // Ignorar si falla el guardado asíncrono
-    }
-  }
-
   apiKeyInput?.addEventListener("input", () => {
     const rawVal = apiKeyInput.value;
     if (!rawVal.trim()) {
@@ -415,6 +460,9 @@ export function initChatController({
     if (event?.relatedTarget === toggleKeyVisBtn) {
       return;
     }
+    keyVisible = false;
+    apiKeyInput.type = "password";
+    syncKeyVisibilityButton(false);
     if (getApiKey(activeProviderId)) {
       syncApiKeyMaskPlaceholder(activeProviderId);
     }
@@ -466,8 +514,7 @@ export function initChatController({
   importKeysBtn?.addEventListener("click", () => {
     if (!importKeysSlot) return;
     if (!importKeysSlot.hidden) {
-      importKeysSlot.hidden = true;
-      importKeysSlot.innerHTML = "";
+      clearImportKeysSlot();
       return;
     }
     importKeysSlot.hidden = false;
@@ -477,7 +524,11 @@ export function initChatController({
     form.className = "inline-edit-form";
 
     const input = document.createElement("input");
-    input.type = "text";
+    input.type = "password";
+    input.autocomplete = "off";
+    input.setAttribute("autocorrect", "off");
+    input.setAttribute("autocapitalize", "off");
+    input.spellcheck = false;
     input.className = "inline-edit-input";
     input.placeholder = '{"gemini":"AIza…","groq":"gsk_…"}';
     input.setAttribute("aria-label", "Pegar paquete de claves exportado");
@@ -495,8 +546,8 @@ export function initChatController({
     closeBtn.innerHTML = icon("x");
 
     const close = () => {
-      importKeysSlot.hidden = true;
-      importKeysSlot.innerHTML = "";
+      input.value = "";
+      clearImportKeysSlot();
     };
 
     closeBtn.addEventListener("click", close);
@@ -528,13 +579,14 @@ export function initChatController({
     const provider = AI_PROVIDERS[activeProviderId];
     if (!provider) return;
     const targetProviderId = provider.id;
+    const targetKey = getApiKey(targetProviderId);
 
     fetchModelsBtn.disabled = true;
     liveModelsController?.abort();
     const ctrl = typeof AbortController === "function" ? new AbortController() : null;
     liveModelsController = ctrl;
     try {
-      const liveModels = await fetchLiveFreeModels(targetProviderId, getApiKey(targetProviderId), ctrl?.signal);
+      const liveModels = await fetchLiveFreeModels(targetProviderId, targetKey, ctrl?.signal);
       if (destroyed || activeProviderId !== targetProviderId) return;
       if (liveModels.length > 0) {
         activeModelId = liveModels[0].id;
@@ -546,7 +598,7 @@ export function initChatController({
       }
     } catch (error) {
       if (!destroyed && !isAbortError(error) && providerHelpEl && activeProviderId === targetProviderId) {
-        providerHelpEl.textContent = error instanceof Error ? error.message : "Error al actualizar modelos.";
+        providerHelpEl.textContent = formatSafeErrorMessage(error, [targetKey], "Error al actualizar modelos.");
       }
     } finally {
       if (liveModelsController === ctrl) {
@@ -582,10 +634,10 @@ export function initChatController({
     return result.slice(0, MAX_AI_ATTACHMENTS);
   }
 
-  function updateTokenEstimate() {
+  function updateTokenEstimate(providedSnapshot = null) {
     if (!tokenCounterEl) return;
     const promptLen = promptInput ? promptInput.value.length : 0;
-    const snapshot = getContextSnapshot ? getContextSnapshot() : null;
+    const snapshot = providedSnapshot || (getContextSnapshot ? getContextSnapshot() : null);
     let contextLen = 0;
     if (snapshot?.activeFile) {
       if (snapshot.selection && snapshot.selection.text) {
@@ -734,6 +786,7 @@ export function initChatController({
 
     const running = activeStreams.get(conversationKey);
     if (running) {
+      cancelStreamRaf(running);
       running.controller.abort();
       return;
     }
@@ -751,6 +804,7 @@ export function initChatController({
     if (promptInput) {
       promptInput.value = "";
     }
+    autoScrollPinned = true;
 
     await sendPrompt(userText, apiKey);
   }, listenOpts);
@@ -792,7 +846,26 @@ export function initChatController({
     return failedPaths;
   }
 
+  function appendConversationTurnToDom(userText, assistantIndex) {
+    if (!streamContainer) return false;
+    if (streamContainer.children.length === 0 || streamContainer.querySelector?.(".chat-empty-welcome")) {
+      return false;
+    }
+    const capsule = document.createElement("div");
+    capsule.className = "chat-user-capsule";
+    capsule.textContent = userText;
+    const aiNode = document.createElement("div");
+    aiNode.className = "chat-ai-response";
+    aiNode.dataset.assistantIndex = String(assistantIndex);
+    populateAssistantNode(aiNode, "", true);
+    streamContainer.append(capsule, aiNode);
+    syncRegenerateButton();
+    updateTokenEstimate();
+    return true;
+  }
+
   async function sendPrompt(userText, apiKey) {
+    if (destroyed) return;
     const key = conversationKey;
     const convo = conversation;
     if (activeStreams.has(key)) return;
@@ -802,33 +875,49 @@ export function initChatController({
     const assistantEntry = { role: "assistant", content: "" };
     convo.push(assistantEntry);
 
-    const stream = { controller: new AbortController(), convo, discarded: false, rafId: 0 };
+    const stream = {
+      controller: new AbortController(),
+      convo,
+      discarded: false,
+      rafId: 0,
+      rafPending: false,
+      flushNow: null
+    };
     activeStreams.set(key, stream);
-    const isVisible = () => conversationKey === key && conversation === convo;
+    const isVisible = () => !destroyed && conversationKey === key && conversation === convo;
 
-    renderConversation();
-    scrollToBottom();
+    autoScrollPinned = true;
+    if (!appendConversationTurnToDom(userText, convo.length - 1)) {
+      renderConversation();
+    }
+    scrollToBottom(true);
 
     currentStreamStatus = "";
     setStreamingUiState(true);
 
-    let rafPending = false;
     let streamSettled = false;
     const cancelQueuedRender = () => {
       streamSettled = true;
-      rafPending = false;
       cancelStreamRaf(stream);
     };
     const scheduleRender = () => {
-      if (destroyed || streamSettled || rafPending || !isVisible()) return;
-      rafPending = true;
-      stream.rafId = window.requestAnimationFrame(() => {
+      if (destroyed || streamSettled || stream.rafPending || !isVisible()) return;
+      if (typeof document !== "undefined" && document.hidden) return;
+      stream.rafPending = true;
+      const rafId = window.requestAnimationFrame(() => {
         stream.rafId = 0;
-        rafPending = false;
+        stream.rafPending = false;
         if (destroyed || streamSettled || !isVisible()) return;
         updateLastAssistantMessage(assistantEntry.content, true);
         scrollToBottom();
       });
+      if (stream.rafPending) {
+        stream.rafId = rafId;
+      }
+    };
+    stream.flushNow = () => {
+      if (destroyed || streamSettled || !isVisible()) return;
+      scheduleRender();
     };
 
     try {
@@ -915,7 +1004,7 @@ export function initChatController({
         if (error instanceof AuthLockoutError || error?.httpStatus === 401 || error?.httpStatus === 403) {
           const lockNow = checkAuthLockout(`ai:${streamProviderId}`);
           keyChecks.set(streamProviderId, {
-            key: apiKey,
+            fingerprint: computeTokenFingerprint(`ai:${streamProviderId}`, apiKey),
             status: lockNow.locked ? "locked" : "invalid",
             message
           });
@@ -943,13 +1032,22 @@ export function initChatController({
       if (activeStreams.get(key) === stream) {
         activeStreams.delete(key);
       }
+      let pruned = false;
+      if (!stream.discarded && convo.length > MAX_STORED_CHAT_TURNS) {
+        convo.splice(0, convo.length - MAX_STORED_CHAT_TURNS);
+        pruned = true;
+      }
       if (isVisible()) {
         currentStreamStatus = "";
         setStreamingUiState(false);
-        updateTokenEstimate();
+        if (pruned) {
+          renderConversation();
+        } else {
+          updateTokenEstimate();
+        }
         scrollToBottom();
       }
-      if (!stream.discarded) {
+      if (!stream.discarded && !destroyed) {
         onConversationChange?.(
           convo.map((m) => ({ role: m.role, content: m.content })),
           key
@@ -1034,7 +1132,8 @@ export function initChatController({
 
     if (keyStatusBtn) {
       const check = keyChecks.get(provider.id);
-      const current = check && check.key === key ? check : null;
+      const keyFp = key ? computeTokenFingerprint(`ai:${provider.id}`, key) : "";
+      const current = check && check.fingerprint === keyFp ? check : null;
       let label = "Falta clave";
       let state = "missing";
       if (lock.locked) {
@@ -1083,9 +1182,9 @@ export function initChatController({
     updateTokenEstimate();
   }
 
-  function renderExtraTabChips() {
+  function renderExtraTabChips(providedSnapshot = null) {
     if (!extraTabsBar) return;
-    const snapshot = getContextSnapshot();
+    const snapshot = providedSnapshot || getContextSnapshot();
     const otherOpenFiles = snapshot?.otherOpenFiles || [];
     const allProjectFiles = snapshot?.projectFiles || otherOpenFiles;
 
@@ -1372,7 +1471,8 @@ export function initChatController({
           previousCodeBlock: "",
           tailHost,
           indicator,
-          lastTailKey: ""
+          lastTailKey: "",
+          lastCodeText: ""
         };
         streamDomState.set(container, state);
       }
@@ -1384,6 +1484,8 @@ export function initChatController({
           state.closedOffset = tailOffsets[localClosedCount];
           state.closedAnchor = markdownText.slice(Math.max(0, state.closedOffset - 32), state.closedOffset);
         }
+        state.lastTailKey = "";
+        state.lastCodeText = "";
       }
 
       const activeSeg = tailSegs[tailSegs.length - 1];
@@ -1393,7 +1495,20 @@ export function initChatController({
           const existingCodeEl =
             state.lastTailKey === tailKey ? state.tailHost.querySelector(".chat-code-pre code") : null;
           if (existingCodeEl) {
-            existingCodeEl.textContent = activeSeg.code;
+            if (
+              state.lastCodeText &&
+              activeSeg.code.startsWith(state.lastCodeText) &&
+              existingCodeEl.firstChild &&
+              typeof existingCodeEl.firstChild.appendData === "function"
+            ) {
+              const delta = activeSeg.code.slice(state.lastCodeText.length);
+              if (delta) {
+                existingCodeEl.firstChild.appendData(delta);
+              }
+            } else {
+              existingCodeEl.textContent = activeSeg.code;
+            }
+            state.lastCodeText = activeSeg.code;
           } else {
             state.tailHost.innerHTML = "";
             const contextHint = {
@@ -1402,11 +1517,32 @@ export function initChatController({
             };
             appendSegmentNodes(state.tailHost, activeSeg, contextHint, null);
             state.lastTailKey = tailKey;
+            state.lastCodeText = activeSeg.code;
           }
         } else {
-          state.tailHost.innerHTML = "";
-          state.lastTailKey = `prose:${state.closedCount}`;
-          appendSegmentNodes(state.tailHost, activeSeg, null, null);
+          // Promocionar párrafos de prosa ya completados (delimitados por \n\n) para evitar re-parseo O(N²) en respuestas largas
+          const rawTail = markdownText.slice(state.closedOffset);
+          const paraSplitIdx = tailSegs.length === 1 ? rawTail.lastIndexOf("\n\n") : -1;
+          if (paraSplitIdx > 0) {
+            const stableText = rawTail.slice(0, paraSplitIdx).trim();
+            if (stableText) {
+              appendClosedSegmentsRange(container, state, [{ type: "prose", content: stableText }], 1);
+            }
+            state.closedOffset += paraSplitIdx + 2;
+            state.closedAnchor = markdownText.slice(Math.max(0, state.closedOffset - 32), state.closedOffset);
+            const remProse = rawTail.slice(paraSplitIdx + 2).trim();
+            state.tailHost.innerHTML = "";
+            state.lastTailKey = `prose:${state.closedCount}`;
+            state.lastCodeText = "";
+            if (remProse) {
+              appendSegmentNodes(state.tailHost, { type: "prose", content: remProse }, null, null);
+            }
+          } else {
+            state.tailHost.innerHTML = "";
+            state.lastTailKey = `prose:${state.closedCount}`;
+            state.lastCodeText = "";
+            appendSegmentNodes(state.tailHost, activeSeg, null, null);
+          }
         }
       }
       return;
@@ -1480,6 +1616,13 @@ export function initChatController({
       infoWrap.appendChild(pathBadge);
     }
 
+    const pre = document.createElement("pre");
+    pre.className = "chat-code-pre code-font";
+    const codeEl = document.createElement("code");
+    codeEl.textContent = code;
+    pre.appendChild(codeEl);
+    const getLiveCode = () => codeEl.textContent || "";
+
     const actions = document.createElement("div");
     actions.className = "chat-code-actions-wrap";
 
@@ -1487,7 +1630,7 @@ export function initChatController({
       btnInsert.disabled = true;
       let inserted = false;
       try {
-        inserted = (await onInsertAtCursor(code, lang)) !== false;
+        inserted = (await onInsertAtCursor(getLiveCode(), lang)) !== false;
       } catch {
         inserted = false;
       } finally {
@@ -1514,7 +1657,7 @@ export function initChatController({
         btnReplace.disabled = true;
         let applied = false;
         try {
-          applied = (await onReplaceSelection(code, contextHint)) !== false;
+          applied = (await onReplaceSelection(getLiveCode(), contextHint)) !== false;
         } catch {
           applied = false;
         } finally {
@@ -1538,7 +1681,7 @@ export function initChatController({
       btnApplyAction = createCodeActionButton("fileCheck", `Aplicar a ${baseName}`, `Aplicar o crear archivo ${filePath}`, async () => {
         btnApplyAction.disabled = true;
         try {
-          const applied = await onApplyToFile(filePath, code, lang);
+          const applied = await onApplyToFile(filePath, getLiveCode(), lang);
           btnApplyAction.innerHTML =
             applied === false
               ? `${icon("x")}<span>Cancelado</span>`
@@ -1554,12 +1697,12 @@ export function initChatController({
       });
     } else {
       btnApplyAction = createCodeActionButton("fileCheck", "Aplicar cambios", "Revisar diferencias y aplicar al archivo (reversible con Deshacer)", () => {
-        onApplyWholeFile(code, lang, contextHint);
+        onApplyWholeFile(getLiveCode(), lang, contextHint);
       });
     }
 
     const btnCopy = createCodeActionButton("copy", "Copiar", "Copiar bloque al portapapeles", async () => {
-      const copied = await copyToClipboardSafe(code);
+      const copied = await copyToClipboardSafe(getLiveCode());
       btnCopy.innerHTML = copied
         ? `${icon("check")}<span>Copiado</span>`
         : `${icon("x")}<span>Sin acceso</span>`;
@@ -1571,12 +1714,6 @@ export function initChatController({
 
     actions.append(btnInsert, btnReplace, btnApplyAction, btnCopy);
     header.append(infoWrap, actions);
-
-    const pre = document.createElement("pre");
-    pre.className = "chat-code-pre code-font";
-    const codeEl = document.createElement("code");
-    codeEl.textContent = code;
-    pre.appendChild(codeEl);
 
     block.append(header, pre);
     return block;
@@ -1599,11 +1736,11 @@ export function initChatController({
     banner.setAttribute("role", "alert");
     banner.textContent = message;
     streamContainer.appendChild(banner);
-    scrollToBottom();
+    scrollToBottom(true);
   }
 
-  function scrollToBottom() {
-    if (scrollBody) {
+  function scrollToBottom(force = false) {
+    if (scrollBody && (force || autoScrollPinned)) {
       scrollBody.scrollTop = scrollBody.scrollHeight;
     }
   }
@@ -1672,9 +1809,12 @@ export function initChatController({
     return parts.join("\n");
   }
 
-  function syncReplaceButtonsState() {
+  function syncReplaceButtonsState(providedSnapshot = null) {
     if (!streamContainer) return;
-    const hasSel = Boolean(getContextSnapshot().selection?.lineCount > 0);
+    const snapshot = providedSnapshot || getContextSnapshot();
+    const hasSel = Boolean(snapshot?.selection?.lineCount > 0);
+    if (lastHasSelection === hasSel) return;
+    lastHasSelection = hasSel;
     const buttons = streamContainer.querySelectorAll('button[data-action="replace-selection"]');
     for (const btn of buttons) {
       if (btn instanceof HTMLButtonElement) {
@@ -1686,13 +1826,95 @@ export function initChatController({
     }
   }
 
+  function abortProjectStream(projectId) {
+    const running = activeStreams.get(projectId);
+    if (!running) return;
+    running.discarded = true;
+    cancelStreamRaf(running);
+    activeStreams.delete(projectId);
+    running.controller.abort();
+    if (conversationKey === projectId && !destroyed) {
+      currentStreamStatus = "";
+      setStreamingUiState(false);
+    }
+  }
+
+  function setPanelVisible(visible) {
+    const next = Boolean(visible);
+    if (panelVisible === next) return;
+    panelVisible = next;
+    if (!panelVisible) {
+      mentionPopover.close();
+      syncApiKeyMaskPlaceholder(activeProviderId);
+      clearImportKeysSlot();
+      window.clearTimeout(keyCheckTimer);
+      keyCheckTimer = 0;
+      keyCheckController?.abort();
+      keyCheckController = null;
+      return;
+    }
+    if (destroyed) return;
+    const snapshot = getContextSnapshot ? getContextSnapshot() : null;
+    renderExtraTabChips(snapshot);
+    updateTokenEstimate(snapshot);
+    updateModelStrip();
+    if (deferredKeyValidation) {
+      deferredKeyValidation = false;
+      scheduleKeyValidation(activeProviderId, 0, false);
+    }
+    activeStreams.get(conversationKey)?.flushNow?.();
+  }
+
+  document?.addEventListener?.(
+    "visibilitychange",
+    () => {
+      if (destroyed) return;
+      if (document.hidden) {
+        syncApiKeyMaskPlaceholder(activeProviderId);
+        clearImportKeysSlot();
+        window.clearTimeout(keyCheckTimer);
+        keyCheckTimer = 0;
+        for (const stream of activeStreams.values()) {
+          cancelStreamRaf(stream);
+        }
+      } else {
+        activeStreams.get(conversationKey)?.flushNow?.();
+      }
+    },
+    listenOpts
+  );
+
+  window?.addEventListener?.(
+    "pagehide",
+    () => {
+      if (destroyed) return;
+      syncApiKeyMaskPlaceholder(activeProviderId);
+      clearImportKeysSlot();
+      window.clearTimeout(keyCheckTimer);
+      keyCheckTimer = 0;
+      keyCheckController?.abort();
+      keyCheckController = null;
+      liveModelsController?.abort();
+      liveModelsController = null;
+      for (const stream of activeStreams.values()) {
+        cancelStreamRaf(stream);
+        stream.controller.abort();
+      }
+    },
+    listenOpts
+  );
+
   window?.addEventListener?.(
     "studio-credentials-updated",
     () => {
       if (destroyed) return;
       keyChecks.clear();
       syncSettingsForm();
-      scheduleKeyValidation(activeProviderId, 0, false);
+      if (panelVisible) {
+        scheduleKeyValidation(activeProviderId, 0, false);
+      } else {
+        deferredKeyValidation = true;
+      }
       updateTokenEstimate();
     },
     listenOpts
@@ -1700,28 +1922,37 @@ export function initChatController({
 
   return {
     notifyWorkspaceChanged() {
-      renderExtraTabChips();
-      syncReplaceButtonsState();
-      updateTokenEstimate();
+      if (destroyed) return;
+      const snapshot = getContextSnapshot ? getContextSnapshot() : null;
+      renderExtraTabChips(snapshot);
+      syncReplaceButtonsState(snapshot);
+      updateTokenEstimate(snapshot);
     },
     notifySelectionChanged() {
-      syncReplaceButtonsState();
-      updateTokenEstimate();
+      if (destroyed) return;
+      const snapshot = getContextSnapshot ? getContextSnapshot() : null;
+      syncReplaceButtonsState(snapshot);
+      updateTokenEstimate(snapshot);
     },
+    setPanelVisible,
+    abortProjectStream,
     setConversation(nextHistory, key = null) {
+      if (destroyed) return;
       conversationKey = key;
       mentionedFileIds.clear();
       mentionPopover.close();
+      lastHasSelection = null;
+      autoScrollPinned = true;
       const live = activeStreams.get(key);
       if (live && !live.discarded) {
         conversation = live.convo;
         renderConversation();
         setStreamingUiState(true);
-        scrollToBottom();
+        scrollToBottom(true);
         return;
       }
       setStreamingUiState(false);
-      conversation = Array.isArray(nextHistory)
+      const filteredHistory = Array.isArray(nextHistory)
         ? nextHistory
             .filter(
               (item) =>
@@ -1729,10 +1960,12 @@ export function initChatController({
                 (item.role === "user" || item.role === "assistant") &&
                 typeof item.content === "string"
             )
+            .slice(-MAX_STORED_CHAT_TURNS)
             .map((item) => ({ role: item.role, content: item.content }))
         : [];
+      conversation = filteredHistory;
       renderConversation();
-      scrollToBottom();
+      scrollToBottom(true);
     },
     switchProvider(providerId) {
       if (AI_PROVIDERS[providerId]) {
@@ -1770,6 +2003,12 @@ export function initChatController({
         stream.controller.abort();
       }
       activeStreams.clear();
+      keyChecks.clear();
+      if (apiKeyInput) {
+        apiKeyInput.value = "";
+        apiKeyInput.type = "password";
+      }
+      clearImportKeysSlot();
       mentionPopover.destroy();
       listenerAbort?.abort();
     }

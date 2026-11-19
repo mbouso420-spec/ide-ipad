@@ -1,4 +1,4 @@
-import { getIndentSize } from "./languageConfig.js";
+import { getIndentSize, normalizeLanguageId } from "./languageConfig.js";
 
 const VOID_HTML_TAGS = new Set([
   "!doctype",
@@ -157,7 +157,7 @@ const REGEX_PREFIX_KEYWORDS = new Set([
 function canStartRegexLiteral(prevNonSpace, prevWord = "") {
   return (
     prevNonSpace === "" ||
-    "=([,:;!&|?~^+-*/%<>{\n".includes(prevNonSpace) ||
+    "=([,:;!&|?~^+-*/%<>{}\n".includes(prevNonSpace) ||
     REGEX_PREFIX_KEYWORDS.has(prevWord)
   );
 }
@@ -175,10 +175,14 @@ function formatBraceCode(code, lang, indentSize) {
   const out = [];
   const rawLineIndices = new Set();
   let braceDepth = 0;
+  // Cada marco de llave guarda si pertenece a un bloque switch/select y si tiene un case activo
   const caseStack = [];
   let activeCaseCount = 0;
+  let pendingSwitch = false;
+  let switchParenDepth = 0;
   let inBlockComment = false;
   let inGoRawString = false;
+  let inCSharpVerbatim = false;
   let cSharpRawDelim = "";
   let cppRawEndMarker = "";
   let rustRawHashLen = -1;
@@ -188,7 +192,7 @@ function formatBraceCode(code, lang, indentSize) {
     const insideLiteralTemplate =
       templateStack.length > 0 &&
       templateStack[templateStack.length - 1].exprDepth === 0;
-    const inRawMulti = Boolean(inGoRawString || cppRawEndMarker || cSharpRawDelim || rustRawHashLen >= 0);
+    const inRawMulti = Boolean(inGoRawString || inCSharpVerbatim || cppRawEndMarker || cSharpRawDelim || rustRawHashLen >= 0);
 
     if (inRawMulti || insideLiteralTemplate) {
       rawLineIndices.add(out.length);
@@ -224,8 +228,9 @@ function formatBraceCode(code, lang, indentSize) {
           }
         }
 
+        const inSwitchBlock = caseStack.length > 0 && caseStack[caseStack.length - 1].isSwitch;
         const isCaseLabel =
-          braceDepth > 0 &&
+          inSwitchBlock &&
           (/^case\b[\s\S]*:/.test(trimmed) || /^default\s*:/.test(trimmed));
 
         let displayDepth = braceDepth - leadingCloseCount;
@@ -234,11 +239,11 @@ function formatBraceCode(code, lang, indentSize) {
         let activeCasesBeforeLine = activeCaseCount;
         if (leadingCloseCount > 0) {
           for (let k = 0; k < leadingCloseCount && k < caseStack.length; k += 1) {
-            if (caseStack[caseStack.length - 1 - k]) {
+            if (caseStack[caseStack.length - 1 - k].inCase) {
               activeCasesBeforeLine -= 1;
             }
           }
-        } else if (isCaseLabel && caseStack.length > 0 && caseStack[caseStack.length - 1]) {
+        } else if (isCaseLabel && caseStack.length > 0 && caseStack[caseStack.length - 1].inCase) {
           activeCasesBeforeLine -= 1;
         }
 
@@ -254,10 +259,12 @@ function formatBraceCode(code, lang, indentSize) {
     let prevNonSpace = "";
     let prevWord = "";
     const trimmedForCase = rawLine.trim();
+    const inSwitchBeforeLine = caseStack.length > 0 && caseStack[caseStack.length - 1].isSwitch;
     const startsCase =
       !inBlockComment &&
+      !inRawMulti &&
       !(templateStack.length > 0 && templateStack[templateStack.length - 1].exprDepth === 0) &&
-      braceDepth > 0 &&
+      inSwitchBeforeLine &&
       (/^case\b[\s\S]*:/.test(trimmedForCase) || /^default\s*:/.test(trimmedForCase));
 
     for (let i = 0; i < rawLine.length; i += 1) {
@@ -289,7 +296,7 @@ function formatBraceCode(code, lang, indentSize) {
         if (ch === "$" && next === "{") {
           templateStack[templateStack.length - 1].exprDepth = 1;
           braceDepth += 1;
-          caseStack.push(false);
+          caseStack.push({ inCase: false, isSwitch: false });
           i += 1;
           prevNonSpace = "{";
           prevWord = "";
@@ -303,6 +310,19 @@ function formatBraceCode(code, lang, indentSize) {
           inGoRawString = false;
           prevNonSpace = ")";
           prevWord = "";
+        }
+        continue;
+      }
+
+      if (inCSharpVerbatim) {
+        if (ch === '"') {
+          if (next === '"') {
+            i += 1;
+          } else {
+            inCSharpVerbatim = false;
+            prevNonSpace = ")";
+            prevWord = "";
+          }
         }
         continue;
       }
@@ -362,6 +382,24 @@ function formatBraceCode(code, lang, indentSize) {
         i += 1;
         continue;
       }
+      if (isCppLike && ch >= "0" && ch <= "9") {
+        // Consumir literales numéricos C/C++ incluyendo separadores de dígitos C++14 (1'000'000, 0xFF'AA)
+        let j = i + 1;
+        while (j < rawLine.length) {
+          const nc = rawLine[j];
+          if ((nc >= "0" && nc <= "9") || (nc >= "a" && nc <= "z") || (nc >= "A" && nc <= "Z") || nc === "." || nc === "_") {
+            j += 1;
+          } else if (nc === "'" && j + 1 < rawLine.length && /[0-9a-fA-F]/.test(rawLine[j + 1])) {
+            j += 2;
+          } else {
+            break;
+          }
+        }
+        prevNonSpace = "0";
+        prevWord = "";
+        i = j - 1;
+        continue;
+      }
       if (isCppLike && ch === "R" && next === '"' && !/[A-Za-z0-9_$]/.test(prevWord)) {
         const parenOffset = rawLine.indexOf("(", i + 2);
         if (parenOffset !== -1) {
@@ -413,7 +451,7 @@ function formatBraceCode(code, lang, indentSize) {
           prevWord = "";
           continue;
         }
-        cSharpRawDelim = '"';
+        inCSharpVerbatim = true;
         i += 1;
         prevWord = "";
         continue;
@@ -486,7 +524,8 @@ function formatBraceCode(code, lang, indentSize) {
           templateStack[templateStack.length - 1].exprDepth -= 1;
           if (templateStack[templateStack.length - 1].exprDepth === 0) {
             if (braceDepth > 0) braceDepth -= 1;
-            if (caseStack.length > 0 && caseStack.pop()) activeCaseCount -= 1;
+            const popped = caseStack.length > 0 ? caseStack.pop() : null;
+            if (popped?.inCase) activeCaseCount -= 1;
             prevNonSpace = "";
             prevWord = "";
             continue;
@@ -501,17 +540,36 @@ function formatBraceCode(code, lang, indentSize) {
         }
         const word = rawLine.slice(i, j);
         prevWord = prevNonSpace === "." ? "" : word;
+        if (prevWord === "switch" || (lang === "go" && prevWord === "select")) {
+          pendingSwitch = true;
+          switchParenDepth = 0;
+        }
         prevNonSpace = word[word.length - 1];
         i = j - 1;
         continue;
       }
 
+      if (pendingSwitch) {
+        if (ch === "(") {
+          switchParenDepth += 1;
+        } else if (ch === ")") {
+          switchParenDepth = Math.max(0, switchParenDepth - 1);
+        } else if (ch === ";" && switchParenDepth === 0) {
+          pendingSwitch = false;
+        }
+      }
+
       if (ch === "{") {
+        const opensSwitch = pendingSwitch && switchParenDepth === 0;
+        if (opensSwitch) {
+          pendingSwitch = false;
+        }
         braceDepth += 1;
-        caseStack.push(false);
+        caseStack.push({ inCase: false, isSwitch: opensSwitch });
       } else if (ch === "}") {
         if (braceDepth > 0) braceDepth -= 1;
-        if (caseStack.length > 0 && caseStack.pop()) activeCaseCount -= 1;
+        const popped = caseStack.length > 0 ? caseStack.pop() : null;
+        if (popped?.inCase) activeCaseCount -= 1;
       } else if (hasRegexLiterals && ((ch === "+" && next === "+") || (ch === "-" && next === "-"))) {
         // Postfix/prefix ++ y -- terminan o preceden un operando, nunca un literal /regex/
         i += 1;
@@ -528,8 +586,8 @@ function formatBraceCode(code, lang, indentSize) {
 
     if (startsCase && caseTopIdxBeforeLine >= 0 && caseTopIdxBeforeLine < caseStack.length) {
       const nextCaseVal = braceDepth <= braceDepthBeforeLine;
-      if (caseStack[caseTopIdxBeforeLine] !== nextCaseVal) {
-        caseStack[caseTopIdxBeforeLine] = nextCaseVal;
+      if (caseStack[caseTopIdxBeforeLine].inCase !== nextCaseVal) {
+        caseStack[caseTopIdxBeforeLine].inCase = nextCaseVal;
         activeCaseCount += nextCaseVal ? 1 : -1;
       }
     }
@@ -835,10 +893,22 @@ function formatHtml(code, indentSize) {
   for (const rawLine of lines) {
     if (rawTag) {
       const closeRe = RAW_HTML_CLOSE_REGEXES.get(rawTag);
-      if (closeRe && closeRe.test(rawLine)) {
+      const closeMatch = closeRe ? closeRe.exec(rawLine) : null;
+      if (closeMatch) {
         rawTag = null;
         if (depth > 0) depth -= 1;
         out.push(rawLine.trim().startsWith("</") ? `${unit.repeat(depth)}${rawLine.trim()}` : rawLine);
+        const afterCloseIdx = closeMatch.index + closeMatch[0].length;
+        if (afterCloseIdx < rawLine.length) {
+          const rest = rawLine.slice(afterCloseIdx).trim();
+          if (rest) {
+            const scannedAfter = scanHtmlTagsInLine(rest, 0, null);
+            depth = Math.max(0, depth + scannedAfter.delta);
+            inComment = scannedAfter.inComment;
+            rawTag = scannedAfter.rawTag;
+            pendingOpenTag = scannedAfter.pendingOpenTag;
+          }
+        }
       } else {
         if (rawTag === "pre" || rawTag === "textarea") {
           rawLineIndices.add(out.length);
@@ -1035,7 +1105,7 @@ function formatMarkdownOrText(code, preserveMarkdownBreaks = false) {
  */
 export function formatCode(code, lang = "text", options = {}) {
   const original = String(code ?? "");
-  const cleanLang = String(lang || "text").toLowerCase();
+  const cleanLang = normalizeLanguageId(lang);
   const parsedIndent = options && options.indentSize !== undefined ? Number(options.indentSize) : NaN;
   const indentSize = Number.isFinite(parsedIndent)
     ? Math.max(2, Math.min(8, Math.round(parsedIndent)))

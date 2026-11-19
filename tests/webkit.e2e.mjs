@@ -71,7 +71,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
     await new Promise((resolve) => server?.close(resolve));
   });
 
-  test("Render iPadOS táctil, IndexedDB, SW v32, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
+  test("Render iPadOS táctil, IndexedDB, SW v33, Formateo, Bundler ES Modules en CSP y WebCrypto en WebKit", async () => {
     const page = await context.newPage();
     const pageErrors = [];
     const coldBootRequests = [];
@@ -81,7 +81,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
 
     await page.goto(`${baseUrl}/index.html`, { waitUntil: "domcontentloaded", timeout: 20000 });
     await page.waitForSelector(".editor-tab-item", { timeout: 20000 });
-    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { state: "attached", timeout: 15000 });
     page.off("request", onColdRequest);
 
     const eagerHeavyDownloads = coldBootRequests.filter((url) =>
@@ -93,14 +93,14 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
       "WebKit no debe descargar runtimes pesados (Pyodide/SQLite/tsc) durante el arranque en frío"
     );
 
-    // 1. Verificar Service Worker v32 accesible y sin desborde horizontal en iPad vertical (820x1180)
+    // 1. Verificar Service Worker v33 accesible y sin desborde horizontal en iPad vertical (820x1180)
     const swAssetOk = await page.evaluate(async () => {
       const res = await fetch("./sw.js");
       if (!res.ok) return false;
       const text = await res.text();
-      return text.includes("studio-ide-shell-v32");
+      return text.includes("studio-ide-shell-v33");
     });
-    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v32 en WebKit");
+    assert.equal(swAssetOk, true, "sw.js debe servir studio-ide-shell-v33 en WebKit");
 
     const portraitOverflow = await page.evaluate(
       () => document.documentElement.scrollWidth > window.innerWidth
@@ -142,7 +142,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
     });
 
     await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
-    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { state: "attached", timeout: 15000 });
 
     // Formatear wk_fmt.js en UI real WebKit
     const clickedFmt = await page.evaluate(() => {
@@ -270,7 +270,7 @@ describe("Studio IDE — Pruebas E2E Cross-Engine en WebKit (Motor Safari / iPad
     }, samplePngB64);
 
     await page.reload({ waitUntil: "domcontentloaded", timeout: 20000 });
-    await page.waitForSelector(".tree-node-btn", { timeout: 15000 });
+    await page.waitForSelector(".tree-node-btn", { state: "attached", timeout: 15000 });
 
     const wkTiendaExpanded = await page.evaluate(() => {
       const folderBtn = document.querySelector('.tree-row[data-path="wk_tienda"] .tree-node-btn');

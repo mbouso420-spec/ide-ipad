@@ -4,7 +4,7 @@
  * Permite ejecutar DDL/DML, tablas formateadas para SELECT, consultas interactivas y exportación a CSV/JSON.
  */
 
-import { escapeHtml } from "./previewUtils.js";
+import { escapeHtml, escapeJsonForInlineScript } from "./previewUtils.js";
 
 /**
  * Convierte un conjunto de resultados de sql.js a formato CSV estándar.
@@ -51,21 +51,22 @@ export function convertResultsToCsv(results, maxRows = Infinity) {
   return sections.join("\r\n\r\n");
 }
 
-const CSV_NEG_NUM_RE = /^-\d+(?:\.\d+)?$/;
-
 function escapeCsvField(val) {
   if (val === null || val === undefined) return "";
   if (typeof val === "number") return String(val);
   let str = String(val);
   if (str.length === 0) return "";
   const firstCode = str.charCodeAt(0);
+  const trimmedLead = str.replace(/^[ \t\r\n]+/, "");
+  const leadCode = trimmedLead.length > 0 ? trimmedLead.charCodeAt(0) : 0;
   const needsFormulaNeutralization =
-    firstCode === 61 || // '='
-    firstCode === 43 || // '+'
     firstCode === 9 || // '\t'
+    firstCode === 10 || // '\n'
     firstCode === 13 || // '\r'
-    firstCode === 64 || // '@'
-    (firstCode === 45 && !CSV_NEG_NUM_RE.test(str)); // '-' no numérico
+    leadCode === 61 || // '='
+    leadCode === 43 || // '+'
+    leadCode === 64 || // '@'
+    (leadCode === 45 && !/^-\d+(?:\.\d+)?$/.test(trimmedLead)); // '-' no numérico
   if (needsFormulaNeutralization) {
     str = `'${str}`;
   }
@@ -82,7 +83,7 @@ function escapeCsvField(val) {
 }
 
 /**
- * Elimina comentarios SQL (-- y /* * /) respetando literales entre comillas simples, dobles o backticks.
+ * Elimina comentarios SQL (-- y /* * /) respetando literales entre comillas simples, dobles, backticks o [corchetes].
  * @param {string} sql
  * @returns {string}
  */
@@ -110,6 +111,16 @@ function stripSqlCommentsSafe(sql) {
         }
         i += 1;
       }
+      continue;
+    }
+    if (ch === "[") {
+      const closeBracket = src.indexOf("]", i + 1);
+      if (closeBracket === -1) {
+        out += src.slice(i);
+        break;
+      }
+      out += src.slice(i, closeBracket + 1);
+      i = closeBracket + 1;
       continue;
     }
     if (ch === "-" && next === "-") {
@@ -207,7 +218,8 @@ function isWithSelectStatement(strippedSql) {
   const backtick = String.fromCharCode(96);
   let i = 0;
   let depth = 0;
-  let passedWith = false;
+  // Estados: "start" -> "cte_name" -> "after_cte_name" -> "expect_cte_body" -> "after_cte_body"
+  let state = "start";
   while (i < src.length) {
     const ch = src[i];
     if (ch === "'" || ch === '"' || ch === backtick) {
@@ -224,11 +236,17 @@ function isWithSelectStatement(strippedSql) {
         }
         i += 1;
       }
+      if (depth === 0 && state === "cte_name") {
+        state = "after_cte_name";
+      }
       continue;
     }
     if (ch === "[") {
       const closeBracket = src.indexOf("]", i + 1);
       i = closeBracket === -1 ? src.length : closeBracket + 1;
+      if (depth === 0 && state === "cte_name") {
+        state = "after_cte_name";
+      }
       continue;
     }
     if (ch === "(") {
@@ -237,7 +255,19 @@ function isWithSelectStatement(strippedSql) {
       continue;
     }
     if (ch === ")") {
-      if (depth > 0) depth -= 1;
+      if (depth > 0) {
+        depth -= 1;
+        if (depth === 0 && state === "expect_cte_body") {
+          state = "after_cte_body";
+        }
+      }
+      i += 1;
+      continue;
+    }
+    if (depth === 0 && ch === ",") {
+      if (state === "after_cte_body") {
+        state = "cte_name";
+      }
       i += 1;
       continue;
     }
@@ -247,20 +277,41 @@ function isWithSelectStatement(strippedSql) {
         end += 1;
       }
       const word = src.slice(i, end).toUpperCase();
-      if (!passedWith) {
-        if (word === "WITH") passedWith = true;
-      } else if (
-        word === "SELECT" ||
-        word === "INSERT" ||
-        word === "UPDATE" ||
-        word === "DELETE" ||
-        word === "REPLACE" ||
-        word === "CREATE" ||
-        word === "DROP" ||
-        word === "ALTER" ||
-        word === "PRAGMA"
-      ) {
-        return word === "SELECT";
+      if (state === "start") {
+        if (word === "WITH") {
+          state = "cte_name";
+        } else {
+          return false;
+        }
+      } else if (state === "cte_name") {
+        if (word !== "RECURSIVE") {
+          state = "after_cte_name";
+        }
+      } else if (state === "after_cte_name") {
+        if (word === "AS") {
+          state = "expect_cte_body";
+        }
+      } else if (state === "expect_cte_body") {
+        // Permite modificadores SQLite: AS NOT MATERIALIZED (...) / AS MATERIALIZED (...)
+        if (word !== "NOT" && word !== "MATERIALIZED") {
+          return false;
+        }
+      } else if (state === "after_cte_body") {
+        if (
+          word === "SELECT" ||
+          word === "VALUES" ||
+          word === "INSERT" ||
+          word === "UPDATE" ||
+          word === "DELETE" ||
+          word === "REPLACE" ||
+          word === "CREATE" ||
+          word === "DROP" ||
+          word === "ALTER" ||
+          word === "PRAGMA"
+        ) {
+          return word === "SELECT" || word === "VALUES";
+        }
+        return false;
       }
       i = end;
       continue;
@@ -329,11 +380,6 @@ export function hasLimitClause(sql, stripComments = stripSqlCommentsSafe) {
       i = closeBracket === -1 ? src.length : closeBracket + 1;
       prevNonWs = "]";
       prevWord = "";
-      continue;
-    }
-    if (ch === "[") {
-      const closeBracket = src.indexOf("]", i + 1);
-      i = closeBracket === -1 ? src.length : closeBracket + 1;
       continue;
     }
     if (ch === "(") {
@@ -414,22 +460,18 @@ export function buildCountQuery(query) {
   return `SELECT COUNT(*) AS total_rows FROM (${cleaned});`;
 }
 
-/**
- * Construye el documento HTML completo del visor SQL interactivo para el iframe.
- * @param {{ path: string, shortName: string, content: string }} sqlFile
- * @returns {string}
- */
-export function buildSqlRunnerPreview(sqlFile) {
-  const rawTitle = String(sqlFile?.shortName || "consulta.sql");
-  const safeTitle = escapeHtml(rawTitle);
-  const safeTitleJson = JSON.stringify(rawTitle).replace(/</g, "\\u003c");
-  const safeContent = JSON.stringify(sqlFile?.content || "").replace(/</g, "\\u003c");
+let cachedSqlPreviewParts = null;
 
-  return `<!DOCTYPE html>
+function getSqlPreviewParts() {
+  if (cachedSqlPreviewParts) return cachedSqlPreviewParts;
+  cachedSqlPreviewParts = [
+    `<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <title>${safeTitle} — SQLite en Vivo</title>
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; connect-src https://cdn.jsdelivr.net; style-src 'unsafe-inline'; img-src data: blob:; base-uri 'none'; form-action 'none';">
+  <title>`,
+    ` — SQLite en Vivo</title>
   <style>
     :root {
       --bg: oklch(15% 0.011 255);
@@ -682,14 +724,15 @@ export function buildSqlRunnerPreview(sqlFile) {
       cursor: not-allowed;
     }
   </style>
-  <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js" crossorigin="anonymous"></script>
 </head>
 <body>
   <div class="sql-shell">
     <div class="sql-header">
       <div class="sql-title-group">
         <span class="sql-title">SQLite 3 (En Vivo)</span>
-        <span class="sql-badge">${safeTitle}</span>
+        <span class="sql-badge">`,
+    `</span>
         <span id="engine-status" class="sql-hint status-loading">Iniciando motor SQLite...</span>
       </div>
       <div class="sql-actions">
@@ -713,9 +756,11 @@ export function buildSqlRunnerPreview(sqlFile) {
 
   <script>
     (function () {
-      var initialScript = ${safeContent};
+      var initialScript = `,
+    `;
       var db = null;
       var sqlEngine = null;
+      var isDisposed = false;
       var lastResults = [];
       var lastFullQuery = null;
       var isPaginatedQuery = false;
@@ -726,6 +771,20 @@ export function buildSqlRunnerPreview(sqlFile) {
       var btnReset = document.getElementById("btn-reset-db");
       var btnCsv = document.getElementById("btn-export-csv");
       var btnJson = document.getElementById("btn-export-json");
+
+      function disposeDb() {
+        if (isDisposed) return;
+        isDisposed = true;
+        if (db && typeof db.close === "function") {
+          try { db.close(); } catch (_) {}
+        }
+        db = null;
+        sqlEngine = null;
+        try { window.SQL = null; } catch (_) {}
+        lastResults = [];
+        lastFullQuery = null;
+        isPaginatedQuery = false;
+      }
 
       function sendLog(level, text) {
         try {
@@ -750,6 +809,7 @@ export function buildSqlRunnerPreview(sqlFile) {
             return "https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/" + file;
           }
         }).then(function (SQL) {
+          if (isDisposed) return;
           sqlEngine = SQL;
           window.SQL = SQL;
           db = new SQL.Database();
@@ -757,6 +817,7 @@ export function buildSqlRunnerPreview(sqlFile) {
           statusEl.style.color = "var(--ok)";
           runFullScript(initialScript);
         }).catch(function (err) {
+          if (isDisposed) return;
           statusEl.textContent = "Error al iniciar SQLite: " + err.message;
           statusEl.style.color = "var(--err)";
           sendLog("error", "Error SQLite: " + err.message);
@@ -767,7 +828,7 @@ export function buildSqlRunnerPreview(sqlFile) {
         if (!results || results.length === 0) {
           var note = document.createElement("div");
           note.className = "status-banner status-ok";
-          note.textContent = "✓ Sentencia ejecutada con éxito (sin filas devueltas).";
+          note.textContent = "\\u2713 Sentencia ejecutada con éxito (sin filas devueltas).";
           resultsArea.appendChild(note);
           return;
         }
@@ -808,7 +869,7 @@ export function buildSqlRunnerPreview(sqlFile) {
             warnBanner.className = "sql-hint";
             warnBanner.style.padding = "6px 12px";
             warnBanner.style.color = "var(--warn)";
-            warnBanner.textContent = "⚠️ La consulta devolvió " + originalRowCount + " filas. Se muestran las primeras " + MAX_SQL_DISPLAY_ROWS + " para prevenir saturación de memoria. Usá LIMIT y OFFSET para paginar consultas masivas.";
+            warnBanner.textContent = "\\u26a0\\ufe0f La consulta devolvió " + originalRowCount + " filas. Se muestran las primeras " + MAX_SQL_DISPLAY_ROWS + " para prevenir saturación de memoria. Usá LIMIT y OFFSET para paginar consultas masivas.";
             card.appendChild(warnBanner);
           }
 
@@ -848,13 +909,13 @@ export function buildSqlRunnerPreview(sqlFile) {
             var btnPrev = document.createElement("button");
             btnPrev.type = "button";
             btnPrev.className = "btn";
-            btnPrev.textContent = "‹ Anterior";
+            btnPrev.textContent = "\\u2039 Anterior";
             btnPrev.disabled = meta.currentPage <= 1;
 
             var btnNext = document.createElement("button");
             btnNext.type = "button";
             btnNext.className = "btn";
-            btnNext.textContent = "Siguiente ›";
+            btnNext.textContent = "Siguiente \\u203a";
             btnNext.disabled = meta.currentPage >= meta.totalPages || res.values.length < meta.pageSize;
 
             btnPrev.addEventListener("click", function () {
@@ -910,12 +971,12 @@ export function buildSqlRunnerPreview(sqlFile) {
             var btnPrev = document.createElement("button");
             btnPrev.type = "button";
             btnPrev.className = "btn";
-            btnPrev.textContent = "‹ Anterior";
+            btnPrev.textContent = "\\u2039 Anterior";
 
             var btnNext = document.createElement("button");
             btnNext.type = "button";
             btnNext.className = "btn";
-            btnNext.textContent = "Siguiente ›";
+            btnNext.textContent = "Siguiente \\u203a";
 
             function renderPage(page) {
               currentPage = Math.max(1, Math.min(page, totalPages));
@@ -975,9 +1036,12 @@ export function buildSqlRunnerPreview(sqlFile) {
           lastResults = res;
           lastFullQuery = code;
           isPaginatedQuery = false;
-          renderResults(res, "Script inicial (" + ${safeTitleJson} + ")");
+          renderResults(res, "Script inicial (" + `,
+    ` + ")");
           sendLog("log", "SQL ejecutado: " + (res.length > 0 ? res.length + " consulta(s) con datos" : "Sentencias DDL/DML exitosas"));
         } catch (e) {
+          lastResults = [];
+          isPaginatedQuery = false;
           var errDiv = document.createElement("div");
           errDiv.className = "status-banner status-err";
           var initErrMsg = e && e.message ? e.message : String(e);
@@ -1038,6 +1102,7 @@ export function buildSqlRunnerPreview(sqlFile) {
               sendLog("log", "Consulta SQL paginada (pág " + page + "): " + paginatedSql);
               return true;
             } catch (e) {
+              lastResults = [];
               var errDiv = document.createElement("div");
               var pageErrMsg = e && e.message ? e.message : String(e);
               errDiv.className = "status-banner status-err";
@@ -1064,6 +1129,8 @@ export function buildSqlRunnerPreview(sqlFile) {
           sendLog("log", "Consulta SQL: " + query + " (" + (res && res[0] ? res[0].values.length : 0) + " filas)");
           queryInput.value = "";
         } catch (e) {
+          lastResults = [];
+          isPaginatedQuery = false;
           var errDiv = document.createElement("div");
           var queryErrMsg = e && e.message ? e.message : String(e);
           errDiv.className = "status-banner status-err";
@@ -1084,7 +1151,7 @@ export function buildSqlRunnerPreview(sqlFile) {
         document.body.removeChild(a);
         window.setTimeout(function () {
           try { URL.revokeObjectURL(url); } catch (_) {}
-        }, 1500);
+        }, 30000);
       }
 
       btnRun.addEventListener("click", runCustomQuery);
@@ -1180,18 +1247,39 @@ export function buildSqlRunnerPreview(sqlFile) {
         sendLog("log", "Exportado JSON " + (dataset.isFull ? "completo (" : "(") + out.length + " filas): " + filename);
       });
 
-      window.addEventListener("pagehide", function () {
-        if (db && typeof db.close === "function") {
-          try {
-            db.close();
-          } catch (_) {}
-          db = null;
-        }
-      });
+      window.addEventListener("pagehide", disposeDb);
+      window.addEventListener("unload", disposeDb);
 
       initDatabase();
     })();
   </script>
 </body>
-</html>`;
+</html>`
+  ].map((chunk) => chunk.replace(/\n[ \t]+/g, "\n"));
+  return cachedSqlPreviewParts;
+}
+
+/**
+ * Construye el documento HTML completo del visor SQL interactivo para el iframe.
+ * @param {{ path: string, shortName: string, content: string }} sqlFile
+ * @returns {string}
+ */
+export function buildSqlRunnerPreview(sqlFile) {
+  const rawTitle = String(sqlFile?.shortName || "consulta.sql");
+  const safeTitle = escapeHtml(rawTitle);
+  const safeTitleJson = escapeJsonForInlineScript(rawTitle);
+  const safeContent = escapeJsonForInlineScript(sqlFile?.content || "");
+  const parts = getSqlPreviewParts();
+
+  return (
+    parts[0] +
+    safeTitle +
+    parts[1] +
+    safeTitle +
+    parts[2] +
+    safeContent +
+    parts[3] +
+    safeTitleJson +
+    parts[4]
+  );
 }

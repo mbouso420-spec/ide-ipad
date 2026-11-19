@@ -217,11 +217,10 @@ export class KeyboardRouter {
       }
     }
 
-    if (this.shouldBlockGlobalShortcuts()) {
+    // 2. Comprobación O(1) de atajo registrado antes de inspeccionar <dialog open> en el DOM
+    if (this.globalShortcuts.size === 0) {
       return;
     }
-
-    // 2. Atajos globales cuando no son bloqueados por el modal o diálogo abierto
     const modParts = [];
     if (event.ctrlKey) modParts.push("ctrl");
     if (event.metaKey) modParts.push("meta");
@@ -236,10 +235,14 @@ export class KeyboardRouter {
         shortcut = this.globalShortcuts.get([...modParts, codeKey].join("+"));
       }
     }
-    if (typeof shortcut === "function") {
-      event.preventDefault();
-      shortcut(event);
+    if (typeof shortcut !== "function") {
+      return;
     }
+    if (this.shouldBlockGlobalShortcuts()) {
+      return;
+    }
+    event.preventDefault();
+    shortcut(event);
   }
 
   destroy() {

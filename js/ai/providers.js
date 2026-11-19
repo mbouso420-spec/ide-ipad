@@ -3,6 +3,7 @@ import {
   AuthLockoutError,
   assertNotLockedOut,
   checkAuthLockout,
+  computeTokenFingerprint,
   CredentialFormatError,
   formatRemainingCooldown,
   isTokenRejectedInSession,
@@ -10,6 +11,7 @@ import {
   recordAuthFailure,
   recordAuthSuccess,
   redactSensitiveTokens,
+  sanitizeErrorCause,
   validateCredentialFormat
 } from "../security/credentialGuard.js";
 import { saveCredentialsBackup } from "../storage/workspaceDb.js";
@@ -90,28 +92,30 @@ export const AI_PROVIDERS = {
     keyPlaceholder: "AIzaSy…",
     helpText: "Sincroniza automáticamente los modelos Flash gratuitos activos en tu cuenta y reintenta si hay alta demanda.",
     contextWindow: 1000000,
-    freeQuota: "15 req/min · 1M TPM (Google AI Studio)",
+    freeQuota: "Cuota gratuita por proyecto (Google AI Studio)",
     models: [
-      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash (Recomendado, cuota gratuita)", contextWindow: 1000000 },
-      { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash Lite (Rápido, menor latencia)", contextWindow: 1000000 },
-      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash (Estable, alta velocidad)", contextWindow: 1000000 }
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash (Recomendado, cuota gratuita)", contextWindow: 1000000 },
+      { id: "gemini-3.6-flash", label: "Gemini 3.6 Flash (Estable, cuota gratuita)", contextWindow: 1000000 },
+      { id: "gemini-3.5-flash-lite", label: "Gemini 3.5 Flash Lite (Rápido, menor latencia)", contextWindow: 1000000 },
+      { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash Lite (Ligero, cuota amplia)", contextWindow: 1000000 }
     ]
   },
   groq: {
     id: "groq",
-    name: "Groq (Llama 3.3, GPT de OpenAI y modelos abiertos)",
+    name: "Groq (GPT-OSS, Llama 3.3 y Qwen 3.8)",
     protocol: "openai",
     endpoint: "https://api.groq.com/openai/v1/chat/completions",
     supportsLiveModels: true,
     keyPlaceholder: "gsk_…",
-    helpText: "100% gratis sin tarjeta en console.groq.com/keys. Incluye Llama 3.3 70B y responde al instante.",
+    helpText: "100% gratis sin tarjeta en console.groq.com/keys. Incluye GPT-OSS 120B, Llama 3.3 70B y Qwen 3.8.",
     contextWindow: 128000,
-    freeQuota: "30 req/min · 6.000 TPM (70B) / 30.000 TPM (8B)",
+    freeQuota: "30 req/min · Modelos abiertos de producción ultrarrápidos",
     models: [
-      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B Versatile (Potente y gratuito)", contextWindow: 128000 },
-      { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant (Ultrarrápido)", contextWindow: 128000 },
       { id: "openai/gpt-oss-120b", label: "OpenAI GPT-OSS 120B (Gratis y ultrarrápido)", contextWindow: 128000 },
-      { id: "openai/gpt-oss-20b", label: "OpenAI GPT-OSS 20B (Instantáneo, cuota amplia)", contextWindow: 128000 }
+      { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B Versatile (Potente y gratuito)", contextWindow: 128000 },
+      { id: "qwen/qwen3.8-27b", label: "Qwen 3.8 27B (Código y razonamiento)", contextWindow: 128000 },
+      { id: "openai/gpt-oss-20b", label: "OpenAI GPT-OSS 20B (Instantáneo, cuota amplia)", contextWindow: 128000 },
+      { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant (Ultrarrápido)", contextWindow: 128000 }
     ]
   },
   openrouter: {
@@ -127,7 +131,8 @@ export const AI_PROVIDERS = {
     models: [
       { id: "openrouter/free", label: "Auto-Router Gratis (Elige un modelo :free activo)", contextWindow: 16000 },
       { id: "nvidia/nemotron-3-ultra-550b-a55b:free", label: "NVIDIA Nemotron 3 Ultra (:free)", contextWindow: 32000 },
-      { id: "google/gemma-4-31b-it:free", label: "Google Gemma 4 31B (:free)", contextWindow: 8192 },
+      { id: "baidu/ernie-5.5-flash-preview:free", label: "Baidu ERNIE 5.5 Flash Preview (:free, código)", contextWindow: 32000 },
+      { id: "google/gemma-4-31b-it:free", label: "Google Gemma 4 31B (:free)", contextWindow: 16000 },
       { id: "cohere/north-mini-code:free", label: "Cohere North Mini Code (:free)", contextWindow: 16000 }
     ]
   },
@@ -144,7 +149,7 @@ export const AI_PROVIDERS = {
     models: [
       { id: "codestral-latest", label: "Codestral (Especialista en código)", contextWindow: 32000 },
       { id: "devstral-small-latest", label: "Devstral Small (Agente de programación)", contextWindow: 32000 },
-      { id: "mistral-small-latest", label: "Mistral Small (Rápido y general)", contextWindow: 32000 }
+      { id: "mistral-small-latest", label: "Mistral Small 4 (Rápido, razonamiento y código)", contextWindow: 32000 }
     ]
   }
 };
@@ -176,7 +181,9 @@ function isFreeActiveGoogleModelId(id) {
   const retiredOrPaidOrSpecial = [
     "1.0",
     "1.5",
+    "2.0",
     "argon",
+    "carbon",
     "-pro",
     "ultra",
     "tts",
@@ -250,8 +257,10 @@ export function setKeyStorageMode(nextMode) {
       }
     }
     if (toSession) {
+      liveSyncedByProvider.clear();
       void saveCredentialsBackup("");
     }
+    notifyCredentialsUpdated();
   } catch {
     // Entorno restringido
   }
@@ -284,6 +293,19 @@ export function getApiKey(providerId) {
   }
 }
 
+export function notifyCredentialsUpdated() {
+  if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") return;
+  try {
+    const evt =
+      typeof CustomEvent === "function"
+        ? new CustomEvent("studio-credentials-updated")
+        : { type: "studio-credentials-updated" };
+    window.dispatchEvent(evt);
+  } catch {
+    // Entorno sin soporte completo de eventos DOM
+  }
+}
+
 export function saveApiKey(providerId, apiKey) {
   if (!Object.hasOwn(AI_PROVIDERS, providerId)) {
     return;
@@ -304,10 +326,12 @@ export function saveApiKey(providerId, apiKey) {
     local?.removeItem(k);
     session?.removeItem(k);
     if (!trimmed) {
+      notifyCredentialsUpdated();
       return;
     }
     const target = getKeyStorageMode() === "session" ? session : local;
     target?.setItem(k, trimmed);
+    notifyCredentialsUpdated();
   } catch {
     // Entorno restringido
   }
@@ -346,6 +370,18 @@ export function getSyncCredentialsBackupPayload() {
     : exportKeysBundle();
 }
 
+/**
+ * Sincroniza de forma segura el respaldo persistente de credenciales en IndexedDB
+ * (o lo borra si el modo activo es "session" o no quedan credenciales).
+ */
+export function syncCredentialsBackup() {
+  try {
+    void saveCredentialsBackup(getSyncCredentialsBackupPayload());
+  } catch {
+    // Entorno restringido o sin soporte de IndexedDB
+  }
+}
+
 function isValidImportedSecretString(raw) {
   if (typeof raw !== "string" || CONTROL_CHARS_RE.test(raw) || NON_BYTE_STRING_RE.test(raw)) {
     return false;
@@ -358,9 +394,17 @@ export function importKeysBundle(rawJson) {
   if (typeof rawJson !== "string" || rawJson.length > MAX_KEY_BUNDLE_JSON_BYTES) {
     throw new Error("Formato de claves inválido.");
   }
-  const parsed = JSON.parse(rawJson);
+  let parsed;
+  try {
+    parsed = JSON.parse(rawJson);
+  } catch {
+    throw new Error("Formato de claves inválido.");
+  }
   if (!parsed || typeof parsed !== "object") {
     throw new Error("Formato de claves inválido.");
+  }
+  if (Array.isArray(parsed)) {
+    return 0;
   }
   let count = 0;
   for (const id of Object.keys(AI_PROVIDERS)) {
@@ -395,6 +439,9 @@ export function importKeysBundle(rawJson) {
   }
   if (typeof parsed.activeProvider === "string" && Object.hasOwn(AI_PROVIDERS, parsed.activeProvider)) {
     saveProviderId(parsed.activeProvider);
+  }
+  if (count > 0) {
+    notifyCredentialsUpdated();
   }
   return count;
 }
@@ -521,87 +568,115 @@ export async function validateApiKey(providerId, apiKey, signal) {
     check.header === "bearer" ? { Authorization: `Bearer ${cleanKey}` } : { [check.header]: cleanKey };
 
   const connect = createFetchConnectSignal(signal, 20000);
-  let res;
   try {
-    res = await fetch(check.url, { headers, signal: connect.signal });
-  } catch (error) {
-    if (isAbortError(error) && !connect.signal.aborted) {
-      throw error;
+    let res;
+    try {
+      res = await fetch(check.url, { headers, signal: connect.signal });
+    } catch (error) {
+      if (signal?.aborted || (isAbortError(error) && !connect.signal.aborted)) {
+        throw error;
+      }
+      const friendly = toFriendlyNetworkError(error, label, [cleanKey]);
+      if (
+        friendly?.isNetworkFailure ||
+        error?.name === "TimeoutError" ||
+        connect.signal.reason?.name === "TimeoutError"
+      ) {
+        return { status: "offline", message: `Sin conexión: no se pudo verificar la clave de ${label}.` };
+      }
+      return { status: "unknown", message: `No se pudo verificar la clave de ${label} ahora.` };
     }
-    if (signal?.aborted) {
-      throw error;
+
+    if (res.ok || res.status === 429) {
+      // 429 = la clave fue reconocida pero llegó al límite momentáneo de consultas.
+      res.body?.cancel?.().catch(() => {});
+      recordAuthSuccess(scope);
+      return { status: "valid", message: `Clave de ${label} verificada.` };
     }
-    const friendly = toFriendlyNetworkError(error, label, [cleanKey]);
-    if (friendly?.isNetworkFailure || error?.name === "TimeoutError") {
-      return { status: "offline", message: `Sin conexión: no se pudo verificar la clave de ${label}.` };
+
+    let detail = "";
+    try {
+      const data = await res.json();
+      detail = String(data?.error?.message || data?.detail || data?.message || "");
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        throw err;
+      }
+      // Sin cuerpo JSON
     }
-    return { status: "unknown", message: `No se pudo verificar la clave de ${label} ahora.` };
+
+    const keyRejected =
+      res.status === 401 ||
+      res.status === 403 ||
+      (res.status === 400 && /api key|api_key|apikey/i.test(detail));
+    if (keyRejected) {
+      markTokenRejectedInSession(scope, cleanKey);
+      const failure = recordAuthFailure(scope);
+      if (failure.locked) {
+        return {
+          status: "locked",
+          remainingMs: failure.remainingMs,
+          message: `${label} rechazó la clave. Bloqueo temporal activado (${formatRemainingCooldown(failure.remainingMs)}) tras múltiples intentos fallidos.`
+        };
+      }
+      return {
+        status: "invalid",
+        message: `${label} rechazó la clave. Revisá que la hayas copiado completa o generá una nueva.`
+      };
+    }
+    return { status: "unknown", message: `No se pudo verificar la clave de ${label} (respuesta ${res.status}).` };
   } finally {
     connect.cleanup();
   }
-
-  if (res.ok || res.status === 429) {
-    // 429 = la clave fue reconocida pero llegó al límite momentáneo de consultas.
-    recordAuthSuccess(scope);
-    return { status: "valid", message: `Clave de ${label} verificada.` };
-  }
-
-  let detail = "";
-  try {
-    const data = await res.json();
-    detail = String(data?.error?.message || data?.detail || data?.message || "");
-  } catch (err) {
-    if (isAbortError(err) || signal?.aborted) {
-      throw err;
-    }
-    // Sin cuerpo JSON
-  }
-
-  const keyRejected =
-    res.status === 401 ||
-    res.status === 403 ||
-    (res.status === 400 && /api key|api_key|apikey/i.test(detail));
-  if (keyRejected) {
-    markTokenRejectedInSession(scope, cleanKey);
-    const failure = recordAuthFailure(scope);
-    if (failure.locked) {
-      return {
-        status: "locked",
-        remainingMs: failure.remainingMs,
-        message: `${label} rechazó la clave. Bloqueo temporal activado (${formatRemainingCooldown(failure.remainingMs)}) tras múltiples intentos fallidos.`
-      };
-    }
-    return {
-      status: "invalid",
-      message: `${label} rechazó la clave. Revisá que la hayas copiado completa o generá una nueva.`
-    };
-  }
-  return { status: "unknown", message: `No se pudo verificar la clave de ${label} (respuesta ${res.status}).` };
 }
 
 export function isAbortError(error) {
   return Boolean(error && typeof error === "object" && error.name === "AbortError");
 }
 
+function sanitizePropagatedError(error, providerId, apiKey = "") {
+  if (
+    isAbortError(error) ||
+    error instanceof AuthLockoutError ||
+    error instanceof CredentialFormatError
+  ) {
+    return error;
+  }
+  const secrets = apiKey ? [apiKey] : [];
+  const friendly = toFriendlyNetworkError(error, providerLabel(providerId), secrets);
+  if (friendly instanceof Error) {
+    if (friendly.message) {
+      friendly.message = redactSensitiveTokens(friendly.message, secrets);
+    }
+    if (friendly.cause) {
+      friendly.cause = sanitizeErrorCause(friendly.cause, secrets);
+    }
+    return friendly;
+  }
+  return new Error(redactSensitiveTokens(String(error || "Error al conectar con el proveedor de IA."), secrets));
+}
+
 export async function fetchLiveFreeModels(providerId, apiKey, signal, options = {}) {
   try {
     return await fetchLiveFreeModelsRaw(providerId, apiKey, signal, options);
   } catch (error) {
-    if (isAbortError(error)) {
-      throw error;
+    if (signal?.aborted && !error?.httpStatus) {
+      throw isAbortError(error) ? error : new DOMException("Aborted", "AbortError");
     }
-    const friendly = toFriendlyNetworkError(error, providerLabel(providerId), [apiKey]);
-    if (friendly instanceof Error && friendly.message) {
-      friendly.message = redactSensitiveTokens(friendly.message, [apiKey]);
-    }
-    throw friendly;
+    throw sanitizePropagatedError(error, providerId, apiKey);
   }
 }
 
-async function fetchWithModelsTimeout(url, fetchInit, signal) {
+async function fetchModelsJson(url, fetchInit, signal, onNotOk) {
   const connect = createFetchConnectSignal(signal, 20000);
   try {
-    return await fetch(url, { ...fetchInit, signal: connect.signal });
+    const res = await fetch(url, { ...fetchInit, signal: connect.signal });
+    if (!res.ok) {
+      await onNotOk(res);
+      res.body?.cancel?.().catch(() => {});
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return await res.json();
   } finally {
     connect.cleanup();
   }
@@ -629,16 +704,33 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     }
     // La clave viaja en cabecera (no en la URL) para que no quede en historiales, logs ni cachés intermedias.
     const url = "https://generativelanguage.googleapis.com/v1beta/models";
-    const res = await fetchWithModelsTimeout(url, { headers: { "x-goog-api-key": apiKey } }, signal);
-    if (!res.ok) {
-      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
-        markTokenRejectedInSession(scope, apiKey);
-        recordAuthFailure(scope);
+    const data = await fetchModelsJson(
+      url,
+      { headers: { "x-goog-api-key": apiKey } },
+      signal,
+      async (res) => {
+        let isBadKey = res.status === 401 || res.status === 403;
+        if (!isBadKey && res.status === 400) {
+          try {
+            const errBody = await res.json();
+            const detail = String(errBody?.error?.message || errBody?.message || "");
+            isBadKey = /api key|api_key|apikey/i.test(detail);
+          } catch {
+            // Sin JSON de error
+          }
+        } else {
+          res.body?.cancel?.().catch(() => {});
+        }
+        if (trackAuthFailure && isBadKey) {
+          markTokenRejectedInSession(scope, apiKey);
+          recordAuthFailure(scope);
+        }
+        const err = new Error(`Error al consultar Gemini (${res.status}).`);
+        err.httpStatus = res.status;
+        throw err;
       }
-      throw new Error(`Error al consultar Gemini (${res.status}).`);
-    }
+    );
     recordAuthSuccess(scope);
-    const data = await res.json();
     const list = Array.isArray(data.models) ? data.models : [];
     const filtered = list
       .filter((m) => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent"))
@@ -653,7 +745,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
 
     filtered.sort((a, b) => scoreGoogleModel(a.id) - scoreGoogleModel(b.id));
 
-    liveSyncedByProvider.set("gemini", apiKey);
+    liveSyncedByProvider.set("gemini", computeTokenFingerprint(scope, apiKey));
     if (filtered.length > 0) {
       liveModelsByProvider.set("gemini", filtered);
     }
@@ -664,20 +756,22 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     if (!apiKey) {
       throw new Error("Pegá primero tu API Key gratuita de Groq.");
     }
-    const res = await fetchWithModelsTimeout(
+    const data = await fetchModelsJson(
       "https://api.groq.com/openai/v1/models",
       { headers: { Authorization: `Bearer ${apiKey}` } },
-      signal
-    );
-    if (!res.ok) {
-      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
-        markTokenRejectedInSession(scope, apiKey);
-        recordAuthFailure(scope);
+      signal,
+      async (res) => {
+        res.body?.cancel?.().catch(() => {});
+        if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
+          markTokenRejectedInSession(scope, apiKey);
+          recordAuthFailure(scope);
+        }
+        const err = new Error(`Error al consultar Groq (${res.status}).`);
+        err.httpStatus = res.status;
+        throw err;
       }
-      throw new Error(`Error al consultar Groq (${res.status}).`);
-    }
+    );
     recordAuthSuccess(scope);
-    const data = await res.json();
     const list = Array.isArray(data.data) ? data.data : [];
     const filtered = list
       .filter((m) => m?.active !== false && isActiveGroqChatModelId(m.id))
@@ -688,7 +782,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
 
     filtered.sort((a, b) => scoreGroqModel(a.id) - scoreGroqModel(b.id));
 
-    liveSyncedByProvider.set("groq", apiKey);
+    liveSyncedByProvider.set("groq", computeTokenFingerprint(scope, apiKey));
     if (filtered.length > 0) {
       liveModelsByProvider.set("groq", filtered);
     }
@@ -696,11 +790,17 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
   }
 
   if (providerId === "openrouter") {
-    const res = await fetchWithModelsTimeout("https://openrouter.ai/api/v1/models", {}, signal);
-    if (!res.ok) {
-      throw new Error(`Error al consultar OpenRouter (${res.status}).`);
-    }
-    const data = await res.json();
+    const data = await fetchModelsJson(
+      "https://openrouter.ai/api/v1/models",
+      {},
+      signal,
+      async (res) => {
+        res.body?.cancel?.().catch(() => {});
+        const err = new Error(`Error al consultar OpenRouter (${res.status}).`);
+        err.httpStatus = res.status;
+        throw err;
+      }
+    );
     const list = Array.isArray(data.data) ? data.data : [];
     const freeItems = list
       .filter((m) => String(m.id || "").endsWith(":free"))
@@ -723,20 +823,22 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
     if (!apiKey) {
       throw new Error("Pegá primero tu clave gratuita de Mistral.");
     }
-    const res = await fetchWithModelsTimeout(
+    const data = await fetchModelsJson(
       "https://api.mistral.ai/v1/models",
       { headers: { Authorization: `Bearer ${apiKey}` } },
-      signal
-    );
-    if (!res.ok) {
-      if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
-        markTokenRejectedInSession(scope, apiKey);
-        recordAuthFailure(scope);
+      signal,
+      async (res) => {
+        res.body?.cancel?.().catch(() => {});
+        if (trackAuthFailure && (res.status === 401 || res.status === 403)) {
+          markTokenRejectedInSession(scope, apiKey);
+          recordAuthFailure(scope);
+        }
+        const err = new Error(`Error al consultar Mistral (${res.status}).`);
+        err.httpStatus = res.status;
+        throw err;
       }
-      throw new Error(`Error al consultar Mistral (${res.status}).`);
-    }
+    );
     recordAuthSuccess(scope);
-    const data = await res.json();
     const list = Array.isArray(data.data) ? data.data : [];
     const filtered = list
       .filter((m) => {
@@ -745,9 +847,15 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
       })
       .map((m) => ({ id: m.id, label: m.id }));
 
-    liveSyncedByProvider.set("mistral", apiKey);
+    liveSyncedByProvider.set("mistral", computeTokenFingerprint(scope, apiKey));
     if (filtered.length > 0) {
-      const preferred = ["codestral-latest", "devstral-small-latest", "mistral-small-latest"];
+      const preferred = [
+        "codestral-latest",
+        "devstral-small-latest",
+        "devstral-medium-latest",
+        "mistral-small-latest",
+        "magistral-small-latest"
+      ];
       filtered.sort((a, b) => {
         const ia = preferred.indexOf(a.id);
         const ib = preferred.indexOf(b.id);
@@ -767,6 +875,7 @@ async function fetchLiveFreeModelsRaw(providerId, apiKey, signal, { trackAuthFai
 function formatGroqLabel(id) {
   if (id === "openai/gpt-oss-120b") return "OpenAI GPT-OSS 120B (Gratis y ultrarrápido)";
   if (id === "openai/gpt-oss-20b") return "OpenAI GPT-OSS 20B (Instantáneo)";
+  if (id === "qwen/qwen3.8-27b") return "Qwen 3.8 27B (Código y razonamiento)";
   return id;
 }
 
@@ -780,12 +889,13 @@ function scoreGroqModel(id) {
 }
 
 function scoreGoogleModel(id) {
-  if (id.includes("flash-lite")) return 1;
-  if (id.startsWith("gemini-2.5-flash")) return 2;
-  if (id.startsWith("gemini-3")) return 3;
-  if (id.startsWith("gemini-")) return 4;
-  if (id.startsWith("gemma-") && id.includes("-it")) return 5;
-  return 6;
+  if (id.startsWith("gemini-3") && id.includes("flash-lite")) return 1;
+  if (id.startsWith("gemini-3")) return 2;
+  if (id.includes("flash-lite")) return 3;
+  if (id.startsWith("gemini-2.5-flash")) return 4;
+  if (id.startsWith("gemini-")) return 5;
+  if (id.startsWith("gemma-") && id.includes("-it")) return 6;
+  return 7;
 }
 
 export async function streamAiCompletion({
@@ -859,8 +969,9 @@ async function streamGeminiWithFallback({
   signal
 }) {
   let cleanRequested = String(model || "").replace(/^models\//, "");
+  const keyFp = computeTokenFingerprint(aiScope("gemini"), apiKey);
 
-  if (liveSyncedByProvider.get("gemini") !== apiKey) {
+  if (liveSyncedByProvider.get("gemini") !== keyFp) {
     try {
       const live = await fetchLiveFreeModels("gemini", apiKey, signal, { trackAuthFailure: false });
       if (live.length > 0) {
@@ -877,7 +988,7 @@ async function streamGeminiWithFallback({
   const activeIds = getProviderModels("gemini").map((m) => m.id);
   if (
     !isFreeActiveGoogleModelId(cleanRequested) ||
-    (liveSyncedByProvider.get("gemini") === apiKey && activeIds.length > 0 && !activeIds.includes(cleanRequested))
+    (liveSyncedByProvider.get("gemini") === keyFp && activeIds.length > 0 && !activeIds.includes(cleanRequested))
   ) {
     cleanRequested = activeIds[0] || AI_PROVIDERS.gemini.models[0].id;
   }
@@ -894,10 +1005,16 @@ async function streamGeminiWithFallback({
   };
 
   for (let i = 0; i < candidates.length; i += 1) {
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
     const candidateModel = candidates[i];
     const maxAttempts = i === 0 ? 3 : 2;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (signal?.aborted) {
+        throw new DOMException("Aborted", "AbortError");
+      }
       try {
         if (i > 0 && attempt === 1) {
           onFallbackNotice?.(
@@ -921,10 +1038,10 @@ async function streamGeminiWithFallback({
         });
         return;
       } catch (rawError) {
-        if (isAbortError(rawError)) {
-          throw rawError;
+        if (isAbortError(rawError) || (signal?.aborted && !rawError?.httpStatus)) {
+          throw isAbortError(rawError) ? rawError : new DOMException("Aborted", "AbortError");
         }
-        const error = toFriendlyNetworkError(rawError, providerLabel("gemini"), [apiKey]);
+        const error = sanitizePropagatedError(rawError, "gemini", apiKey);
         if (emittedAnyChunk || error?.isNetworkFailure) {
           // Ya se mostró parte de la respuesta (reintentar duplicaría texto) o no hay red (reintentar no sirve).
           throw error;
@@ -969,7 +1086,7 @@ async function streamOpenAiWithFallback({
   onModelsSynced,
   signal
 }) {
-  const syncToken = provider.id === "openrouter" ? "public" : apiKey;
+  const syncToken = provider.id === "openrouter" ? "public" : computeTokenFingerprint(aiScope(provider.id), apiKey);
   if (provider.supportsLiveModels && liveSyncedByProvider.get(provider.id) !== syncToken) {
     try {
       const live = await fetchLiveFreeModels(provider.id, apiKey, signal, { trackAuthFailure: false });
@@ -1008,6 +1125,9 @@ async function streamOpenAiWithFallback({
   };
 
   for (let i = 0; i < candidates.length; i += 1) {
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
     const candidateModel = candidates[i];
     try {
       if (i > 0) {
@@ -1025,10 +1145,10 @@ async function streamOpenAiWithFallback({
       });
       return;
     } catch (rawError) {
-      if (isAbortError(rawError)) {
-        throw rawError;
+      if (isAbortError(rawError) || (signal?.aborted && !rawError?.httpStatus)) {
+        throw isAbortError(rawError) ? rawError : new DOMException("Aborted", "AbortError");
       }
-      const error = toFriendlyNetworkError(rawError, providerLabel(provider.id), [apiKey]);
+      const error = sanitizePropagatedError(rawError, provider.id, apiKey);
       if (emittedAnyChunk || error?.isNetworkFailure) {
         // Ya se mostró parte de la respuesta (reintentar duplicaría texto) o no hay red (reintentar no sirve).
         throw error;
@@ -1085,19 +1205,25 @@ function createFetchConnectSignal(parentSignal, timeoutMs = 45000) {
   const timerApi = typeof window !== "undefined" ? window : globalThis;
   const controller = new AbortController();
   let onParentAbort = null;
+  const abort = (reason) => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason || new DOMException("Aborted", "AbortError"));
+    }
+  };
   if (parentSignal?.aborted) {
-    controller.abort(parentSignal.reason || new DOMException("Aborted", "AbortError"));
-    return { signal: controller.signal, clearTimer: () => {}, cleanup: () => {} };
+    abort(parentSignal.reason);
+    return { signal: controller.signal, abort, clearTimer: () => {}, cleanup: () => {} };
   }
   if (parentSignal) {
-    onParentAbort = () => {
-      controller.abort(parentSignal.reason || new DOMException("Aborted", "AbortError"));
-    };
+    onParentAbort = () => abort(parentSignal.reason);
     parentSignal.addEventListener("abort", onParentAbort, { once: true });
   }
   let timer = timerApi.setTimeout(() => {
-    controller.abort(new DOMException("Tiempo de espera agotado al conectar con el servidor de IA.", "TimeoutError"));
+    abort(new DOMException("Tiempo de espera agotado al conectar con el servidor de IA.", "TimeoutError"));
   }, timeoutMs);
+  if (timer && typeof timer.unref === "function") {
+    timer.unref();
+  }
   const clearTimer = () => {
     if (timer) {
       timerApi.clearTimeout(timer);
@@ -1106,6 +1232,7 @@ function createFetchConnectSignal(parentSignal, timeoutMs = 45000) {
   };
   return {
     signal: controller.signal,
+    abort,
     clearTimer,
     cleanup: () => {
       clearTimer();
@@ -1115,6 +1242,33 @@ function createFetchConnectSignal(parentSignal, timeoutMs = 45000) {
       }
     }
   };
+}
+
+async function cancelReaderBounded(reader, timeoutMs = 1000) {
+  if (!reader || typeof reader.cancel !== "function") return;
+  const timerApi = typeof window !== "undefined" ? window : globalThis;
+  let timerId = 0;
+  try {
+    await Promise.race([
+      Promise.resolve(reader.cancel()).catch(() => {}),
+      new Promise((resolve) => {
+        timerId = timerApi.setTimeout(() => {
+          timerId = 0;
+          resolve();
+        }, timeoutMs);
+        if (timerId && typeof timerId.unref === "function") {
+          timerId.unref();
+        }
+      })
+    ]);
+  } catch {
+    // Ignorar errores secundarios al cancelar el lector
+  } finally {
+    if (timerId) {
+      timerApi.clearTimeout(timerId);
+      timerId = 0;
+    }
+  }
 }
 
 async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history, onChunk, signal }) {
@@ -1199,7 +1353,9 @@ async function runSingleGeminiStream({ cleanModel, apiKey, systemPrompt, history
           }
         }
       },
-      connect.signal
+      connect.signal,
+      45000,
+      (reason) => connect.abort(reason)
     );
   } finally {
     connect.cleanup();
@@ -1273,7 +1429,9 @@ async function runSingleOpenAiStream({ providerId, endpoint, model, apiKey, syst
           onChunk(delta);
         }
       },
-      connect.signal
+      connect.signal,
+      45000,
+      (reason) => connect.abort(reason)
     );
   } finally {
     connect.cleanup();
@@ -1317,6 +1475,9 @@ function readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs) {
       timerId = timerApi.setTimeout(() => {
         fail(new DOMException("Tiempo de espera agotado esperando datos del flujo de IA.", "TimeoutError"));
       }, chunkTimeoutMs);
+      if (timerId && typeof timerId.unref === "function") {
+        timerId.unref();
+      }
     }
     Promise.resolve(reader.read()).then(
       (chunk) => {
@@ -1332,7 +1493,7 @@ function readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs) {
   });
 }
 
-async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutMs = 45000) {
+async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutMs = 45000, onAbortRequest = null) {
   if (!body) {
     throw new Error("El navegador no recibió un flujo de datos válido.");
   }
@@ -1341,6 +1502,8 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
   const eventDataLines = [];
+  let eventDataChars = 0;
+  let receivedDone = false;
 
   const flushEvent = () => {
     if (eventDataLines.length === 0) {
@@ -1348,7 +1511,12 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
     }
     const payload = eventDataLines.join("\n").trim();
     eventDataLines.length = 0;
-    if (!payload || payload === "[DONE]") {
+    eventDataChars = 0;
+    if (!payload) {
+      return;
+    }
+    if (payload === "[DONE]") {
+      receivedDone = true;
       return;
     }
     try {
@@ -1362,6 +1530,7 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
   };
 
   const processLine = (rawLine) => {
+    if (receivedDone) return;
     if (rawLine === "") {
       flushEvent();
       return;
@@ -1371,6 +1540,10 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
     }
     if (rawLine === "data") {
       eventDataLines.push("");
+      eventDataChars += 1;
+      if (eventDataChars > MAX_SSE_BUFFER_CHARS) {
+        throw new Error("El flujo SSE superó el límite de tamaño de evento permitido.");
+      }
       return;
     }
     if (rawLine.startsWith("data:")) {
@@ -1379,12 +1552,16 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
         val = val.slice(1);
       }
       eventDataLines.push(val);
+      eventDataChars += val.length + 1;
+      if (eventDataChars > MAX_SSE_BUFFER_CHARS) {
+        throw new Error("El flujo SSE superó el límite de tamaño de evento permitido.");
+      }
     }
   };
 
   const drainLines = (isFinal) => {
     let pos = 0;
-    while (pos < buffer.length) {
+    while (pos < buffer.length && !receivedDone) {
       const nlIdx = buffer.indexOf("\n", pos);
       const crIdx = buffer.indexOf("\r", pos);
       let brIdx = -1;
@@ -1414,7 +1591,7 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
   };
 
   try {
-    while (true) {
+    while (!receivedDone) {
       const { value, done } = await readChunkWithAbortAndTimeout(reader, signal, chunkTimeoutMs);
       if (done) {
         buffer += decoder.decode();
@@ -1427,17 +1604,23 @@ async function consumeSseStream(body, onDataPacket, signal = null, chunkTimeoutM
       drainLines(false);
     }
 
+    if (receivedDone) {
+      // Cerrar la lectura/socket de inmediato al recibir [DONE] sin esperar timeout del servidor
+      await cancelReaderBounded(reader, 500);
+      onAbortRequest?.();
+      return;
+    }
+
     drainLines(true);
-    if (buffer.length > 0) {
+    if (!receivedDone && buffer.length > 0) {
       processLine(buffer);
     }
-    flushEvent();
-  } catch (err) {
-    try {
-      await reader.cancel?.();
-    } catch {
-      // Ignorar errores secundarios al cancelar el lector
+    if (!receivedDone) {
+      flushEvent();
     }
+  } catch (err) {
+    onAbortRequest?.(err);
+    await cancelReaderBounded(reader, 1000);
     throw err;
   } finally {
     try {
@@ -1510,7 +1693,8 @@ export function setAiContextBudget(mode) {
 async function extractApiError(res, label, secret = "") {
   try {
     const data = await res.json();
-    const detail = data?.error?.message || data?.message || JSON.stringify(data);
+    const rawDetail = String(data?.error?.message || data?.detail || data?.message || JSON.stringify(data));
+    const detail = rawDetail.length > 500 ? `${rawDetail.slice(0, 500)}…` : rawDetail;
     return redactSensitiveTokens(`${label} (${res.status}): ${detail}`, [secret]);
   } catch {
     return `${label}: error HTTP ${res.status}. Verificá tu clave gratuita o probá otro modelo de la lista.`;

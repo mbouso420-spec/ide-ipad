@@ -475,7 +475,8 @@ export function inspectModuleUsage(jsCode) {
                 beforeOpen >= 0 &&
                 (tokens[beforeOpen].value === "function" ||
                   tokens[beforeOpen].type === "ident" ||
-                  tokens[beforeOpen].value === "*")
+                  tokens[beforeOpen].value === "*" ||
+                  tokens[beforeOpen].value === "]")
               ) {
                 const bTok = tokens[beforeOpen].value;
                 if (bTok !== "if" && bTok !== "while" && bTok !== "for" && bTok !== "switch" && bTok !== "catch" && bTok !== "with") {
@@ -522,13 +523,13 @@ export function inspectModuleUsage(jsCode) {
       }
       if (n1 < tokens.length && tokens[n1].type === "punct" && tokens[n1].value === "(") {
         const argIdx = skipTrivia(tokens, n1 + 1);
-        const closeP = skipTrivia(tokens, argIdx + 1);
+        const afterArg = skipTrivia(tokens, argIdx + 1);
         if (
           argIdx < tokens.length &&
           tokens[argIdx].type === "string" &&
-          closeP < tokens.length &&
-          tokens[closeP].type === "punct" &&
-          tokens[closeP].value === ")"
+          afterArg < tokens.length &&
+          tokens[afterArg].type === "punct" &&
+          (tokens[afterArg].value === ")" || tokens[afterArg].value === ",")
         ) {
           const spec = unquoteStringToken(tokens[argIdx]);
           if (spec && isRelativeModuleSpecifier(spec)) dynamicLocalImports.push(spec);

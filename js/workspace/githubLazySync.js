@@ -49,6 +49,8 @@ export function createGithubLazySync({
   listProjects
 }) {
   const inFlightFileFetches = new Map();
+  let previewPreloadController = null;
+  const MAX_PREVIEW_PRELOAD_FILES = 60;
 
   function isWebScriptOrMarkupFile(file) {
     if (!file) return false;
@@ -185,7 +187,7 @@ export function createGithubLazySync({
     }
   }
 
-  async function ensureFilesLoaded(fileList, onProgress) {
+  async function ensureFilesLoaded(fileList, onProgress, { signal = null } = {}) {
     const activeProject = getActiveProject();
     const candidates = (Array.isArray(fileList) ? fileList : []).filter(
       (f) => f && f.contentLoaded === false && f.blobSha
@@ -218,7 +220,8 @@ export function createGithubLazySync({
         owner: activeProject.github.owner,
         repo: activeProject.github.repo,
         items: unloaded.map((f) => ({ path: f.path, blobSha: f.blobSha, isBinary: Boolean(f.isBinary) })),
-        onProgress
+        onProgress,
+        signal
       });
 
       const byPath = new Map((Array.isArray(loadedItems) ? loadedItems : []).map((item) => [item.path, item]));
@@ -338,24 +341,47 @@ export function createGithubLazySync({
     });
 
     if (needed.length > 0) {
+      // Priorizar archivos en la misma carpeta y acotar precarga para no saturar batería/red en repos masivos.
+      if (needed.length > MAX_PREVIEW_PRELOAD_FILES) {
+        needed.sort((a, b) => {
+          const aSame = folderPrefix && a.path.startsWith(folderPrefix) ? 0 : 1;
+          const bSame = folderPrefix && b.path.startsWith(folderPrefix) ? 0 : 1;
+          if (aSame !== bSame) return aSame - bSame;
+          const aScript = isWebScriptOrMarkupFile(a) ? 0 : 1;
+          const bScript = isWebScriptOrMarkupFile(b) ? 0 : 1;
+          return aScript - bScript;
+        });
+        needed.length = MAX_PREVIEW_PRELOAD_FILES;
+      }
+
+      previewPreloadController?.abort();
+      previewPreloadController = typeof AbortController === "function" ? new AbortController() : null;
+      const preloadSignal = previewPreloadController ? previewPreloadController.signal : null;
+
       explorer.setAutosaveStatus(`Cargando ${needed.length} archivo(s) para la vista previa…`);
       try {
-        await ensureFilesLoaded(needed);
-        if (getActiveProject()?.id === sourceProjectId) {
+        await ensureFilesLoaded(needed, undefined, { signal: preloadSignal });
+        if (!preloadSignal?.aborted && getActiveProject()?.id === sourceProjectId) {
           explorer.setAutosaveStatus("Vista previa lista");
         }
-      } catch {
-        if (getActiveProject()?.id === sourceProjectId) {
+      } catch (err) {
+        if (err?.name !== "AbortError" && !preloadSignal?.aborted && getActiveProject()?.id === sourceProjectId) {
           explorer.setAutosaveStatus("Vista previa parcial (sin red)");
         }
       }
     }
   }
 
+  function cancelPreviewPreload() {
+    previewPreloadController?.abort();
+    previewPreloadController = null;
+  }
+
   return {
     syncOfflineButtonState,
     ensureFileContentLoaded,
     ensureFilesLoaded,
-    preloadForPreview
+    preloadForPreview,
+    cancelPreviewPreload
   };
 }

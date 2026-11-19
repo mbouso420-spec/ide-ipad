@@ -86,6 +86,9 @@ export function createSplitEditorController({
     if (!splitFileSelectEl) return;
     const textFiles = getFilesOnly().filter((f) => f && !isBinaryFile(f));
     splitFileSelectEl.innerHTML = "";
+    const frag = typeof document.createDocumentFragment === "function"
+      ? document.createDocumentFragment()
+      : null;
     for (const f of textFiles) {
       const opt = document.createElement("option");
       opt.value = f.id;
@@ -93,7 +96,14 @@ export function createSplitEditorController({
       if (f.id === splitActiveFileId) {
         opt.selected = true;
       }
-      splitFileSelectEl.appendChild(opt);
+      if (frag) {
+        frag.appendChild(opt);
+      } else {
+        splitFileSelectEl.appendChild(opt);
+      }
+    }
+    if (frag) {
+      splitFileSelectEl.appendChild(frag);
     }
     if (!splitActiveFileId || !textFiles.some((f) => f.id === splitActiveFileId)) {
       splitFileSelectEl.value = "";
@@ -215,20 +225,41 @@ export function createSplitEditorController({
     let totalWidth = 0;
     let isDragging = false;
     let activePointerId = null;
+    let pendingClientX = null;
+    let dragRaf = null;
+    const safeRaf = typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(cb, 16);
+    const safeCancelRaf = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : (id) => clearTimeout(id);
 
-    const onPointerMove = (e) => {
-      if (!isDragging || totalWidth <= 0) return;
-      if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
-      const delta = e.clientX - startX;
+    const flushDragLayout = () => {
+      dragRaf = null;
+      if (!isDragging || totalWidth <= 0 || pendingClientX === null) return;
+      const delta = pendingClientX - startX;
       const newLeft = startLeftWidth + delta;
       const leftPct = Math.max(20, Math.min(80, (newLeft / totalWidth) * 100));
       if (editorMountEl) editorMountEl.style.flex = `0 0 ${leftPct}%`;
       if (splitMountEl) splitMountEl.style.flex = `0 0 ${100 - leftPct}%`;
     };
 
+    const onPointerMove = (e) => {
+      if (!isDragging || totalWidth <= 0) return;
+      if (activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
+      pendingClientX = e.clientX;
+      if (!dragRaf) {
+        dragRaf = safeRaf(flushDragLayout);
+      }
+    };
+
     const onPointerUp = (e) => {
       if (!isDragging) return;
       if (e && activePointerId !== null && e.pointerId !== undefined && e.pointerId !== activePointerId) return;
+      if (dragRaf) {
+        safeCancelRaf(dragRaf);
+        dragRaf = null;
+      }
+      if (pendingClientX !== null && totalWidth > 0) {
+        flushDragLayout();
+      }
+      pendingClientX = null;
       isDragging = false;
       if (activePointerId !== null) {
         try {
@@ -257,10 +288,11 @@ export function createSplitEditorController({
         }
       }
       startX = e.clientX;
+      pendingClientX = e.clientX;
       startLeftWidth = editorMountEl ? editorMountEl.getBoundingClientRect().width : 0;
       totalWidth = editorStageEl.getBoundingClientRect().width;
       splitDividerEl.classList.add("is-dragging");
-      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointermove", onPointerMove, { passive: true });
       window.addEventListener("pointerup", onPointerUp);
       window.addEventListener("pointercancel", onPointerUp);
       activeDragCleanup = onPointerUp;
@@ -305,18 +337,10 @@ export function createSplitEditorController({
     },
     dropFileState(filePath, isFolder = false) {
       openRequestSeq += 1;
-      if (isFolder) {
-        const prefix = `${filePath}/`;
-        for (const f of getFilesOnly()) {
-          if (f.id === filePath || f.id.startsWith(prefix)) {
-            editorSplit?.dropFileState?.(f.id);
-          }
-        }
-      }
-      editorSplit?.dropFileState?.(filePath);
+      editorSplit?.dropFileState?.(filePath, isFolder);
       const affectsActive =
         splitActiveFileId === filePath ||
-        Boolean(splitActiveFileId && splitActiveFileId.startsWith(`${filePath}/`));
+        Boolean(isFolder && splitActiveFileId && splitActiveFileId.startsWith(`${filePath}/`));
       if (affectsActive) {
         splitActiveFileId = null;
         editorSplit?.clearActiveFile?.();
@@ -346,7 +370,7 @@ export function createSplitEditorController({
     },
     replaceIfActive(fileId, code) {
       if (editorSplit && editorSplit.getActiveFileId() === fileId) {
-        editorSplit.replaceEntireDocument(code);
+        editorSplit.syncDoc(fileId, code);
       }
     },
     handleRemoteFileUpdated(filePath, updatedFile) {
@@ -360,6 +384,10 @@ export function createSplitEditorController({
       }
       if (splitActiveFileId === filePath && !isBinaryFile(updatedFile)) {
         editorSplit.dropFileState(filePath);
+        if (updatedFile?.contentLoaded === false) {
+          void openFile(updatedFile);
+          return;
+        }
         editorSplit.openFile(updatedFile);
       } else {
         editorSplit.dropFileState(filePath);

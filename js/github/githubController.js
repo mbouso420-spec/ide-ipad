@@ -28,12 +28,11 @@ import {
   hydrateLazyGithubProject,
   makeGithubProjectId,
   markProjectSynced,
-  migrateGithubProjectBranch,
-  saveCredentialsBackup
+  migrateGithubProjectBranch
 } from "../storage/workspaceDb.js";
 import { classifyRemotePullChanges, buildRemotePullPlan } from "./githubMerge.js";
 import { initGithubLocalBackupPanel, setGithubStatus as setStatus } from "./githubLocalBackupPanel.js";
-import { getSyncCredentialsBackupPayload } from "../ai/providers.js";
+import { syncCredentialsBackup } from "../ai/providers.js";
 import {
   checkAuthLockout,
   formatRemainingCooldown,
@@ -119,10 +118,15 @@ export function initGithubController({
 
   const listenerController = typeof AbortController === "function" ? new AbortController() : null;
   const listenOpts = listenerController ? { signal: listenerController.signal } : undefined;
+  let destroyed = false;
+  let reconnectFocusTimer = 0;
 
   tokenReconnectBtn?.addEventListener("click", () => {
     openDialogBtn?.click();
-    window.setTimeout(() => {
+    window.clearTimeout(reconnectFocusTimer);
+    reconnectFocusTimer = window.setTimeout(() => {
+      reconnectFocusTimer = 0;
+      if (destroyed) return;
       tokenInput?.focus();
       tokenInput?.select();
     }, 50);
@@ -238,14 +242,6 @@ export function initGithubController({
     return isPulling || isPushing || isSwitchingBranch;
   }
 
-  function syncCredentialsBackupFromGithub() {
-    try {
-      void saveCredentialsBackup(getSyncCredentialsBackupPayload());
-    } catch {
-      /* ignorar error al respaldar credenciales */
-    }
-  }
-
   function cleanupDialogTransientState() {
     if (tokenInput) tokenInput.value = "";
     window.clearTimeout(lockoutUiTimer);
@@ -269,6 +265,8 @@ export function initGithubController({
 
   function syncLockoutUi() {
     window.clearTimeout(lockoutUiTimer);
+    lockoutUiTimer = 0;
+    if (destroyed) return false;
     const lock = checkAuthLockout("github");
     if (lock.locked) {
       if (connectBtn) connectBtn.disabled = true;
@@ -277,12 +275,28 @@ export function initGithubController({
         `Bloqueo temporal de seguridad por múltiples intentos fallidos. Reintentá en ${formatRemainingCooldown(lock.remainingMs)}.`,
         "error"
       );
-      lockoutUiTimer = window.setTimeout(syncLockoutUi, Math.min(lock.remainingMs + 50, 1000));
+      if (typeof document === "undefined" || !document.hidden) {
+        lockoutUiTimer = window.setTimeout(syncLockoutUi, Math.min(lock.remainingMs + 50, 1000));
+      }
       return true;
     }
     if (connectBtn) connectBtn.disabled = false;
     return false;
   }
+
+  document?.addEventListener?.(
+    "visibilitychange",
+    () => {
+      if (destroyed) return;
+      if (document.hidden) {
+        window.clearTimeout(lockoutUiTimer);
+        lockoutUiTimer = 0;
+      } else if (dialog?.open) {
+        syncLockoutUi();
+      }
+    },
+    listenOpts
+  );
 
   openDialogBtn?.addEventListener("click", async () => {
     if (!dialog || isOpeningDialog) return;
@@ -368,7 +382,7 @@ export function initGithubController({
       saveGithubToken(token);
       syncTokenPlaceholder(token);
       hideTokenWarning();
-      syncCredentialsBackupFromGithub();
+      syncCredentialsBackup();
 
       if (check.status !== "valid") {
         // Sin internet o GitHub sin responder: se guarda para usarlo cuando vuelva la conexión.
@@ -386,7 +400,7 @@ export function initGithubController({
     clearGithubToken();
     hideTokenWarning();
     cleanupDialogTransientState();
-    syncCredentialsBackupFromGithub();
+    syncCredentialsBackup();
     reposCache = [];
     connectedUserLogin = "";
     isSessionConnected = false;
@@ -604,6 +618,7 @@ export function initGithubController({
         });
       }
       hideConflictBox();
+      isPulling = false;
       await onProjectClonedOrSynced(updated.id);
       await refreshSyncPanel();
       if (wasTruncated) {
@@ -678,23 +693,29 @@ export function initGithubController({
       hideConflictBox();
       // Solo se consolida lo que viajó en este commit: lo editado mientras tanto sigue pendiente.
       await markProjectSynced(project.id, commitSha, changes);
-      if (force) {
-        // Al forzar push, conciliar entradas remotas intermedias para evitar desincronización silenciosa.
+      if (force && allChanges.length === changes.length) {
+        // Solo re-conciliar árbol remoto tras force push si NO quedan cambios locales sin seleccionar ni ediciones concurrentes.
         try {
-          const remoteSnapshot = await fetchRepoTreeIndex({
-            token,
-            owner: project.github.owner,
-            repo: project.github.repo,
-            branch: project.github.branch
-          });
-          if (remoteSnapshot && !remoteSnapshot.isEmptyRepo) {
-            await hydrateLazyGithubProject({
+          const remainingAfterPush = await getPendingGithubChanges(project.id);
+          if (remainingAfterPush.length === 0) {
+            const remoteSnapshot = await fetchRepoTreeIndex({
+              token,
               owner: project.github.owner,
               repo: project.github.repo,
-              branch: project.github.branch,
-              commitSha: remoteSnapshot.commitSha || commitSha,
-              entries: remoteSnapshot.entries
+              branch: project.github.branch
             });
+            if (remoteSnapshot && !remoteSnapshot.isEmptyRepo) {
+              const recheckPending = await getPendingGithubChanges(project.id);
+              if (recheckPending.length === 0) {
+                await hydrateLazyGithubProject({
+                  owner: project.github.owner,
+                  repo: project.github.repo,
+                  branch: project.github.branch,
+                  commitSha: remoteSnapshot.commitSha || commitSha,
+                  entries: remoteSnapshot.entries
+                });
+              }
+            }
           }
         } catch {
           /* si falla re-hidratación best-effort, mantener estado consolidado del commit */
@@ -908,6 +929,7 @@ export function initGithubController({
     conflictMergeBtn.disabled = true;
     setStatus(pushStatusEl, "Analizando diferencias remotas frente a tus cambios locales…", "neutral");
     try {
+      await onFlushPendingSaves?.();
       const [diffFiles, localEntries, localPendingChanges] = await Promise.all([
         compareRemoteCommits({
           token,
@@ -919,6 +941,16 @@ export function initGithubController({
         getProjectEntries(activeConflict.project.id),
         getPendingGithubChanges(activeConflict.project.id)
       ]);
+      if (diffFiles?.compareMeta?.truncated || diffFiles?.compareMeta?.status === "diverged") {
+        setStatus(
+          pushStatusEl,
+          diffFiles.compareMeta.status === "diverged"
+            ? "La historia remota divergió (rebase o force-push remoto). Usá Actualizar remoto o Forzar envío."
+            : "La comparación supera los 300 archivos de la API de GitHub. Usá Actualizar remoto para una sincronización íntegra.",
+          "error"
+        );
+        return;
+      }
 
       const classification = classifyRemotePullChanges({
         localEntries,
@@ -1015,6 +1047,7 @@ export function initGithubController({
     conflictApplyBtn.disabled = true;
     setStatus(pushStatusEl, "Aplicando integración segura en el workspace…", "neutral");
     try {
+      await onFlushPendingSaves?.();
       const targetProject = activeConflict.project;
       const remoteSha = activeConflict.remoteSha;
       const priorChoices = new Map(
@@ -1031,6 +1064,14 @@ export function initGithubController({
         getProjectEntries(targetProject.id),
         getPendingGithubChanges(targetProject.id)
       ]);
+      if (diffFiles?.compareMeta?.truncated || diffFiles?.compareMeta?.status === "diverged") {
+        setStatus(
+          pushStatusEl,
+          "La historia remota divergió o supera los 300 archivos: usá Actualizar remoto antes de integrar.",
+          "error"
+        );
+        return;
+      }
       const freshClassification = classifyRemotePullChanges({
         localEntries,
         localPendingChanges: freshPendingChanges,
@@ -1039,9 +1080,9 @@ export function initGithubController({
       for (const c of freshClassification.conflicts) {
         if (priorChoices.has(c.path)) {
           c.resolution = priorChoices.get(c.path);
-        } else if (freshClassification.conflicts.length > (activeMergeClassification.conflicts || []).length) {
+        } else {
           activeMergeClassification = freshClassification;
-          setStatus(pushStatusEl, "Hubo ediciones locales nuevas en conflicto: revisá la clasificación antes de aplicar.", "error");
+          setStatus(pushStatusEl, `Apareció un nuevo conflicto en "${c.path}": revisá la clasificación antes de aplicar.`, "error");
           return;
         }
       }
@@ -1224,6 +1265,7 @@ export function initGithubController({
               })
             ))();
       hideConflictBox();
+      isSwitchingBranch = false;
       await onProjectClonedOrSynced?.(updated.id);
       await refreshSyncPanel();
       setStatus(pushStatusEl, `Rama activa cambiada a "${chosen}".`, "ok");
@@ -1452,7 +1494,12 @@ export function initGithubController({
             } else {
               selectedCommitPaths.clear();
             }
-            refreshSyncPanel();
+            selectAllCb.indeterminate = false;
+            selectAllText.textContent = `Seleccionar todo (${selectedCommitPaths.size}/${changes.length})`;
+            changesListEl.querySelectorAll(".gh-change-item:not(.gh-change-summary) .gh-change-check").forEach((cb) => {
+              cb.checked = selectAllCb.checked;
+            });
+            updatePushButtonState();
           });
           selectAllLabel.append(selectAllCb, selectAllText);
 
@@ -1605,9 +1652,9 @@ export function initGithubController({
 
     try {
       const liveUser = await fetchGithubUser(token);
-      if (getGithubToken() !== token) return;
+      if (destroyed || getGithubToken() !== token) return;
       const liveRepos = await fetchUserRepositories(token);
-      if (getGithubToken() !== token) return;
+      if (destroyed || getGithubToken() !== token) return;
       if (liveUser?.login) {
         connectedUserLogin = liveUser.login;
         isSessionConnected = true;
@@ -1619,7 +1666,7 @@ export function initGithubController({
       applyConnectedSessionUi(connectedUserLogin, reposCache);
       hideTokenWarning();
     } catch (error) {
-      if (getGithubToken() !== token) return;
+      if (destroyed || getGithubToken() !== token) return;
       if (error?.status === 401 || error?.credentialRejected) {
         isSessionConnected = false;
         // El token guardado dejó de funcionar: avisar ahora y no recién al intentar el push.
@@ -1633,10 +1680,17 @@ export function initGithubController({
     refreshTopbarBadge,
     syncExplorerReposInBackground,
     destroy() {
+      destroyed = true;
+      authConnectSeq += 1;
+      branchesRequestSeq += 1;
+      syncPanelRequestSeq += 1;
+      badgeRequestSeq += 1;
       window.clearTimeout(pullConfirmTimer);
       window.clearTimeout(openConfirmTimer);
       window.clearTimeout(lockoutUiTimer);
+      window.clearTimeout(reconnectFocusTimer);
       lockoutUiTimer = 0;
+      reconnectFocusTimer = 0;
       localBackupPanel?.destroy?.();
       listenerController?.abort();
     }

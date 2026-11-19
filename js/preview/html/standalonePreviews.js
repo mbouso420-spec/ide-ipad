@@ -48,6 +48,7 @@ export function buildStandaloneTsPreview(tsFile, transformJs = (code) => code, o
 }
 
 export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, options = {}) {
+  const safeTransformJs = typeof transformJs === "function" ? transformJs : (code) => code;
   const bridge = buildConsoleBridgeScript(true);
   const exactMap = options?.prebuiltExactMap || buildExactModuleMap(options?.assetMap || options?.companionFiles || null);
   const allowParentTraversal = options?.allowParentTraversal !== false;
@@ -86,7 +87,7 @@ export function buildStandaloneJsPreview(jsFile, transformJs = (code) => code, o
       entryPath: jsFile.path,
       entryCode: jsFile.content,
       exactMap,
-      transformJs,
+      transformJs: safeTransformJs,
       transformCss: (cssText, cssPath) => inlineCssImports(cssText, cssPath),
       allowParentTraversal,
       precompiledEntryCode: normalizedJsCode,
@@ -122,7 +123,7 @@ ${statusFooter}
 }
 </script>`;
   } else {
-    const safeJs = escapeCloseScript(transformJs(normalizedJsCode, isModule));
+    const safeJs = escapeCloseScript(safeTransformJs(normalizedJsCode, isModule));
     scriptSnippet = isModule
       ? `<script type="module">
 ${safeJs}

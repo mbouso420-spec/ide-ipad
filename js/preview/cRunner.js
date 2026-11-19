@@ -238,7 +238,7 @@ export function injectInteractiveInputGuard(code, filePath = "main.c", isC = tru
   }
 
   const safeFile = String(filePath || "main.c")
-    .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+    .replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "")
     .replace(/\\/g, "/")
     .replace(/"/g, "");
   const lines = [
@@ -483,16 +483,18 @@ function resolveCompilationUnit({ activeFile, companionFiles = [] }) {
       ? compClean.slice(prefix.length)
       : compClean;
     let relName = String(rawRelName || "companion.c")
-      .replace(/[\r\n\x00-\x1f\x7f]/g, "")
+      .replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "")
       .replace(/\\/g, "/")
-      .replace(/^\/+/, "");
-    const relSegments = relName.split("/");
+      .replace(/^\/+/, "")
+      .trim();
+    const relSegments = relName.split("/").map((seg) => seg.trim());
     if (
       !relName ||
-      relSegments.some((seg) => !seg || seg === "." || seg === ".." || seg === "__proto__" || seg === "constructor" || seg === "prototype")
+      relSegments.some((seg) => !seg || seg === "." || seg === ".." || seg.includes(":") || seg === "__proto__" || seg === "constructor" || seg === "prototype")
     ) {
       continue;
     }
+    relName = relSegments.join("/");
     if (relName.startsWith("-") || relName.startsWith("@")) {
       relName = `./${relName}`;
     }
@@ -579,14 +581,32 @@ export function buildClangWasmPayload({ activeFile, companionFiles = [], stdin =
     isCppFamily
   } = resolveCompilationUnit({ activeFile, companionFiles });
 
+  const defaultMain = isC ? "main.c" : "main.cpp";
   const cleanMain = normalizePath(effectiveMainFile.path);
   const lastSlash = cleanMain.lastIndexOf("/");
-  const mainFileName = lastSlash >= 0 ? cleanMain.slice(lastSlash + 1) : cleanMain || (isC ? "main.c" : "main.cpp");
+  let mainFileName = String(lastSlash >= 0 ? cleanMain.slice(lastSlash + 1) : cleanMain || defaultMain)
+    .replace(/[\r\n\x00-\x1f\x7f-\x9f\u2028\u2029]/g, "")
+    .trim();
+  if (
+    !mainFileName ||
+    mainFileName === "." ||
+    mainFileName === ".." ||
+    mainFileName.includes(":") ||
+    mainFileName === "__proto__" ||
+    mainFileName === "constructor" ||
+    mainFileName === "prototype" ||
+    mainFileName.toLowerCase() === "program.wasm"
+  ) {
+    mainFileName = defaultMain;
+  }
+  if (mainFileName.startsWith("-") || mainFileName.startsWith("@")) {
+    mainFileName = `./${mainFileName}`;
+  }
 
-  const files = {
-    [mainFileName]: String(effectiveMainFile.content || "")
-  };
+  const files = Object.create(null);
+  files[mainFileName] = String(effectiveMainFile.content || "");
   for (const item of codes) {
+    if (!item?.file || item.file.toLowerCase() === "program.wasm") continue;
     files[item.file] = String(item.code || "");
   }
 
@@ -598,6 +618,34 @@ export function buildClangWasmPayload({ activeFile, companionFiles = [], stdin =
     extraSources: extraSourceFiles.slice(),
     stdin: String(stdin || "")
   };
+}
+
+const WASM_WORKER_IDLE_TTL_MS = 60_000;
+
+function clearWorkerIdleTimer(workerRef) {
+  if (workerRef?.idleTimerId) {
+    clearTimeout(workerRef.idleTimerId);
+    workerRef.idleTimerId = null;
+  }
+}
+
+function terminateWasmWorkerRef(workerRef) {
+  clearWorkerIdleTimer(workerRef);
+  if (workerRef?.current) {
+    try { workerRef.current.terminate(); } catch (_) {}
+    workerRef.current = null;
+  }
+}
+
+function scheduleWasmWorkerIdleShutdown(workerRef) {
+  if (!workerRef || !workerRef.current) return;
+  clearWorkerIdleTimer(workerRef);
+  const id = setTimeout(() => {
+    workerRef.idleTimerId = null;
+    terminateWasmWorkerRef(workerRef);
+  }, WASM_WORKER_IDLE_TTL_MS);
+  if (typeof id?.unref === "function") id.unref();
+  workerRef.idleTimerId = id;
 }
 
 /**
@@ -621,7 +669,8 @@ function compileAndRunClangWorker(
       return;
     }
 
-    const createWorker = workerFactory || (() => new Worker("./js/preview/clangWorker.js", { type: "module" }));
+    clearWorkerIdleTimer(workerRef);
+    const createWorker = workerFactory || (() => new Worker(new URL("./clangWorker.js", import.meta.url), { type: "module" }));
     let worker = workerRef?.current || null;
     if (!worker) {
       try {
@@ -638,6 +687,7 @@ function compileAndRunClangWorker(
     let timerId = null;
 
     const terminateWorker = () => {
+      clearWorkerIdleTimer(workerRef);
       try { worker.terminate(); } catch (_) {}
       if (workerRef && workerRef.current === worker) {
         workerRef.current = null;
@@ -651,6 +701,7 @@ function compileAndRunClangWorker(
       }
       worker.removeEventListener("message", onMessage);
       worker.removeEventListener("error", onError);
+      worker.removeEventListener("messageerror", onMessageError);
       if (signal && onAbort) {
         signal.removeEventListener("abort", onAbort);
       }
@@ -676,6 +727,7 @@ function compileAndRunClangWorker(
       if (settled) return;
       settled = true;
       cleanup();
+      scheduleWasmWorkerIdleShutdown(workerRef);
       if (msg.ok) {
         resolve(msg.result);
       } else {
@@ -691,6 +743,14 @@ function compileAndRunClangWorker(
       reject(new Error(event?.message || "Error inesperado en el Web Worker de Clang WASM."));
     };
 
+    const onMessageError = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      terminateWorker();
+      reject(new Error("Error de deserialización en la respuesta del Web Worker de Clang WASM."));
+    };
+
     if (timeoutMs > 0) {
       timerId = setTimeout(() => {
         if (settled) return;
@@ -699,19 +759,30 @@ function compileAndRunClangWorker(
         terminateWorker();
         reject(new Error("Tiempo de espera agotado en la compilación/ejecución WASM local."));
       }, timeoutMs);
+      if (typeof timerId?.unref === "function") timerId.unref();
     }
 
     worker.addEventListener("message", onMessage);
     worker.addEventListener("error", onError);
+    worker.addEventListener("messageerror", onMessageError);
     if (signal && typeof signal.addEventListener === "function") {
       signal.addEventListener("abort", onAbort, { once: true });
     }
 
-    worker.postMessage({
-      id: requestId,
-      action: "compileAndRun",
-      payload: wasmPayload
-    });
+    try {
+      worker.postMessage({
+        id: requestId,
+        action: "compileAndRun",
+        payload: wasmPayload
+      });
+    } catch (postErr) {
+      if (!settled) {
+        settled = true;
+        cleanup();
+        terminateWorker();
+        reject(postErr);
+      }
+    }
   });
 }
 
@@ -729,6 +800,11 @@ export async function compileAndRunWithFallback({
   signal = null,
   onStatus = () => {}
 }) {
+  if (signal?.aborted) {
+    const abortErr = new Error("Aborted");
+    abortErr.name = "AbortError";
+    throw abortErr;
+  }
   if (mode === COMPILER_MODES.WASM) {
     if (!isCppFamily) {
       throw new Error("El compilador offline Clang WASM solo está disponible para C y C++.");
@@ -1011,7 +1087,7 @@ export function mountCRunnerView(containerEl, {
   const listenerAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
   const listenerOpts = listenerAbort ? { signal: listenerAbort.signal } : undefined;
   let focusTimerId = 0;
-  const wasmWorkerRef = { current: null };
+  const wasmWorkerRef = { current: null, idleTimerId: null };
 
   const { isC, isCppFamily, langLabel } = detectRunnerLanguage(activeFile.path, companionFiles);
   const initialPayload = buildWandboxPayload({ activeFile, companionFiles, stdin: "" });
@@ -1067,6 +1143,9 @@ export function mountCRunnerView(containerEl, {
     modeSelect.value = selectedMode;
     modeSelect.addEventListener("change", () => {
       selectedMode = modeSelect.value;
+      if (selectedMode === COMPILER_MODES.WANDBOX && !isCompiling) {
+        terminateWasmWorkerRef(wasmWorkerRef);
+      }
     }, listenerOpts);
     headerActions.appendChild(modeSelect);
   }
@@ -1147,6 +1226,12 @@ export function mountCRunnerView(containerEl, {
   const termBody = document.createElement("div");
   termBody.className = "c-terminal-body code-font";
   termBody.textContent = "Iniciando compilador en Wandbox...";
+
+  let errLinesController = null;
+  const resetErrLineListeners = () => {
+    errLinesController?.abort();
+    errLinesController = null;
+  };
 
   // 4. Barra de Entrada Interactiva (Paso a Paso)
   const termInputBar = document.createElement("div");
@@ -1294,12 +1379,15 @@ export function mountCRunnerView(containerEl, {
         termStatus.className = "c-term-status is-err";
         termStatus.textContent = `Falló compilación / ejecución (código ${res.status}) — ${ms} ms`;
         termBody.innerHTML = "";
+        resetErrLineListeners();
         const compBlock = document.createElement("div");
         compBlock.className = "c-term-comp-err";
 
         const rawErrText = (res.compilerErr || res.compilerOut || res.stderr || "").trim();
 
         if (compilerErrors.length > 0) {
+          errLinesController = typeof AbortController === "function" ? new AbortController() : null;
+          const errLineOpts = errLinesController ? { signal: errLinesController.signal } : listenerOpts;
           const banner = document.createElement("div");
           banner.className = "c-term-err-banner";
           banner.textContent = `⚠ Se detectaron ${compilerErrors.length} fallo(s) de compilación. Hacé clic en cualquier línea señalada para saltar al editor:`;
@@ -1319,23 +1407,25 @@ export function mountCRunnerView(containerEl, {
               );
             });
             if (matched) {
+              const targetLine = matched.line;
               const errLineEl = document.createElement("div");
               errLineEl.className = "c-term-err-line";
               errLineEl.setAttribute("role", "button");
               errLineEl.setAttribute("tabindex", "0");
-              errLineEl.title = `Saltar a línea ${matched.line} en el editor`;
+              errLineEl.dataset.line = String(targetLine);
+              errLineEl.title = `Saltar a línea ${targetLine} en el editor`;
               errLineEl.textContent = lineText;
-              const jump = (evt) => {
-                evt.stopPropagation();
-                onGoToLine(matched.line);
-              };
-              errLineEl.addEventListener("click", jump, listenerOpts);
+              errLineEl.addEventListener("click", (evt) => {
+                evt?.stopPropagation?.();
+                onGoToLine(targetLine);
+              }, errLineOpts);
               errLineEl.addEventListener("keydown", (evt) => {
                 if (evt.key === "Enter" || evt.key === " ") {
                   evt.preventDefault();
-                  jump(evt);
+                  evt.stopPropagation();
+                  onGoToLine(targetLine);
                 }
-              }, listenerOpts);
+              }, errLineOpts);
               compBlock.appendChild(errLineEl);
             } else {
               const normalLine = document.createElement("div");
@@ -1468,6 +1558,9 @@ export function mountCRunnerView(containerEl, {
         sessionInputs.pop();
       }
       if (isDestroyed) return;
+      if (pendingResetAfterAbort && err?.name === "AbortError") {
+        return;
+      }
       termStatus.className = "c-term-status is-err";
       termStatus.textContent = "Error de red / API";
       const errDiv = document.createElement("div");
@@ -1482,11 +1575,23 @@ export function mountCRunnerView(containerEl, {
       btnSendStdin.disabled = false;
       btnSendStep.disabled = false;
       termInput.disabled = false;
+      if (pendingResetAfterAbort && !isDestroyed) {
+        pendingResetAfterAbort = false;
+        triggerFreshRun(true);
+      }
     }
   }
 
+  let pendingResetAfterAbort = false;
+
   function triggerFreshRun(resetTerminal = false) {
-    if (isCompiling) return false;
+    if (isCompiling) {
+      if (resetTerminal) {
+        pendingResetAfterAbort = true;
+        try { activeRequestController?.abort(); } catch (_) {}
+      }
+      return false;
+    }
     sessionInputs = [];
     lastRawStdout = "";
     initialMenuSnapshot = "";
@@ -1569,19 +1674,28 @@ export function mountCRunnerView(containerEl, {
   }
   containerEl.addEventListener("keydown", handleKeydown, listenerOpts);
 
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden && !isCompiling) {
+        terminateWasmWorkerRef(wasmWorkerRef);
+      }
+    }, listenerOpts);
+  }
+
   // Ejecución inicial automática al montar
   executeStep(null);
 
   const instance = {
     destroy() {
       isDestroyed = true;
+      pendingResetAfterAbort = false;
+      resetErrLineListeners();
       if (focusTimerId) {
         clearTimeout(focusTimerId);
         focusTimerId = 0;
       }
       try { activeRequestController?.abort(); } catch (_) {}
-      try { wasmWorkerRef.current?.terminate(); } catch (_) {}
-      wasmWorkerRef.current = null;
+      terminateWasmWorkerRef(wasmWorkerRef);
       try { listenerAbort?.abort(); } catch (_) {}
       if (!listenerAbort) {
         containerEl.removeEventListener("keydown", handleKeydown);

@@ -602,7 +602,7 @@ describe("Studio IDE v1.3.0 — Suite Integral de Features, Refactorización y S
       assert.equal(/\beval\s*\(|new\s+Function\s*\(/.test(appJs), false);
 
       const swJs = fs.readFileSync(path.join(ROOT_DIR, "sw.js"), "utf-8");
-      assert.ok(swJs.includes('SHELL_CACHE = "studio-ide-shell-v32"'));
+      assert.ok(swJs.includes('SHELL_CACHE = "studio-ide-shell-v33"'));
       assert.equal(swJs.includes("@yowasp/clang"), false, "sw.js no debe precalentar ~23MB de Clang en install");
     });
   });

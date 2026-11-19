@@ -999,7 +999,7 @@ describe("Regresiones de Auditoría Integral", () => {
       await assert.rejects(installPromise, /crítico/);
 
       // 2. Fallback navigate offline y 503 offline limpio
-      const shellCache = await ctx.caches.open("studio-ide-shell-v32");
+      const shellCache = await ctx.caches.open("studio-ide-shell-v33");
       await shellCache.put("./index.html", new ctx.Response("<html>cached</html>", { status: 200 }));
 
       let navPromise = null;

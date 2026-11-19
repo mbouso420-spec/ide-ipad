@@ -2,14 +2,13 @@
  * Expansor léxico de sintaxis JSX / TSX a llamadas `__studioJsx(...)` sin dependencias externas.
  */
 
-import { nextSigIndex } from "../jsTokenUtils.js";
 import {
   EXPR_START_KEYWORDS,
+  FOUR_CHAR_OPS,
   THREE_CHAR_OPS,
   TWO_CHAR_OPS,
   canStartRegex,
-  tokenize,
-  prevSigToken
+  tokenize
 } from "./tsTokenizer.js";
 import { isArrowGenericAhead } from "./typeStripper.js";
 
@@ -75,39 +74,39 @@ function __studioAppendChildren(parent, list) {
 }
 `;
 
-function canStartJsxAt(tokens, idx) {
-  const tok = tokens[idx];
-  if (!tok || tok.type !== "punct" || tok.value !== "<") return false;
-  const prev = prevSigToken(tokens, idx);
-  if (prev) {
-    if (prev.type === "number" || prev.type === "string" || prev.type === "regex" || prev.type === "template_full" || prev.type === "template_tail") {
-      return false;
-    }
-    if (prev.type === "ident" && !EXPR_START_KEYWORDS.has(prev.value)) {
-      return false;
-    }
-    if (prev.type === "punct" && (prev.value === ")" || prev.value === "]" || prev.value === "}")) {
-      return false;
-    }
-  }
-  const n1 = nextSigIndex(tokens, idx + 1);
-  if (n1 >= tokens.length) return false;
-  if (tokens[n1].type === "punct" && tokens[n1].value === ">") return true; // Fragment <>
-  if (tokens[n1].type !== "ident") return false;
-  return !isArrowGenericAhead(tokens, idx);
-}
-
 export function expandJsxInSource(source, fileName, transpileExprFn) {
-  let cursor = 0;
-  const outChunks = [];
   let usedJsx = false;
 
-  function findBalancedCurly(src, openIdx) {
-    let p = openIdx + 1;
-    let cursorCurly = openIdx + 1;
+  const isJsxAllowedAfter = (lastSig, lastSigWasProp = false) => {
+    if (!lastSig) return true;
+    if (lastSig.type === "template_head" || lastSig.type === "template_mid") return true;
+    if (lastSig.type === "ident") {
+      return !lastSigWasProp && EXPR_START_KEYWORDS.has(lastSig.value);
+    }
+    if (lastSig.type === "punct") {
+      return (
+        lastSig.value !== ")" &&
+        lastSig.value !== "]" &&
+        lastSig.value !== "}" &&
+        lastSig.value !== "++" &&
+        lastSig.value !== "--"
+      );
+    }
+    return false;
+  };
+
+  function scanJsSegment(src, startIdx, stopOnCloseCurly) {
+    let p = startIdx;
+    let segCursor = startIdx;
     const chunks = [];
-    let depth = 1;
+    let depth = stopOnCloseCurly ? 1 : 0;
     let lastSig = null;
+    let lastSigWasProp = false;
+
+    const setLast = (tok, wasProp = false) => {
+      lastSig = tok;
+      lastSigWasProp = wasProp;
+    };
 
     const skipQuoted = (idx, quote) => {
       let j = idx + 1;
@@ -171,23 +170,24 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
 
       if (ch === "'" || ch === '"') {
         p = skipQuoted(p, ch);
-        lastSig = { type: "string", value: ch };
+        setLast({ type: "string", value: ch }, false);
         continue;
       }
 
       if (ch === "`") {
         const tplStart = p;
         const tplRes = skipTemplate(p);
-        chunks.push(src.slice(cursorCurly, tplStart), tplRes.text);
-        cursorCurly = tplRes.endIdx;
+        chunks.push(src.slice(segCursor, tplStart), tplRes.text);
+        segCursor = tplRes.endIdx;
         p = tplRes.endIdx;
-        lastSig = { type: "template_full", value: "`" };
+        setLast({ type: "template_full", value: "`" }, false);
         continue;
       }
 
-      if (ch === "/" && canStartRegex(lastSig)) {
+      if (ch === "/" && canStartRegex(lastSig, lastSigWasProp)) {
         let j = p + 1;
         let inClass = false;
+        let closedRegex = false;
         while (j < src.length) {
           const rc = src[j];
           if (rc === "\\") {
@@ -195,8 +195,9 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
             continue;
           }
           if (rc === "[") inClass = true;
-          else if (rc === "]") inClass = false;
+          else if (rc === "]" && inClass) inClass = false;
           else if (rc === "/" && !inClass) {
+            closedRegex = true;
             j += 1;
             break;
           } else if (rc === "\n") {
@@ -204,40 +205,39 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
           }
           j += 1;
         }
-        while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
-        p = j;
-        lastSig = { type: "regex", value: "/" };
-        continue;
+        if (closedRegex) {
+          while (j < src.length && /[a-z]/i.test(src[j])) j += 1;
+          p = j;
+          setLast({ type: "regex", value: "/" }, false);
+          continue;
+        }
       }
 
-      if (ch === "<") {
-        const prevAllowsJsx =
-          !lastSig ||
-          (lastSig.type === "ident" && EXPR_START_KEYWORDS.has(lastSig.value)) ||
-          (lastSig.type === "punct" &&
-            lastSig.value !== ")" &&
-            lastSig.value !== "]" &&
-            lastSig.value !== "}" &&
-            lastSig.value !== "++" &&
-            lastSig.value !== "--");
-        if (prevAllowsJsx) {
-          let afterLt = p + 1;
-          while (afterLt < src.length && /\s/.test(src[afterLt])) afterLt += 1;
-          if (src[afterLt] === ">" || /[A-Za-z_$]/.test(src[afterLt] || "")) {
-            let isArrowGen = false;
-            if (src[afterLt] !== ">") {
-              const probeTokens = tokenize(src.slice(p, Math.min(src.length, p + 512)));
-              isArrowGen = isArrowGenericAhead(probeTokens, 0);
-            }
-            if (!isArrowGen) {
-              const parsed = parseJsxElement(src, p);
-              if (parsed) {
-                chunks.push(src.slice(cursorCurly, p), parsed.js);
-                cursorCurly = parsed.endIdx;
-                p = parsed.endIdx;
-                lastSig = { type: "punct", value: ")" };
-                continue;
+      if (ch === "<" && isJsxAllowedAfter(lastSig, lastSigWasProp)) {
+        let afterLt = p + 1;
+        while (afterLt < src.length && /\s/.test(src[afterLt])) afterLt += 1;
+        if (src[afterLt] === ">" || /[A-Za-z_$]/.test(src[afterLt] || "")) {
+          let isArrowGen = false;
+          if (src[afterLt] !== ">") {
+            const probeTokens = tokenize(src.slice(p, Math.min(src.length, p + 512)));
+            isArrowGen = isArrowGenericAhead(probeTokens, 0);
+          }
+          if (!isArrowGen) {
+            let parsed = null;
+            try {
+              parsed = parseJsxElement(src, p);
+            } catch (err) {
+              if (err instanceof Error && err.message.startsWith("Etiqueta JSX")) {
+                throw err;
               }
+              parsed = null;
+            }
+            if (parsed) {
+              chunks.push(src.slice(segCursor, p), parsed.js);
+              segCursor = parsed.endIdx;
+              p = parsed.endIdx;
+              setLast({ type: "punct", value: ")" }, false);
+              continue;
             }
           }
         }
@@ -245,28 +245,31 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
 
       if (ch === "{") {
         depth += 1;
-        lastSig = { type: "punct", value: "{" };
+        setLast({ type: "punct", value: "{" }, false);
         p += 1;
         continue;
       }
       if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          chunks.push(src.slice(cursorCurly, p));
-          return {
-            inner: chunks.join(""),
-            endIdx: p + 1
-          };
+        if (stopOnCloseCurly) {
+          depth -= 1;
+          if (depth === 0) {
+            chunks.push(src.slice(segCursor, p));
+            return {
+              inner: chunks.join(""),
+              endIdx: p + 1
+            };
+          }
         }
-        lastSig = { type: "punct", value: "}" };
+        setLast({ type: "punct", value: "}" }, false);
         p += 1;
         continue;
       }
 
-      if (/[A-Za-z_$]/.test(ch)) {
+      if (/[A-Za-z_$]/.test(ch) || ch.charCodeAt(0) > 127) {
         let j = p + 1;
-        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j += 1;
-        lastSig = { type: "ident", value: src.slice(p, j) };
+        while (j < src.length && (/[A-Za-z0-9_$]/.test(src[j]) || src.charCodeAt(j) > 127)) j += 1;
+        const wasProp = Boolean(lastSig && lastSig.type === "punct" && (lastSig.value === "." || lastSig.value === "?."));
+        setLast({ type: "ident", value: src.slice(p, j) }, wasProp);
         p = j;
         continue;
       }
@@ -274,18 +277,34 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
       if (/[0-9]/.test(ch)) {
         let j = p + 1;
         while (j < src.length && /[0-9A-Za-z_.]/.test(src[j])) j += 1;
-        lastSig = { type: "number", value: src.slice(p, j) };
+        setLast({ type: "number", value: src.slice(p, j) }, false);
         p = j;
         continue;
       }
 
+      const quad = src.slice(p, p + 4);
       const tri = src.slice(p, p + 3);
       const duo = src.slice(p, p + 2);
-      const op = THREE_CHAR_OPS.has(tri) ? tri : TWO_CHAR_OPS.has(duo) ? duo : ch;
-      lastSig = { type: "punct", value: op };
+      const op = FOUR_CHAR_OPS.has(quad)
+        ? quad
+        : THREE_CHAR_OPS.has(tri)
+          ? tri
+          : TWO_CHAR_OPS.has(duo)
+            ? duo
+            : ch;
+      setLast({ type: "punct", value: op }, false);
       p += op.length;
     }
-    throw new Error(`Llave JSX sin cerrar en ${fileName}`);
+
+    if (stopOnCloseCurly) {
+      throw new Error(`Llave JSX sin cerrar en ${fileName}`);
+    }
+    chunks.push(src.slice(segCursor));
+    return { inner: chunks.join(""), endIdx: src.length };
+  }
+
+  function findBalancedCurly(src, openIdx) {
+    return scanJsSegment(src, openIdx + 1, true);
   }
 
   function skipGenericArgsInJsxTag(src, startIdx) {
@@ -347,7 +366,7 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
       p += 1;
     } else {
       const nameStart = p;
-      while (p < src.length && /[A-Za-z0-9_$.]/.test(src[p])) p += 1;
+      while (p < src.length && /[A-Za-z0-9_$.-]/.test(src[p])) p += 1;
       tagName = src.slice(nameStart, p);
       if (!tagName) return null;
 
@@ -363,7 +382,23 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
 
     if (!isFragment) {
       while (p < src.length) {
-        while (p < src.length && /\s/.test(src[p])) p += 1;
+        while (p < src.length) {
+          if (/\s/.test(src[p])) {
+            p += 1;
+            continue;
+          }
+          if (src[p] === "/" && src[p + 1] === "/") {
+            const nl = src.indexOf("\n", p + 2);
+            p = nl === -1 ? src.length : nl + 1;
+            continue;
+          }
+          if (src[p] === "/" && src[p + 1] === "*") {
+            const endC = src.indexOf("*/", p + 2);
+            p = endC === -1 ? src.length : endC + 2;
+            continue;
+          }
+          break;
+        }
         if (src[p] === "/" && src[p + 1] === ">") {
           selfClosing = true;
           p += 2;
@@ -464,8 +499,9 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
           flushText();
           const exprRes = findBalancedCurly(src, p);
           const trimmed = exprRes.inner.trim();
-          // Omitir comentarios JSX {/* ... */}
-          if (trimmed && !/^\/\*[\s\S]*\*\/$/.test(trimmed)) {
+          // Omitir solo comentarios JSX puros `{/* ... */}` sin descartar `{/* a */ expr /* b */}`
+          const withoutBlockComments = trimmed.replace(/\/\*[\s\S]*?\*\//g, "").trim();
+          if (withoutBlockComments) {
             const sub = transpileExprFn(exprRes.inner, fileName);
             if (sub.code.trim()) childArgs.push(sub.code.trim());
           }
@@ -493,32 +529,6 @@ export function expandJsxInSource(source, fileName, transpileExprFn) {
     };
   }
 
-  const tokens = tokenize(source);
-  let pos = 0;
-  for (let idx = 0; idx < tokens.length; idx += 1) {
-    const tok = tokens[idx];
-    if (pos < cursor) {
-      pos += tok.value.length;
-      continue;
-    }
-    if (canStartJsxAt(tokens, idx)) {
-      let parsed = null;
-      try {
-        parsed = parseJsxElement(source, pos);
-      } catch (err) {
-        if (err instanceof Error && err.message.startsWith("Etiqueta JSX")) {
-          throw err;
-        }
-        parsed = null;
-      }
-      if (parsed) {
-        outChunks.push(source.slice(cursor, pos), parsed.js);
-        cursor = parsed.endIdx;
-      }
-    }
-    pos += tok.value.length;
-  }
-  outChunks.push(source.slice(cursor));
-
-  return { code: outChunks.join(""), usedJsx };
+  const expanded = scanJsSegment(source, 0, false);
+  return { code: expanded.inner, usedJsx };
 }

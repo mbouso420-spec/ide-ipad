@@ -61,18 +61,19 @@ export function truncateCodeContent(content, maxChars = 16000) {
 function sanitizeDetectedFilePath(rawCandidate) {
   if (typeof rawCandidate !== "string") return null;
   const trimmed = rawCandidate.trim();
-  if (!trimmed || /[\x00-\x1f\x7f]/.test(trimmed)) return null;
-  if (trimmed.startsWith("/") || trimmed.includes("\\") || trimmed.includes("://")) return null;
+  if (!trimmed || /[\x00-\x1f\x7f:*?"<>|]/.test(trimmed)) return null;
+  if (trimmed.startsWith("/") || trimmed.includes("\\") || trimmed.includes("://") || trimmed.includes("::")) return null;
   if (/^[a-zA-Z]:/.test(trimmed)) return null;
 
   const rawParts = trimmed.split("/");
   const cleanParts = [];
   for (const part of rawParts) {
-    if (!part || part === ".") continue;
-    if (part === ".." || FORBIDDEN_PATH_SEGMENTS.has(part.toLowerCase())) {
+    const seg = part.trim();
+    if (!seg || seg === ".") continue;
+    if (seg === ".." || seg.length > 255 || FORBIDDEN_PATH_SEGMENTS.has(seg.toLowerCase())) {
       return null;
     }
-    cleanParts.push(part);
+    cleanParts.push(seg);
   }
   if (cleanParts.length === 0) return null;
   const normalized = cleanParts.join("/");
@@ -100,19 +101,24 @@ export function detectFilePathFromCodeSegment(rawHeader, code, precedingProse = 
     }
   }
 
-  const firstLine = (code || "").trim().split(/\r?\n/)[0] || "";
-  const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s]+)/i);
-  if (commentMatch) {
-    const cleaned = commentMatch[1].replace(/(?:\*\/|-->)+$/g, "");
-    const candidate = sanitizeDetectedFilePath(cleaned);
-    if (candidate) {
-      return candidate;
+  if (code) {
+    const trimmedCode = code.trimStart();
+    const nlIdx = trimmedCode.indexOf("\n");
+    const firstLine = (nlIdx === -1 ? trimmedCode : trimmedCode.slice(0, nlIdx)).replace(/\r$/, "");
+    const commentMatch = firstLine.match(/^(?:\/\/|#|\/\*|<!--)\s*(?:file(?:path)?|archivo):\s*([^\s]+)/i);
+    if (commentMatch) {
+      const cleaned = commentMatch[1].replace(/(?:\*\/|-->)+$/g, "");
+      const candidate = sanitizeDetectedFilePath(cleaned);
+      if (candidate) {
+        return candidate;
+      }
     }
   }
 
   if (precedingProse) {
-    const lines = precedingProse.trim().split(/\r?\n/);
-    const lastProseLine = lines[lines.length - 1] || "";
+    const trimmedProse = precedingProse.trimEnd();
+    const lastNl = trimmedProse.lastIndexOf("\n");
+    const lastProseLine = (lastNl === -1 ? trimmedProse : trimmedProse.slice(lastNl + 1)).replace(/\r$/, "");
     const proseMatch = lastProseLine.match(/(?:archivo|file|filepath):\s*[`*_]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]+)[`*_]?/i);
     if (proseMatch) {
       const candidate = sanitizeDetectedFilePath(proseMatch[1]);
@@ -301,7 +307,7 @@ export function formatInlineMarkdown(str) {
 
   let safe = escapeHtml(withPlaceholders);
   safe = safe.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^\s)\u0000]+)\)/g,
+    /\[([^\]]+)\]\((https?:\/\/[^\s)\x00-\x1f\x7f]+)\)/g,
     (_, label, url) => {
       const idx = linkTokens.length;
       linkTokens.push(
@@ -325,19 +331,29 @@ export async function copyToClipboardSafe(text) {
       // Respaldo con textarea temporal
     }
   }
+  let temp = null;
   try {
-    const temp = document.createElement("textarea");
+    temp = document.createElement("textarea");
     temp.value = text;
     temp.setAttribute("readonly", "");
+    temp.setAttribute("autocomplete", "off");
+    temp.setAttribute("autocorrect", "off");
+    temp.setAttribute("spellcheck", "false");
     temp.style.position = "fixed";
     temp.style.opacity = "0";
     temp.style.pointerEvents = "none";
     document.body.appendChild(temp);
     temp.select();
     const ok = document.execCommand("copy");
-    temp.remove();
     return Boolean(ok);
   } catch {
     return false;
+  } finally {
+    if (temp) {
+      try {
+        temp.value = "";
+        temp.remove();
+      } catch (_) {}
+    }
   }
 }

@@ -50,35 +50,39 @@ function validatePassphrase(passphrase) {
       `La contraseña maestra no puede superar los ${MAX_PASSPHRASE_LENGTH} caracteres.`
     );
   }
-  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(passphrase)) {
+  if (/[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(passphrase)) {
     throw new Error("La contraseña contiene caracteres de control no válidos.");
   }
 }
 
 async function deriveAesGcmKey(cryptoApi, passphrase, saltBytes, iterations, usages) {
-  const encoder = new TextEncoder();
-  const baseKey = await cryptoApi.subtle.importKey(
-    "raw",
-    encoder.encode(passphrase),
-    "PBKDF2",
-    false,
-    ["deriveKey"]
-  );
-  return cryptoApi.subtle.deriveKey(
-    {
-      name: "PBKDF2",
-      salt: saltBytes,
-      iterations,
-      hash: "SHA-256"
-    },
-    baseKey,
-    {
-      name: "AES-GCM",
-      length: 256
-    },
-    false,
-    usages
-  );
+  const passBytes = new TextEncoder().encode(passphrase);
+  try {
+    const baseKey = await cryptoApi.subtle.importKey(
+      "raw",
+      passBytes,
+      "PBKDF2",
+      false,
+      ["deriveKey"]
+    );
+    return await cryptoApi.subtle.deriveKey(
+      {
+        name: "PBKDF2",
+        salt: saltBytes,
+        iterations,
+        hash: "SHA-256"
+      },
+      baseKey,
+      {
+        name: "AES-GCM",
+        length: 256
+      },
+      false,
+      usages
+    );
+  } finally {
+    passBytes.fill(0);
+  }
 }
 
 /**
@@ -95,8 +99,11 @@ export function isEncryptedKeyVault(rawText) {
     return Boolean(
       parsed &&
         typeof parsed === "object" &&
+        !Array.isArray(parsed) &&
         parsed.format === VAULT_FORMAT &&
-        Number(parsed.version) === VAULT_VERSION &&
+        parsed.version === VAULT_VERSION &&
+        typeof parsed.salt === "string" &&
+        typeof parsed.iv === "string" &&
         typeof parsed.ciphertext === "string"
     );
   } catch {
@@ -144,15 +151,21 @@ export async function encryptKeysPayload(plainJson, passphrase, options = {}) {
   const additionalData = buildVaultAad(iterations, kdf, cipher);
   const aesKey = await deriveAesGcmKey(cryptoApi, passphrase, salt, iterations, ["encrypt"]);
   const plainBytes = new TextEncoder().encode(plainJson);
-  const cipherBuffer = await cryptoApi.subtle.encrypt(
-    {
-      name: "AES-GCM",
-      iv,
-      additionalData
-    },
-    aesKey,
-    plainBytes
-  );
+  let cipherBuffer;
+  try {
+    cipherBuffer = await cryptoApi.subtle.encrypt(
+      {
+        name: "AES-GCM",
+        iv,
+        tagLength: 128,
+        additionalData
+      },
+      aesKey,
+      plainBytes
+    );
+  } finally {
+    plainBytes.fill(0);
+  }
 
   return JSON.stringify(
     {
@@ -197,13 +210,14 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
   if (
     !parsed ||
     typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
     parsed.format !== VAULT_FORMAT ||
-    Number(parsed.version) !== VAULT_VERSION
+    parsed.version !== VAULT_VERSION
   ) {
     throw new Error("El archivo no tiene el formato de bóveda cifrada de Studio IDE.");
   }
 
-  const iterations = Number(parsed.iterations);
+  const iterations = typeof parsed.iterations === "number" ? parsed.iterations : NaN;
   if (
     !Number.isInteger(iterations) ||
     iterations < MIN_PBKDF2_ITERATIONS ||
@@ -231,20 +245,21 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
     throw new Error("La estructura binaria de la bóveda está dañada.");
   }
 
-  if (salt.length < 8 || iv.length !== IV_BYTES || ciphertext.length < 16) {
+  if (salt.length < 8 || salt.length > 64 || iv.length !== IV_BYTES || ciphertext.length < 16) {
     throw new Error("La bóveda cifrada está incompleta o alterada.");
   }
 
   const cryptoApi = getWebCrypto();
   const safeIterations = Math.floor(iterations);
   const aesKey = await deriveAesGcmKey(cryptoApi, passphrase, salt, safeIterations, ["decrypt"]);
-  const decryptParams = { name: "AES-GCM", iv };
+  const decryptParams = { name: "AES-GCM", iv, tagLength: 128 };
   if (parsed.aad === "metadata-v1") {
     decryptParams.additionalData = buildVaultAad(safeIterations, "PBKDF2-SHA256", "AES-GCM-256");
   }
 
+  let plainBuffer = null;
   try {
-    const plainBuffer = await cryptoApi.subtle.decrypt(
+    plainBuffer = await cryptoApi.subtle.decrypt(
       decryptParams,
       aesKey,
       ciphertext
@@ -252,5 +267,9 @@ export async function decryptKeysPayload(encryptedJson, passphrase) {
     return new TextDecoder("utf-8", { fatal: true }).decode(plainBuffer);
   } catch {
     throw new Error("Contraseña incorrecta o archivo de respaldo dañado.");
+  } finally {
+    if (plainBuffer) {
+      new Uint8Array(plainBuffer).fill(0);
+    }
   }
 }

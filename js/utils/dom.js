@@ -27,7 +27,7 @@ export function escapeHtml(value) {
  * @param {string} filename
  * @param {{ revokeDelayMs?: number }} [options]
  */
-export function downloadBlob(blob, filename, { revokeDelayMs = 1500 } = {}) {
+export function downloadBlob(blob, filename, { revokeDelayMs = 30_000 } = {}) {
   if (!blob || typeof URL === "undefined" || typeof URL.createObjectURL !== "function") {
     return false;
   }
@@ -44,7 +44,7 @@ export function downloadBlob(blob, filename, { revokeDelayMs = 1500 } = {}) {
     String(filename || "download")
       .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
       .trim() || "download";
-  const delayMs = Number.isFinite(Number(revokeDelayMs)) ? Math.max(0, Number(revokeDelayMs)) : 1500;
+  const delayMs = Number.isFinite(Number(revokeDelayMs)) ? Math.max(0, Number(revokeDelayMs)) : 30_000;
 
   try {
     url = URL.createObjectURL(blob);
@@ -74,11 +74,14 @@ export function downloadBlob(blob, filename, { revokeDelayMs = 1500 } = {}) {
       const scheduleRevoke = typeof window !== "undefined" && typeof window.setTimeout === "function"
         ? window.setTimeout.bind(window)
         : setTimeout;
-      scheduleRevoke(() => {
+      const timer = scheduleRevoke(() => {
         try {
           URL.revokeObjectURL(url);
         } catch (_) {}
       }, delayMs);
+      if (timer && typeof timer.unref === "function") {
+        timer.unref();
+      }
     }
   }
   return true;

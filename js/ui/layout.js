@@ -14,7 +14,7 @@ const COMPACT_MEDIA = "(max-width: 73.99rem)";
  * Inicializa el sistema de layout híbrido de 3 paneles (islas acopladas en ancho / drawers flotantes en Stage Manager o vertical),
  * divisores táctiles, atajos de teclado, gestos swipe de cierre y ajuste al teclado virtual de iPadOS.
  */
-export function initLayoutController() {
+export function initLayoutController({ onLeftPanelVisibilityChange, onRightPanelVisibilityChange } = {}) {
   const controller = typeof AbortController === "function" ? new AbortController() : null;
   const signal = controller?.signal;
   const listenOpts = signal ? { signal } : undefined;
@@ -38,6 +38,8 @@ export function initLayoutController() {
   let leftOpen = readStoredBool(STORAGE_KEYS.leftOpen, !isCompact());
   let rightOpen = readStoredBool(STORAGE_KEYS.rightOpen, !isCompact());
   let isZenActive = false;
+  let lastReportedLeftVisible = null;
+  let lastReportedRightVisible = null;
 
   // En modo compacto inicial evitamos abrir ambos drawers superpuestos a la vez
   if (isCompact() && leftOpen && rightOpen) {
@@ -72,6 +74,17 @@ export function initLayoutController() {
     }
     if (btnRight) {
       btnRight.setAttribute("aria-expanded", String(rightOpen));
+    }
+
+    const leftVisibleNow = leftOpen && !isZenActive;
+    if (lastReportedLeftVisible !== leftVisibleNow) {
+      lastReportedLeftVisible = leftVisibleNow;
+      onLeftPanelVisibilityChange?.(leftVisibleNow);
+    }
+    const rightVisibleNow = rightOpen && !isZenActive;
+    if (lastReportedRightVisible !== rightVisibleNow) {
+      lastReportedRightVisible = rightVisibleNow;
+      onRightPanelVisibilityChange?.(rightVisibleNow);
     }
   }
 
@@ -144,13 +157,31 @@ export function initLayoutController() {
   }, listenOpts);
 
   let restoreRaf = 0;
+  let pendingRestoreWhileHidden = false;
   const scheduleRestoreWidths = () => {
+    if (typeof document !== "undefined" && document.hidden) {
+      pendingRestoreWhileHidden = true;
+      return;
+    }
     if (restoreRaf) return;
     restoreRaf = window.requestAnimationFrame(() => {
       restoreRaf = 0;
+      if (typeof document !== "undefined" && document.hidden) {
+        pendingRestoreWhileHidden = true;
+        return;
+      }
       restorePanelWidths();
     });
   };
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && pendingRestoreWhileHidden) {
+        pendingRestoreWhileHidden = false;
+        scheduleRestoreWidths();
+      }
+    }, listenOpts);
+  }
 
   window.addEventListener("resize", scheduleRestoreWidths, passiveOpts);
   window.addEventListener("orientationchange", scheduleRestoreWidths, passiveOpts);
@@ -228,7 +259,7 @@ export function initLayoutController() {
   }
 
   // Sincronización con visualViewport para elevar la barra de símbolos sobre el teclado virtual de iPadOS
-  bindVisualViewport(signal);
+  const cancelViewportSync = bindVisualViewport(signal);
 
   return {
     isLeftPanelOpen: () => leftOpen,
@@ -252,6 +283,7 @@ export function initLayoutController() {
         window.cancelAnimationFrame(restoreRaf);
       }
       restoreRaf = 0;
+      cancelViewportSync?.();
       controller?.abort();
       keyboardRouter.unregisterGlobalShortcut("ctrl+b");
       keyboardRouter.unregisterGlobalShortcut("meta+b");
@@ -291,16 +323,34 @@ function bindSplitter(handle, side, callbacks = {}) {
     isLeft ? "Divisor de ancho del explorador de archivos" : "Divisor de ancho del panel de asistente"
   );
 
-  const applyWidth = (nextWidth) => {
+  const passiveOpts = signal ? { passive: true, signal } : { passive: true };
+  let dragRaf = 0;
+  let pendingDragWidth = null;
+  let pendingDragMaxW = null;
+  let lastAppliedDragWidth = null;
+
+  const applyWidth = (nextWidth, { persist = true, maxW = getMaxW() } = {}) => {
     if (isLeft) {
       document.documentElement.style.setProperty("--left-panel-w", `${nextWidth}px`);
-      saveStoredValue(STORAGE_KEYS.leftWidth, String(nextWidth));
+      if (persist) saveStoredValue(STORAGE_KEYS.leftWidth, String(nextWidth));
     } else {
       document.documentElement.style.setProperty("--right-panel-w", `${nextWidth}px`);
-      saveStoredValue(STORAGE_KEYS.rightWidth, String(nextWidth));
+      if (persist) saveStoredValue(STORAGE_KEYS.rightWidth, String(nextWidth));
     }
-    handle.setAttribute("aria-valuemax", String(getMaxW()));
+    handle.setAttribute("aria-valuemax", String(maxW));
     handle.setAttribute("aria-valuenow", String(nextWidth));
+    lastAppliedDragWidth = nextWidth;
+  };
+
+  const flushDragRaf = () => {
+    dragRaf = 0;
+    if (pendingDragWidth !== null) {
+      const w = pendingDragWidth;
+      const m = pendingDragMaxW ?? getMaxW();
+      pendingDragWidth = null;
+      pendingDragMaxW = null;
+      applyWidth(w, { persist: false, maxW: m });
+    }
   };
 
   handle.addEventListener("keydown", (event) => {
@@ -324,14 +374,14 @@ function bindSplitter(handle, side, callbacks = {}) {
     }
 
     event.preventDefault();
-    applyWidth(clamp(targetW, minW, maxW));
+    applyWidth(clamp(targetW, minW, maxW), { persist: true, maxW });
   }, listenOpts);
 
   handle.addEventListener("pointerdown", (event) => {
     activePointerId = event.pointerId;
     try {
       handle.setPointerCapture?.(event.pointerId);
-    } catch (_) {
+    } catch {
       /* setPointerCapture no disponible */
     }
     handle.classList.add("is-dragging");
@@ -345,6 +395,7 @@ function bindSplitter(handle, side, callbacks = {}) {
 
     const viewportWidth = window.innerWidth;
     const maxW = getMaxW(viewportWidth);
+    let nextW;
     if (isLeft) {
       const rawWidth = Math.round(event.clientX - 8);
       if (rawWidth < 140) {
@@ -354,7 +405,7 @@ function bindSplitter(handle, side, callbacks = {}) {
       if (callbacks.isOpen && !callbacks.isOpen()) {
         callbacks.onExpand?.();
       }
-      applyWidth(clamp(rawWidth, minW, maxW));
+      nextW = clamp(rawWidth, minW, maxW);
     } else {
       const rawWidth = Math.round(viewportWidth - event.clientX - 8);
       if (rawWidth < 160) {
@@ -364,9 +415,18 @@ function bindSplitter(handle, side, callbacks = {}) {
       if (callbacks.isOpen && !callbacks.isOpen()) {
         callbacks.onExpand?.();
       }
-      applyWidth(clamp(rawWidth, minW, maxW));
+      nextW = clamp(rawWidth, minW, maxW);
     }
-  }, listenOpts);
+    pendingDragWidth = nextW;
+    pendingDragMaxW = maxW;
+    if (!dragRaf) {
+      if (typeof window.requestAnimationFrame === "function") {
+        dragRaf = window.requestAnimationFrame(flushDragRaf);
+      } else {
+        flushDragRaf();
+      }
+    }
+  }, passiveOpts);
 
   const endDrag = (event) => {
     if (event.pointerId !== activePointerId) {
@@ -374,7 +434,27 @@ function bindSplitter(handle, side, callbacks = {}) {
     }
     activePointerId = null;
     handle.classList.remove("is-dragging");
+    if (dragRaf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(dragRaf);
+      dragRaf = 0;
+    }
+    if (pendingDragWidth !== null) {
+      applyWidth(pendingDragWidth, { persist: true, maxW: pendingDragMaxW ?? getMaxW() });
+      pendingDragWidth = null;
+      pendingDragMaxW = null;
+    } else if (lastAppliedDragWidth !== null) {
+      saveStoredValue(storageKey, String(lastAppliedDragWidth));
+    }
   };
+
+  if (signal) {
+    signal.addEventListener("abort", () => {
+      if (dragRaf && typeof window.cancelAnimationFrame === "function") {
+        window.cancelAnimationFrame(dragRaf);
+        dragRaf = 0;
+      }
+    }, { once: true });
+  }
 
   handle.addEventListener("pointerup", endDrag, listenOpts);
   handle.addEventListener("pointercancel", endDrag, listenOpts);
@@ -437,27 +517,48 @@ function bindSwipeToClose(panel, direction, onClose, signal) {
 function bindVisualViewport(signal) {
   const vv = window.visualViewport;
   if (!vv) {
-    return;
+    return null;
   }
-  const listenOpts = signal ? { signal } : undefined;
+  const passiveOpts = signal ? { passive: true, signal } : { passive: true };
+  let vpRaf = 0;
+  let lastVHeight = -1;
+  let lastOffsetTop = -1;
+  let lastKeyboardOpen = null;
 
   const syncViewport = () => {
+    if (typeof document !== "undefined" && document.hidden) return;
     const vHeight = Math.round(vv.height);
     const offsetTop = Math.max(0, Math.round(vv.offsetTop));
     const keyboardOpen = window.innerHeight - vHeight > 110;
 
-    document.documentElement.style.setProperty("--vvh", `${vHeight}px`);
-    document.documentElement.style.setProperty("--vv-offset-top", `${offsetTop}px`);
-    document.body.dataset.keyboardOpen = String(keyboardOpen);
+    if (vHeight !== lastVHeight) {
+      lastVHeight = vHeight;
+      document.documentElement.style.setProperty("--vvh", `${vHeight}px`);
+    }
+    if (offsetTop !== lastOffsetTop) {
+      lastOffsetTop = offsetTop;
+      document.documentElement.style.setProperty("--vv-offset-top", `${offsetTop}px`);
+      if (document.body) {
+        document.body.dataset.vvOffset = String(offsetTop > 0);
+      }
+    }
+    const keyboardJustOpened = keyboardOpen && lastKeyboardOpen !== true;
+    if (keyboardOpen !== lastKeyboardOpen) {
+      lastKeyboardOpen = keyboardOpen;
+      if (document.body) {
+        document.body.dataset.keyboardOpen = String(keyboardOpen);
+      }
+    }
 
     if (window.scrollY !== 0 || window.scrollX !== 0) {
       window.scrollTo(0, 0);
     }
 
-    if (keyboardOpen) {
+    if (keyboardJustOpened) {
       const activeEl = document.activeElement;
       if (
         activeEl instanceof HTMLElement &&
+        activeEl.tagName !== "IFRAME" &&
         (activeEl.matches("input, textarea") || activeEl.closest(".ide-dialog"))
       ) {
         activeEl.scrollIntoView({ block: "nearest" });
@@ -465,9 +566,38 @@ function bindVisualViewport(signal) {
     }
   };
 
+  const scheduleSyncViewport = () => {
+    if (typeof document !== "undefined" && document.hidden) return;
+    if (vpRaf) return;
+    if (typeof window.requestAnimationFrame === "function") {
+      vpRaf = window.requestAnimationFrame(() => {
+        vpRaf = 0;
+        syncViewport();
+      });
+    } else {
+      syncViewport();
+    }
+  };
+
   syncViewport();
-  vv.addEventListener("resize", syncViewport, listenOpts);
-  vv.addEventListener("scroll", syncViewport, listenOpts);
+  vv.addEventListener("resize", scheduleSyncViewport, passiveOpts);
+  vv.addEventListener("scroll", scheduleSyncViewport, passiveOpts);
+  document?.addEventListener?.(
+    "visibilitychange",
+    () => {
+      if (!document.hidden) {
+        scheduleSyncViewport();
+      }
+    },
+    signal ? { signal } : undefined
+  );
+
+  return () => {
+    if (vpRaf && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(vpRaf);
+      vpRaf = 0;
+    }
+  };
 }
 
 function restorePanelWidths() {

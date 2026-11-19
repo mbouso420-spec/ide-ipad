@@ -1,6 +1,6 @@
 import { keyboardRouter } from "./keyboardRouter.js";
 import { getStorageQuotaEstimate, formatStorageBytes } from "../storage/storageQuota.js";
-import { saveCredentialsBackup, broadcastWorkspaceChange } from "../storage/workspaceDb.js";
+import { broadcastWorkspaceChange } from "../storage/workspaceDb.js";
 import { escapeHtml, downloadBlob } from "../utils/dom.js";
 import { readStoredValue, saveStoredValue, removeStoredValue } from "../utils/storage.js";
 import { estimateTokens } from "../ai/markdownRenderer.js";
@@ -9,12 +9,13 @@ import {
   decryptKeysPayload,
   isEncryptedKeyVault
 } from "../security/keyVaultCrypto.js";
+import { formatSafeErrorMessage } from "../security/credentialGuard.js";
 import {
   AI_PROVIDERS,
   getKeyStorageMode,
   setKeyStorageMode,
   exportKeysBundle,
-  getSyncCredentialsBackupPayload,
+  syncCredentialsBackup,
   importKeysBundle,
   hasStoredCredentials,
   getApiKey,
@@ -428,6 +429,21 @@ export function initSettingsModal({
     if (e.target === dialog) close();
   }, listenOpts);
 
+  dialog?.addEventListener("close", () => {
+    if (vaultPassphraseInput) vaultPassphraseInput.value = "";
+    keyboardRouter.popModal("settings-dialog");
+  }, listenOpts);
+
+  document?.addEventListener?.("visibilitychange", () => {
+    if (document.hidden && vaultPassphraseInput) {
+      vaultPassphraseInput.value = "";
+    }
+  }, listenOpts);
+
+  window?.addEventListener?.("pagehide", () => {
+    if (vaultPassphraseInput) vaultPassphraseInput.value = "";
+  }, listenOpts);
+
   selectTheme?.addEventListener("change", (e) => {
     const chosen = (e?.target ? e.target.value : selectTheme?.value) || "default";
     if (chosen === "default") {
@@ -494,10 +510,11 @@ export function initSettingsModal({
     const mode = e.target.value;
     if (mode === "session" || mode === "local") {
       setKeyStorageMode(mode);
-      try {
-        void saveCredentialsBackup(getSyncCredentialsBackupPayload());
-      } catch (_) {}
+      syncCredentialsBackup();
       broadcastWorkspaceChange({ type: "KEY_STORAGE_MODE_CHANGED", mode });
+      if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
+        window.dispatchEvent(new CustomEvent("studio-credentials-updated"));
+      }
       showKeyStorageNotice(mode);
       onKeyStorageModeChange?.(mode);
     }
@@ -555,7 +572,7 @@ export function initSettingsModal({
       if (vaultPassphraseInput) vaultPassphraseInput.value = "";
       setVaultStatus("Bóveda cifrada descargada correctamente (studio-ide-claves.vault.json).", "ok");
     } catch (err) {
-      setVaultStatus(err instanceof Error ? err.message : "No se pudo cifrar la bóveda.", "error");
+      setVaultStatus(formatSafeErrorMessage(err, [passphrase], "No se pudo cifrar la bóveda."), "error");
     } finally {
       if (btnExportVault) btnExportVault.disabled = false;
     }
@@ -572,10 +589,7 @@ export function initSettingsModal({
       throw new Error("Solo se admite importar archivos cifrados de bóveda Studio IDE (.vault.json).");
     }
     const count = importKeysBundle(payloadJson);
-    const payload = getSyncCredentialsBackupPayload();
-    if (payload) {
-      void saveCredentialsBackup(payload);
-    }
+    syncCredentialsBackup();
     refreshTokensMeter();
     if (typeof window !== "undefined" && typeof window.dispatchEvent === "function" && typeof CustomEvent === "function") {
       window.dispatchEvent(new CustomEvent("studio-credentials-updated"));
@@ -612,7 +626,7 @@ export function initSettingsModal({
       const rawText = await readSelectedFileText(file);
       await importVaultText(rawText, passphrase);
     } catch (err) {
-      setVaultStatus(err instanceof Error ? err.message : "No se pudo importar la bóveda.", "error");
+      setVaultStatus(formatSafeErrorMessage(err, [passphrase], "No se pudo importar la bóveda."), "error");
     } finally {
       vaultFileInput.value = "";
       if (btnImportVault) btnImportVault.disabled = false;
@@ -628,6 +642,7 @@ export function initSettingsModal({
     close,
     syncControls: syncControlsWithState,
     destroy() {
+      if (vaultPassphraseInput) vaultPassphraseInput.value = "";
       modelsRenderController?.abort();
       controller?.abort();
     }

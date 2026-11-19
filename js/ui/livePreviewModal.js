@@ -1,40 +1,41 @@
-import { ACORN_CDN_URL } from "../editor/liveLinter.js";
+import { loadAcornModule } from "../editor/liveLinter.js";
 import { normalizePath } from "../storage/workspaceDb.js";
 import { redactSensitiveTokens } from "../security/credentialGuard.js";
 import { instrumentLoops } from "../preview/loopGuard.js";
 import { isBlockedPreviewUrlScheme, isIgnoredPreviewPath } from "../preview/previewUtils.js";
-import { buildSqlRunnerPreview } from "../preview/sqlRunner.js";
-import { mountCRunnerView } from "../preview/cRunner.js";
+
+let sqlRunnerModPromise = null;
+function loadSqlRunner() {
+  if (!sqlRunnerModPromise) {
+    sqlRunnerModPromise = import("../preview/sqlRunner.js").catch((err) => {
+      sqlRunnerModPromise = null;
+      throw err;
+    });
+  }
+  return sqlRunnerModPromise;
+}
+
+let cRunnerModPromise = null;
+function loadCRunner() {
+  if (!cRunnerModPromise) {
+    cRunnerModPromise = import("../preview/cRunner.js").catch((err) => {
+      cRunnerModPromise = null;
+      throw err;
+    });
+  }
+  return cRunnerModPromise;
+}
 
 let acornModule = null;
-let acornLoading = null;
 
-/** Carga (una sola vez) el analizador de JS usado para proteger los bucles. Sin red, la vista previa sigue sin protección. */
-function loadAcorn() {
-  if (!acornLoading) {
-    let timeoutId = null;
-    acornLoading = Promise.race([
-      import(ACORN_CDN_URL),
-      new Promise((_, reject) => {
-        timeoutId = window.setTimeout(() => reject(new Error("timeout")), 5000);
-      })
-    ])
-      .then((mod) => {
-        acornModule = mod && typeof mod.parse === "function" ? mod : null;
-        return acornModule;
-      })
-      .catch(() => {
-        acornLoading = null; // reintentar la próxima vez que se abra la vista previa
-        return null;
-      })
-      .finally(() => {
-        if (timeoutId !== null) {
-          window.clearTimeout(timeoutId);
-          timeoutId = null;
-        }
-      });
+/** Carga (una sola vez, compartida con liveLinter) el analizador de JS usado para proteger bucles. */
+async function loadAcorn() {
+  if (acornModule) return acornModule;
+  const mod = await loadAcornModule();
+  if (mod && typeof mod.parse === "function") {
+    acornModule = mod;
   }
-  return acornLoading;
+  return acornModule;
 }
 
 /** Inserta el guardián de bucles si el analizador está disponible. */
@@ -88,16 +89,19 @@ export * from "../preview/htmlBundler.js";
  * - Si la pestaña es .py   -> "Vista previa de Python" (ejecuta Python 3 real en el navegador vía Pyodide WebAssembly,
  *                             incluyendo módulos .py vecinos de su misma carpeta, print() e input()).
  * - Si la pestaña es .css  -> "Vista previa de CSS" (aplica sobre el HTML de su misma carpeta si existe).
- * - Cualquier otro archivo (.c, .cpp, .sql, etc.) -> informa claramente que la vista previa no está disponible.
+ * - Si la pestaña es .ts/.tsx, .md, .sql, .c/.cpp/.rs/.go/.java/.cs o imagen -> ejecuta el motor contextual correspondiente.
+ * - Cualquier otro archivo no soportado -> informa claramente que la vista previa no está disponible.
  */
 export function initLivePreviewModal({
   getWorkspaceSnapshot,
   onBeforePreview,
+  onClosePreview,
   onErrorMarker,
   onClearErrorMarkers,
   onGoToLine,
   ensureFileLoaded,
-  ensureFilesLoaded
+  ensureFilesLoaded,
+  bindOpenButton = true
 }) {
   const openBtn = document.getElementById("btn-live-preview");
   const dialog = document.getElementById("preview-dialog");
@@ -445,27 +449,40 @@ export function initLivePreviewModal({
     }, listenOpts);
   });
 
-  openBtn?.addEventListener("click", async () => {
-    if (destroyed) return;
-    await openPreview();
-  }, listenOpts);
+  if (bindOpenButton) {
+    openBtn?.addEventListener("click", async () => {
+      if (destroyed) return;
+      await openPreview();
+    }, listenOpts);
+  }
 
-  closeBtn?.addEventListener("click", () => {
+  function handlePreviewCloseCleanup() {
     renderSeq += 1;
     stopIframe();
+    clearConsoleOutput();
+    cachedKnownSecrets = null;
+    if (typeof onClosePreview === "function") {
+      try {
+        onClosePreview();
+      } catch {
+        // cancelar precarga opcional
+      }
+    }
+  }
+
+  closeBtn?.addEventListener("click", () => {
+    handlePreviewCloseCleanup();
     dialog?.close();
   }, listenOpts);
 
   dialog?.addEventListener("close", () => {
     if (dialog.open) return;
-    renderSeq += 1;
-    stopIframe();
+    handlePreviewCloseCleanup();
   }, listenOpts);
 
   dialog?.addEventListener("click", (event) => {
     if (event.target === dialog) {
-      renderSeq += 1;
-      stopIframe();
+      handlePreviewCloseCleanup();
       dialog.close();
     }
   }, listenOpts);
@@ -630,13 +647,76 @@ export function initLivePreviewModal({
     }
   }
 
+  let consoleScrollRaf = 0;
+
   function clearConsoleOutput() {
+    if (consoleScrollRaf && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(consoleScrollRaf);
+      consoleScrollRaf = 0;
+    }
     if (!consoleList) return;
     consoleList.innerHTML = "";
   }
 
+  function scheduleConsoleScrollBottom() {
+    if (!consoleList || consoleScrollRaf) return;
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      consoleScrollRaf = window.requestAnimationFrame(() => {
+        consoleScrollRaf = 0;
+        if (consoleList && !destroyed && (!document || !document.hidden)) {
+          consoleList.scrollTop = consoleList.scrollHeight;
+        }
+      });
+    } else {
+      consoleList.scrollTop = consoleList.scrollHeight;
+    }
+  }
+
   const MAX_CONSOLE_LINES = 500;
   const MAX_CONSOLE_LINE_CHARS = 10000;
+  let cachedKnownSecrets = null;
+
+  function collectActiveKnownSecrets() {
+    const secrets = [];
+    if (typeof window === "undefined") return secrets;
+    const keyNames = [
+      "ide.github.pat",
+      "ide.ai.key.gemini",
+      "ide.ai.key.groq",
+      "ide.ai.key.openrouter",
+      "ide.ai.key.mistral"
+    ];
+    for (const storeName of ["localStorage", "sessionStorage"]) {
+      try {
+        const store = window[storeName];
+        if (!store || typeof store.getItem !== "function") continue;
+        for (const k of keyNames) {
+          const val = store.getItem(k);
+          if (typeof val === "string" && val.trim().length >= 8) {
+            secrets.push(val.trim());
+          }
+        }
+      } catch {
+        // storage no disponible
+      }
+    }
+    return secrets;
+  }
+
+  function getCachedKnownSecrets() {
+    if (cachedKnownSecrets === null) {
+      cachedKnownSecrets = collectActiveKnownSecrets();
+    }
+    return cachedKnownSecrets;
+  }
+
+  const refreshCachedKnownSecrets = () => {
+    if (!destroyed && cachedKnownSecrets !== null) {
+      cachedKnownSecrets = collectActiveKnownSecrets();
+    }
+  };
+  window?.addEventListener?.("studio-credentials-updated", refreshCachedKnownSecrets, listenOpts);
+  window?.addEventListener?.("storage", refreshCachedKnownSecrets, listenOpts);
 
   function appendConsoleLine(level, text) {
     if (!consoleList) return;
@@ -647,11 +727,11 @@ export function initLivePreviewModal({
     const preSlice = rawStr.length > MAX_CONSOLE_LINE_CHARS + 512
       ? rawStr.slice(0, MAX_CONSOLE_LINE_CHARS + 512)
       : rawStr;
-    let redacted = preSlice;
+    let redacted = "";
     try {
-      redacted = redactSensitiveTokens(preSlice);
-    } catch (_) {
-      redacted = preSlice;
+      redacted = redactSensitiveTokens(preSlice, getCachedKnownSecrets());
+    } catch {
+      redacted = "[salida omitida por error de redacción]";
     }
     const safeText =
       rawStr.length > MAX_CONSOLE_LINE_CHARS || redacted.length > MAX_CONSOLE_LINE_CHARS
@@ -666,12 +746,13 @@ export function initLivePreviewModal({
           : "preview-log-item";
     item.textContent = safeText;
     consoleList.appendChild(item);
-    consoleList.scrollTop = consoleList.scrollHeight;
+    scheduleConsoleScrollBottom();
   }
 
   async function openPreview() {
     if (!dialog || destroyed) return;
     const openSeq = ++renderSeq;
+    cachedKnownSecrets = collectActiveKnownSecrets();
     jsRunOverride = "auto";
     tsRunOverride = "auto";
     imageRunOverride = "auto";
@@ -776,7 +857,7 @@ export function initLivePreviewModal({
     }
   }
 
-  function showCRunnerView(activeFile, companionFiles = []) {
+  async function showCRunnerView(activeFile, companionFiles = [], expectedSeq = renderSeq) {
     stopIframe();
     clearConsoleOutput();
     hideWebNavigationControls();
@@ -824,6 +905,8 @@ export function initLivePreviewModal({
 
     if (cRunnerContainer) {
       cRunnerContainer.hidden = false;
+      const { mountCRunnerView } = await loadCRunner();
+      if (destroyed || expectedSeq !== renderSeq) return;
       const runnerInstance = mountCRunnerView(cRunnerContainer, {
         activeFile,
         companionFiles,
@@ -1044,6 +1127,8 @@ export function initLivePreviewModal({
     // 6. Pestaña SQL (.sql): base de datos SQLite interactiva en WebAssembly
     if (SQL_EXTENSIONS.has(ext)) {
       hideWebNavigationControls();
+      const { buildSqlRunnerPreview } = await loadSqlRunner();
+      if (isStale()) return;
       const compiledSqlHtml = buildSqlRunnerPreview(activeFile);
       showRunnableIframe({
         headerTitle: "Vista previa de SQL (SQLite)",
@@ -1060,7 +1145,7 @@ export function initLivePreviewModal({
     // 7. TypeScript / TSX (.ts / .tsx): ejecución offline en navegador o compilador remoto
     if (TS_EXTENSIONS.has(ext)) {
       if (tsRunOverride === "compiler") {
-        showCRunnerView(activeFile, sameFolderFiles);
+        await showCRunnerView(activeFile, sameFolderFiles, seq);
         return;
       }
       const savedHtml = getSavedPreviewHtml(projectId);
@@ -1118,7 +1203,7 @@ export function initLivePreviewModal({
       JAVA_EXTENSIONS.has(ext) ||
       CSHARP_EXTENSIONS.has(ext)
     ) {
-      showCRunnerView(activeFile, sameFolderFiles);
+      await showCRunnerView(activeFile, sameFolderFiles, seq);
       return;
     }
 
@@ -1193,8 +1278,7 @@ export function initLivePreviewModal({
     openPreview,
     destroy() {
       destroyed = true;
-      renderSeq += 1;
-      stopIframe();
+      handlePreviewCloseCleanup();
       controller?.abort();
     }
   };

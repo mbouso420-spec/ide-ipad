@@ -59,24 +59,36 @@ function getBrowserStorageGetters() {
 
 function readPersistedLockoutRecord(scope) {
   const key = `${LOCKOUT_STORAGE_PREFIX}${scope}`;
+  let best = { failedAttempts: 0, lockoutUntil: 0, updatedAt: 0 };
+  const consider = (rec) => {
+    if (!rec || typeof rec !== "object") return;
+    const cand = {
+      failedAttempts: Math.max(0, Number(rec.failedAttempts) || 0),
+      lockoutUntil: Math.max(0, Number(rec.lockoutUntil) || 0),
+      updatedAt: Math.max(0, Number(rec.updatedAt) || 0)
+    };
+    if (
+      cand.lockoutUntil > best.lockoutUntil ||
+      (cand.lockoutUntil === best.lockoutUntil && cand.failedAttempts > best.failedAttempts) ||
+      (cand.lockoutUntil === best.lockoutUntil &&
+        cand.failedAttempts === best.failedAttempts &&
+        cand.updatedAt > best.updatedAt)
+    ) {
+      best = cand;
+    }
+  };
   for (const getStore of getBrowserStorageGetters()) {
     try {
       const store = getStore();
       const raw = store?.getItem(key) || "";
       if (!raw) continue;
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === "object") {
-        return {
-          failedAttempts: Math.max(0, Number(parsed.failedAttempts) || 0),
-          lockoutUntil: Math.max(0, Number(parsed.lockoutUntil) || 0),
-          updatedAt: Math.max(0, Number(parsed.updatedAt) || 0)
-        };
-      }
+      consider(JSON.parse(raw));
     } catch {
-      // Fall back to next storage backend or in-memory map if JSON or storage fails
+      // Ignorar backend dañado o inaccesible
     }
   }
-  return memoryLockoutFallback.get(scope) || { failedAttempts: 0, lockoutUntil: 0, updatedAt: 0 };
+  consider(memoryLockoutFallback.get(scope));
+  return best;
 }
 
 function writePersistedLockoutRecord(scope, record) {
@@ -222,15 +234,28 @@ export function recordAuthSuccess(scope) {
   writePersistedLockoutRecord(scope, { failedAttempts: 0, lockoutUntil: 0, updatedAt: 0 });
 }
 
+const SESSION_FINGERPRINT_SALT = (() => {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === "function") {
+      const bytes = new Uint8Array(16);
+      globalThis.crypto.getRandomValues(bytes);
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    }
+  } catch {
+    // fallback determinístico por sesión si crypto no está disponible
+  }
+  return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+})();
+
 /**
- * Calcula una huella no reversible (hash FNV-1a dual de 64 bits con longitud) para almacenar
+ * Calcula una huella no reversible con sal criptográfica de sesión (96 bits) para almacenar
  * claves rechazadas en memoria sin conservar ningún substring del secreto original.
  * @param {string} scope
  * @param {string} rawToken
  * @returns {string}
  */
 export function computeTokenFingerprint(scope, rawToken) {
-  const input = `${String(scope || "")}\x1f${String(rawToken || "")}\x1f${String(rawToken || "").length}`;
+  const input = `${SESSION_FINGERPRINT_SALT}\x1f${String(scope || "")}\x1f${String(rawToken || "")}\x1f${String(rawToken || "").length}`;
   let h1 = 0x811c9dc5 >>> 0;
   let h2 = 0x01000193 >>> 0;
   let h3 = 0x9e3779b9 >>> 0;
@@ -462,19 +487,34 @@ export function redactSensitiveTokens(input, extraKnownSecrets = []) {
   if (!out) return "";
 
   out = out
-    .replace(/\b(?:github_pat|gh[pousr])_[A-Za-z0-9_]{6,}\b/gi, "[REDACTED_GH_TOKEN]")
-    .replace(/\bAIza[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_AI_KEY]")
-    .replace(/\b(?:sk-or-v1-|sk-or-|sk-ant-|sk-proj-|sk-|gsk_)[A-Za-z0-9_-]{8,}\b/gi, "[REDACTED_AI_KEY]")
+    .replace(/(^|[^A-Za-z0-9])(?:github_pat|gh[pousr])_[A-Za-z0-9_]{6,}(?![A-Za-z0-9_])/gi, "$1[REDACTED_GH_TOKEN]")
+    .replace(/(^|[^A-Za-z0-9])AIza[A-Za-z0-9_.-]{7,}[A-Za-z0-9_-](?![A-Za-z0-9_-])/g, "$1[REDACTED_AI_KEY]")
+    .replace(/(^|[^A-Za-z0-9])(?:sk-or-v1-|sk-or-|sk-ant-|sk-proj-|sk-|gsk_)[A-Za-z0-9_.-]{7,}[A-Za-z0-9_-](?![A-Za-z0-9_-])/gi, "$1[REDACTED_AI_KEY]")
     .replace(/((?:Bearer|token|Basic)\s+)[A-Za-z0-9._~+/=-]{6,}/gi, "$1[REDACTED]")
-    .replace(/((?:["']?(?:x-goog-api-key|x-api-key|x-auth-token)["']?\s*[:=]\s*["']?))([^\s"',<>}]+)/gi, "$1[REDACTED]")
+    .replace(/((?:["']?(?:x-goog-api-key|x-api-key|x-auth-token|proxy-authorization)["']?\s*[:=]\s*["']?))([^\s"',<>}]+)/gi, "$1[REDACTED]")
+    .replace(/((?:["']?(?:set-cookie|cookie)["']?\s*[:=]\s*["']?))([^\r\n"'<>}]+)/gi, "$1[REDACTED]")
     .replace(/((?:["']?authorization["']?\s*[:=]\s*["']?))(?:(?:Bearer|token|Basic)\s+)?[A-Za-z0-9._~+/=-]{6,}/gi, "$1[REDACTED]")
-    .replace(/([?&](?:key|token|api_key|apikey|access_token)=)[^&\s"'<>]+/gi, "$1[REDACTED]");
+    .replace(/(https?:\/\/[^:/\s@]+:)([^@\s/]+)(@)/gi, "$1[REDACTED]$3")
+    .replace(/([?&#](?:key|token|api_key|apikey|access_token|secret|client_secret|private_token)=)[^&#\s"'<>]+/gi, "$1[REDACTED]");
 
-  if (Array.isArray(extraKnownSecrets)) {
+  if (Array.isArray(extraKnownSecrets) && extraKnownSecrets.length > 0) {
+    const candidates = [];
     for (const secret of extraKnownSecrets) {
       const s = typeof secret === "string" ? secret.trim() : "";
-      if (s && s.length >= 8 && out.includes(s)) {
-        out = out.split(s).join("[REDACTED_SECRET]");
+      if (s && s.length >= 8) {
+        candidates.push(s);
+        try {
+          const enc = encodeURIComponent(s);
+          if (enc !== s && enc.length >= 8) candidates.push(enc);
+        } catch {
+          // ignorar secuencia Unicode inválida
+        }
+      }
+    }
+    candidates.sort((a, b) => b.length - a.length);
+    for (const cand of candidates) {
+      if (out.includes(cand)) {
+        out = out.split(cand).join("[REDACTED_SECRET]");
       }
     }
   }
@@ -492,6 +532,43 @@ const SENSITIVE_HEADER_KEYS = new Set([
   "set-cookie"
 ]);
 
+const SENSITIVE_OBJECT_KEYS = new Set([
+  "auth",
+  "authorization",
+  "password",
+  "passphrase",
+  "token",
+  "apikey",
+  "api_key",
+  "access_token",
+  "accesstoken",
+  "refresh_token",
+  "refreshtoken",
+  "secret",
+  "client_secret",
+  "clientsecret",
+  "private_key",
+  "privatekey",
+  "githubpat",
+  "pat",
+  "cookie",
+  "set-cookie",
+  "credentials"
+]);
+
+function scrubHeaderValue(value, extraKnownSecrets) {
+  if (typeof value === "string") {
+    return redactSensitiveTokens(value, extraKnownSecrets);
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => scrubHeaderValue(item, extraKnownSecrets));
+  }
+  if (value && typeof value === "object") {
+    return sanitizeErrorCause(value, extraKnownSecrets, 1);
+  }
+  return value;
+}
+
 function scrubSensitiveHeaders(headers, extraKnownSecrets = []) {
   if (!headers || typeof headers !== "object") return headers;
   if (Array.isArray(headers)) {
@@ -500,10 +577,7 @@ function scrubSensitiveHeaders(headers, extraKnownSecrets = []) {
       if (Array.isArray(entry) && entry.length >= 2) {
         const k = String(entry[0]);
         if (SENSITIVE_HEADER_KEYS.has(k.toLowerCase())) continue;
-        cleanArr.push([
-          k,
-          typeof entry[1] === "string" ? redactSensitiveTokens(entry[1], extraKnownSecrets) : entry[1]
-        ]);
+        cleanArr.push([k, scrubHeaderValue(entry[1], extraKnownSecrets)]);
       }
     }
     return cleanArr;
@@ -523,7 +597,7 @@ function scrubSensitiveHeaders(headers, extraKnownSecrets = []) {
     if (key === "__proto__" || SENSITIVE_HEADER_KEYS.has(String(key).toLowerCase())) {
       continue;
     }
-    clean[key] = typeof value === "string" ? redactSensitiveTokens(value, extraKnownSecrets) : value;
+    clean[key] = scrubHeaderValue(value, extraKnownSecrets);
   }
   return clean;
 }
@@ -532,12 +606,13 @@ function scrubRequestOrConfig(obj, extraKnownSecrets, depth, seen) {
   const copy = Object.create(null);
   for (const [k, v] of Object.entries(obj)) {
     if (k === "__proto__") continue;
-    if (k === "headers") {
-      copy.headers = scrubSensitiveHeaders(v, extraKnownSecrets);
-    } else if (k === "auth" || k === "password" || k === "token" || k === "apiKey") {
+    const lowerKey = k.toLowerCase();
+    if (lowerKey === "headers") {
+      copy[k] = scrubSensitiveHeaders(v, extraKnownSecrets);
+    } else if (SENSITIVE_OBJECT_KEYS.has(lowerKey)) {
       copy[k] = "[REDACTED]";
-    } else if (k === "url" && typeof v === "string") {
-      copy.url = redactSensitiveTokens(v, extraKnownSecrets);
+    } else if (lowerKey === "url" && typeof v === "string") {
+      copy[k] = redactSensitiveTokens(v, extraKnownSecrets);
     } else if (typeof v === "string") {
       copy[k] = redactSensitiveTokens(v, extraKnownSecrets);
     } else if (v && typeof v === "object") {
@@ -604,9 +679,10 @@ export function sanitizeErrorCause(error, extraKnownSecrets = [], depth = 0, see
   const out = Object.create(null);
   for (const [k, v] of Object.entries(error)) {
     if (k === "__proto__") continue;
-    if (k === "headers") {
-      out.headers = scrubSensitiveHeaders(v, extraKnownSecrets);
-    } else if (k === "auth" || k === "password" || k === "token" || k === "apiKey") {
+    const lowerKey = k.toLowerCase();
+    if (lowerKey === "headers") {
+      out[k] = scrubSensitiveHeaders(v, extraKnownSecrets);
+    } else if (SENSITIVE_OBJECT_KEYS.has(lowerKey)) {
       out[k] = "[REDACTED]";
     } else if (typeof v === "string") {
       out[k] = redactSensitiveTokens(v, extraKnownSecrets);

@@ -96,7 +96,7 @@
 
 1. **Content Security Policy (CSP) Estricta:**
    `index.html` declara una directiva CSP restrictiva que autoriza únicamente las APIs oficiales de GitHub y proveedores de IA (`api.github.com`, `generativelanguage.googleapis.com`, `api.groq.com`, `openrouter.ai`, `api.mistral.ai`), el compilador seguro de C/C++ (`https://wandbox.org`), CDNs certificados para ESM y librerías WebAssembly (`esm.sh`, `cdn.jsdelivr.net`, `cdnjs.cloudflare.com`) y orígenes de fuentes seguros (`fonts.googleapis.com`, `fonts.gstatic.com`).
-2. **Service Worker (`studio-ide-shell-v32` y `studio-ide-runtime-v2`):**
+2. **Service Worker (`studio-ide-shell-v33` y `studio-ide-runtime-v2`):**
    - Estrategia **Network-First** para el App Shell propio con reintentos exponenciales en precacheo, soporte `{ ignoreSearch: true }`, y protección contra respuestas HTTP 5xx sobre caché válido.
    - Pre-cacheo completo de los módulos y submódulos vigentes (incluyendo el sistema modular de `tsTranspiler` (`js/preview/ts/`), `moduleBundler` (`js/preview/bundler/`), `htmlBundler` (`js/preview/html/`), `workspaceDb` (`js/storage/db/`), `liveLinter.js`, `mentionPopover.js`, `markdownRenderer.js`, `projectModal.js`, `wasiRunner.js`, `clangWorker.js`, `githubBlobCache.js`, `credentialGuard.js`, `keyVaultCrypto.js`, `githubMerge.js`, `codeFormatter.js`, el analizador sintáctico Acorn, las 16 dependencias CDN del importmap CodeMirror/Octokit con precalentamiento acotado de sub-chunks de `esm.sh` y caché bajo demanda de `@yowasp/clang` WASM con timeout extendido de 60 s).
 3. **Blindaje de Credenciales y Anti-Fuerza Bruta (`js/security/credentialGuard.js` y `js/security/keyVaultCrypto.js`):**

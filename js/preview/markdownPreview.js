@@ -7,7 +7,9 @@ import {
   isBlockedPreviewUrlScheme,
   normalizePreviewUrlRef,
   resolveRelativePath,
-  buildSafeImageDataUrl
+  buildSafeImageDataUrl,
+  sanitizeSvgMarkup,
+  safeEncodeURIComponent
 } from "./previewUtils.js";
 import { normalizePath } from "../storage/workspaceDb.js";
 
@@ -20,7 +22,7 @@ export function buildMarkdownPreview(mdFile, assetMap = null) {
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:; base-uri 'none'; form-action 'none';">
   <title>${safeTitle}</title>
   <style>
     :root {
@@ -354,6 +356,7 @@ function renderMarkdownProseBlock(text, options = {}) {
 
 export function formatMdInline(str, options = {}) {
   const codes = [];
+  const rawCodes = [];
   const links = [];
   const images = [];
   const assetMap = options?.assetMap || null;
@@ -362,9 +365,13 @@ export function formatMdInline(str, options = {}) {
   const cleanStr = String(str ?? "").replace(/\u0000/g, "");
   let working = cleanStr.replace(/`([^`]+)`/g, (_, c) => {
     const i = codes.length;
+    rawCodes.push(c);
     codes.push(`<code>${escapeHtml(c)}</code>`);
     return `\u0000C${i}\u0000`;
   });
+
+  const restorePlainCodeTokens = (txt) =>
+    String(txt ?? "").replace(/\u0000C(\d+)\u0000/g, (_, i) => rawCodes[Number(i)] ?? "");
 
   const applyEmphasis = (text) =>
     text
@@ -374,11 +381,18 @@ export function formatMdInline(str, options = {}) {
   // Imágenes Markdown: ![alt](url "title") — evaluar antes de escapeHtml para no alterar '&' o '\'' en rutas locales
   working = working.replace(
     /!\[([^\]]*)\]\(([^)\s\u0000]+)(?:\s+(?:"([^"]*)"|'([^']*)'))?\)/g,
-    (_, alt, rawUrl, t1, t2) => {
-      const title = t1 || t2 || "";
+    (_, rawAlt, rawUrl, t1, t2) => {
+      const alt = restorePlainCodeTokens(rawAlt);
+      const title = restorePlainCodeTokens(t1 || t2 || "");
       let resolvedSrc = rawUrl;
+      let builtFromSafeAsset = false;
       if (assetMap) {
-        const cleanRef = rawUrl.trim().split("?")[0].split("#")[0];
+        let cleanRef = rawUrl.trim().split("?")[0].split("#")[0];
+        try {
+          cleanRef = decodeURIComponent(cleanRef);
+        } catch {
+          // conservar cadena original si contiene % inválido
+        }
         const relPath = resolveRelativePath(baseDir, cleanRef);
         const normRef = normalizePath(cleanRef);
         const entry = assetMap.get(relPath) || assetMap.get(normRef) || assetMap.get(cleanRef) || null;
@@ -386,12 +400,50 @@ export function formatMdInline(str, options = {}) {
           const built = buildSafeImageDataUrl(entry, cleanRef);
           if (built) {
             resolvedSrc = built.src;
+            builtFromSafeAsset = true;
           }
         }
       }
       const normCandidate = normalizePreviewUrlRef(resolvedSrc);
-      const isSafeDataImage = /^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|ico|svg\+xml)[;,]/i.test(normCandidate);
-      if (isBlockedPreviewUrlScheme(normCandidate) && !isSafeDataImage) {
+      let isAllowedImg = builtFromSafeAsset;
+      if (!isAllowedImg) {
+        if (/^data:image\/svg\+xml/i.test(normCandidate)) {
+          const commaIdx = resolvedSrc.indexOf(",");
+          const meta = commaIdx !== -1 ? resolvedSrc.slice(0, commaIdx).toLowerCase() : "";
+          const payload = commaIdx !== -1 ? resolvedSrc.slice(commaIdx + 1) : "";
+          let svgRaw = "";
+          try {
+            if (meta.includes(";base64")) {
+              const builtSvg = buildSafeImageDataUrl({ path: "inline.svg", isBinary: true, base64: payload }, "inline.svg");
+              if (builtSvg) {
+                resolvedSrc = builtSvg.src;
+                isAllowedImg = true;
+              }
+            } else {
+              svgRaw = decodeURIComponent(payload);
+              const cleaned = sanitizeSvgMarkup(svgRaw);
+              if (cleaned) {
+                resolvedSrc = `data:image/svg+xml;charset=utf-8,${safeEncodeURIComponent(cleaned).replace(/'/g, "%27").replace(/"/g, "%22")}`;
+                isAllowedImg = true;
+              }
+            }
+          } catch {
+            isAllowedImg = false;
+          }
+        } else if (/^data:image\/(?:png|jpe?g|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon);base64,[a-z0-9+/=]+$/i.test(normCandidate)) {
+          isAllowedImg = true;
+        } else if (/^https?:\/\//i.test(normCandidate)) {
+          isAllowedImg = true;
+        } else if (
+          !isBlockedPreviewUrlScheme(normCandidate) &&
+          !/^blob:/i.test(normCandidate) &&
+          !normCandidate.startsWith("//") &&
+          !/^[a-z][a-z0-9+.-]*:/i.test(normCandidate)
+        ) {
+          isAllowedImg = true;
+        }
+      }
+      if (!isAllowedImg) {
         const safeLabel = escapeHtml(alt || "imagen bloqueada");
         const i = images.length;
         images.push(`<span class="md-blocked-img">[${safeLabel}]</span>`);

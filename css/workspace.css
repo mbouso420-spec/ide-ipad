@@ -283,8 +283,6 @@
 
 .ide-dialog::backdrop {
   background: var(--color-backdrop);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
 }
 
 .dialog-shell {
@@ -531,6 +529,8 @@
   padding-inline: var(--space-xs);
   white-space: pre-wrap;
   word-break: break-word;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 22px;
 }
 
 .diff-row-add {

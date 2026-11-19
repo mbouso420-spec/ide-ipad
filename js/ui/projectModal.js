@@ -18,10 +18,33 @@ export function initProjectModal({ onCreateProject } = {}) {
 
   let selectedTemplateId = PROJECT_TEMPLATES[0]?.id || "web";
   let isSubmitting = false;
+  let focusTimer = null;
+
+  const syncSelectedTemplateCards = () => {
+    if (!gridEl) return;
+    const cards = gridEl.querySelectorAll(".template-card");
+    for (const card of cards) {
+      const isSelected = card.dataset.templateId === selectedTemplateId;
+      card.classList.toggle("is-selected", isSelected);
+      card.setAttribute("aria-checked", isSelected ? "true" : "false");
+    }
+  };
+
+  gridEl?.addEventListener("click", (event) => {
+    const target = event.target?.closest?.(".template-card");
+    if (!target || !target.dataset?.templateId) return;
+    selectedTemplateId = target.dataset.templateId;
+    syncSelectedTemplateCards();
+  }, listenOpts);
 
   const renderTemplates = () => {
     if (!gridEl) return;
+    if (gridEl.children.length === PROJECT_TEMPLATES.length) {
+      syncSelectedTemplateCards();
+      return;
+    }
     gridEl.innerHTML = "";
+    const frag = typeof document.createDocumentFragment === "function" ? document.createDocumentFragment() : null;
     for (const tpl of PROJECT_TEMPLATES) {
       const card = document.createElement("button");
       card.type = "button";
@@ -43,15 +66,16 @@ export function initProjectModal({ onCreateProject } = {}) {
       filesWrap.textContent = Array.isArray(tpl.filesPreview) ? tpl.filesPreview.join(" · ") : "";
 
       card.append(title, desc, filesWrap);
-      card.addEventListener("click", () => {
-        selectedTemplateId = tpl.id;
-        renderTemplates();
-      }, listenOpts);
-      gridEl.appendChild(card);
+      (frag || gridEl).appendChild(card);
     }
+    if (frag) gridEl.appendChild(frag);
   };
 
   const close = () => {
+    if (focusTimer !== null) {
+      clearTimeout(focusTimer);
+      focusTimer = null;
+    }
     keyboardRouter.popModal("project-template-dialog");
     if (dialog?.open) dialog.close();
   };
@@ -101,13 +125,22 @@ export function initProjectModal({ onCreateProject } = {}) {
       blockGlobalShortcuts: true,
       onEscape: () => close()
     });
-    setTimeout(() => nameInput?.focus(), 30);
+    if (focusTimer !== null) {
+      clearTimeout(focusTimer);
+    }
+    focusTimer = setTimeout(() => {
+      focusTimer = null;
+      nameInput?.focus();
+    }, 30);
   }
 
   return {
     open,
-    close,
     destroy() {
+      if (focusTimer !== null) {
+        clearTimeout(focusTimer);
+        focusTimer = null;
+      }
       keyboardRouter.popModal("project-template-dialog");
       listenerController?.abort();
     }

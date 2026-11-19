@@ -47,6 +47,7 @@ export function escapeRegExp(str) {
  */
 const MAX_LINE_SNIPPET_LENGTH = 300;
 const SNIPPET_MATCH_LEADING_CONTEXT = 60;
+const MAX_REGEX_LENGTH = 2000;
 const WILDCARD_EQUIV_CLASSES = new Set(["[\\s\\S]", "[\\S\\s]", "[\\w\\W]", "[\\W\\w]", "[\\d\\D]", "[\\D\\d]", "[^]"]);
 const SAMPLE_OVERLAP_CHARS = (() => {
   const chars = [
@@ -464,6 +465,8 @@ function groupHasOverlappingBranches(branches, caseSensitive = true) {
 function createBranchState() {
   return {
     prevQuantified: null,
+    hadUnquantifiedSep: false,
+    chainedOverlapCount: 0,
     startsWithQuantified: false,
     leadingQuantified: null,
     leadingNullable: true,
@@ -571,6 +574,8 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
       }
 
       if (group.isAssertion) {
+        // Una aserción lookahead/lookbehind cuantificada (ej. (?=a+)+) es inválida o peligrosa
+        if (groupQuantified) return true;
         if (group.hasBackref) parent.hasBackref = true;
         if (group.hasAlternationOverlap) parent.hasAlternationOverlap = true;
         if (group.hasQuantifier) parent.hasQuantifier = true;
@@ -580,10 +585,11 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
       const branchOverlap = groupHasOverlappingBranches(group.branches, caseSensitive);
       const hasNestedOverlap = group.hasAlternationOverlap || branchOverlap;
       const groupAtoms = group.branches.flat();
-      const groupAllNullable = group.completedBranches.every((b) => b.allNullable);
+      // Un grupo de alternancia es anulable si AL MENOS UNA de sus ramas puede coincidir con vacío (ej. (?:b|))
+      const groupAnyNullable = group.completedBranches.some((b) => b.allNullable);
 
       if (groupQuantified) {
-        if (group.hasQuantifier || group.hasBackref || group.hasOptional || groupAllNullable || hasNestedOverlap) {
+        if (group.hasQuantifier || group.hasBackref || group.hasOptional || groupAnyNullable || hasNestedOverlap) {
           return true;
         }
         parent.hasQuantifier = true;
@@ -595,8 +601,13 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
         }
         if (groupAtoms.length > 0) {
           if (anyAtomOverlaps(pBr.prevQuantified, groupAtoms, caseSensitive)) {
-            return true;
+            if (!pBr.hadUnquantifiedSep) return true;
+            pBr.chainedOverlapCount += 1;
+            if (pBr.chainedOverlapCount >= 3) return true;
+          } else {
+            pBr.chainedOverlapCount = 1;
           }
+          pBr.hadUnquantifiedSep = false;
           pBr.prevQuantified = isNullableQuant
             ? mergeAtomLists(pBr.prevQuantified, groupAtoms)
             : groupAtoms;
@@ -646,38 +657,58 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
       }
 
       if (anyStartsQuantified && anyAtomOverlaps(pBr.prevQuantified, unionLeading, caseSensitive)) {
-        return true;
+        if (!pBr.hadUnquantifiedSep) return true;
+        pBr.chainedOverlapCount += 1;
+        if (pBr.chainedOverlapCount >= 3) return true;
       }
 
       if (groupOptional) {
         parent.hasOptional = true;
-        const addedOpts = groupAllNullable ? Math.max(1, maxBranchOpts) : 1;
+        const addedOpts = groupAnyNullable ? Math.max(1, maxBranchOpts) : 1;
         pBr.consecutiveOptionals += addedOpts;
         pBr.optionalCount += addedOpts;
         if (pBr.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
         if (unionEnding) {
           pBr.prevQuantified = mergeAtomLists(pBr.prevQuantified, unionEnding);
+          pBr.hadUnquantifiedSep = false;
         }
         if (anyStartsQuantified && (!pBr.sawFirstToken || pBr.leadingNullable)) {
           pBr.startsWithQuantified = true;
           pBr.leadingQuantified = mergeAtomLists(pBr.leadingQuantified, unionLeading);
         }
       } else {
-        if (!groupAllNullable) {
+        if (!groupAnyNullable) {
           pBr.allNullable = false;
           pBr.consecutiveOptionals = 0;
         } else {
-          pBr.consecutiveOptionals += maxBranchOpts;
-          pBr.optionalCount += maxBranchOpts;
+          const nullableOpts = Math.max(1, maxBranchOpts);
+          pBr.consecutiveOptionals += nullableOpts;
+          pBr.optionalCount += nullableOpts;
           if (pBr.consecutiveOptionals > MAX_CONTIGUOUS_OPTIONALS) return true;
         }
         if (anyStartsQuantified && (!pBr.sawFirstToken || pBr.leadingNullable)) {
           pBr.startsWithQuantified = true;
           pBr.leadingQuantified = mergeAtomLists(pBr.leadingQuantified, unionLeading);
         }
-        if (!groupAllNullable) {
+        if (!groupAnyNullable) {
           pBr.leadingNullable = false;
-          pBr.prevQuantified = unionEnding;
+          if (unionEnding) {
+            pBr.prevQuantified = unionEnding;
+            pBr.hadUnquantifiedSep = false;
+            pBr.chainedOverlapCount = Math.max(1, pBr.chainedOverlapCount);
+          } else {
+            const carried = pBr.prevQuantified
+              ? pBr.prevQuantified.filter((prev) => anyAtomOverlaps([prev], groupAtoms, caseSensitive))
+              : [];
+            if (carried.length > 0) {
+              pBr.prevQuantified = carried;
+              pBr.hadUnquantifiedSep = true;
+            } else {
+              pBr.prevQuantified = null;
+              pBr.hadUnquantifiedSep = false;
+              pBr.chainedOverlapCount = 0;
+            }
+          }
         } else {
           pBr.prevQuantified = mergeAtomLists(pBr.prevQuantified, unionEnding);
         }
@@ -693,7 +724,7 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
         }
       } else {
         if (groupAtoms.length > 0) {
-          branch.push({ type: "alt-group", atoms: groupAtoms, isOptional: groupOptional || groupAllNullable });
+          branch.push({ type: "alt-group", atoms: groupAtoms, isOptional: groupOptional || groupAnyNullable });
         }
       }
       continue;
@@ -720,8 +751,13 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
           current.hasOptional = true;
         }
         if (anyAtomOverlaps(br.prevQuantified, [tok], caseSensitive)) {
-          return true;
+          if (!br.hadUnquantifiedSep) return true;
+          br.chainedOverlapCount += 1;
+          if (br.chainedOverlapCount >= 3) return true;
+        } else {
+          br.chainedOverlapCount = 1;
         }
+        br.hadUnquantifiedSep = false;
         br.prevQuantified = isNullableQuant ? mergeAtomLists(br.prevQuantified, [tok]) : [tok];
         if (!br.sawFirstToken || br.leadingNullable) {
           br.startsWithQuantified = true;
@@ -741,7 +777,17 @@ export function hasUnsafeReDoSPattern(rawPattern, options = {}) {
         br.allNullable = false;
         br.leadingNullable = false;
         br.consecutiveOptionals = 0;
-        br.prevQuantified = null;
+        const carried = br.prevQuantified
+          ? br.prevQuantified.filter((prev) => atomsCanOverlap(prev, tok, caseSensitive))
+          : [];
+        if (carried.length > 0) {
+          br.prevQuantified = carried;
+          br.hadUnquantifiedSep = true;
+        } else {
+          br.prevQuantified = null;
+          br.hadUnquantifiedSep = false;
+          br.chainedOverlapCount = 0;
+        }
       }
       br.sawFirstToken = true;
     }
@@ -756,53 +802,74 @@ export function searchInFiles(files, query, options = {}) {
     matchWholeWord = false,
     isRegex = false,
     maxMatchesPerFile = 200,
-    maxTotalMatches = 2000
+    maxTotalMatches = 2000,
+    signal = null
   } = options;
 
-  const cleanQuery = String(query || "").trim();
+  const rawQuery = String(query ?? "");
+  const cleanQuery = rawQuery.trim();
   if (!cleanQuery) {
-    return { results: [], totalMatches: 0, filesMatched: 0, error: null };
+    return { results: [], totalMatches: 0, filesMatched: 0, truncated: false, unloadedFiles: 0, error: null };
   }
 
-  let regex;
-  try {
-    let pattern;
-    if (isRegex) {
-      if (hasUnsafeReDoSPattern(query, { caseSensitive })) {
-        return {
-          results: [],
-          totalMatches: 0,
-          filesMatched: 0,
-          error: "Expresión regular inválida: contiene cuantificadores anidados inseguros."
-        };
-      }
-      pattern = query;
-    } else {
-      pattern = escapeRegExp(query);
-    }
-
-    if (matchWholeWord) {
-      pattern = `\\b(?:${pattern})\\b`;
-    }
-
-    const needsUnicode = /\\(?:p|P)\{|\\u\{/.test(pattern);
-    const flags = `${caseSensitive ? "g" : "gi"}${needsUnicode ? "u" : ""}`;
-    try {
-      regex = new RegExp(pattern, flags);
-    } catch (unicodeErr) {
-      if (needsUnicode) {
-        regex = new RegExp(pattern, caseSensitive ? "g" : "gi");
-      } else {
-        throw unicodeErr;
-      }
-    }
-  } catch (err) {
+  if (isRegex && rawQuery.length > MAX_REGEX_LENGTH) {
     return {
       results: [],
       totalMatches: 0,
       filesMatched: 0,
-      error: `Expresión regular inválida: ${err.message}`
+      truncated: false,
+      unloadedFiles: 0,
+      error: `Expresión regular demasiado larga (máximo ${MAX_REGEX_LENGTH} caracteres).`
     };
+  }
+
+  const useLiteralFastPath = !isRegex && !matchWholeWord && caseSensitive && !rawQuery.includes("\n") && !rawQuery.includes("\r");
+
+  let regex = null;
+  if (!useLiteralFastPath) {
+    try {
+      let pattern;
+      if (isRegex) {
+        if (hasUnsafeReDoSPattern(rawQuery, { caseSensitive })) {
+          return {
+            results: [],
+            totalMatches: 0,
+            filesMatched: 0,
+            truncated: false,
+            unloadedFiles: 0,
+            error: "Expresión regular inválida: contiene cuantificadores anidados inseguros."
+          };
+        }
+        pattern = rawQuery;
+      } else {
+        pattern = escapeRegExp(rawQuery);
+      }
+
+      if (matchWholeWord) {
+        pattern = `\\b(?:${pattern})\\b`;
+      }
+
+      const needsUnicode = /\\(?:p|P)\{|\\u\{/.test(pattern);
+      const flags = `${caseSensitive ? "g" : "gi"}${needsUnicode ? "u" : ""}`;
+      try {
+        regex = new RegExp(pattern, flags);
+      } catch (unicodeErr) {
+        if (needsUnicode) {
+          regex = new RegExp(pattern, caseSensitive ? "g" : "gi");
+        } else {
+          throw unicodeErr;
+        }
+      }
+    } catch (err) {
+      return {
+        results: [],
+        totalMatches: 0,
+        filesMatched: 0,
+        truncated: false,
+        unloadedFiles: 0,
+        error: `Expresión regular inválida: ${err.message}`
+      };
+    }
   }
 
   const hasAnchorOutsideClass = (pat) => {
@@ -827,19 +894,66 @@ export function searchInFiles(files, query, options = {}) {
   };
   const canPretestWholeFile = !isRegex || !hasAnchorOutsideClass(cleanQuery);
 
+  const buildMatchEntry = (lineIdx, lineText, matchStart, matchText) => {
+    const matchEnd = matchStart + matchText.length;
+    let snippet = lineText;
+    let start = matchStart;
+    let end = matchEnd;
+
+    if (lineText.length > MAX_LINE_SNIPPET_LENGTH) {
+      const fitsFromStart = matchEnd <= MAX_LINE_SNIPPET_LENGTH;
+      const windowStart = fitsFromStart
+        ? 0
+        : Math.max(0, Math.min(matchStart - SNIPPET_MATCH_LEADING_CONTEXT, lineText.length - MAX_LINE_SNIPPET_LENGTH));
+      const prefix = windowStart > 0 ? "…" : "";
+      const maxBodyLength = MAX_LINE_SNIPPET_LENGTH - prefix.length;
+      const windowEnd = Math.min(lineText.length, windowStart + maxBodyLength);
+      const suffix = windowEnd < lineText.length ? "…" : "";
+      snippet = `${prefix}${lineText.slice(windowStart, windowEnd)}${suffix}`;
+
+      const minSnippetIdx = prefix.length;
+      const maxSnippetIdx = prefix.length + (windowEnd - windowStart);
+      start = Math.max(minSnippetIdx, Math.min(maxSnippetIdx, prefix.length + (matchStart - windowStart)));
+      end = Math.max(start, Math.min(maxSnippetIdx, prefix.length + (matchEnd - windowStart)));
+    }
+
+    return {
+      line: lineIdx + 1,
+      column: matchStart + 1,
+      lineText: snippet,
+      matchText,
+      start,
+      end
+    };
+  };
+
   const results = [];
   let totalMatchesCount = 0;
+  let truncated = false;
+  let unloadedFiles = 0;
 
   for (const file of files || []) {
+    if (signal?.aborted) {
+      truncated = true;
+      break;
+    }
     if (!file || file.isFolder || file.isBinary) continue;
-    if (typeof file.path !== "string" || typeof file.content !== "string" || !file.content) continue;
+    if (typeof file.path !== "string") continue;
 
     const baseName = file.path.split(/[/\\]/).pop() || file.path;
     const ext = baseName.includes(".") ? baseName.split(".").pop().toLowerCase() : "";
     if (BINARY_EXTENSIONS.has(ext)) continue;
 
+    if (file.contentLoaded === false) {
+      unloadedFiles += 1;
+      continue;
+    }
+    if (typeof file.content !== "string" || !file.content) continue;
+
     // Optimización: si el archivo no contiene el patrón, evitar escanear línea a línea.
-    if (canPretestWholeFile) {
+    if (useLiteralFastPath) {
+      if (file.content.indexOf(rawQuery) === -1) continue;
+    } else if (canPretestWholeFile) {
       regex.lastIndex = 0;
       if (!regex.test(file.content)) continue;
       regex.lastIndex = 0;
@@ -854,6 +968,10 @@ export function searchInFiles(files, query, options = {}) {
     let lineStart = 0;
 
     while (lineStart <= contentLen) {
+      if (signal?.aborted) {
+        truncated = true;
+        break;
+      }
       const nlIdx = content.indexOf("\n", lineStart);
       const hasNl = nlIdx !== -1;
       const rawEnd = hasNl ? nlIdx : contentLen;
@@ -861,54 +979,38 @@ export function searchInFiles(files, query, options = {}) {
 
       if (lineEnd > lineStart) {
         const lineText = content.slice(lineStart, lineEnd);
-        regex.lastIndex = 0;
 
-        let match;
-        while ((match = regex.exec(lineText)) !== null) {
-          const matchText = match[0];
-          if (matchText.length === 0) {
-            // Avanzar un code point completo para no partir pares sustitutos UTF-16.
-            const cp = lineText.codePointAt(regex.lastIndex);
-            regex.lastIndex += cp !== undefined && cp > 0xffff ? 2 : 1;
-            continue;
+        if (useLiteralFastPath) {
+          let searchFrom = 0;
+          let hitIdx = -1;
+          while ((hitIdx = lineText.indexOf(rawQuery, searchFrom)) !== -1) {
+            fileMatches.push(buildMatchEntry(lineIdx, lineText, hitIdx, rawQuery));
+            totalMatchesCount += 1;
+            searchFrom = hitIdx + rawQuery.length;
+            if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
+              truncated = true;
+              break;
+            }
           }
+        } else {
+          regex.lastIndex = 0;
+          let match;
+          while ((match = regex.exec(lineText)) !== null) {
+            const matchText = match[0];
+            if (matchText.length === 0) {
+              // Avanzar un code point completo para no partir pares sustitutos UTF-16.
+              const cp = lineText.codePointAt(regex.lastIndex);
+              regex.lastIndex += cp !== undefined && cp > 0xffff ? 2 : 1;
+              continue;
+            }
 
-          const matchStart = match.index;
-          const matchEnd = matchStart + matchText.length;
-          let snippet = lineText;
-          let start = matchStart;
-          let end = matchEnd;
+            fileMatches.push(buildMatchEntry(lineIdx, lineText, match.index, matchText));
+            totalMatchesCount += 1;
 
-          if (lineText.length > MAX_LINE_SNIPPET_LENGTH) {
-            const fitsFromStart = matchEnd <= MAX_LINE_SNIPPET_LENGTH;
-            const windowStart = fitsFromStart
-              ? 0
-              : Math.max(0, Math.min(matchStart - SNIPPET_MATCH_LEADING_CONTEXT, lineText.length - MAX_LINE_SNIPPET_LENGTH));
-            const prefix = windowStart > 0 ? "…" : "";
-            const maxBodyLength = MAX_LINE_SNIPPET_LENGTH - prefix.length;
-            const windowEnd = Math.min(lineText.length, windowStart + maxBodyLength);
-            const suffix = windowEnd < lineText.length ? "…" : "";
-            snippet = `${prefix}${lineText.slice(windowStart, windowEnd)}${suffix}`;
-
-            const minSnippetIdx = prefix.length;
-            const maxSnippetIdx = prefix.length + (windowEnd - windowStart);
-            start = Math.max(minSnippetIdx, Math.min(maxSnippetIdx, prefix.length + (matchStart - windowStart)));
-            end = Math.max(start, Math.min(maxSnippetIdx, prefix.length + (matchEnd - windowStart)));
-          }
-
-          fileMatches.push({
-            line: lineIdx + 1,
-            column: match.index + 1,
-            lineText: snippet,
-            matchText,
-            start,
-            end
-          });
-
-          totalMatchesCount++;
-
-          if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
-            break;
+            if (fileMatches.length >= maxMatchesPerFile || totalMatchesCount >= maxTotalMatches) {
+              truncated = true;
+              break;
+            }
           }
         }
       }
@@ -930,6 +1032,7 @@ export function searchInFiles(files, query, options = {}) {
     }
 
     if (totalMatchesCount >= maxTotalMatches) {
+      truncated = true;
       break;
     }
   }
@@ -938,6 +1041,8 @@ export function searchInFiles(files, query, options = {}) {
     results,
     totalMatches: totalMatchesCount,
     filesMatched: results.length,
+    truncated,
+    unloadedFiles,
     error: null
   };
 }

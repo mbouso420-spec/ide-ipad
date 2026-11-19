@@ -5,9 +5,11 @@
 
 export const LIVE_LINT_DEBOUNCE_MS = 500;
 export const ACORN_CDN_URL = "https://esm.sh/acorn@8.14.0";
-export const MAX_LIVE_DIAGNOSTICS = 25;
+const MAX_LIVE_DIAGNOSTICS = 25;
+const ACORN_LOAD_TIMEOUT_MS = 4000;
+const ACORN_RETRY_COOLDOWN_MS = 60_000;
 
-export const LIVE_LINT_EXTENSIONS = new Set([
+const LIVE_LINT_EXTENSIONS = new Set([
   "js",
   "mjs",
   "cjs",
@@ -22,24 +24,96 @@ const HTML_VOID_TAGS = new Set([
 ]);
 const JSON_NUM_STICKY_RE = /-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
 const HTML_TAG_NAME_RE = /^([a-zA-Z][a-zA-Z0-9:-]*)/;
-const HTML_ID_ATTR_RE = /\bid\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"'=<>`]+))/gi;
 const HTML_CLOSE_TAG_RE = {
   script: /<\/script\s*>/gi,
   style: /<\/style\s*>/gi
 };
 
-let lazyAcornPromise = null;
+let lazyAcornModulePromise = null;
+let lastAcornFailureAt = 0;
+
+/**
+ * Carga diferida y compartida de Acorn desde CDN con timeout acotado y cooldown ante fallos
+ * para evitar tormentas de red offline o sesiones colgadas en iPadOS.
+ */
+export async function loadAcornModule() {
+  if (lazyAcornModulePromise) return lazyAcornModulePromise;
+  if (typeof navigator !== "undefined" && navigator.onLine === false) {
+    return null;
+  }
+  if (lastAcornFailureAt && (Date.now() - lastAcornFailureAt) < ACORN_RETRY_COOLDOWN_MS) {
+    return null;
+  }
+
+  let timeoutId = null;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error("Acorn load timeout")), ACORN_LOAD_TIMEOUT_MS);
+    if (typeof timeoutId?.unref === "function") timeoutId.unref();
+  });
+
+  lazyAcornModulePromise = Promise.race([import(ACORN_CDN_URL), timeoutPromise])
+    .then((mod) => {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      if (mod && typeof mod.parse === "function") {
+        lastAcornFailureAt = 0;
+        return mod;
+      }
+      lazyAcornModulePromise = null;
+      lastAcornFailureAt = Date.now();
+      return null;
+    })
+    .catch(() => {
+      if (timeoutId !== null) clearTimeout(timeoutId);
+      lazyAcornModulePromise = null;
+      lastAcornFailureAt = Date.now();
+      return null;
+    });
+
+  return lazyAcornModulePromise;
+}
 
 async function getLazyAcornParse() {
-  if (!lazyAcornPromise) {
-    lazyAcornPromise = import(ACORN_CDN_URL)
-      .then((mod) => (typeof mod?.parse === "function" ? mod.parse : null))
-      .catch(() => {
-        lazyAcornPromise = null;
-        return null;
-      });
+  const mod = await loadAcornModule();
+  return typeof mod?.parse === "function" ? mod.parse : null;
+}
+
+function extractHtmlIdValues(rawTag, startOffset) {
+  const ids = [];
+  const len = rawTag.length;
+  let pos = startOffset;
+  while (pos < len) {
+    while (pos < len && (rawTag.charCodeAt(pos) <= 32 || rawTag[pos] === "/")) pos += 1;
+    if (pos >= len) break;
+    const attrStart = pos;
+    while (pos < len) {
+      const ch = rawTag[pos];
+      if (ch <= " " || ch === "=" || ch === "/") break;
+      pos += 1;
+    }
+    const attrName = rawTag.slice(attrStart, pos).toLowerCase();
+    while (pos < len && rawTag.charCodeAt(pos) <= 32) pos += 1;
+    let attrVal = "";
+    if (pos < len && rawTag[pos] === "=") {
+      pos += 1;
+      while (pos < len && rawTag.charCodeAt(pos) <= 32) pos += 1;
+      if (pos < len && (rawTag[pos] === '"' || rawTag[pos] === "'")) {
+        const quote = rawTag[pos];
+        pos += 1;
+        const valStart = pos;
+        while (pos < len && rawTag[pos] !== quote) pos += 1;
+        attrVal = rawTag.slice(valStart, pos);
+        if (pos < len) pos += 1;
+      } else {
+        const valStart = pos;
+        while (pos < len && rawTag.charCodeAt(pos) > 32 && rawTag[pos] !== "/") pos += 1;
+        attrVal = rawTag.slice(valStart, pos);
+      }
+    }
+    if (attrName === "id" && attrVal) {
+      ids.push(attrVal);
+    }
   }
-  return lazyAcornPromise;
+  return ids;
 }
 
 /**
@@ -91,7 +165,14 @@ function locateJsonSyntaxFallback(text) {
   let i = 0;
 
   const skipWs = () => {
-    while (i < len && /\s/.test(text[i])) i += 1;
+    while (i < len) {
+      const code = text.charCodeAt(i);
+      if (code === 32 || code === 9 || code === 10 || code === 13) {
+        i += 1;
+      } else {
+        break;
+      }
+    }
   };
 
   const fail = (msg, idx = i) => {
@@ -333,7 +414,8 @@ export function lintHtml(code) {
 
     if (cursor >= len || src[cursor] !== ">") {
       pushIssue(lt, "error", "[HTML] Etiqueta abierta '<' sin carácter de cierre '>'.");
-      i = lt + 1;
+      if (cursor >= len) break;
+      i = Math.max(lt + 1, cursor);
       continue;
     }
 
@@ -369,17 +451,13 @@ export function lintHtml(code) {
     if (!nameMatch) continue;
     const tagName = nameMatch[1].toLowerCase();
 
-    // Detectar IDs duplicados como advertencia
-    HTML_ID_ATTR_RE.lastIndex = 0;
-    let idMatch;
-    while ((idMatch = HTML_ID_ATTR_RE.exec(rawTag)) !== null) {
-      const idVal = idMatch[1] ?? idMatch[2] ?? idMatch[3] ?? "";
-      if (idVal) {
-        if (seenIds.has(idVal)) {
-          pushIssue(lt, "warning", `[HTML warning] Atributo id="${idVal}" duplicado en el documento.`);
-        } else {
-          seenIds.add(idVal);
-        }
+    // Detectar IDs duplicados como advertencia (ignorando atributos prefijados como data-id y valores entrecomillados)
+    const idValues = extractHtmlIdValues(rawTag, nameMatch[0].length);
+    for (const idVal of idValues) {
+      if (seenIds.has(idVal)) {
+        pushIssue(lt, "warning", `[HTML warning] Atributo id="${idVal}" duplicado en el documento.`);
+      } else {
+        seenIds.add(idVal);
       }
     }
 
@@ -557,7 +635,7 @@ function fallbackLintJsDelimiters(code) {
         if (Array.isArray(tplRes)) return tplRes;
         continue;
       }
-      expectRegex = ch === "{";
+      expectRegex = ch === "}";
       i += 1;
       continue;
     }

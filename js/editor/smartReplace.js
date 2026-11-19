@@ -17,11 +17,12 @@ function prepareLineForSimilarity(rawLine) {
   if (!trimmed) {
     return null;
   }
-  const lhsMatch = trimmed.match(ASSIGN_REGEX);
-  const sigMatch = trimmed.match(SIG_REGEX);
-  const stmtMatch = trimmed.match(STMT_REGEX);
-  const tagMatch = trimmed.match(TAG_REGEX);
-  const tokens = trimmed.match(TOKEN_REGEX) || [];
+  const bounded = trimmed.length > 1024 ? trimmed.slice(0, 1024) : trimmed;
+  const lhsMatch = bounded.match(ASSIGN_REGEX);
+  const sigMatch = bounded.match(SIG_REGEX);
+  const stmtMatch = bounded.match(STMT_REGEX);
+  const tagMatch = bounded.match(TAG_REGEX);
+  const tokens = bounded.match(TOKEN_REGEX) || [];
 
   const tokenCounts = new Map();
   for (const t of tokens) {
@@ -214,6 +215,9 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     for (let i = startIdx; i <= endIdx; i++) {
       toOffset += docLines[i].length + (i < endIdx ? 1 : 0);
     }
+    if (endIdx >= 0 && endIdx < docLines.length && docLines[endIdx].endsWith("\r")) {
+      toOffset -= 1;
+    }
     return { from: fromOffset, to: toOffset };
   };
 
@@ -232,13 +236,21 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
 
   // 3. Pistas explícitas del mensaje de la IA (bloque "antes" o código inline `...` o número de línea)
   if (contextHint && typeof contextHint === "object") {
+    const hintScanStart = docLines.length > MAX_PREPARED_DOC_LINES
+      ? Math.max(0, safeCursorIdx - MAX_PREPARED_DOC_LINES)
+      : 0;
+    const hintScanEnd = docLines.length > MAX_PREPARED_DOC_LINES
+      ? Math.min(docLines.length - 1, safeCursorIdx + MAX_PREPARED_DOC_LINES)
+      : docLines.length - 1;
+
     const prevBlock = String(contextHint.previousCodeBlock || "").replace(/\r\n/g, "\n").trim();
     if (prevBlock && prevBlock.length < rawDoc.length) {
-      const prevLines = prevBlock.split("\n").map((l) => l.trim()).filter(Boolean);
+      const prevLines = prevBlock.split("\n").map((l) => l.trim());
       if (prevLines.length > 0 && prevLines.length < docLines.length) {
         let bestPrevMatchIdx = -1;
         let bestPrevDist = Infinity;
-        for (let i = 0; i <= docLines.length - prevLines.length; i++) {
+        const maxStart = Math.min(docLines.length - prevLines.length, hintScanEnd - prevLines.length + 1);
+        for (let i = hintScanStart; i <= maxStart; i++) {
           let allMatch = true;
           for (let j = 0; j < prevLines.length; j++) {
             if (docLines[i + j].trim() !== prevLines[j]) {
@@ -279,7 +291,7 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
         if (candidate === rawSnippet.trim()) continue;
         let bestInlineIdx = -1;
         let bestInlineDist = Infinity;
-        for (let li = 0; li < docLines.length; li++) {
+        for (let li = hintScanStart; li <= hintScanEnd; li++) {
           if (docLines[li].trim() === candidate) {
             const dist = Math.abs(li - safeCursorIdx);
             if (dist < bestInlineDist) {
@@ -322,15 +334,15 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
     const windowRadius = 400;
     const scanStart = Math.max(0, safeCursorIdx - windowRadius);
     const scanEnd = Math.min(docLines.length - 1, safeCursorIdx + windowRadius);
-    const snippetPrep = snippetLines.map(prepareLineForSimilarity);
 
     if (snippetLines.length === 1) {
+      const singleSnippetPrep = prepareLineForSimilarity(snippetLines[0]);
       let bestIdx = -1;
       let bestScore = -1;
       for (let i = scanStart; i <= scanEnd; i++) {
         if (!docLines[i].trim()) continue;
         const prepDoc = prepareLineForSimilarity(docLines[i]);
-        let score = scorePreparedLines(prepDoc, snippetPrep[0]);
+        let score = scorePreparedLines(prepDoc, singleSnippetPrep);
         if (i === hintedLineIdx) score += 0.35;
         const proximityBonus = 0.04 / (1 + Math.abs(i - safeCursorIdx) * 0.25);
         const totalScore = score + (score >= 0.25 ? proximityBonus : 0);
@@ -388,18 +400,22 @@ export function computeSmartReplacement(docText, newSnippet, options = {}) {
       }
       const winLen = Math.min(snippetLines.length, scanEnd - scanStart + 1);
       if (winLen > 0) {
+        const snippetPrep = snippetLines.slice(0, winLen).map(prepareLineForSimilarity);
         let bestWinIdx = safeCursorIdx;
         let bestWinScore = -1;
+        let checks = 0;
         for (let i = scanStart; i <= scanEnd - winLen + 1; i++) {
           let sum = 0;
           for (let j = 0; j < winLen; j++) {
             sum += scorePreparedLines(getWindowPrep(i + j), snippetPrep[j]);
+            checks += 1;
           }
           const avg = sum / winLen;
           if (avg > bestWinScore) {
             bestWinScore = avg;
             bestWinIdx = i;
           }
+          if (checks >= MAX_WINDOW_CHECKS) break;
         }
         const startIdx = bestWinScore >= 0.32 ? bestWinIdx : safeCursorIdx;
         const endIdx = bestWinScore >= 0.32 ? Math.min(docLines.length - 1, startIdx + winLen - 1) : startIdx;

@@ -1,6 +1,6 @@
-import { getKeyStorageMode } from "../ai/providers.js";
+import { getKeyStorageMode, notifyCredentialsUpdated } from "../ai/providers.js";
 import { sanitizeRemoteRepoPath } from "../storage/db/dbCore.js";
-import { toFriendlyNetworkError } from "../net/networkErrors.js";
+import { isNetworkFailure, toFriendlyNetworkError } from "../net/networkErrors.js";
 import {
   AuthLockoutError,
   assertNotLockedOut,
@@ -62,7 +62,7 @@ export function parseRepoFullName(fullName) {
 
 function validateGithubRouteParam(key, rawValue) {
   const val = String(rawValue ?? "");
-  if (!val || /[\x00-\x1f\x7f?#\\]/.test(val)) {
+  if (!val || /[\x00-\x1f\x7f-\x9f\u2028\u2029?#\\]/.test(val)) {
     throw new Error(`Parámetro de ruta GitHub inválido (${key}).`);
   }
   if (key === "owner" || key === "repo") {
@@ -73,8 +73,8 @@ function validateGithubRouteParam(key, rawValue) {
   }
   if (key === "branch" || key === "ref" || key === "path") {
     const segments = val.split("/");
-    if (segments.some((seg) => seg === "." || seg === "..")) {
-      throw new Error(`Segmento relativo no permitido en "${key}".`);
+    if (segments.some((seg) => !seg || seg === "." || seg === "..")) {
+      throw new Error(`Segmento relativo o vacío no permitido en "${key}".`);
     }
     return segments.map(encodeURIComponent).join("/");
   }
@@ -85,50 +85,34 @@ function validateGithubRouteParam(key, rawValue) {
 }
 
 function createRequestTimeoutSignal(externalSignal = null, timeoutMs = GITHUB_REQUEST_TIMEOUT_MS) {
-  let timerId = null;
-  let controller = null;
-  let onExternalAbort = null;
-
-  let timeoutSignal;
-  if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
-    timeoutSignal = AbortSignal.timeout(timeoutMs);
-  } else {
-    controller = new AbortController();
-    timerId = setTimeout(() => controller.abort(new Error("Tiempo de espera agotado.")), timeoutMs);
-    if (typeof timerId?.unref === "function") {
-      timerId.unref();
+  const controller = new AbortController();
+  let timerId = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      const timeoutErr = new Error("Tiempo de espera agotado al conectar con GitHub.");
+      timeoutErr.name = "TimeoutError";
+      controller.abort(timeoutErr);
     }
-    timeoutSignal = controller.signal;
+  }, timeoutMs);
+  if (typeof timerId?.unref === "function") {
+    timerId.unref();
   }
 
-  let signal = timeoutSignal;
-  let onTimeoutAbort = null;
+  let onExternalAbort = null;
   if (externalSignal) {
-    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.any === "function") {
-      signal = AbortSignal.any([externalSignal, timeoutSignal]);
+    if (externalSignal.aborted) {
+      controller.abort(externalSignal.reason);
     } else {
-      const combined = new AbortController();
-      const forwardAbort = (source) => {
-        if (!combined.signal.aborted) {
-          combined.abort(source?.reason);
+      onExternalAbort = () => {
+        if (!controller.signal.aborted) {
+          controller.abort(externalSignal.reason);
         }
       };
-      if (externalSignal.aborted) {
-        forwardAbort(externalSignal);
-      } else {
-        onExternalAbort = () => forwardAbort(externalSignal);
-        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
-        if (timeoutSignal) {
-          onTimeoutAbort = () => forwardAbort(timeoutSignal);
-          timeoutSignal.addEventListener("abort", onTimeoutAbort, { once: true });
-        }
-      }
-      signal = combined.signal;
+      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
     }
   }
 
   return {
-    signal,
+    signal: controller.signal,
     dispose() {
       if (timerId !== null) {
         clearTimeout(timerId);
@@ -138,12 +122,32 @@ function createRequestTimeoutSignal(externalSignal = null, timeoutMs = GITHUB_RE
         externalSignal.removeEventListener("abort", onExternalAbort);
         onExternalAbort = null;
       }
-      if (timeoutSignal && onTimeoutAbort) {
-        timeoutSignal.removeEventListener("abort", onTimeoutAbort);
-        onTimeoutAbort = null;
-      }
     }
   };
+}
+
+function parseGithubRetryAfterSeconds(headers) {
+  if (!headers || typeof headers.get !== "function") return 0;
+  const retryAfter = headers.get("retry-after");
+  if (retryAfter) {
+    const num = Number(retryAfter);
+    if (Number.isFinite(num) && num > 0) return Math.ceil(num);
+    const parsedDate = Date.parse(retryAfter);
+    if (Number.isFinite(parsedDate)) {
+      const delta = Math.ceil((parsedDate - Date.now()) / 1000);
+      if (delta > 0) return delta;
+    }
+  }
+  const remaining = headers.get("x-ratelimit-remaining");
+  const reset = headers.get("x-ratelimit-reset");
+  if (remaining === "0" && reset) {
+    const resetEpoch = Number(reset);
+    if (Number.isFinite(resetEpoch) && resetEpoch > 0) {
+      const delta = Math.ceil(resetEpoch - Date.now() / 1000);
+      if (delta > 0) return delta;
+    }
+  }
+  return 0;
 }
 
 function isRemoteRepoEmpty(err, { allowNotFound = false } = {}) {
@@ -179,10 +183,12 @@ export function saveGithubToken(token) {
       window.sessionStorage.removeItem(GH_REPOS_CACHE_KEY);
       window.localStorage.removeItem(GH_USER_CACHE_KEY);
       window.sessionStorage.removeItem(GH_USER_CACHE_KEY);
+      notifyCredentialsUpdated();
       return;
     }
     const store = getKeyStorageMode() === "session" ? window.sessionStorage : window.localStorage;
     store.setItem(GH_TOKEN_KEY, trimmed);
+    notifyCredentialsUpdated();
   } catch {
     // Entorno restringido
   }
@@ -328,10 +334,11 @@ async function createGithubClient(token, { requireToken = true } = {}) {
             throw new AuthLockoutError(GH_SCOPE, failure.remainingMs, failure.failedAttempts);
           }
           const scrubbed = sanitizeErrorCause(error, [cleanToken]);
-          const rejectedErr =
-            scrubbed instanceof Error
-              ? scrubbed
-              : new Error(redactSensitiveTokens(rawMsg || "GitHub rechazó la credencial.", [cleanToken]));
+          const safeMsg =
+            scrubbed instanceof Error && scrubbed.message
+              ? scrubbed.message
+              : redactSensitiveTokens(rawMsg || "GitHub rechazó la credencial.", [cleanToken]);
+          const rejectedErr = new Error(safeMsg);
           rejectedErr.status = 403;
           rejectedErr.credentialRejected = true;
           rejectedErr.cause = scrubbed;
@@ -362,7 +369,7 @@ async function createGithubClient(token, { requireToken = true } = {}) {
         if (scrubbedErr instanceof Error) {
           throw scrubbedErr;
         }
-        throw friendly;
+        throw new Error(redactSensitiveTokens(rawMsg || "Error al comunicarse con GitHub.", [cleanToken]));
       }
     }
   };
@@ -415,13 +422,25 @@ async function createRawGithubClient(token) {
           for (const match of rawPath.matchAll(/\{([^}]+)\}/g)) {
             validateGithubRouteParam(match[1], params?.[match[1]]);
           }
-          const timeout = createRequestTimeoutSignal(params?.signal || null);
+          const { signal: externalSignal = null, request: extraRequestOpts, ...restParams } = params || {};
+          const timeout = createRequestTimeoutSignal(externalSignal);
           try {
             const res = await octokit.request(route, {
-              ...params,
-              request: { ...(params?.request || {}), signal: timeout.signal }
+              ...restParams,
+              request: { ...(extraRequestOpts || {}), signal: timeout.signal }
             });
             return res.data;
+          } catch (octoErr) {
+            // Octokit envuelve TypeError("Failed to fetch" / "Load failed") con status=500 sin response HTTP real.
+            if (
+              octoErr &&
+              Number(octoErr.status) === 500 &&
+              !octoErr.response &&
+              isNetworkFailure(new TypeError(String(octoErr.message || "")))
+            ) {
+              throw new TypeError(String(octoErr.message || "Failed to fetch"));
+            }
+            throw octoErr;
           } finally {
             timeout.dispose();
           }
@@ -474,30 +493,38 @@ async function createRawGithubClient(token) {
 
       const timeout = createRequestTimeoutSignal(externalSignal);
       init.signal = timeout.signal;
-      let res;
       try {
-        res = await fetch(url, init);
+        const res = await fetch(url, init);
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const errJson = await res.json();
+            if (errJson?.message) detail = errJson.message;
+          } catch {
+            // Ignorar
+          }
+          if (detail.includes("Resource not accessible by personal access token") && rawPath.startsWith("/gists")) {
+            detail =
+              "Resource not accessible by personal access token: Tu token de GitHub no tiene permiso para Gists. Activá 'Account permissions -> Gists (Read and write)' en GitHub o usá un Token Classic con la casilla 'gist'.";
+          }
+          const retryAfterSeconds =
+            res.status === 403 || res.status === 429 ? parseGithubRetryAfterSeconds(res.headers) : 0;
+          const retrySuffix =
+            retryAfterSeconds > 0 && !/reintent/i.test(detail)
+              ? ` (Reintentá en ~${retryAfterSeconds}s)`
+              : "";
+          const safeDetail = redactSensitiveTokens(`${detail}${retrySuffix}`, [token]);
+          const err = new Error(`GitHub API: ${safeDetail}`);
+          err.status = res.status;
+          if (retryAfterSeconds > 0) {
+            err.retryAfterSeconds = retryAfterSeconds;
+          }
+          throw err;
+        }
+        return await res.json();
       } finally {
         timeout.dispose();
       }
-      if (!res.ok) {
-        let detail = `HTTP ${res.status}`;
-        try {
-          const errJson = await res.json();
-          if (errJson?.message) detail = errJson.message;
-        } catch {
-          // Ignorar
-        }
-        if (detail.includes("Resource not accessible by personal access token") && rawPath.startsWith("/gists")) {
-          detail =
-            "Resource not accessible by personal access token: Tu token de GitHub no tiene permiso para Gists. Activá 'Account permissions -> Gists (Read and write)' en GitHub o usá un Token Classic con la casilla 'gist'.";
-        }
-        const safeDetail = redactSensitiveTokens(detail, [token]);
-        const err = new Error(`GitHub API: ${safeDetail}`);
-        err.status = res.status;
-        throw err;
-      }
-      return res.json();
     }
   };
 }
@@ -851,10 +878,35 @@ export async function fetchSingleRepoBlob({ token, owner, repo, blobSha, path = 
   return parsed.content;
 }
 
+function createAbortError(message = "Operación cancelada.") {
+  const err = new Error(message);
+  err.name = "AbortError";
+  return err;
+}
+
+function isFatalBatchBlobError(err) {
+  if (!err) return false;
+  return Boolean(
+    err.name === "AbortError" ||
+      err instanceof AuthLockoutError ||
+      err.code === "ERR_AUTH_LOCKOUT" ||
+      err.status === 401 ||
+      err.credentialRejected
+  );
+}
+
 /**
  * Descarga en lote una lista de archivos pendientes para dejar el repositorio disponible sin internet.
  */
-export async function downloadBatchBlobs({ token, owner, repo, items, onProgress, signal = null }) {
+export async function downloadBatchBlobs({
+  token,
+  owner,
+  repo,
+  items,
+  onProgress,
+  signal = null,
+  throwOnFailure = false
+}) {
   const client = await createGithubClient(token, { requireToken: false });
   const results = [];
   let completed = 0;
@@ -863,9 +915,15 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
 
   const CONCURRENCY = 6;
   for (let i = 0; i < items.length; i += CONCURRENCY) {
+    if (signal?.aborted) {
+      throw createAbortError("Descarga cancelada.");
+    }
     const batch = items.slice(i, i + CONCURRENCY);
     const settled = await Promise.allSettled(
       batch.map(async (item) => {
+        if (signal?.aborted) {
+          throw createAbortError("Descarga cancelada.");
+        }
         const blob = await client.request("GET /repos/{owner}/{repo}/git/blobs/{file_sha}", {
           owner,
           repo,
@@ -885,13 +943,20 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
         };
       })
     );
+    let fatalError = null;
     for (const outcome of settled) {
       if (outcome.status === "fulfilled" && outcome.value) {
         results.push(outcome.value);
       } else if (outcome.status === "rejected") {
         completed += 1;
         onProgress?.(completed, total);
+        if (!fatalError && (throwOnFailure || isFatalBatchBlobError(outcome.reason))) {
+          fatalError = outcome.reason;
+        }
       }
+    }
+    if (fatalError) {
+      throw fatalError;
     }
   }
   return results;
@@ -900,7 +965,7 @@ export async function downloadBatchBlobs({ token, owner, repo, items, onProgress
 /**
  * Descarga completa de un repositorio y rama hacia memoria para hidratar IndexedDB (modo offline completo).
  */
-export async function downloadRepoFiles({ token, owner, repo, branch, onProgress }) {
+export async function downloadRepoFiles({ token, owner, repo, branch, onProgress, signal = null }) {
   const index = await fetchRepoTreeIndex({ token, owner, repo, branch });
   if (index.isEmptyRepo || index.entries.length === 0) {
     onProgress?.(0, 0);
@@ -916,7 +981,9 @@ export async function downloadRepoFiles({ token, owner, repo, branch, onProgress
     owner,
     repo,
     items: index.entries,
-    onProgress
+    onProgress,
+    signal,
+    throwOnFailure: true
   });
 
   return {
@@ -950,11 +1017,16 @@ export async function compareRemoteCommits({ token, owner, repo, base, head }) {
     basehead: `${base}...${head}`
   });
   const files = Array.isArray(data?.files) ? data.files : [];
-  return files
+  const result = files
     .map((f) => {
       const safePath = sanitizeRemoteRepoPath(f?.filename);
       if (!safePath) return null;
-      const safePrev = f?.previous_filename ? sanitizeRemoteRepoPath(f.previous_filename) || null : null;
+      if (safePath.startsWith("node_modules/") || safePath.startsWith(".git/")) return null;
+      const safePrevRaw = f?.previous_filename ? sanitizeRemoteRepoPath(f.previous_filename) || null : null;
+      const safePrev =
+        safePrevRaw && !safePrevRaw.startsWith("node_modules/") && !safePrevRaw.startsWith(".git/")
+          ? safePrevRaw
+          : null;
       return {
         path: safePath,
         previousPath: safePrev,
@@ -963,6 +1035,14 @@ export async function compareRemoteCommits({ token, owner, repo, base, head }) {
       };
     })
     .filter(Boolean);
+  Object.defineProperty(result, "compareMeta", {
+    value: {
+      status: typeof data?.status === "string" ? data.status : null,
+      truncated: files.length >= 300
+    },
+    enumerable: false
+  });
+  return result;
 }
 
 /**
@@ -1066,10 +1146,11 @@ export async function pushAtomicCommit({
   const BLOB_UPLOAD_CONCURRENCY = 4;
   const treeItems = new Array(remainingChanges.length);
   let nextIdx = 0;
+  const uploadPoolAbort = new AbortController();
 
   try {
     async function uploadWorker() {
-      while (nextIdx < remainingChanges.length) {
+      while (nextIdx < remainingChanges.length && !uploadPoolAbort.signal.aborted) {
         const idx = nextIdx++;
         const change = remainingChanges[idx];
         if (change.status === "deleted") {
@@ -1084,15 +1165,28 @@ export async function pushAtomicCommit({
         const mode = change.mode === "100755" ? "100755" : "100644";
         if (change.isBinary || change.encoding === "base64" || (change.base64 && typeof change.base64 === "string")) {
           const b64 = change.base64 || (typeof change.content === "string" ? change.content : "");
-          const createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
-            owner,
-            repo,
-            content: b64,
-            encoding: "base64"
-          });
+          let createdBlob;
+          try {
+            createdBlob = await client.request("POST /repos/{owner}/{repo}/git/blobs", {
+              owner,
+              repo,
+              content: b64,
+              encoding: "base64",
+              signal: uploadPoolAbort.signal
+            });
+          } catch (uploadErr) {
+            if (!uploadPoolAbort.signal.aborted) {
+              uploadPoolAbort.abort(uploadErr);
+            }
+            throw uploadErr;
+          }
           const blobSha = createdBlob?.sha || createdBlob?.data?.sha || "";
           if (typeof blobSha !== "string" || !blobSha.trim()) {
-            throw new Error(`GitHub no devolvió un SHA de blob válido para "${change.path}".`);
+            const invalidShaErr = new Error(`GitHub no devolvió un SHA de blob válido para "${change.path}".`);
+            if (!uploadPoolAbort.signal.aborted) {
+              uploadPoolAbort.abort(invalidShaErr);
+            }
+            throw invalidShaErr;
           }
           treeItems[idx] = {
             path: change.path,
@@ -1299,10 +1393,10 @@ export async function saveProjectToGist(token, { projectName, entries, existingG
  * Obtiene la lista de proyectos respaldados en Gists privados de GitHub del usuario.
  * @param {string} token
  */
-export async function fetchUserGistBackups(token) {
+export async function fetchUserGistBackups(token, { signal = null } = {}) {
   if (!token) return [];
   const client = await createGithubClient(token);
-  const list = await client.request("GET /gists", { per_page: 50 });
+  const list = await client.request("GET /gists", { per_page: 50, signal });
   if (!Array.isArray(list)) return [];
 
   return list
@@ -1323,6 +1417,8 @@ export async function fetchUserGistBackups(token) {
     });
 }
 
+const TRUSTED_GIST_RAW_URL_RE = /^https:\/\/(gist\.githubusercontent\.com|api\.github\.com)\//i;
+
 /**
  * Descarga y extrae los archivos de un Gist de respaldo de Studio IDE.
  * @param {string} token
@@ -1336,68 +1432,77 @@ export async function fetchGistBackupContent(token, gistId) {
 
   if (manifestFile) {
     let manifestRawContent = manifestFile.content || "";
-    if ((manifestFile.truncated || !manifestRawContent) && manifestFile.raw_url) {
+    if (manifestFile.truncated || !manifestRawContent) {
+      const rawUrl = String(manifestFile.raw_url || "");
+      if (!TRUSTED_GIST_RAW_URL_RE.test(rawUrl)) {
+        throw new Error("El manifiesto del Gist está truncado y su URL de descarga no es confiable.");
+      }
+      const timeout = createRequestTimeoutSignal();
       try {
-        const rawUrl = String(manifestFile.raw_url);
-        if (/^https:\/\/(gist\.githubusercontent\.com|api\.github\.com)\//i.test(rawUrl)) {
-          const timeout = createRequestTimeoutSignal();
-          try {
-            const rawRes = await fetch(rawUrl, { signal: timeout.signal });
-            if (rawRes.ok) {
-              const rawLen = Number(rawRes.headers?.get?.("content-length") || 0);
-              if (!rawLen || rawLen <= 10 * 1024 * 1024) {
-                const text = await rawRes.text();
-                if (text.length <= 10 * 1024 * 1024) {
-                  manifestRawContent = text;
-                }
-              }
-            }
-          } finally {
-            timeout.dispose();
-          }
+        const rawRes = await fetch(rawUrl, { signal: timeout.signal, credentials: "omit" });
+        if (!rawRes.ok) {
+          throw new Error(`No se pudo descargar el manifiesto completo del Gist (HTTP ${rawRes.status}).`);
         }
-      } catch (_) {
-        // Fallback a contenido parcial o archivos planos
+        if (rawRes.url && !TRUSTED_GIST_RAW_URL_RE.test(String(rawRes.url))) {
+          throw new Error("Redirección inesperada al descargar el manifiesto del Gist.");
+        }
+        const rawLen = Number(rawRes.headers?.get?.("content-length") || 0);
+        if (rawLen > 10 * 1024 * 1024) {
+          throw new Error("El manifiesto del Gist supera el límite máximo permitido (10 MB).");
+        }
+        const text = await rawRes.text();
+        if (text.length > 10 * 1024 * 1024) {
+          throw new Error("El manifiesto del Gist supera el límite máximo permitido (10 MB).");
+        }
+        manifestRawContent = text;
+      } finally {
+        timeout.dispose();
       }
     }
 
-    if (manifestRawContent) {
-      try {
-        const parsed = JSON.parse(manifestRawContent);
-        const sanitizedEntries = (Array.isArray(parsed.entries) ? parsed.entries : [])
-          .map((e) => {
-            if (!e || typeof e.path !== "string") return null;
-            const raw = e.path.replace(/\\/g, "/").trim().replace(/^\/+/, "");
-            if (!raw || /^[A-Za-z]:\//.test(raw) || /[\x00-\x1f\x7f]/.test(raw)) return null;
-            const segs = raw.split("/").filter((s) => s && s !== ".");
-            if (segs.length === 0 || segs.some((s) => s === ".." || s === "__proto__" || s === "constructor" || s === "prototype")) {
-              return null;
-            }
-            return { ...e, path: segs.join("/") };
-          })
-          .filter(Boolean);
-        return {
-          projectName: parsed.projectName || gist.description || "proyecto-restaurado",
-          entries: sanitizedEntries
-        };
-      } catch {
-        // Fallback a archivos planos
-      }
+    let parsed;
+    try {
+      parsed = JSON.parse(manifestRawContent);
+    } catch {
+      throw new Error("El archivo studio_project.json del Gist está dañado o incompleto.");
     }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("El manifiesto studio_project.json del Gist tiene un formato inválido.");
+    }
+
+    const sanitizedEntries = (Array.isArray(parsed.entries) ? parsed.entries : [])
+      .map((e) => {
+        if (!e || typeof e.path !== "string") return null;
+        const safePath = sanitizeRemoteRepoPath(e.path);
+        if (!safePath) return null;
+        const isBinary = Boolean(e.isBinary);
+        return {
+          path: safePath,
+          isFolder: false,
+          isBinary,
+          content: !isBinary && typeof e.content === "string" ? e.content : "",
+          base64: isBinary && typeof e.base64 === "string" ? e.base64 : null,
+          mode: typeof e.mode === "string" ? e.mode : null
+        };
+      })
+      .filter(Boolean);
+    return {
+      projectName:
+        typeof parsed.projectName === "string" && parsed.projectName.trim()
+          ? parsed.projectName.trim()
+          : (gist.description || "proyecto-restaurado"),
+      entries: sanitizedEntries
+    };
   }
 
   const entries = [];
   for (const [filename, fileObj] of Object.entries(gist.files || {})) {
     if (filename === "studio_project.json") continue;
-    const raw = filename.replace(/__/g, "/").replace(/\\/g, "/").trim().replace(/^\/+/, "");
-    if (!raw || /^[A-Za-z]:\//.test(raw) || /[\x00-\x1f\x7f]/.test(raw)) continue;
-    const segs = raw.split("/").filter((s) => s && s !== ".");
-    if (segs.length === 0 || segs.some((s) => s === ".." || s === "__proto__" || s === "constructor" || s === "prototype")) {
-      continue;
-    }
+    const safePath = sanitizeRemoteRepoPath(filename.replace(/__/g, "/"));
+    if (!safePath) continue;
     entries.push({
-      path: segs.join("/"),
-      content: fileObj?.content || "",
+      path: safePath,
+      content: typeof fileObj?.content === "string" ? fileObj.content : "",
       isFolder: false
     });
   }

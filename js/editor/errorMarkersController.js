@@ -17,6 +17,7 @@ function renderErrorRuler(markers, totalLines, onJump) {
   const rulerEl = typeof document !== "undefined" ? document.getElementById("editor-error-ruler") : null;
   if (!rulerEl) return;
   if (!markers || markers.length === 0) {
+    if (rulerEl.hidden && rulerEl.childElementCount === 0) return;
     rulerEl.hidden = true;
     rulerEl.innerHTML = "";
     return;
@@ -110,8 +111,17 @@ export function createErrorMarkersController({
     markersByFile.delete(resolveKey(fileId));
   }
 
-  function dropFile(fileId) {
-    markersByFile.delete(resolveKey(fileId));
+  function dropFile(fileId, isFolder = false) {
+    const key = resolveKey(fileId);
+    markersByFile.delete(key);
+    if (isFolder && typeof fileId === "string" && fileId) {
+      const prefix = `${fileId}/`;
+      for (const existingKey of [...markersByFile.keys()]) {
+        if (existingKey.startsWith(prefix)) {
+          markersByFile.delete(existingKey);
+        }
+      }
+    }
   }
 
   function renamePaths(oldPath, newPath, isFolder) {

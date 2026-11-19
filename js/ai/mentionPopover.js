@@ -122,14 +122,40 @@ export function createMentionPopover({
   let activeMention = null;
   let items = [];
   let activeIndex = 0;
+  let blurTimer = 0;
+  let destroyed = false;
+
+  function clearBlurTimer() {
+    if (blurTimer) {
+      window.clearTimeout(blurTimer);
+      blurTimer = 0;
+    }
+  }
 
   function close() {
+    clearBlurTimer();
+    if (popoverEl.hidden && !activeMention && items.length === 0) {
+      return;
+    }
     activeMention = null;
     items = [];
     activeIndex = 0;
     popoverEl.hidden = true;
     popoverEl.innerHTML = "";
     promptInput.removeAttribute("aria-expanded");
+  }
+
+  function syncActiveItemSelection() {
+    const buttons = popoverEl.querySelectorAll(".chat-mention-item");
+    if (!buttons || buttons.length !== items.length) {
+      render();
+      return;
+    }
+    buttons.forEach((btn, idx) => {
+      const selected = idx === activeIndex;
+      btn.classList?.toggle("is-selected", selected);
+      btn.setAttribute?.("aria-selected", String(selected));
+    });
   }
 
   function render() {
@@ -191,6 +217,8 @@ export function createMentionPopover({
   }
 
   function refresh() {
+    if (destroyed) return;
+    clearBlurTimer();
     const caret = typeof promptInput.selectionStart === "number" ? promptInput.selectionStart : (promptInput.value || "").length;
     const mention = extractMentionQuery(promptInput.value || "", caret);
     if (!mention) {
@@ -215,15 +243,15 @@ export function createMentionPopover({
   promptInput.addEventListener("input", refresh, listenOpts);
   promptInput.addEventListener("click", refresh, listenOpts);
   promptInput.addEventListener("keydown", (event) => {
-    if (popoverEl.hidden || items.length === 0) return;
+    if (destroyed || popoverEl.hidden || items.length === 0) return;
     if (event.key === "ArrowDown") {
       event.preventDefault();
       activeIndex = (activeIndex + 1) % items.length;
-      render();
+      syncActiveItemSelection();
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
       activeIndex = (activeIndex - 1 + items.length) % items.length;
-      render();
+      syncActiveItemSelection();
     } else if (event.key === "Enter" || event.key === "Tab") {
       event.preventDefault();
       event.stopPropagation();
@@ -236,7 +264,10 @@ export function createMentionPopover({
   }, listenOpts);
 
   promptInput.addEventListener("blur", () => {
-    window.setTimeout(() => {
+    clearBlurTimer();
+    blurTimer = window.setTimeout(() => {
+      blurTimer = 0;
+      if (destroyed) return;
       if (typeof document !== "undefined" && document.activeElement && popoverEl.contains(document.activeElement)) {
         return;
       }
@@ -249,8 +280,9 @@ export function createMentionPopover({
     close,
     refresh,
     destroy: () => {
+      destroyed = true;
       close();
-      if (popoverEl.parentNode === composerForm) {
+      if (popoverEl.parentNode === composerForm || popoverEl.parentElement === composerForm) {
         popoverEl.remove();
       }
     }

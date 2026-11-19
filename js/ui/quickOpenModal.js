@@ -48,6 +48,30 @@ export function initQuickOpenModal({
   let activeIndex = 0;
   let lastHighlightedIndex = 0;
   let currentTargetLine = null;
+  let focusRaf = 0;
+  let focusTimer = null;
+
+  function cancelPendingFocus() {
+    if (focusRaf && typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
+      window.cancelAnimationFrame(focusRaf);
+    }
+    focusRaf = 0;
+    if (focusTimer !== null) {
+      clearTimeout(focusTimer);
+      focusTimer = null;
+    }
+  }
+
+  function clearQuickOpenCache() {
+    filtered = [];
+    renderedButtons = [];
+    activeIndex = 0;
+    lastHighlightedIndex = 0;
+    currentTargetLine = null;
+    if (listEl) {
+      listEl.innerHTML = "";
+    }
+  }
 
   function open(initialPrefix = "") {
     if (!dialog) return;
@@ -74,18 +98,25 @@ export function initQuickOpenModal({
         return false;
       }
     });
-    const scheduleFocus = typeof window !== "undefined" && typeof window.requestAnimationFrame === "function"
-      ? (cb) => window.requestAnimationFrame(cb)
-      : (cb) => setTimeout(cb, 0);
-    scheduleFocus(() => {
+    cancelPendingFocus();
+    const applyFocus = () => {
+      focusRaf = 0;
+      focusTimer = null;
       input?.focus();
       if (initialPrefix && typeof input?.setSelectionRange === "function") {
         input.setSelectionRange(initialPrefix.length, initialPrefix.length);
       }
-    });
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      focusRaf = window.requestAnimationFrame(applyFocus);
+    } else {
+      focusTimer = setTimeout(applyFocus, 0);
+    }
   }
 
   function close() {
+    cancelPendingFocus();
+    clearQuickOpenCache();
     keyboardRouter.popModal("quick-open-dialog");
     dialog?.close();
   }
@@ -330,8 +361,9 @@ export function initQuickOpenModal({
 
   return {
     open,
-    close,
     destroy() {
+      cancelPendingFocus();
+      clearQuickOpenCache();
       controller?.abort();
       keyboardRouter.unregisterGlobalShortcut("ctrl+p");
       keyboardRouter.unregisterGlobalShortcut("meta+p");
